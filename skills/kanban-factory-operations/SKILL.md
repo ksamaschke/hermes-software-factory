@@ -101,6 +101,10 @@ job and repairs only:
 - blocked tasks whose latest spawn failure is a duplicate clean managed Git
   worktree, preserving the branch, removing only the clean worktree, unblocking
   the task, and reading the status back.
+- blocked/terminal tasks whose `current_run_id` is null but whose task-bound
+  Hermes worker process group or descendants remain live; cleanup matches exact
+  task plus board/database identity and reaps only the isolated group after a
+  final task readback.
 
 Dirty or non-managed worktrees, product failures, provider authorization,
 review findings, and deployment decisions remain explicit blockers. Do not

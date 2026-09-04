@@ -34,6 +34,26 @@ One supervised gateway owns dispatcher promotion, claims, worktrees,
 heartbeats, retries, and recovery. A source reconciler or progress digest does
 not start another dispatcher.
 
+### Worker/process reconciliation
+
+Dispatcher workers are started in an isolated POSIX session and carry the
+following non-secret identity values in their environment:
+
+- `HERMES_KANBAN_TASK`;
+- `HERMES_KANBAN_RUN_ID`;
+- `HERMES_KANBAN_BOARD` and/or `HERMES_KANBAN_DB`.
+
+The factory recovery add-on may reconcile a worker only after an exact task
+readback shows a terminal handoff (`blocked`, `review`, `done`, `failed`,
+`cancelled`, or `archived`) and `current_run_id=null`. It must revalidate the
+task and process start-time before signalling, require an isolated process
+group whose members all carry the same task/board identity, use bounded
+`SIGTERM`/`SIGKILL`, and read the process state back. Active tasks, board
+mismatches, PID reuse, unreadable group members, and non-isolated sessions are
+preserved as explicit `unsafe` evidence. Process names, shell command text,
+and broad `pkill`/`killall` matching are never valid identity or cleanup
+mechanisms.
+
 `failure_limit` is a recovery breaker, not a review verdict. Review leaves set
 `max_retries: 1` individually and use the declared two-tier review budget. A
 timeout, crash, or

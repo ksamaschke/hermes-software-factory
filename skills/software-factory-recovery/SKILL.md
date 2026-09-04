@@ -29,7 +29,7 @@ Treat internal execution failures as factory-owned. Do not leave work human-bloc
 
 The factory is an add-on around Hermes, not a replacement for Hermes runtime behavior. Keep deterministic repairs in `~/.hermes/scripts/kanban_factory_recovery.py` and user-owned cron/board operations. Do not modify Hermes source for per-job pinning or routine worktree recovery.
 
-Before escalating, run the recovery layer. It promotes legacy cron snapshots with `hermes cron edit`, repairs only duplicate clean managed linked worktrees after resolving the shared Git common directory and verifying the occupied worktree is checked out to the reported branch, preserves dirty work, unblocks only after readback, and leaves product/review/auth/capability/deployment decisions for explicit handling.
+Before escalating, run the recovery layer. It promotes legacy cron snapshots with `hermes cron edit`, repairs only duplicate clean managed linked worktrees after resolving the shared Git common directory and verifying the occupied worktree is checked out to the reported branch, reconciles task-owned worker process groups after a terminal Kanban handoff, preserves dirty work, unblocks only after readback, and leaves product/review/auth/capability/deployment decisions for explicit handling. Worker cleanup requires exact `HERMES_KANBAN_TASK` plus board/database identity and a terminal task with no `current_run_id`; it never falls back to process-name matching or a broad `pkill`.
 
 The orchestrator owns the recovery decision: it chooses whether to replan, split,
 reassign, requeue, unblock, replace, or retire work. The recovery layer and
@@ -136,7 +136,23 @@ hermes kanban --board <board> notify-list --json
 
 Reconcile counts programmatically. Inspect every root blocker and every task that appears ready. Classify each as internal execution, dependency, review, external capability/authorization, or explicit operator disposition.
 
-### 2. Repair the worker execution contract
+### 2. Reconcile terminal worker processes
+
+Run the installed recovery add-on before classifying a blocked lane as external or
+before reporting a worker as active. For each blocked task, it reads the exact
+task detail and, only when the card is terminal with `current_run_id=null`, scans
+task-owned process environments and isolated process groups. The controller
+revalidates the task and process start-times immediately before signalling,
+sends bounded `SIGTERM` followed by `SIGKILL` when necessary, and emits only
+bounded task/PID/group status. A board mismatch, PID reuse, unreadable member,
+or non-isolated group is `unsafe` and is preserved for operator/orchestrator
+disposition; it is never a reason to kill by command name.
+
+The recovery result is evidence, not delivery proof. Read back the task status,
+`current_run_id`, process inventory, and cleanup result. A task that is still
+`running` or has a current run is not eligible for cleanup.
+
+### 3. Repair the worker execution contract
 
 Interactive profile limits must not silently cap durable Kanban jobs. Add a recognized `kanban.worker_max_turns` config key with a bounded default and pass it after the `chat` subcommand:
 
