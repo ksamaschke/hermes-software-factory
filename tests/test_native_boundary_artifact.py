@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -76,6 +77,106 @@ def test_unsafe_relative_and_symlink_paths_fail_closed(tmp_path):
     output_parent.symlink_to(tmp_path, target_is_directory=True)
     with pytest.raises(ValueError, match="symlink"):
         builder.stage(str(source), str(output_parent / "staged"), None)
+
+
+@pytest.mark.parametrize("destination", ["output", "manifest"])
+@pytest.mark.parametrize("boundary", ["source", "artifact"])
+def test_stage_rejects_source_and_artifact_destinations_before_side_effects(
+    tmp_path, destination, boundary
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    token = f".native-boundary-test-{tmp_path.name}-{destination}-{boundary}"
+    boundary_root = source if boundary == "source" else ARTIFACT
+    output = tmp_path / "staged-output"
+    manifest = tmp_path / "manifest.json"
+    if destination == "output":
+        output = boundary_root / f"{token}-runtime"
+    else:
+        manifest = boundary_root / f"{token}.json"
+
+    try:
+        with pytest.raises(ValueError, match="inside"):
+            builder.stage(str(source), str(output), str(manifest))
+        assert not output.exists()
+        assert not manifest.exists()
+        assert not any(source.iterdir())
+    finally:
+        if output.is_dir():
+            shutil.rmtree(output)
+        elif output.exists() or output.is_symlink():
+            output.unlink()
+        if manifest.exists() or manifest.is_symlink():
+            manifest.unlink()
+
+
+def test_patch_application_uses_fixed_tool_and_scrubbed_environment(
+    tmp_path, monkeypatch
+):
+    if not builder._PATCH_EXECUTABLE.is_file():
+        pytest.skip("fixed patch executable is not available")
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    marker = tmp_path / "ambient-path-used"
+    fake_patch = fake_bin / "patch"
+    fake_patch.write_text(
+        "#!/bin/sh\n"
+        f'test -z "${{NATIVE_SECRET_SENTINEL-}}" || printf \'%s\' "$NATIVE_SECRET_SENTINEL" > {marker}\n'
+        "exit 99\n",
+        encoding="utf-8",
+    )
+    fake_patch.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_bin))
+    monkeypatch.setenv("NATIVE_SECRET_SENTINEL", "review-secret")
+
+    staging = tmp_path / "runtime"
+    staging.mkdir()
+    target = staging / "target.txt"
+    target.write_text("old\n", encoding="utf-8")
+    patch = tmp_path / "change.patch"
+    patch.write_text(
+        "--- a/target.txt\n+++ b/target.txt\n@@ -1 +1 @@\n-old\n+new\n",
+        encoding="utf-8",
+    )
+
+    builder._apply_patches(
+        staging,
+        [(patch, "patches/change.patch")],
+        ["target.txt"],
+    )
+
+    assert target.read_text(encoding="utf-8") == "new\n"
+    assert not marker.exists()
+
+
+def test_documented_cgroup_reader_fails_closed_on_find_error(tmp_path):
+    readme = (ARTIFACT / "README.md").read_text(encoding="utf-8")
+    start = readme.index("read_extra_pids() {")
+    end = readme.index("\n}", start) + 2
+    reader = readme[start:end]
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_find = fake_bin / "find"
+    fake_find.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    fake_find.chmod(0o755)
+    script = (
+        "set -euo pipefail\n"
+        f"{reader}\n"
+        "if read_extra_pids /does-not-exist 123; then\n"
+        "  printf 'read-error-treated-as-empty\\n'\n"
+        "  exit 1\n"
+        "fi\n"
+        "printf 'read-error-failed-closed\\n'\n"
+    )
+    result = subprocess.run(
+        ["bash", "-c", script],
+        env={"PATH": f"{fake_bin}:/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert result.stdout == "read-error-failed-closed\n"
 
 
 def test_tampered_manifest_pins_are_rejected(tmp_path):

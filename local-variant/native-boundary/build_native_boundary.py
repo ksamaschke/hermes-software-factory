@@ -24,6 +24,13 @@ ARTIFACT_SCHEMA = "factory.native-boundary.v1"
 ARTIFACT_VERSION = "1.0.0"
 ROOT = Path(__file__).resolve().parent
 STATIC_MANIFEST = ROOT / "manifest.json"
+_PATCH_EXECUTABLE = Path("/usr/bin/patch")
+_PATCH_ENVIRONMENT = {
+    "HOME": "/nonexistent",
+    "LANG": "C",
+    "LC_ALL": "C",
+    "PATH": "/usr/bin:/bin",
+}
 
 _COPY_IGNORE_NAMES = frozenset(
     {
@@ -314,6 +321,21 @@ def _copy_ignore(_directory: str, names: list[str]) -> set[str]:
     return {name for name in names if _is_copy_ignored(name)}
 
 
+def _authenticated_patch_command() -> tuple[list[str], dict[str, str]]:
+    """Return the fixed patch tool and a scrubbed execution environment."""
+    executable = _PATCH_EXECUTABLE
+    if not executable.is_absolute():
+        raise RuntimeError(f"patch executable must be absolute: {executable}")
+    _reject_symlink_components(executable)
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise RuntimeError(
+            f"patch executable is missing or not executable: {executable}"
+        )
+    if executable.stat().st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise RuntimeError(f"patch executable is group/world writable: {executable}")
+    return [str(executable)], dict(_PATCH_ENVIRONMENT)
+
+
 def _apply_patches(
     staging: Path,
     patches: list[tuple[Path, str]],
@@ -323,8 +345,9 @@ def _apply_patches(
         targets = _patch_targets(_static_manifest())
     _validate_patch_targets(patches, targets)
     for patch_path, _relative in patches:
+        executable, environment = _authenticated_patch_command()
         command = [
-            "patch",
+            *executable,
             "--batch",
             "--forward",
             "--fuzz=0",
@@ -338,6 +361,7 @@ def _apply_patches(
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            env=environment,
             check=False,
         )
         if completed.returncode != 0:
@@ -494,6 +518,25 @@ def _verification_metadata() -> dict[str, bool]:
     }
 
 
+def _new_destination(raw: str | Path, *, label: str) -> Path:
+    path = Path(raw).expanduser()
+    _reject_symlink_components(path)
+    if path.exists() or path.is_symlink():
+        raise ValueError(f"{label} must be a new non-symlink path: {path}")
+    return path.resolve(strict=False)
+
+
+def _reject_destination_boundary(
+    path: Path, *, label: str, source: Path, artifact_root: Path
+) -> None:
+    for boundary, boundary_label in (
+        (source, "source runtime"),
+        (artifact_root, "artifact root"),
+    ):
+        if path.is_relative_to(boundary):
+            raise ValueError(f"{label} may not be inside the {boundary_label}")
+
+
 def stage(
     source_arg: str, output_arg: str, manifest_output_arg: str | None
 ) -> dict[str, Any]:
@@ -502,24 +545,26 @@ def stage(
     targets = _patch_targets(manifest)
     _validate_patch_targets(patches, targets)
     source = _resolve_directory(source_arg, label="source runtime")
-    output = Path(output_arg).expanduser()
-    _reject_symlink_components(output)
-    if output.exists() or output.is_symlink():
-        raise ValueError(f"output must be a new non-symlink path: {output}")
-    output_parent = output.parent.resolve(strict=False)
-    if output.resolve(strict=False).is_relative_to(source):
-        raise ValueError("output runtime may not be inside the source runtime")
+    artifact_root = ROOT.resolve(strict=True)
+    output = _new_destination(output_arg, label="output")
+    _reject_destination_boundary(
+        output, label="output runtime", source=source, artifact_root=artifact_root
+    )
+    output_parent = output.parent
     manifest_output = (
-        Path(manifest_output_arg).expanduser()
+        _new_destination(manifest_output_arg, label="manifest output")
         if manifest_output_arg
         else output.parent / f"{output.name}.native-boundary-manifest.json"
     )
-    _reject_symlink_components(manifest_output)
-    if manifest_output.exists() or manifest_output.is_symlink():
-        raise ValueError(
-            f"manifest output must be a new non-symlink path: {manifest_output}"
-        )
-    if manifest_output.resolve(strict=False).is_relative_to(output):
+    if not manifest_output_arg:
+        manifest_output = _new_destination(manifest_output, label="manifest output")
+    _reject_destination_boundary(
+        manifest_output,
+        label="manifest output",
+        source=source,
+        artifact_root=artifact_root,
+    )
+    if manifest_output.is_relative_to(output):
         raise ValueError("output manifest must be outside the staged runtime")
     for _entry in _walk_without_symlinks(source):
         pass

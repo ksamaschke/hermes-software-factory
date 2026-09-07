@@ -37,6 +37,13 @@ python3 -B local-variant/native-boundary/build_native_boundary.py verify \
   --source "$SOURCE"
 ```
 
+Both destinations are canonicalized and must be outside the source runtime
+and this artifact's input root. The builder rejects an existing, symlinked,
+source-tree, or artifact-root destination before it copies or writes anything.
+Patch application uses the fixed, non-writable `/usr/bin/patch` path with a
+minimal environment and fixed `PATH`; a missing, symlinked, or writable tool
+fails closed.
+
 The builder validates the source pins before copying, records a SHA-256 entry
 for every copied regular source file, parses the unified patch against the
 exact target allowlist, applies it with zero fuzz, and records the complete
@@ -129,12 +136,53 @@ trap resume_main EXIT
 systemctl --user kill --kill-who=main --signal=SIGSTOP "$SERVICE"
 test "$(systemctl --user show "$SERVICE" -p MainPID --value)" = "$MAIN_PID"
 
+read_extra_pids() {
+  local cgroup_root="$1" main_pid="$2" tmpdir status
+  if ! tmpdir=$(mktemp -d); then
+    printf 'cannot create cgroup read workspace\n' >&2
+    return 1
+  fi
+  if ! find "$cgroup_root" -type f -name cgroup.procs -print0 >"$tmpdir/paths"; then
+    rm -rf "$tmpdir"
+    printf 'cannot enumerate cgroup processes\n' >&2
+    return 1
+  fi
+  if ! xargs -0r cat <"$tmpdir/paths" >"$tmpdir/pids"; then
+    rm -rf "$tmpdir"
+    printf 'cannot read cgroup processes\n' >&2
+    return 1
+  fi
+  if ! sort -nu "$tmpdir/pids" >"$tmpdir/sorted"; then
+    rm -rf "$tmpdir"
+    printf 'cannot sort cgroup processes\n' >&2
+    return 1
+  fi
+  if grep -vx "$main_pid" "$tmpdir/sorted" >"$tmpdir/extra"; then
+    status=0
+  else
+    status=$?
+  fi
+  if test "$status" -gt 1; then
+    rm -rf "$tmpdir"
+    printf 'cannot filter cgroup processes\n' >&2
+    return 1
+  fi
+  if test "$status" -eq 0 && ! cat "$tmpdir/extra"; then
+    rm -rf "$tmpdir"
+    printf 'cannot read filtered cgroup processes\n' >&2
+    return 1
+  fi
+  if ! rm -rf "$tmpdir"; then
+    printf 'cannot remove cgroup read workspace\n' >&2
+    return 1
+  fi
+}
+
 # Existing workers may drain while the dispatcher is stopped. No new worker
 # can be admitted. Fail closed after the bounded drain window.
 deadline=$((SECONDS + 90))
 while :; do
-  EXTRA_PIDS=$(find "$CGROUP_ROOT" -type f -name cgroup.procs -print0 \
-    | xargs -0r cat | sort -nu | grep -vx "$MAIN_PID" || true)
+  EXTRA_PIDS=$(read_extra_pids "$CGROUP_ROOT" "$MAIN_PID")
   test -z "$EXTRA_PIDS" && break
   test "$SECONDS" -lt "$deadline"
   sleep 1
