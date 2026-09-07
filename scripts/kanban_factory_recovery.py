@@ -475,15 +475,36 @@ def _repair_collision(board: str, task: dict[str, Any], *, dry_run: bool) -> str
     return f"recovered {task_id}: removed clean {occupied} and read back status={status}"
 
 
-def recover(board: str, *, dry_run: bool = False) -> list[str]:
-    changes = _repair_cron_pins(dry_run=dry_run)
-    try:
-        tasks = _json_command("kanban", "--board", board, "list", "--status", "blocked", "--json")
-    except RuntimeError:
+def recover(
+    board: str, *, dry_run: bool = False, workers_only: bool = False
+) -> list[str]:
+    changes = [] if workers_only else _repair_cron_pins(dry_run=dry_run)
+    if workers_only:
         tasks = _readonly_blocked_tasks(board)
+        if tasks is None:
+            try:
+                tasks = _json_command(
+                    "kanban", "--board", board, "list", "--status", "blocked", "--json"
+                )
+            except RuntimeError:
+                tasks = None
+    else:
+        try:
+            tasks = _json_command(
+                "kanban", "--board", board, "list", "--status", "blocked", "--json"
+            )
+        except RuntimeError:
+            tasks = _readonly_blocked_tasks(board)
     if not isinstance(tasks, list):
         return changes
     blocked_tasks = [task for task in tasks if isinstance(task, dict)]
+    if workers_only:
+        for task in blocked_tasks:
+            change = _reconcile_terminal_worker(board, task, dry_run=dry_run)
+            if change:
+                changes.append(change)
+        return changes
+
     deadline = time.monotonic() + _recovery_budget_seconds()
     budget_reported = False
     for task in blocked_tasks:
@@ -519,11 +540,14 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--board", default=os.environ.get("HERMES_FACTORY_BOARD"))
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--workers-only", action="store_true")
     args = parser.parse_args()
     if not args.board:
         parser.error("--board or HERMES_FACTORY_BOARD is required")
     try:
-        changes = recover(args.board, dry_run=args.dry_run)
+        changes = recover(
+            args.board, dry_run=args.dry_run, workers_only=args.workers_only
+        )
     except Exception as exc:
         print(f"factory recovery failed: {exc}", file=sys.stderr)
         return 1

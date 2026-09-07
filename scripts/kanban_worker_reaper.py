@@ -40,6 +40,10 @@ MAX_GRACE_SECONDS = 30.0
 # Survivor readback is independently bounded after SIGKILL.
 MAX_SURVIVOR_READBACK_SECONDS = 2.0
 MAX_DB_RESERVATION_SECONDS = 2.0
+# A worker can be observed before its immediately spawned child appears in
+# procfs. Allow one short, bounded settling window before opening pidfds.
+MAX_MEMBER_SETTLE_SECONDS = 0.1
+MEMBER_SETTLE_INTERVAL_SECONDS = 0.01
 TERMINAL_TASK_STATES = frozenset(
     {"archived", "blocked", "cancelled", "done", "failed", "review"}
 )
@@ -609,8 +613,19 @@ def _validated_groups(
     board: str,
     kanban_db: str | os.PathLike[str] | None,
     current_pid: int,
+    proc_root: Path | None = None,
 ) -> tuple[list[ProcessGroup], list[str]]:
-    all_records = list(records)
+    all_records = [
+        record
+        for record in records
+        if not (
+            proc_root is not None
+            and isinstance(record, ProcessRecord)
+            and not _record_is_readable(record)
+            and record.pid > 0
+            and not _proc_entry_present(record.pid, proc_root=proc_root)
+        )
+    ]
     unreadable = [
         record
         for record in all_records
@@ -738,7 +753,12 @@ def _snapshot_still_bound(
             return False, f"pid {pid} changed session"
         if record.pgrp != group.pgrp:
             return False, f"pid {pid} changed process group"
-        if not process_identity_matches(
+        # A member that became a zombie after an earlier signal is no longer
+        # signalable. Its captured start time, session, and process group were
+        # already verified above, so an emptied /proc environment must not
+        # prevent the remaining live members from being signalled. PID reuse
+        # is still rejected by the start-time check immediately above.
+        if record.state != "Z" and not process_identity_matches(
             record, task_id=task_id, board=board, kanban_db=kanban_db
         ):
             return False, f"pid {pid} changed task identity"
@@ -747,6 +767,16 @@ def _snapshot_still_bound(
         enumerated = list(iter_process_records(proc_root=proc_root))
     except Exception:
         return False, "process enumeration failed during revalidation"
+    enumerated = [
+        record
+        for record in enumerated
+        if not (
+            isinstance(record, ProcessRecord)
+            and not _record_is_readable(record)
+            and record.pid > 0
+            and not _proc_entry_present(record.pid, proc_root=proc_root)
+        )
+    ]
     if any(not _record_is_readable(record) for record in enumerated):
         return False, "process enumeration is incomplete during revalidation"
     enumerated_by_pid: dict[int, ProcessRecord] = {}
@@ -766,14 +796,14 @@ def _snapshot_still_bound(
             return False, f"pid {pid} changed session"
         if record.pgrp != group.pgrp:
             return False, f"pid {pid} changed process group"
-        if not process_identity_matches(
+        if record.state != "Z" and not process_identity_matches(
             record, task_id=task_id, board=board, kanban_db=kanban_db
         ):
             return False, f"pid {pid} changed task identity"
     captured_pids = set(group.pids)
     for record in enumerated:
         if record.session == group.session and record.pgrp == group.pgrp:
-            if record.pid not in captured_pids:
+            if record.pid not in captured_pids and record.state != "Z":
                 return False, f"process group {group.pgrp} gained an unexpected member"
     return True, None
 
@@ -820,11 +850,20 @@ def _membership_snapshot(
         if record.pid in by_pid:
             errors.append(f"process enumeration contains duplicate pid {record.pid}")
             continue
-        by_pid[record.pid] = record
         if not _record_is_readable(record):
+            # procfs can expose an entry during directory enumeration and lose
+            # it before its fields are read. For a captured PID that is now
+            # absent, this is an ordinary exit, not an uncertain survivor.
+            if record.pid > 0 and not _proc_entry_present(
+                record.pid, proc_root=proc_root
+            ):
+                continue
+            by_pid[record.pid] = record
             if record.pid > 0:
                 uncertain.add(record.pid)
             errors.append(f"process enumeration contains unreadable record {record.pid}")
+            continue
+        by_pid[record.pid] = record
 
     for pid, expected_start in group.start_times.items():
         record = by_pid.get(pid)
@@ -1201,6 +1240,57 @@ def _terminate_groups(
 
 
 
+def _settle_process_groups(
+    groups: list[ProcessGroup],
+    *,
+    task_id: str,
+    board: str,
+    kanban_db: str | os.PathLike[str] | None,
+    proc_root: Path,
+    current_pid: int,
+    unsafe: list[str],
+    sleep: Callable[[float], None],
+    monotonic: Callable[[], float],
+) -> tuple[list[ProcessGroup], list[str]]:
+    """Capture task-owned members that appear just after worker startup.
+
+    The worker may be visible in procfs before a child created during its
+    startup is enumerated. A short settling window makes that normal startup
+    race part of the pre-handle snapshot, while any member that appears after
+    the window remains a fail-closed revalidation failure.
+    """
+
+    if not groups:
+        return [], unsafe
+    deadline = monotonic() + MAX_MEMBER_SETTLE_SECONDS
+    max_polls = max(
+        1, int(MAX_MEMBER_SETTLE_SECONDS / MEMBER_SETTLE_INTERVAL_SECONDS) + 1
+    )
+    settled = groups
+    settled_unsafe = list(unsafe)
+    for _ in range(max_polls):
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            break
+        sleep(min(MEMBER_SETTLE_INTERVAL_SECONDS, remaining))
+        records = iter_process_records(proc_root=proc_root)
+        next_groups, next_unsafe = _validated_groups(
+            records,
+            task_id=task_id,
+            board=board,
+            kanban_db=kanban_db,
+            current_pid=current_pid,
+            proc_root=proc_root,
+        )
+        if next_unsafe:
+            return [], next_unsafe
+        if not next_groups:
+            return [], []
+        settled = next_groups
+        settled_unsafe = list(next_unsafe)
+    return settled, settled_unsafe
+
+
 def _reap_with_reservation(
     detail: Mapping[str, Any],
     *,
@@ -1250,10 +1340,29 @@ def _reap_with_reservation(
         board=board,
         kanban_db=kanban_db,
         current_pid=current_pid,
+        proc_root=proc_root,
     )
     unsafe.extend(unsafe_after_refresh)
     if not groups:
         result: dict[str, Any] = {"status": "none", "task_id": task_id}
+        if unsafe:
+            result.update({"status": "unsafe", "reason": "; ".join(unsafe[:3])})
+        return result
+
+    groups, settle_unsafe = _settle_process_groups(
+        groups,
+        task_id=task_id,
+        board=board,
+        kanban_db=kanban_db,
+        proc_root=proc_root,
+        current_pid=current_pid,
+        unsafe=unsafe,
+        sleep=sleep,
+        monotonic=monotonic,
+    )
+    unsafe = settle_unsafe
+    if not groups:
+        result = {"status": "none", "task_id": task_id}
         if unsafe:
             result.update({"status": "unsafe", "reason": "; ".join(unsafe[:3])})
         return result
@@ -1364,6 +1473,7 @@ def reap_terminal_task_workers(
         board=board,
         kanban_db=kanban_db,
         current_pid=pid,
+        proc_root=proc_root,
     )
     if not groups:
         result: dict[str, Any] = {"status": "none", "task_id": task_id}

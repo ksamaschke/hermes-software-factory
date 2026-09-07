@@ -332,6 +332,35 @@ def test_recovery_budget_applies_before_terminal_worker_scans(monkeypatch):
     ]
 
 
+def test_workers_only_skips_other_recovery_mutations(monkeypatch):
+    task = {"id": "t_blocked", "status": "blocked"}
+    monkeypatch.setattr(factory, "_readonly_blocked_tasks", lambda *args: [task])
+    monkeypatch.setattr(
+        factory,
+        "_reconcile_terminal_worker",
+        lambda board, task, dry_run: "t_blocked: terminal worker reconciliation=none",
+    )
+    monkeypatch.setattr(
+        factory,
+        "_repair_cron_pins",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("cron repair called")),
+    )
+    monkeypatch.setattr(
+        factory,
+        "_acknowledge_parked",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("parked repair called")),
+    )
+    monkeypatch.setattr(
+        factory,
+        "_repair_collision",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("collision repair called")),
+    )
+
+    assert factory.recover("factory-reaper-test", workers_only=True) == [
+        "t_blocked: terminal worker reconciliation=none"
+    ]
+
+
 def test_cli_timeout_is_converted_to_bounded_failure(monkeypatch):
     def timeout(*args, **kwargs):
         raise subprocess.TimeoutExpired(kwargs.get("args", args[0]), kwargs["timeout"])
