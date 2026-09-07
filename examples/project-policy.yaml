@@ -60,6 +60,39 @@ decision_authority:
     - rollback_or_fallback
     - next_gate
 
+# The controller passes this compact, provider-neutral envelope to the reasoning
+# model. Projects may lower these budgets, but may not omit required identity or
+# evidence fields. Runtime adapters enforce the ladder and exact readback.
+decision_contract:
+  schema: factory.decision.v1
+  ladder: [diagnose, choose, act, read_back, advance]
+  required_context:
+    - execution_mode
+    - profile_name
+    - source_item
+    - phase
+    - input_identity
+    - current_task
+    - current_run
+    - blocker
+    - parent_completion
+    - evidence.scheduler
+    - evidence.worker
+    - evidence.source
+    - evidence.review
+  evidence_kinds: [scheduler, worker, source, review]
+  budgets:
+    max_prompt_chars: 12000
+    max_skill_chars: 6000
+    max_skills: 4
+  repeated_blocker_threshold: 3
+  conflict_mode: fail_closed
+  current_run_null:
+    before_spawn: true
+    reused_or_held: true
+    new_admission_requires_run: true
+  denied_capability: hold_or_external_gate
+
 operator_bridge:
   mode: central_transport_only
   enabled: true

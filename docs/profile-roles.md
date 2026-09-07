@@ -71,6 +71,28 @@ For every selected issue or locked lane, the orchestrator:
 Readback and evidence verify the result after the decision; they do not return
 routine decision-making to the operator.
 
+### Typed context and evidence boundary
+
+The decision input is the `factory.decision.v1` envelope. It keeps the runtime
+`execution_mode` separate from the selected `profile_name`, and carries canonical
+source-item, phase, input-identity, current-task/run, blocker-fingerprint,
+parent-completion, and typed scheduler/worker/source/review evidence. A profile
+name is an identity and routing lookup, not a permission grant; taskless
+board-wide authority and bounded worker authority remain different modes.
+
+The model must use the envelope and read-only observations rather than title/body
+heuristics, copied history, or unbounded log material. Effective prompt and skill budgets are
+measured before invocation; optional skills are omitted or trimmed, while the
+identity/evidence contract is never truncated. Contradictory identities,
+statuses, candidates, run IDs, or evidence references fail closed. A null current
+run is not a new execution: it represents not-started, reused, or held work.
+Repeated unchanged blockers stay quarantined, verified resolution/new-contract
+admission allocates one run, and independent ready lanes remain eligible. Profile
+continuity is scoped to the same source/phase/input identity, and worker shared
+memory writes are disabled or isolated. A denied tool or capability is typed
+evidence: choose a supported permitted tool or surface the exact external gate;
+do not vary a denied command or lower its approval boundary.
+
 The complete role boundary is defined here. Other runtime and skill documents
 should reference this contract rather than narrow the orchestrator to routing.
 
