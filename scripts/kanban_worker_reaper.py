@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import signal
 import sqlite3
 import stat
@@ -44,8 +45,26 @@ MAX_DB_RESERVATION_SECONDS = 2.0
 # procfs. Allow one short, bounded settling window before opening pidfds.
 MAX_MEMBER_SETTLE_SECONDS = 0.1
 MEMBER_SETTLE_INTERVAL_SECONDS = 0.01
+MAX_REPORT_SAMPLE = 8
+MAX_REPORT_REASON_LENGTH = 240
+MAX_REPORT_REASONS = 3
 TERMINAL_TASK_STATES = frozenset(
     {"archived", "blocked", "cancelled", "done", "failed", "review"}
+)
+TERMINAL_RUN_EVENT_KINDS = frozenset(
+    {
+        "blocked",
+        "block_loop_detected",
+        "cancelled",
+        "completed",
+        "crashed",
+        "done",
+        "failed",
+        "gave_up",
+        "reclaimed",
+        "spawn_failed",
+        "timed_out",
+    }
 )
 
 
@@ -265,13 +284,44 @@ class SQLiteWriteReservation:
             return None
         if not isinstance(row[0], str) or not isinstance(row[1], str):
             raise ReservationError("task readback identity is malformed")
-        return {
+        detail: dict[str, Any] = {
             "task": {
                 "id": row[0],
                 "status": row[1],
                 "current_run_id": row[2],
             }
         }
+        try:
+            run_rows = connection.execute(
+                "SELECT id, status, outcome, ended_at "
+                "FROM task_runs WHERE task_id = ? ORDER BY id",
+                (task_id,),
+            ).fetchall()
+        except sqlite3.Error:
+            run_rows = []
+        if run_rows:
+            detail["runs"] = [
+                {
+                    "id": run[0],
+                    "status": run[1],
+                    "outcome": run[2],
+                    "ended_at": run[3],
+                }
+                for run in run_rows
+            ]
+        try:
+            event_rows = connection.execute(
+                "SELECT kind, run_id FROM task_events "
+                "WHERE task_id = ? ORDER BY id",
+                (task_id,),
+            ).fetchall()
+        except sqlite3.Error:
+            event_rows = []
+        if event_rows:
+            detail["events"] = [
+                {"kind": event[0], "run_id": event[1]} for event in event_rows
+            ]
+        return detail
 
 
 
@@ -399,15 +449,138 @@ def iter_process_records(*, proc_root: Path = PROC_ROOT) -> list[ProcessRecord]:
 
 
 def _normalise_path(value: str | os.PathLike[str] | None) -> str | None:
-    if value is None:
+    try:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        return str(Path(text).expanduser().resolve(strict=False))
+    except (OSError, RuntimeError, ValueError, TypeError):
         return None
-    text = str(value).strip()
-    if not text:
+
+
+def _canonical_run_id(value: Any) -> int | None:
+    """Return one positive, representation-stable task run id."""
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9]+", value):
         return None
     try:
-        return str(Path(text).expanduser().resolve(strict=False))
-    except (OSError, RuntimeError, ValueError):
-        return text
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if parsed <= 0 or str(parsed) != value:
+        return None
+    return parsed
+
+
+def _terminal_run_binding(
+    detail: Mapping[str, Any],
+) -> tuple[int | None, str | None]:
+    """Resolve one durable run id from a terminal handoff detail.
+
+    The SQLite reservation supplies ``terminal_run_id`` directly.  CLI-shaped
+    details carry the same identity either on the latest terminal event or on
+    the latest closed ``task_runs`` row.  Multiple sources must agree; a
+    disagreement is an unsafe readback rather than a best-effort choice.
+    """
+
+    if not isinstance(detail, Mapping):
+        return None, "terminal run identity is missing"
+
+    candidates: list[tuple[str, int]] = []
+
+    for key in ("terminal_run_id", "handoff_run_id"):
+        if key in detail:
+            value = _canonical_run_id(detail.get(key))
+            if value is None:
+                return None, f"terminal run identity in {key} is missing or invalid"
+            candidates.append((key, value))
+
+    events = detail.get("events")
+    if isinstance(events, list):
+        terminal_events = [
+            event
+            for event in events
+            if isinstance(event, Mapping)
+            and str(event.get("kind") or "").strip().lower()
+            in TERMINAL_RUN_EVENT_KINDS
+        ]
+        if terminal_events:
+            event = terminal_events[-1]
+            value = _canonical_run_id(event.get("run_id"))
+            if value is None:
+                return None, "terminal handoff run identity is missing or invalid"
+            candidates.append(("terminal event", value))
+
+    runs = detail.get("runs")
+    if isinstance(runs, list):
+        terminal_runs = [
+            run
+            for run in runs
+            if isinstance(run, Mapping)
+            and (
+                run.get("ended_at") is not None
+                or str(run.get("status") or "").strip().lower()
+                in TERMINAL_RUN_EVENT_KINDS
+                or str(run.get("outcome") or "").strip().lower()
+                in TERMINAL_RUN_EVENT_KINDS
+            )
+        ]
+        if terminal_runs:
+            run = terminal_runs[-1]
+            value = _canonical_run_id(run.get("id"))
+            if value is None:
+                return None, "terminal task run identity is missing or invalid"
+            candidates.append(("terminal task run", value))
+
+    if not candidates:
+        return None, "terminal run identity is missing"
+    values = {value for _source, value in candidates}
+    if len(values) != 1:
+        return None, "terminal run identity sources disagree"
+    return candidates[0][1], None
+
+
+_SECRET_TEXT_RE = re.compile(
+    r"(?i)\b(token|secret|password|api[_-]?key|authorization|cookie)\b\s*[:=]\s*\S+"
+)
+_ABSOLUTE_PATH_RE = re.compile(r"(?<![\w])(?:/[\S]+|[A-Za-z]:[\\/][^\s;,)]+)")
+
+
+def _sanitize_reason(value: Any) -> str:
+    """Keep diagnostic wording while removing secrets, paths, and control text."""
+
+    text = str(value).replace("\x00", " ")
+    text = _SECRET_TEXT_RE.sub(r"\1=<redacted>", text)
+    text = _ABSOLUTE_PATH_RE.sub("<path>", text)
+    text = re.sub(r"[\x00-\x1f\x7f]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"(.)\1{31,}", r"\1…", text)
+    if not text:
+        return "unspecified error"
+    if len(text) > MAX_REPORT_REASON_LENGTH:
+        return text[: MAX_REPORT_REASON_LENGTH - 1] + "…"
+    return text
+
+
+def _bounded_reasons(reasons: Iterable[Any]) -> str:
+    values: list[str] = []
+    for reason in reasons:
+        safe = _sanitize_reason(reason)
+        if safe not in values:
+            values.append(safe)
+        if len(values) >= MAX_REPORT_REASONS:
+            break
+    return _sanitize_reason("; ".join(values)) if values else ""
+
+
+def _sample(values: Iterable[int]) -> list[int]:
+    return list(values)[:MAX_REPORT_SAMPLE]
 
 
 def _canonical_identity_reason(
@@ -428,19 +601,24 @@ def process_identity_matches(
     task_id: str,
     board: str,
     kanban_db: str | os.PathLike[str] | None = None,
+    run_id: Any = None,
 ) -> bool:
-    """Require task identity plus at least one exact board binding."""
+    """Require exact task, terminal-run, and board/database identity."""
 
     if _canonical_identity_reason(task_id, label="task id"):
         return False
     if _canonical_identity_reason(board, label="board", allow_empty=True):
         return False
-    if not record.env_readable:
+    expected_run = _canonical_run_id(run_id)
+    if expected_run is None or not record.env_readable:
         return False
     actual_task = record.env.get(TASK_ENV, "")
     if not isinstance(actual_task, str) or actual_task != task_id:
         return False
     if actual_task != actual_task.strip():
+        return False
+    actual_run = _canonical_run_id(record.env.get(RUN_ENV))
+    if actual_run != expected_run:
         return False
     expected_board = board
     actual_board = record.env.get(BOARD_ENV, "")
@@ -588,7 +766,7 @@ def _open_process_handles(
                 fd = open_handle(pid)
             except Exception as exc:
                 _close_process_handles(handles, close_handle)
-                return {}, f"stable process handle unavailable for pid {pid}: {exc}"
+                return {}, f"stable process handle unavailable for pid {pid}: {_sanitize_reason(exc)}"
             if isinstance(fd, bool) or not isinstance(fd, int) or fd < 0:
                 _close_process_handles(handles, close_handle)
                 return {}, f"stable process handle for pid {pid} is unreadable"
@@ -613,6 +791,7 @@ def _validated_groups(
     board: str,
     kanban_db: str | os.PathLike[str] | None,
     current_pid: int,
+    run_id: Any = None,
     proc_root: Path | None = None,
 ) -> tuple[list[ProcessGroup], list[str]]:
     all_records = [
@@ -639,10 +818,28 @@ def _validated_groups(
         record
         for record in all_records
         if process_identity_matches(
-            record, task_id=task_id, board=board, kanban_db=kanban_db
+            record,
+            task_id=task_id,
+            board=board,
+            kanban_db=kanban_db,
+            run_id=run_id,
         )
     ]
     if not matching:
+        expected_db = _normalise_path(kanban_db)
+        scoped = [
+            record
+            for record in all_records
+            if _record_is_readable(record)
+            and record.env.get(TASK_ENV) == task_id
+            and record.env.get(BOARD_ENV) == board
+            and (
+                expected_db is None
+                or _normalise_path(record.env.get(DB_ENV)) == expected_db
+            )
+        ]
+        if scoped:
+            return [], ["no process matched terminal run identity"]
         return [], []
 
     by_session: dict[int, list[ProcessRecord]] = {}
@@ -666,7 +863,11 @@ def _validated_groups(
             continue
         if any(
             not process_identity_matches(
-                member, task_id=task_id, board=board, kanban_db=kanban_db
+                member,
+                task_id=task_id,
+                board=board,
+                kanban_db=kanban_db,
+                run_id=run_id,
             )
             for member in members
         ):
@@ -699,6 +900,7 @@ def _snapshot_still_bound(
     board: str,
     kanban_db: str | os.PathLike[str] | None,
     proc_root: Path,
+    run_id: Any = None,
     handles: Mapping[int, ProcessHandle] | None = None,
 ) -> tuple[bool, str | None]:
     """Reject PID reuse or a changed process identity before signalling.
@@ -759,7 +961,11 @@ def _snapshot_still_bound(
         # prevent the remaining live members from being signalled. PID reuse
         # is still rejected by the start-time check immediately above.
         if record.state != "Z" and not process_identity_matches(
-            record, task_id=task_id, board=board, kanban_db=kanban_db
+            record,
+            task_id=task_id,
+            board=board,
+            kanban_db=kanban_db,
+            run_id=run_id,
         ):
             return False, f"pid {pid} changed task identity"
     # A new, unbound member in the same session/group is a fail-closed race.
@@ -797,7 +1003,11 @@ def _snapshot_still_bound(
         if record.pgrp != group.pgrp:
             return False, f"pid {pid} changed process group"
         if record.state != "Z" and not process_identity_matches(
-            record, task_id=task_id, board=board, kanban_db=kanban_db
+            record,
+            task_id=task_id,
+            board=board,
+            kanban_db=kanban_db,
+            run_id=run_id,
         ):
             return False, f"pid {pid} changed task identity"
     captured_pids = set(group.pids)
@@ -826,6 +1036,7 @@ def _membership_snapshot(
     task_id: str,
     board: str,
     kanban_db: str | os.PathLike[str] | None,
+    run_id: Any = None,
 ) -> MembershipSnapshot:
     """Enumerate the current session/group, not only captured process IDs."""
 
@@ -899,10 +1110,20 @@ def _membership_snapshot(
             errors.append(f"pid {pid} changed process group during survivor readback")
             continue
         if record.state != "Z":
-            # A process with an unreadable environment is still a live
-            # survivor.  Identity is required for a future signal, not for
-            # conservative survivor reporting.
             live.add(pid)
+            if not record.env_readable:
+                uncertain.add(pid)
+                errors.append(
+                    f"pid {pid} has an unreadable environment during survivor readback"
+                )
+            elif not process_identity_matches(
+                record,
+                task_id=task_id,
+                board=board,
+                kanban_db=kanban_db,
+                run_id=run_id,
+            ):
+                errors.append(f"pid {pid} changed task identity")
 
     for record in enumerated:
         if not _record_is_readable(record):
@@ -925,6 +1146,7 @@ def _live_pids(
     task_id: str,
     board: str,
     kanban_db: str | os.PathLike[str] | None,
+    run_id: Any = None,
 ) -> list[int]:
     """Return all known and uncertain current survivors for compatibility."""
 
@@ -934,6 +1156,7 @@ def _live_pids(
         task_id=task_id,
         board=board,
         kanban_db=kanban_db,
+        run_id=run_id,
     )
     survivors = set(state.live_pids) | set(state.uncertain_pids)
     if not survivors:
@@ -952,6 +1175,7 @@ def _refresh_task_reason(
     *,
     task_id: str,
     signal_name: str,
+    run_id: Any,
     reservation: Any | None = None,
 ) -> str | None:
     try:
@@ -966,7 +1190,76 @@ def _refresh_task_reason(
         return f"task readback failed before {signal_name}"
     if latest is None:
         return f"task readback disappeared before {signal_name}"
-    return _terminal_reason_for_task(latest, task_id=task_id)
+    terminal_reason = _terminal_reason_for_task(latest, task_id=task_id)
+    if terminal_reason:
+        return terminal_reason
+    latest_run_id, run_reason = _terminal_run_binding(latest)
+    if run_reason and run_reason != "terminal run identity is missing":
+        return f"{run_reason} before {signal_name}"
+    if latest_run_id is not None and latest_run_id != _canonical_run_id(run_id):
+        return f"terminal run identity changed before {signal_name}"
+    if _canonical_run_id(run_id) is None:
+        return f"terminal run identity is missing before {signal_name}"
+    return None
+
+
+def _read_reserved_task(
+    reservation: Any, *, task_id: str
+) -> tuple[Mapping[str, Any] | None, str | None]:
+    """Read one task while an exact database reservation is held."""
+
+    try:
+        reservation.assert_healthy()
+        latest = reservation.read_task(task_id)
+    except Exception as exc:
+        return None, _sanitize_reason(
+            f"board database reservation/readback failed: {exc}"
+        )
+    if latest is None:
+        return None, "task readback disappeared under board database reservation"
+    if not isinstance(latest, Mapping):
+        return None, "task readback is malformed under board database reservation"
+    return latest, None
+
+
+def _resolve_reserved_run(
+    detail: Mapping[str, Any], *, task_id: str, run_id: Any = None
+) -> tuple[int | None, dict[str, Any] | None]:
+    """Validate a reserved task row and reconcile its terminal run binding."""
+
+    identity_reason = _task_identity_reason(detail, task_id)
+    if identity_reason:
+        return None, {"status": "skipped", "task_id": task_id, "reason": identity_reason}
+    terminal_reason = _terminal_reason_for_task(detail, task_id=task_id)
+    if terminal_reason:
+        return None, {
+            "status": "not_applicable",
+            "task_id": task_id,
+            "reason": terminal_reason,
+        }
+    candidate, candidate_reason = _terminal_run_binding(detail)
+    if candidate_reason and candidate_reason != "terminal run identity is missing":
+        return None, {
+            "status": "unsafe",
+            "task_id": task_id,
+            "reason": _sanitize_reason(candidate_reason),
+        }
+    expected = _canonical_run_id(run_id)
+    if candidate is not None:
+        if expected is not None and candidate != expected:
+            return None, {
+                "status": "unsafe",
+                "task_id": task_id,
+                "reason": "terminal run identity changed under board database reservation",
+            }
+        expected = candidate
+    if expected is None:
+        return None, {
+            "status": "unsafe",
+            "task_id": task_id,
+            "reason": "terminal run identity is missing",
+        }
+    return expected, None
 
 
 def _terminate_groups(
@@ -975,6 +1268,7 @@ def _terminate_groups(
     task_id: str,
     board: str,
     kanban_db: str | os.PathLike[str] | None,
+    run_id: Any,
     proc_root: Path,
     grace_seconds: float,
     sleep: Callable[[float], None],
@@ -1025,6 +1319,7 @@ def _terminate_groups(
             task_id=task_id,
             board=board,
             kanban_db=kanban_db,
+            run_id=run_id,
         )
         final_states[group.pgrp] = state
         for reason in state.errors:
@@ -1042,6 +1337,7 @@ def _terminate_groups(
                 board=board,
                 kanban_db=kanban_db,
                 proc_root=proc_root,
+                run_id=run_id,
                 handles=handles,
             )
             if not safe:
@@ -1051,6 +1347,7 @@ def _terminate_groups(
                 refresh,
                 task_id=task_id,
                 signal_name="SIGTERM",
+                run_id=run_id,
                 reservation=reservation,
             )
             if task_reason:
@@ -1062,6 +1359,7 @@ def _terminate_groups(
                 board=board,
                 kanban_db=kanban_db,
                 proc_root=proc_root,
+                run_id=run_id,
                 handles=handles,
             )
             if not safe:
@@ -1077,6 +1375,7 @@ def _terminate_groups(
                     board=board,
                     kanban_db=kanban_db,
                     proc_root=proc_root,
+                    run_id=run_id,
                     handles=handles,
                 )
                 if not safe:
@@ -1138,6 +1437,7 @@ def _terminate_groups(
                 board=board,
                 kanban_db=kanban_db,
                 proc_root=proc_root,
+                run_id=run_id,
                 handles=handles,
             )
             if not safe:
@@ -1147,6 +1447,7 @@ def _terminate_groups(
                 refresh,
                 task_id=task_id,
                 signal_name="SIGKILL",
+                run_id=run_id,
                 reservation=reservation,
             )
             if task_reason:
@@ -1158,6 +1459,7 @@ def _terminate_groups(
                 board=board,
                 kanban_db=kanban_db,
                 proc_root=proc_root,
+                run_id=run_id,
                 handles=handles,
             )
             if not safe:
@@ -1173,6 +1475,7 @@ def _terminate_groups(
                     board=board,
                     kanban_db=kanban_db,
                     proc_root=proc_root,
+                    run_id=run_id,
                     handles=handles,
                 )
                 if not safe:
@@ -1246,6 +1549,7 @@ def _settle_process_groups(
     task_id: str,
     board: str,
     kanban_db: str | os.PathLike[str] | None,
+    run_id: Any,
     proc_root: Path,
     current_pid: int,
     unsafe: list[str],
@@ -1280,6 +1584,7 @@ def _settle_process_groups(
             board=board,
             kanban_db=kanban_db,
             current_pid=current_pid,
+            run_id=run_id,
             proc_root=proc_root,
         )
         if next_unsafe:
@@ -1297,6 +1602,7 @@ def _reap_with_reservation(
     task_id: str,
     board: str,
     kanban_db: str | os.PathLike[str] | None,
+    run_id: Any,
     reservation: Any,
     refresh: Callable[[], Mapping[str, Any] | None] | None,
     grace_seconds: float,
@@ -1308,28 +1614,33 @@ def _reap_with_reservation(
     pidfd_open: Callable[[int], int] | None,
     pidfd_send_signal: Callable[[int, int], None] | None,
     close_handle: Callable[[int], None] | None,
+    initial_readback: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Perform the final readback and cleanup while ``reservation`` is held."""
 
-    try:
-        reservation.assert_healthy()
-        latest = reservation.read_task(task_id)
-    except Exception as exc:
+    if initial_readback is None:
+        latest, readback_reason = _read_reserved_task(reservation, task_id=task_id)
+    else:
+        try:
+            reservation.assert_healthy()
+            latest, readback_reason = initial_readback, None
+        except Exception as exc:
+            latest, readback_reason = None, _sanitize_reason(
+                f"board database reservation/readback failed: {exc}"
+            )
+    if readback_reason:
         return {
             "status": "unsafe",
             "task_id": task_id,
-            "reason": f"board database reservation/readback failed: {exc}",
+            "reason": readback_reason,
         }
-    if latest is None:
-        return {
-            "status": "unsafe",
-            "task_id": task_id,
-            "reason": "task readback disappeared under board database reservation",
-        }
-    latest_reason = _terminal_reason_for_task(latest, task_id=task_id)
-    if latest_reason:
-        status = "skipped" if "identity" in latest_reason else "not_applicable"
-        return {"status": status, "task_id": task_id, "reason": latest_reason}
+    assert latest is not None
+    run_id, early_result = _resolve_reserved_run(
+        latest, task_id=task_id, run_id=run_id
+    )
+    if early_result:
+        return early_result
+    assert run_id is not None
 
     # Re-scan after the reserved task readback.  This catches a worker that
     # ended naturally and establishes the exact member set for handle opening.
@@ -1340,6 +1651,7 @@ def _reap_with_reservation(
         board=board,
         kanban_db=kanban_db,
         current_pid=current_pid,
+        run_id=run_id,
         proc_root=proc_root,
     )
     unsafe.extend(unsafe_after_refresh)
@@ -1354,6 +1666,7 @@ def _reap_with_reservation(
         task_id=task_id,
         board=board,
         kanban_db=kanban_db,
+        run_id=run_id,
         proc_root=proc_root,
         current_pid=current_pid,
         unsafe=unsafe,
@@ -1374,6 +1687,7 @@ def _reap_with_reservation(
         task_id=task_id,
         board=board,
         kanban_db=kanban_db,
+        run_id=run_id,
         proc_root=proc_root,
         grace_seconds=grace_seconds,
         sleep=sleep,
@@ -1394,6 +1708,7 @@ def _reap_with_reservation(
     handle_unavailable = any(
         "stable process handle" in reason for reason in errors
     )
+    signalled_unique = list(dict.fromkeys(signalled))
     result = {
         "status": (
             "unsafe"
@@ -1403,14 +1718,20 @@ def _reap_with_reservation(
             else "partial"
         ),
         "task_id": task_id,
-        "pids": pids,
-        "process_groups": groups_payload,
-        "signalled_groups": signalled_groups,
-        "signalled_pids": signalled,
-        "survivors": survivors,
+        "pids": _sample(pids),
+        "process_groups": _sample(groups_payload),
+        "signalled_groups": _sample(signalled_groups),
+        "signalled_pids": _sample(signalled_unique),
+        "survivors": _sample(survivors),
+        "pid_count": len(pids),
+        "process_group_count": len(groups_payload),
+        "signalled_group_count": len(signalled_groups),
+        "signalled_pid_count": len(signalled_unique),
+        "survivor_count": len(survivors),
+        "error_count": len(all_errors),
     }
     if all_errors:
-        result["reason"] = "; ".join(all_errors[:3])
+        result["reason"] = _bounded_reasons(all_errors)
     return result
 
 
@@ -1458,6 +1779,19 @@ def reap_terminal_task_workers(
     initial_reason = _terminal_reason_for_task(detail, task_id=task_id)
     if initial_reason:
         return {"status": "not_applicable", "task_id": task_id, "reason": initial_reason}
+    run_id, run_reason = _terminal_run_binding(detail)
+    if run_reason and run_reason != "terminal run identity is missing":
+        return {
+            "status": "unsafe",
+            "task_id": task_id,
+            "reason": _sanitize_reason(run_reason),
+        }
+    if dry_run and run_reason:
+        return {
+            "status": "unsafe",
+            "task_id": task_id,
+            "reason": _sanitize_reason(run_reason),
+        }
     if not proc_root.is_dir():
         return {
             "status": "unsupported",
@@ -1466,6 +1800,120 @@ def reap_terminal_task_workers(
         }
 
     pid = current_pid if current_pid is not None else os.getpid()
+    if not dry_run and reservation is not None:
+        try:
+            reservation_path = getattr(reservation, "path", None)
+        except Exception:  # noqa: BLE001 - injected reservations fail closed
+            reservation_path = None
+        expected_path = _normalise_path(kanban_db)
+        actual_path = _normalise_path(reservation_path)
+        if expected_path is None or actual_path is None:
+            return {
+                "status": "unsafe",
+                "task_id": task_id,
+                "reason": "exact board database reservation path is required",
+            }
+        if expected_path != actual_path:
+            return {
+                "status": "unsafe",
+                "task_id": task_id,
+                "reason": "board database reservation does not match resolved database",
+            }
+
+    if not dry_run and reservation is None:
+        if kanban_db is None:
+            return {
+                "status": "unsafe",
+                "task_id": task_id,
+                "reason": "exact board database is required for destructive cleanup",
+            }
+        try:
+            with SQLiteWriteReservation(
+                kanban_db,
+                task_id,
+                timeout_seconds=reservation_timeout_seconds,
+            ) as acquired:
+                latest, readback_reason = _read_reserved_task(
+                    acquired, task_id=task_id
+                )
+                if readback_reason:
+                    return {
+                        "status": "unsafe",
+                        "task_id": task_id,
+                        "reason": readback_reason,
+                    }
+                assert latest is not None
+                resolved_run, early_result = _resolve_reserved_run(
+                    latest, task_id=task_id, run_id=run_id
+                )
+                if early_result:
+                    return early_result
+                assert resolved_run is not None
+                return _reap_with_reservation(
+                    detail,
+                    task_id=task_id,
+                    board=board,
+                    kanban_db=kanban_db,
+                    run_id=resolved_run,
+                    reservation=acquired,
+                    refresh=refresh,
+                    grace_seconds=grace_seconds,
+                    proc_root=proc_root,
+                    current_pid=pid,
+                    unsafe=[],
+                    sleep=sleep,
+                    monotonic=monotonic,
+                    pidfd_open=pidfd_open,
+                    pidfd_send_signal=pidfd_send_signal,
+                    close_handle=close_handle,
+                    initial_readback=latest,
+                )
+        except ReservationError as exc:
+            return {
+                "status": "unsafe",
+                "task_id": task_id,
+                "reason": _sanitize_reason(exc),
+            }
+
+    if reservation is not None and not dry_run:
+        latest, readback_reason = _read_reserved_task(
+            reservation, task_id=task_id
+        )
+        if readback_reason:
+            return {
+                "status": "unsafe",
+                "task_id": task_id,
+                "reason": readback_reason,
+            }
+        assert latest is not None
+        resolved_run, early_result = _resolve_reserved_run(
+            latest, task_id=task_id, run_id=run_id
+        )
+        if early_result:
+            return early_result
+        assert resolved_run is not None
+        run_id = resolved_run
+        return _reap_with_reservation(
+            detail,
+            task_id=task_id,
+            board=board,
+            kanban_db=kanban_db,
+            run_id=run_id,
+            reservation=reservation,
+            refresh=refresh,
+            grace_seconds=grace_seconds,
+            proc_root=proc_root,
+            current_pid=pid,
+            unsafe=[],
+            sleep=sleep,
+            monotonic=monotonic,
+            pidfd_open=pidfd_open,
+            pidfd_send_signal=pidfd_send_signal,
+            close_handle=close_handle,
+            initial_readback=latest,
+        )
+
+    assert run_id is not None
     records = iter_process_records(proc_root=proc_root)
     groups, unsafe = _validated_groups(
         records,
@@ -1473,79 +1921,24 @@ def reap_terminal_task_workers(
         board=board,
         kanban_db=kanban_db,
         current_pid=pid,
+        run_id=run_id,
         proc_root=proc_root,
     )
     if not groups:
         result: dict[str, Any] = {"status": "none", "task_id": task_id}
         if unsafe:
-            result.update({"status": "unsafe", "reason": "; ".join(unsafe[:3])})
+            result.update(
+                {"status": "unsafe", "reason": _bounded_reasons(unsafe)}
+            )
         return result
 
     pids = sorted({member for group in groups for member in group.pids})
     groups_payload = [group.pgrp for group in groups]
-    if dry_run:
-        return {
-            "status": "would_reap",
-            "task_id": task_id,
-            "pids": pids,
-            "process_groups": groups_payload,
-        }
-
-    if reservation is not None:
-        expected_path = _normalise_path(kanban_db)
-        actual_path = _normalise_path(getattr(reservation, "path", None))
-        if expected_path is not None and actual_path is not None and expected_path != actual_path:
-            return {
-                "status": "unsafe",
-                "task_id": task_id,
-                "reason": "board database reservation does not match resolved database",
-            }
-        return _reap_with_reservation(
-            detail,
-            task_id=task_id,
-            board=board,
-            kanban_db=kanban_db,
-            reservation=reservation,
-            refresh=refresh,
-            grace_seconds=grace_seconds,
-            proc_root=proc_root,
-            current_pid=pid,
-            unsafe=unsafe,
-            sleep=sleep,
-            monotonic=monotonic,
-            pidfd_open=pidfd_open,
-            pidfd_send_signal=pidfd_send_signal,
-            close_handle=close_handle,
-        )
-
-    if kanban_db is None:
-        return {
-            "status": "unsafe",
-            "task_id": task_id,
-            "reason": "exact board database is required for destructive cleanup",
-        }
-    try:
-        with SQLiteWriteReservation(
-            kanban_db,
-            task_id,
-            timeout_seconds=reservation_timeout_seconds,
-        ) as acquired:
-            return _reap_with_reservation(
-                detail,
-                task_id=task_id,
-                board=board,
-                kanban_db=kanban_db,
-                reservation=acquired,
-                refresh=refresh,
-                grace_seconds=grace_seconds,
-                proc_root=proc_root,
-                current_pid=pid,
-                unsafe=unsafe,
-                sleep=sleep,
-                monotonic=monotonic,
-                pidfd_open=pidfd_open,
-                pidfd_send_signal=pidfd_send_signal,
-                close_handle=close_handle,
-            )
-    except ReservationError as exc:
-        return {"status": "unsafe", "task_id": task_id, "reason": str(exc)}
+    return {
+        "status": "would_reap",
+        "task_id": task_id,
+        "pids": _sample(pids),
+        "process_groups": _sample(groups_payload),
+        "pid_count": len(pids),
+        "process_group_count": len(groups_payload),
+    }

@@ -138,14 +138,19 @@ def test_repair_preserves_collision_when_branch_does_not_match(monkeypatch, tmp_
     assert "does not match" in result
 
 
-def _terminal_detail(task_id: str, *, current_run_id=None):
-    return {
+def _terminal_detail(
+    task_id: str, *, current_run_id=None, terminal_run_id: int | None = 41
+):
+    detail: dict[str, object] = {
         "task": {
             "id": task_id,
             "status": "blocked",
             "current_run_id": current_run_id,
         }
     }
+    if terminal_run_id is not None:
+        detail["terminal_run_id"] = terminal_run_id
+    return detail
 
 
 def _create_reaper_test_database(path: Path, task_id: str) -> None:
@@ -200,6 +205,7 @@ def _wait_for_task_process(task_id: str, board: str, kanban_db: Path) -> None:
                 task_id=task_id,
                 board=board,
                 kanban_db=kanban_db,
+                run_id=41,
             )
             for record in records
         ):
@@ -247,6 +253,16 @@ def test_reaper_terminal_cleanup_reaps_worker_and_live_descendant(tmp_path):
 def test_reaper_does_not_kill_worker_for_active_run_or_board_mismatch(tmp_path):
     kanban_db = tmp_path / "kanban.db"
     active_id = "t_reaper_active"
+    _create_reaper_test_database(kanban_db, active_id)
+    connection = sqlite3.connect(kanban_db)
+    try:
+        connection.execute(
+            "INSERT INTO tasks VALUES (?, ?, ?)",
+            ("t_reaper_mismatch", "blocked", None),
+        )
+        connection.commit()
+    finally:
+        connection.close()
     active = _start_task_worker(active_id, "factory-reaper-test", kanban_db)
     mismatched_id = "t_reaper_mismatch"
     mismatched = _start_task_worker(mismatched_id, "other-board", kanban_db)
@@ -433,6 +449,7 @@ def _write_proc_record(
 def test_unreadable_process_group_member_fails_closed(tmp_path):
     identity = {
         reaper.TASK_ENV: "t_unreadable",
+        reaper.RUN_ENV: "41",
         reaper.BOARD_ENV: "factory-reaper-test",
     }
     _write_proc_record(
@@ -461,6 +478,7 @@ def test_unreadable_process_group_member_fails_closed(tmp_path):
         board="factory-reaper-test",
         kanban_db=None,
         current_pid=os.getpid(),
+        run_id=41,
     )
 
     assert {record.pid for record in records} == {42000, 42001}
@@ -512,16 +530,42 @@ def _synthetic_record(
         session=session,
         start_time=start_time,
         state="S",
-        env={reaper.TASK_ENV: task_id, reaper.BOARD_ENV: board},
+        env={
+            reaper.TASK_ENV: task_id,
+            reaper.RUN_ENV: "41",
+            reaper.BOARD_ENV: board,
+        },
     )
 
 
 def _patch_synthetic_process_view(monkeypatch, record):
-    monkeypatch.setattr(reaper, "iter_process_records", lambda **kwargs: [record])
+    def bind(record, proc_root):
+        if not isinstance(proc_root, Path) or reaper.DB_ENV in record.env:
+            return record
+        env = {**record.env, reaper.DB_ENV: str(proc_root / "kanban.db")}
+        return reaper.ProcessRecord(
+            pid=record.pid,
+            ppid=record.ppid,
+            pgrp=record.pgrp,
+            session=record.session,
+            start_time=record.start_time,
+            state=record.state,
+            env=env,
+            env_readable=record.env_readable,
+            readable=record.readable,
+        )
+
+    monkeypatch.setattr(
+        reaper,
+        "iter_process_records",
+        lambda **kwargs: [bind(record, kwargs.get("proc_root"))],
+    )
     monkeypatch.setattr(
         reaper,
         "read_process_record",
-        lambda pid, **kwargs: record if pid == record.pid else None,
+        lambda pid, **kwargs: (
+            bind(record, kwargs.get("proc_root")) if pid == record.pid else None
+        ),
     )
     monkeypatch.setattr(reaper.os, "getpgrp", lambda: 1)
     monkeypatch.setattr(reaper.os, "getsid", lambda pid: 2)
@@ -574,10 +618,12 @@ def test_f1_reaper_revalidates_task_before_sigterm(monkeypatch, tmp_path):
         _terminal_detail(task_id),
         task_id=task_id,
         board="factory-reaper-test",
+        kanban_db=tmp_path / "kanban.db",
         proc_root=tmp_path,
         reservation=_ReservationFixture(
             _terminal_detail(task_id),
             _terminal_detail(task_id, current_run_id=41),
+            path=tmp_path / "kanban.db",
         ),
         pidfd_open=lambda pid: pid,
         pidfd_send_signal=lambda fd, signum: signals.append((fd, signum)),
@@ -600,8 +646,11 @@ def test_f1_reaper_rejects_mismatched_refresh_identity(monkeypatch, tmp_path):
         _terminal_detail(task_id),
         task_id=task_id,
         board="factory-reaper-test",
+        kanban_db=tmp_path / "kanban.db",
         proc_root=tmp_path,
-        reservation=_ReservationFixture(_terminal_detail("t_other")),
+        reservation=_ReservationFixture(
+            _terminal_detail("t_other"), path=tmp_path / "kanban.db"
+        ),
     )
 
     assert report["status"] == "skipped"
@@ -611,6 +660,8 @@ def test_f1_reaper_rejects_mismatched_refresh_identity(monkeypatch, tmp_path):
 
 def test_f2_reaper_rejects_malformed_numeric_proc_entry(tmp_path):
     task_id = "t_f2_malformed"
+    kanban_db = tmp_path / "kanban.db"
+    _create_reaper_test_database(kanban_db, task_id)
     identity = {
         reaper.TASK_ENV: task_id,
         reaper.BOARD_ENV: "factory-reaper-test",
@@ -633,6 +684,7 @@ def test_f2_reaper_rejects_malformed_numeric_proc_entry(tmp_path):
         detail,
         task_id=task_id,
         board="factory-reaper-test",
+        kanban_db=kanban_db,
         proc_root=tmp_path,
         current_pid=os.getpid(),
         refresh=lambda: detail,
@@ -654,8 +706,11 @@ def test_f2_reaper_rejects_unreadable_captured_member(monkeypatch, tmp_path):
         detail,
         task_id=task_id,
         board="factory-reaper-test",
+        kanban_db=tmp_path / "kanban.db",
         proc_root=tmp_path,
-        reservation=_ReservationFixture(detail),
+        reservation=_ReservationFixture(
+            detail, path=tmp_path / "kanban.db"
+        ),
         pidfd_open=lambda pid: pid,
         pidfd_send_signal=lambda fd, signum: signals.append((fd, signum)),
         close_handle=lambda fd: None,
@@ -668,8 +723,16 @@ def test_f2_reaper_rejects_unreadable_captured_member(monkeypatch, tmp_path):
 
 def test_f3_reaper_rejects_moved_captured_member(monkeypatch, tmp_path):
     task_id = "t_f3_moved"
-    captured = _synthetic_record(task_id, pid=54000, pgrp=54000, session=54000)
-    moved = _synthetic_record(task_id, pid=54000, pgrp=54001, session=54000)
+    captured = _record_with_run(
+        _synthetic_record(task_id, pid=54000, pgrp=54000, session=54000),
+        41,
+        tmp_path / "kanban.db",
+    )
+    moved = _record_with_run(
+        _synthetic_record(task_id, pid=54000, pgrp=54001, session=54000),
+        41,
+        tmp_path / "kanban.db",
+    )
     monkeypatch.setattr(reaper, "iter_process_records", lambda **kwargs: [captured])
     monkeypatch.setattr(
         reaper, "read_process_record", lambda *args, **kwargs: moved
@@ -682,8 +745,11 @@ def test_f3_reaper_rejects_moved_captured_member(monkeypatch, tmp_path):
         detail,
         task_id=task_id,
         board="factory-reaper-test",
+        kanban_db=tmp_path / "kanban.db",
         proc_root=tmp_path,
-        reservation=_ReservationFixture(detail),
+        reservation=_ReservationFixture(
+            detail, path=tmp_path / "kanban.db"
+        ),
         pidfd_open=lambda pid: pid,
         pidfd_send_signal=lambda fd, signum: signals.append((fd, signum)),
         close_handle=lambda fd: None,
@@ -696,6 +762,8 @@ def test_f3_reaper_rejects_moved_captured_member(monkeypatch, tmp_path):
 
 def test_f4_reaper_rejects_unknown_caller_session(monkeypatch, tmp_path):
     task_id = "t_f4_session"
+    kanban_db = tmp_path / "kanban.db"
+    _create_reaper_test_database(kanban_db, task_id)
     record = _synthetic_record(task_id, pid=55000, pgrp=55000, session=55000)
     _patch_synthetic_process_view(monkeypatch, record)
     monkeypatch.setattr(
@@ -707,6 +775,7 @@ def test_f4_reaper_rejects_unknown_caller_session(monkeypatch, tmp_path):
         detail,
         task_id=task_id,
         board="factory-reaper-test",
+        kanban_db=kanban_db,
         proc_root=tmp_path,
         refresh=lambda: detail,
     )
@@ -743,6 +812,7 @@ def test_reaper_f5_force_authorization_never_escalates_to_sigkill(monkeypatch, t
         task_id=task_id,
         board="factory-reaper-test",
         kanban_db=None,
+        run_id=41,
         proc_root=tmp_path,
         grace_seconds=0,
         pidfd_open=lambda pid: pid,
@@ -794,6 +864,7 @@ def test_reaper_rejects_final_enumeration_pid_reuse_before_signal(monkeypatch, t
         task_id=task_id,
         board="factory-reaper-test",
         kanban_db=None,
+        run_id=41,
         proc_root=tmp_path,
         grace_seconds=0,
         pidfd_open=lambda pid: pid,
@@ -853,6 +924,7 @@ def test_reaper_does_not_sigterm_later_member_after_identity_loss(
         task_id=task_id,
         board="factory-reaper-test",
         kanban_db=None,
+        run_id=41,
         proc_root=tmp_path,
         grace_seconds=0,
         pidfd_open=lambda pid: pid,
@@ -910,6 +982,7 @@ def test_reaper_does_not_sigkill_later_member_after_identity_rebind(
         task_id=task_id,
         board="factory-reaper-test",
         kanban_db=None,
+        run_id=41,
         proc_root=tmp_path,
         grace_seconds=0,
         pidfd_open=lambda pid: pid,
@@ -1057,6 +1130,7 @@ def test_reaper_caps_oversized_grace_before_force_kill(monkeypatch, tmp_path):
         task_id=task_id,
         board="factory-reaper-test",
         kanban_db=None,
+        run_id=41,
         proc_root=tmp_path,
         grace_seconds=reaper.MAX_GRACE_SECONDS + 1,
         pidfd_open=lambda pid: pid,
@@ -1131,12 +1205,14 @@ def test_reaper_rejects_whitespace_normalized_process_identity(env_key, env_valu
         task_id=task_id,
         board=board,
         kanban_db=None,
+        run_id=41,
     )
 
 
 class _ReservationFixture:
-    def __init__(self, *details):
+    def __init__(self, *details, path=None):
         self.details = iter(details)
+        self.path = path
         self.reads = 0
 
     def assert_healthy(self):
@@ -1160,8 +1236,11 @@ def test_r1_pidfd_unavailable_fails_closed_without_group_fallback(monkeypatch, t
         _terminal_detail(task_id),
         task_id=task_id,
         board="factory-reaper-test",
+        kanban_db=tmp_path / "kanban.db",
         proc_root=tmp_path,
-        reservation=_ReservationFixture(_terminal_detail(task_id)),
+        reservation=_ReservationFixture(
+            _terminal_detail(task_id), path=tmp_path / "kanban.db"
+        ),
         pidfd_open=unavailable,
         pidfd_send_signal=lambda fd, signum: sends.append((fd, signum)),
     )
@@ -1173,9 +1252,17 @@ def test_r1_pidfd_unavailable_fails_closed_without_group_fallback(monkeypatch, t
 
 def test_r1_pid_reuse_after_handle_acquisition_is_not_signalled(monkeypatch, tmp_path):
     task_id = "t_r1_handle_pid_reuse"
-    captured = _synthetic_record(task_id, pid=61000, pgrp=61000, session=61000)
-    replacement = _synthetic_record(
-        task_id, pid=61000, pgrp=61000, session=61000, start_time=99
+    captured = _record_with_run(
+        _synthetic_record(task_id, pid=61000, pgrp=61000, session=61000),
+        41,
+        tmp_path / "kanban.db",
+    )
+    replacement = _record_with_run(
+        _synthetic_record(
+            task_id, pid=61000, pgrp=61000, session=61000, start_time=99
+        ),
+        41,
+        tmp_path / "kanban.db",
     )
     acquired = {"value": False}
     monkeypatch.setattr(
@@ -1200,8 +1287,11 @@ def test_r1_pid_reuse_after_handle_acquisition_is_not_signalled(monkeypatch, tmp
         _terminal_detail(task_id),
         task_id=task_id,
         board="factory-reaper-test",
+        kanban_db=tmp_path / "kanban.db",
         proc_root=tmp_path,
-        reservation=_ReservationFixture(_terminal_detail(task_id)),
+        reservation=_ReservationFixture(
+            _terminal_detail(task_id), path=tmp_path / "kanban.db"
+        ),
         pidfd_open=open_handle,
         pidfd_send_signal=lambda fd, signum: sends.append((fd, signum)),
     )
@@ -1215,9 +1305,17 @@ def test_r1_membership_change_between_validation_and_signal_fails_closed(
     monkeypatch, tmp_path
 ):
     task_id = "t_r1_membership_change"
-    captured = _synthetic_record(task_id, pid=62000, pgrp=62000, session=62000)
-    new_member = _synthetic_record(
-        task_id, pid=62001, pgrp=62000, session=62000, start_time=13
+    captured = _record_with_run(
+        _synthetic_record(task_id, pid=62000, pgrp=62000, session=62000),
+        41,
+        tmp_path / "kanban.db",
+    )
+    new_member = _record_with_run(
+        _synthetic_record(
+            task_id, pid=62001, pgrp=62000, session=62000, start_time=13
+        ),
+        41,
+        tmp_path / "kanban.db",
     )
     acquired = {"value": False}
     monkeypatch.setattr(
@@ -1242,8 +1340,11 @@ def test_r1_membership_change_between_validation_and_signal_fails_closed(
         _terminal_detail(task_id),
         task_id=task_id,
         board="factory-reaper-test",
+        kanban_db=tmp_path / "kanban.db",
         proc_root=tmp_path,
-        reservation=_ReservationFixture(_terminal_detail(task_id)),
+        reservation=_ReservationFixture(
+            _terminal_detail(task_id), path=tmp_path / "kanban.db"
+        ),
         pidfd_open=open_handle,
         pidfd_send_signal=lambda fd, signum: sends.append((fd, signum)),
     )
@@ -1258,7 +1359,8 @@ def test_r2_redispatch_readback_under_reservation_blocks_signal(monkeypatch, tmp
     record = _synthetic_record(task_id)
     _patch_synthetic_process_view(monkeypatch, record)
     reservation = _ReservationFixture(
-        _terminal_detail(task_id), _terminal_detail(task_id, current_run_id=42)
+        _terminal_detail(task_id), _terminal_detail(task_id, current_run_id=42),
+        path=tmp_path / "kanban.db",
     )
     sends = []
 
@@ -1266,6 +1368,7 @@ def test_r2_redispatch_readback_under_reservation_blocks_signal(monkeypatch, tmp
         _terminal_detail(task_id),
         task_id=task_id,
         board="factory-reaper-test",
+        kanban_db=tmp_path / "kanban.db",
         proc_root=tmp_path,
         reservation=reservation,
         pidfd_open=lambda pid: 32,
@@ -1281,9 +1384,17 @@ def test_r2_redispatch_readback_under_reservation_blocks_signal(monkeypatch, tmp
 
 def test_r3_new_member_after_sigterm_is_reported_as_survivor(monkeypatch, tmp_path):
     task_id = "t_r3_spawned_survivor"
-    captured = _synthetic_record(task_id, pid=63000, pgrp=63000, session=63000)
-    new_member = _synthetic_record(
-        task_id, pid=63001, pgrp=63000, session=63000, start_time=13
+    captured = _record_with_run(
+        _synthetic_record(task_id, pid=63000, pgrp=63000, session=63000),
+        41,
+        tmp_path / "kanban.db",
+    )
+    new_member = _record_with_run(
+        _synthetic_record(
+            task_id, pid=63001, pgrp=63000, session=63000, start_time=13
+        ),
+        41,
+        tmp_path / "kanban.db",
     )
     phase = {"term_sent": False}
     monkeypatch.setattr(
@@ -1309,10 +1420,12 @@ def test_r3_new_member_after_sigterm_is_reported_as_survivor(monkeypatch, tmp_pa
         _terminal_detail(task_id),
         task_id=task_id,
         board="factory-reaper-test",
+        kanban_db=tmp_path / "kanban.db",
         proc_root=tmp_path,
         reservation=_ReservationFixture(
             _terminal_detail(task_id), _terminal_detail(task_id),
             _terminal_detail(task_id), _terminal_detail(task_id),
+            path=tmp_path / "kanban.db",
         ),
         pidfd_open=lambda pid: 33,
         pidfd_send_signal=send,
@@ -1368,3 +1481,343 @@ def test_r2_lock_timeout_is_unsafe_and_sends_nothing(tmp_path, monkeypatch):
 
 def test_reaper_contains_no_killpg_fallback():
     assert "killpg" not in inspect.getsource(reaper)
+
+
+class _BoundReservationFixture:
+    def __init__(self, path, detail):
+        self.path = path
+        self.detail = detail
+        self.reads = 0
+
+    def assert_healthy(self):
+        return None
+
+    def read_task(self, task_id):
+        self.reads += 1
+        return self.detail
+
+
+def _bound_detail(task_id: str, run_id: int = 41):
+    detail = _terminal_detail(task_id)
+    detail["terminal_run_id"] = run_id
+    return detail
+
+
+def _record_with_run(record, run_id, kanban_db=None):
+    env = dict(record.env)
+    if run_id is None:
+        env.pop(reaper.RUN_ENV, None)
+    else:
+        env[reaper.RUN_ENV] = str(run_id)
+    if kanban_db is not None:
+        env[reaper.DB_ENV] = str(kanban_db)
+    return reaper.ProcessRecord(
+        pid=record.pid,
+        ppid=record.ppid,
+        pgrp=record.pgrp,
+        session=record.session,
+        start_time=record.start_time,
+        state=record.state,
+        env=env,
+        env_readable=record.env_readable,
+        readable=record.readable,
+    )
+
+
+def _patch_bound_process_view(monkeypatch, records):
+    by_pid = {record.pid: record for record in records}
+    monkeypatch.setattr(reaper, "iter_process_records", lambda **kwargs: list(records))
+    monkeypatch.setattr(
+        reaper,
+        "read_process_record",
+        lambda pid, **kwargs: by_pid.get(pid),
+    )
+    monkeypatch.setattr(reaper.os, "getpgrp", lambda: 1)
+    monkeypatch.setattr(reaper.os, "getsid", lambda pid: 2)
+    monkeypatch.setattr(
+        reaper,
+        "_membership_snapshot",
+        lambda *args, **kwargs: reaper.MembershipSnapshot((), (), ()),
+    )
+
+
+def test_sqlite_reservation_readback_binds_latest_terminal_run(tmp_path):
+    task_id = "t_sqlite_terminal_run"
+    database = tmp_path / "kanban.db"
+    connection = sqlite3.connect(database)
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE tasks (
+                id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                current_run_id INTEGER
+            );
+            CREATE TABLE task_runs (
+                id INTEGER PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                outcome TEXT,
+                ended_at INTEGER
+            );
+            CREATE TABLE task_events (
+                id INTEGER PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                run_id INTEGER,
+                kind TEXT NOT NULL
+            );
+            """
+        )
+        connection.execute(
+            "INSERT INTO tasks VALUES (?, 'blocked', NULL)", (task_id,)
+        )
+        connection.executemany(
+            "INSERT INTO task_runs VALUES (?, ?, 'blocked', 'blocked', ?)",
+            [(40, task_id, 10), (41, task_id, 11)],
+        )
+        connection.execute(
+            "INSERT INTO task_events VALUES (1, ?, 41, 'blocked')", (task_id,)
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with reaper.SQLiteWriteReservation(database, task_id) as reservation:
+        detail = reservation.read_task(task_id)
+
+    assert reaper._terminal_run_binding(detail) == (41, None)
+
+
+def test_reaper_requires_canonical_terminal_run_before_initial_scan(monkeypatch, tmp_path):
+    task_id = "t_run_missing_terminal_binding"
+    monkeypatch.setattr(
+        reaper,
+        "iter_process_records",
+        lambda **kwargs: pytest.fail("missing terminal run reached procfs"),
+    )
+
+    report = reaper.reap_terminal_task_workers(
+        _terminal_detail(task_id, terminal_run_id=None),
+        task_id=task_id,
+        board="factory-reaper-test",
+        kanban_db=tmp_path / "kanban.db",
+        proc_root=tmp_path,
+        reservation=_BoundReservationFixture(
+            tmp_path / "kanban.db",
+            _terminal_detail(task_id, terminal_run_id=None),
+        ),
+    )
+
+    assert report["status"] == "unsafe"
+    assert "run" in report["reason"]
+
+
+def test_reaper_signals_only_selected_run_and_refuses_missing_run_member(
+    monkeypatch, tmp_path
+):
+    task_id = "t_run_selected"
+    old = _record_with_run(
+        _synthetic_record(task_id, pid=70000, pgrp=70000, session=70000),
+        40,
+        tmp_path / "kanban.db",
+    )
+    selected = _record_with_run(
+        _synthetic_record(task_id, pid=70001, pgrp=70001, session=70001),
+        41,
+        tmp_path / "kanban.db",
+    )
+    _patch_bound_process_view(monkeypatch, [old, selected])
+    signals = []
+    detail = _bound_detail(task_id, 41)
+    report = reaper.reap_terminal_task_workers(
+        detail,
+        task_id=task_id,
+        board="factory-reaper-test",
+        kanban_db=tmp_path / "kanban.db",
+        proc_root=tmp_path,
+        reservation=_BoundReservationFixture(tmp_path / "kanban.db", detail),
+        pidfd_open=lambda pid: pid + 100,
+        pidfd_send_signal=lambda fd, signum: signals.append((fd, signum)),
+        close_handle=lambda fd: None,
+        grace_seconds=0,
+    )
+
+    assert report["status"] == "reaped"
+    assert report["signalled_pids"] == [selected.pid]
+    assert signals == [
+        (selected.pid + 100, signal.SIGTERM),
+        (selected.pid + 100, signal.SIGKILL),
+    ]
+
+    missing_run = _record_with_run(
+        _synthetic_record(task_id, pid=70002, pgrp=70001, session=70001), None
+    )
+    _patch_bound_process_view(monkeypatch, [selected, missing_run])
+    signals.clear()
+    report = reaper.reap_terminal_task_workers(
+        detail,
+        task_id=task_id,
+        board="factory-reaper-test",
+        kanban_db=tmp_path / "kanban.db",
+        proc_root=tmp_path,
+        reservation=_BoundReservationFixture(tmp_path / "kanban.db", detail),
+        pidfd_open=lambda pid: pid + 100,
+        pidfd_send_signal=lambda fd, signum: signals.append((fd, signum)),
+        close_handle=lambda fd: None,
+        grace_seconds=0,
+    )
+
+    assert report["status"] == "unsafe"
+    assert "unbound" in report["reason"]
+    assert signals == []
+
+
+def test_reaper_rejects_mismatched_injected_reservation_path_before_scan(
+    monkeypatch, tmp_path
+):
+    task_id = "t_reservation_path_mismatch"
+    detail = _bound_detail(task_id)
+    expected = tmp_path / "expected.db"
+    actual = tmp_path / "actual.db"
+    monkeypatch.setattr(
+        reaper,
+        "iter_process_records",
+        lambda **kwargs: pytest.fail("DB mismatch reached procfs"),
+    )
+
+    report = reaper.reap_terminal_task_workers(
+        detail,
+        task_id=task_id,
+        board="factory-reaper-test",
+        kanban_db=expected,
+        proc_root=tmp_path,
+        reservation=_BoundReservationFixture(actual, detail),
+    )
+
+    assert report["status"] == "unsafe"
+    assert "database" in report["reason"]
+
+
+def test_reaper_rejects_injected_reservation_without_exact_path_before_scan(
+    monkeypatch, tmp_path
+):
+    task_id = "t_reservation_path_absent"
+    detail = _bound_detail(task_id)
+    reservation = _ReservationFixture(detail)
+    monkeypatch.setattr(
+        reaper,
+        "iter_process_records",
+        lambda **kwargs: pytest.fail("missing DB path reached procfs"),
+    )
+
+    report = reaper.reap_terminal_task_workers(
+        detail,
+        task_id=task_id,
+        board="factory-reaper-test",
+        proc_root=tmp_path,
+        reservation=reservation,
+    )
+
+    assert report["status"] == "unsafe"
+    assert "database" in report["reason"]
+
+
+def test_workers_only_recovery_uses_global_budget_and_bounded_skip_report(monkeypatch):
+    tasks = [
+        {"id": "t_worker_1", "status": "blocked"},
+        {"id": "t_worker_2", "status": "blocked"},
+        {"id": "t_worker_3", "status": "blocked"},
+    ]
+    calls = []
+    clock = {"now": 0.0}
+    monkeypatch.setattr(factory, "_readonly_blocked_tasks", lambda board: tasks)
+    monkeypatch.setattr(factory, "_recovery_budget_seconds", lambda: 1.0)
+
+    def reconcile(board, task, *, dry_run):
+        calls.append(task["id"])
+        clock["now"] = 2.0
+        return f"{task['id']}: terminal worker reconciliation=none"
+
+    monkeypatch.setattr(factory, "_reconcile_terminal_worker", reconcile)
+    monkeypatch.setattr(factory.time, "monotonic", lambda: clock["now"])
+
+    assert factory.recover("factory-reaper-test", workers_only=True) == [
+        "t_worker_1: terminal worker reconciliation=none",
+        "recovery budget exhausted; skipped remaining blocked-task repairs",
+    ]
+    assert calls == ["t_worker_1"]
+
+
+def test_reaper_report_bounds_samples_counts_and_exception_text(monkeypatch, tmp_path):
+    task_id = "t_report_bounds"
+    detail = _bound_detail(task_id)
+    group = reaper.ProcessGroup(
+        session=71000,
+        pgrp=71000,
+        pids=tuple(range(71000, 71100)),
+        start_times={pid: 12 for pid in range(71000, 71100)},
+    )
+    monkeypatch.setattr(
+        reaper,
+        "_validated_groups",
+        lambda *args, **kwargs: ([group], []),
+    )
+    monkeypatch.setattr(
+        reaper,
+        "_settle_process_groups",
+        lambda groups, **kwargs: (groups, []),
+    )
+    private_error = "/private/customer/home/secret-token=" + ("x" * 5000)
+    monkeypatch.setattr(
+        reaper,
+        "_terminate_groups",
+        lambda *args, **kwargs: (
+            list(range(71000, 71100)),
+            list(range(72000, 72100)),
+            [private_error, private_error],
+        ),
+    )
+
+    report = reaper.reap_terminal_task_workers(
+        detail,
+        task_id=task_id,
+        board="factory-reaper-test",
+        kanban_db=tmp_path / "kanban.db",
+        proc_root=tmp_path,
+        reservation=_BoundReservationFixture(tmp_path / "kanban.db", detail),
+    )
+
+    assert report["pid_count"] == 100
+    assert report["survivor_count"] == 100
+    assert report["process_group_count"] == 1
+    assert len(report["pids"]) <= reaper.MAX_REPORT_SAMPLE
+    assert len(report["survivors"]) <= reaper.MAX_REPORT_SAMPLE
+    assert len(report["signalled_pids"]) <= reaper.MAX_REPORT_SAMPLE
+    assert len(report["reason"]) <= reaper.MAX_REPORT_REASON_LENGTH
+    assert "/private/customer" not in report["reason"]
+    assert "secret-token" not in report["reason"]
+    assert "x" * 100 not in report["reason"]
+
+
+def test_reaper_sanitizes_reservation_exception_text(monkeypatch, tmp_path):
+    task_id = "t_report_exception"
+    detail = _bound_detail(task_id)
+
+    class BrokenReservation(_BoundReservationFixture):
+        def read_task(self, task_id):
+            raise RuntimeError("/private/customer/logs/token=super-secret " + "z" * 5000)
+
+    report = reaper.reap_terminal_task_workers(
+        detail,
+        task_id=task_id,
+        board="factory-reaper-test",
+        kanban_db=tmp_path / "kanban.db",
+        proc_root=tmp_path,
+        reservation=BrokenReservation(tmp_path / "kanban.db", detail),
+    )
+
+    assert report["status"] == "unsafe"
+    assert len(report["reason"]) <= reaper.MAX_REPORT_REASON_LENGTH
+    assert "/private/customer" not in report["reason"]
+    assert "super-secret" not in report["reason"]
+    assert "z" * 100 not in report["reason"]

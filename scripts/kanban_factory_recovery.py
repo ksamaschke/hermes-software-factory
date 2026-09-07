@@ -43,6 +43,32 @@ _COLLISION_RE = re.compile(
 _PARKED_ACK_MARKER = "[factory] parked backlog acknowledged"
 _DEFAULT_CLI_TIMEOUT_SECONDS = 5.0
 _DEFAULT_RECOVERY_BUDGET_SECONDS = 30.0
+_MAX_WORKER_REPORT_SAMPLE = 8
+_MAX_WORKER_REPORT_REASON = 240
+_REPORT_SECRET_RE = re.compile(
+    r"(?i)\b(token|secret|password|api[_-]?key|authorization|cookie)\b\s*[:=]\s*\S+"
+)
+_REPORT_PATH_RE = re.compile(r"(?<![\w])(?:/[\S]+|[A-Za-z]:[\\/][^\s;,)]+)")
+
+
+def _bounded_worker_text(value: Any) -> str:
+    text = str(value).replace("\x00", " ")
+    text = _REPORT_SECRET_RE.sub(r"\1=<redacted>", text)
+    text = _REPORT_PATH_RE.sub("<path>", text)
+    text = re.sub(r"[\x00-\x1f\x7f]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"(.)\1{31,}", r"\1…", text)
+    if not text:
+        return "unspecified error"
+    if len(text) > _MAX_WORKER_REPORT_REASON:
+        return text[: _MAX_WORKER_REPORT_REASON - 1] + "…"
+    return text
+
+
+def _bounded_worker_sample(value: Any) -> str:
+    if not isinstance(value, (list, tuple)):
+        return ""
+    return ",".join(str(item) for item in list(value)[:_MAX_WORKER_REPORT_SAMPLE])
 
 
 def _factory_cli_timeout_seconds() -> float:
@@ -96,6 +122,8 @@ def _readonly_task_detail(task_id: str, board: str | None = None) -> dict[str, A
     path = _kanban_db_path(board)
     if path is None:
         return None
+    run_rows: list[tuple[Any, ...]] = []
+    event_rows: list[tuple[Any, ...]] = []
     try:
         conn = sqlite3.connect(
             f"file:{path}?mode=ro", uri=True, timeout=2
@@ -105,6 +133,23 @@ def _readonly_task_detail(task_id: str, board: str | None = None) -> dict[str, A
             "SELECT id, status, current_run_id FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
+        if row is not None:
+            try:
+                run_rows = conn.execute(
+                    "SELECT id, status, outcome, ended_at, error "
+                    "FROM task_runs WHERE task_id = ? ORDER BY id",
+                    (task_id,),
+                ).fetchall()
+            except sqlite3.Error:
+                pass
+            try:
+                event_rows = conn.execute(
+                    "SELECT kind, run_id FROM task_events "
+                    "WHERE task_id = ? ORDER BY id",
+                    (task_id,),
+                ).fetchall()
+            except sqlite3.Error:
+                pass
     except (OSError, sqlite3.Error):
         return None
     finally:
@@ -114,13 +159,29 @@ def _readonly_task_detail(task_id: str, board: str | None = None) -> dict[str, A
             pass
     if row is None:
         return None
-    return {
+    detail: dict[str, Any] = {
         "task": {
             "id": str(row[0]),
             "status": str(row[1]),
             "current_run_id": row[2],
         }
     }
+    if run_rows:
+        detail["runs"] = [
+            {
+                "id": run[0],
+                "status": run[1],
+                "outcome": run[2],
+                "ended_at": run[3],
+                "error": run[4],
+            }
+            for run in run_rows
+        ]
+    if event_rows:
+        detail["events"] = [
+            {"kind": event[0], "run_id": event[1]} for event in event_rows
+        ]
+    return detail
 
 
 def _readonly_blocked_tasks(board: str | None = None) -> list[dict[str, Any]] | None:
@@ -356,14 +417,23 @@ def _reconcile_terminal_worker(
     if status in {"none", "not_applicable"}:
         return None
     fields = []
-    if report.get("pids"):
-        fields.append(f"pids={','.join(str(pid) for pid in report['pids'])}")
-    if report.get("survivors"):
-        fields.append(
-            f"survivors={','.join(str(pid) for pid in report['survivors'])}"
-        )
+    for key in (
+        "pid_count",
+        "process_group_count",
+        "signalled_group_count",
+        "signalled_pid_count",
+        "survivor_count",
+        "error_count",
+    ):
+        value = report.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            fields.append(f"{key}={value}")
+    for key in ("pids", "process_groups", "signalled_groups", "survivors"):
+        sample = _bounded_worker_sample(report.get(key))
+        if sample:
+            fields.append(f"{key}={sample}")
     if report.get("reason"):
-        fields.append(f"reason={report['reason']}")
+        fields.append(f"reason={_bounded_worker_text(report['reason'])}")
     suffix = f" ({'; '.join(fields)})" if fields else ""
     return f"{task_id}: terminal worker reconciliation={status}{suffix}"
 
@@ -499,7 +569,13 @@ def recover(
         return changes
     blocked_tasks = [task for task in tasks if isinstance(task, dict)]
     if workers_only:
+        deadline = time.monotonic() + _recovery_budget_seconds()
         for task in blocked_tasks:
+            if time.monotonic() >= deadline:
+                changes.append(
+                    "recovery budget exhausted; skipped remaining blocked-task repairs"
+                )
+                break
             change = _reconcile_terminal_worker(board, task, dry_run=dry_run)
             if change:
                 changes.append(change)
