@@ -23,6 +23,9 @@ ROOT = Path(__file__).resolve().parents[1]
 ARTIFACT = ROOT / "local-variant" / "native-boundary"
 BUILDER_PATH = ARTIFACT / "build_native_boundary.py"
 NATIVE_PATH = ARTIFACT / "runtime" / "hermes_cli" / "native_boundary.py"
+# This URL is an opaque, non-routable fixture value. Tests never contact GitHub;
+# the old guard only needs the same URL shape as its production PR detector.
+FIXTURE_PR_URL = "https://github.com/fixture-owner/fixture-repository/pull/123"
 
 
 def _load_module(name: str, path: Path):
@@ -113,6 +116,58 @@ def test_manifest_symlink_is_rejected(tmp_path):
 
     with pytest.raises(ValueError, match="symlink"):
         builder.verify(str(link))
+
+
+def test_complete_tree_manifest_rejects_unlisted_imported_module(tmp_path):
+    runtime = tmp_path / "runtime"
+    package = runtime / "hermes_cli"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("ORIGINAL = True\n", encoding="utf-8")
+    (package / "kanban_db.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (package / "kanban_specify.py").write_text("VALUE = 2\n", encoding="utf-8")
+    expected = builder._tree_files(runtime, allow_excluded=False)
+
+    # __init__.py is intentionally not a patched target, but it is imported
+    # as part of the same staged package and therefore must be authenticated.
+    (package / "__init__.py").write_text("TAMPERED = True\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="staged runtime tree"):
+        builder._verify_tree(
+            runtime,
+            ["hermes_cli/kanban_db.py"],
+            expected=expected,
+        )
+
+
+def test_patch_target_allowlist_rejects_unlisted_file(tmp_path):
+    patch_path = tmp_path / "unlisted.patch"
+    patch_path.write_text(
+        "--- a/hermes_cli/kanban_db.py\n"
+        "+++ b/hermes_cli/kanban_db.py\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+        "--- a/hermes_cli/unlisted.py\n"
+        "+++ b/hermes_cli/unlisted.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+unexpected\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="outside the exact allowlist"):
+        builder._validate_patch_targets(
+            [(patch_path, "patches/unlisted.patch")],
+            ["hermes_cli/kanban_db.py"],
+        )
+
+
+def test_hardlinked_runtime_entries_fail_closed(tmp_path):
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    original = runtime / "original.py"
+    original.write_text("value = 1\n", encoding="utf-8")
+    hardlink = runtime / "hardlink.py"
+    hardlink.hardlink_to(original)
+    with pytest.raises(ValueError, match="hard-linked"):
+        builder._tree_files(runtime, allow_excluded=False)
 
 
 def test_native_quarantine_decision_is_conservative():
@@ -251,7 +306,31 @@ def _staged_runtime() -> Path:
     return runtime
 
 
-def test_staged_imports_are_private_and_provenanced():
+def _private_environment(
+    runtime: Path,
+    tmp_path: Path,
+    *,
+    db: Path | None = None,
+    task_file: Path | None = None,
+) -> dict[str, str]:
+    """Build a fresh child environment with no inherited identity or secrets."""
+    environment = {
+        "HERMES_HOME": str(tmp_path / "hermes-home"),
+        "HOME": str(tmp_path / "home"),
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "PYTHONHASHSEED": "0",
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONPATH": str(runtime),
+        "TMPDIR": str(tmp_path),
+    }
+    if db is not None:
+        environment["HERMES_KANBAN_DB"] = str(db)
+    if task_file is not None:
+        environment["TASK_ID_FILE"] = str(task_file)
+    return environment
+
+
+def test_staged_imports_are_private_and_provenanced(tmp_path):
     runtime = _staged_runtime()
     script = textwrap.dedent(
         """
@@ -266,12 +345,7 @@ def test_staged_imports_are_private_and_provenanced():
         }))
         """
     )
-    environment = os.environ.copy()
-    environment["PYTHONPATH"] = str(runtime)
-    environment["PYTHONNOUSERSITE"] = "1"
-    for key in tuple(environment):
-        if key.startswith("HERMES_"):
-            environment.pop(key, None)
+    environment = _private_environment(runtime, tmp_path)
     result = subprocess.run(
         [sys.executable, "-B", "-c", script],
         cwd=runtime,
@@ -287,7 +361,7 @@ def test_staged_imports_are_private_and_provenanced():
     )
 
 
-def test_staged_native_direct_callers_have_one_admission():
+def test_staged_native_direct_callers_have_one_admission(tmp_path):
     runtime = _staged_runtime()
     script = textwrap.dedent(
         """
@@ -329,11 +403,9 @@ def test_staged_native_direct_callers_have_one_admission():
         print(json.dumps({"runtime": str(Path(kb.__file__).resolve()), "outcomes": outcomes}))
         """
     )
-    environment = os.environ.copy()
-    environment["PYTHONPATH"] = str(runtime)
-    environment["PYTHONNOUSERSITE"] = "1"
-    environment["HOME"] = str(runtime / ".test-home")
-    environment["HERMES_KANBAN_DB"] = str(runtime / ".native-concurrency.db")
+    environment = _private_environment(
+        runtime, tmp_path, db=tmp_path / ".native-concurrency.db"
+    )
     result = subprocess.run(
         [sys.executable, "-B", "-c", script],
         cwd=runtime,
@@ -347,7 +419,16 @@ def test_staged_native_direct_callers_have_one_admission():
 
 def test_staged_dispatch_tick_uses_guard_before_dry_run_admission(tmp_path):
     runtime = _staged_runtime()
-    script = textwrap.dedent(
+    old_runtime = Path(
+        os.environ.get(
+            "FACTORY_NATIVE_LEGACY_RUNTIME",
+            "/home/ksamaschke/.hermes/profiles/orchestrator/runtime-hotfix-20260906",
+        )
+    ).resolve()
+    if not old_runtime.is_dir():
+        pytest.skip("FACTORY_NATIVE_LEGACY_RUNTIME is not available")
+    db = tmp_path / "native-dispatch-migration.db"
+    old_script = textwrap.dedent(
         """
         import json
         import os
@@ -374,38 +455,212 @@ def test_staged_dispatch_tick_uses_guard_before_dry_run_admission(tmp_path):
                 expected_run_id=running.current_run_id,
             )
             assert kb.unblock_task(conn, task_id)
-            kb.add_comment(
-                conn,
-                task_id,
-                "fixture-controller",
-                "Existing pull request remains the source evidence.",
-            )
+            kb.add_comment(conn, task_id, "fixture-controller", __FIXTURE_PR_URL__)
+            guard = kb.check_respawn_guard(conn, task_id, lane="ready")
             result = kb.dispatch_once(
                 conn,
                 dry_run=True,
                 max_spawn=1,
                 reconcile_orphans=False,
             )
-            spawned = [item[0] for item in result.spawned]
-            assert task_id in spawned, result
-            assert kb.get_task(conn, task_id).status == "ready"
-        print(json.dumps({"runtime": str(Path(kb.__file__).resolve()), "spawned": spawned}))
+            print(json.dumps({
+                "runtime": str(Path(kb.__file__).resolve()),
+                "task_id": task_id,
+                "guard": guard,
+                "spawned": [item[0] for item in result.spawned],
+            }))
         """
+    ).replace("__FIXTURE_PR_URL__", repr(FIXTURE_PR_URL))
+    old_result = subprocess.run(
+        [sys.executable, "-B", "-c", old_script],
+        cwd=old_runtime,
+        env=_private_environment(old_runtime, tmp_path, db=db),
+        capture_output=True,
+        text=True,
+        check=False,
     )
-    environment = os.environ.copy()
-    environment["PYTHONPATH"] = str(runtime)
-    environment["PYTHONNOUSERSITE"] = "1"
-    environment["HOME"] = str(runtime / ".dispatch-test-home")
-    environment["HERMES_KANBAN_DB"] = str(tmp_path / "native-dispatch.db")
+    assert old_result.returncode == 0, old_result.stderr or old_result.stdout
+    old_probe = json.loads(old_result.stdout)
+    assert old_probe["guard"] == "active_pr"
+    assert old_probe["spawned"] == []
+
+    staged_script = textwrap.dedent(
+        """
+        import json
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+
+        db = Path(__import__("os").environ["HERMES_KANBAN_DB"])
+        with kb.connect_closing(db) as conn:
+            task_id = __TASK_ID__
+            guard = kb.check_respawn_guard(conn, task_id, lane="ready")
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            resumed = kb.claim_task(conn, task_id, claimer="fixture-owner:2")
+            second = kb.claim_task(conn, task_id, claimer="fixture-owner:3")
+            print(json.dumps({
+                "runtime": str(Path(kb.__file__).resolve()),
+                "guard": guard,
+                "spawned": [item[0] for item in result.spawned],
+                "resumed": resumed is not None,
+                "second_claim": second is not None,
+            }))
+        """
+    ).replace("__TASK_ID__", repr(old_probe["task_id"]))
+    staged_result = subprocess.run(
+        [sys.executable, "-B", "-c", staged_script],
+        cwd=runtime,
+        env=_private_environment(runtime, tmp_path, db=db),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert staged_result.returncode == 0, staged_result.stderr or staged_result.stdout
+    staged_probe = json.loads(staged_result.stdout)
+    assert staged_probe["guard"] is None
+    assert staged_probe["spawned"] == [old_probe["task_id"]]
+    assert staged_probe["resumed"] is True
+    assert staged_probe["second_claim"] is False
+
+
+def test_staged_dispatch_negative_controls(tmp_path):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import time
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        negative = {}
+        with kb.connect_closing(db) as conn:
+            def create_lifecycle(name, *, explicit, comment=True):
+                task_id = kb.create_task(
+                    conn,
+                    title=name,
+                    body="Private negative-control fixture",
+                    assignee="default",
+                    created_by="fixture",
+                )
+                run = kb.claim_task(conn, task_id, claimer="fixture-owner:1")
+                assert run is not None
+                assert kb.block_task(
+                    conn,
+                    task_id,
+                    reason="fixture resolution boundary",
+                    kind="needs_input",
+                    expected_run_id=run.current_run_id,
+                )
+                if explicit:
+                    assert kb.unblock_task(conn, task_id)
+                if comment:
+                    kb.add_comment(conn, task_id, "fixture-controller", __FIXTURE_PR_URL__)
+                return task_id
+
+            def ready_without_requeue(task_id):
+                with kb.write_txn(conn):
+                    conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+
+            absent = create_lifecycle("absent explicit requeue", explicit=False)
+            ready_without_requeue(absent)
+            negative["absent_requeue"] = absent
+
+            comment_only = kb.create_task(
+                conn,
+                title="comment-only resolution",
+                body="No durable lifecycle transition",
+                assignee="default",
+                created_by="fixture",
+            )
+            kb.add_comment(conn, comment_only, "fixture-controller", __FIXTURE_PR_URL__)
+            negative["comment_only"] = comment_only
+
+            wrong_owner = create_lifecycle("wrong owner", explicit=True)
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET assignee = 'other-owner' WHERE id = ?", (wrong_owner,))
+            negative["wrong_owner"] = wrong_owner
+
+            unknown_owner = create_lifecycle("unknown owner", explicit=True)
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET assignee = NULL WHERE id = ?", (unknown_owner,))
+            negative["unknown_owner"] = unknown_owner
+
+            live_run = create_lifecycle("live run", explicit=True)
+            assert kb.claim_task(conn, live_run, claimer="fixture-owner:2") is not None
+            negative["live_run"] = live_run
+
+            quota = kb.create_task(
+                conn,
+                title="quota auth blocker",
+                body="Private quota fixture",
+                assignee="default",
+                created_by="fixture",
+            )
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                    ("401 unauthorized provider token", quota),
+                )
+            negative["quota_auth"] = quota
+
+            retry = kb.create_task(
+                conn,
+                title="retry quarantine",
+                body="Private retry fixture",
+                assignee="default",
+                created_by="fixture",
+            )
+            now = int(time.time())
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome) "
+                "VALUES (?, ?, 'done', ?, ?, 'rate_limited')",
+                (retry, "default", now, now),
+            )
+            conn.commit()
+            negative["retry_quarantine"] = retry
+
+            guards = {name: kb.check_respawn_guard(conn, task_id, lane="ready")
+                      for name, task_id in negative.items()}
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "guards": guards,
+                "spawned": [item[0] for item in result.spawned],
+                "runtime": str(Path(kb.__file__).resolve()),
+            }))
+        """
+    ).replace("__FIXTURE_PR_URL__", repr(FIXTURE_PR_URL))
     result = subprocess.run(
         [sys.executable, "-B", "-c", script],
         cwd=runtime,
-        env=environment,
+        env=_private_environment(
+            runtime, tmp_path, db=tmp_path / "negative-controls.db"
+        ),
         capture_output=True,
         text=True,
         check=False,
     )
     assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["guards"]["absent_requeue"] == "active_pr"
+    assert probe["guards"]["comment_only"] == "active_pr"
+    assert probe["guards"]["wrong_owner"] == "active_pr"
+    assert probe["guards"]["unknown_owner"] == "active_pr"
+    assert probe["guards"]["live_run"] == "active_pr"
+    assert probe["guards"]["quota_auth"] == "blocker_auth"
+    assert probe["guards"]["retry_quarantine"] == "rate_limit_cooldown"
+    assert probe["spawned"] == []
 
 
 def test_old_runtime_lifecycle_state_is_admitted_by_staged_runtime(tmp_path):
@@ -449,16 +704,13 @@ def test_old_runtime_lifecycle_state_is_admitted_by_staged_runtime(tmp_path):
             with kb.write_txn(conn):
                 for _ in range(3):
                     kb._append_event(conn, task_id, "respawn_guarded", {"reason": "active_pr"})
-            kb.add_comment(conn, task_id, "fixture-controller", "Existing pull request remains.")
+            kb.add_comment(conn, task_id, "fixture-controller", __FIXTURE_PR_URL__)
         Path(os.environ["TASK_ID_FILE"]).write_text(task_id, encoding="utf-8")
         """
+    ).replace("__FIXTURE_PR_URL__", repr(FIXTURE_PR_URL))
+    old_environment = _private_environment(
+        old_runtime, tmp_path, db=db, task_file=task_file
     )
-    old_environment = os.environ.copy()
-    old_environment["PYTHONPATH"] = str(old_runtime)
-    old_environment["PYTHONNOUSERSITE"] = "1"
-    old_environment["HOME"] = str(tmp_path / "old-home")
-    old_environment["HERMES_KANBAN_DB"] = str(db)
-    old_environment["TASK_ID_FILE"] = str(task_file)
     old_result = subprocess.run(
         [sys.executable, "-B", "-c", old_script],
         cwd=old_runtime,
@@ -486,12 +738,9 @@ def test_old_runtime_lifecycle_state_is_admitted_by_staged_runtime(tmp_path):
         print(json.dumps({"runtime": str(Path(kb.__file__).resolve()), "task_id": task_id}))
         """
     )
-    staged_environment = os.environ.copy()
-    staged_environment["PYTHONPATH"] = str(runtime)
-    staged_environment["PYTHONNOUSERSITE"] = "1"
-    staged_environment["HOME"] = str(tmp_path / "staged-home")
-    staged_environment["HERMES_KANBAN_DB"] = str(db)
-    staged_environment["TASK_ID_FILE"] = str(task_file)
+    staged_environment = _private_environment(
+        runtime, tmp_path, db=db, task_file=task_file
+    )
     staged_result = subprocess.run(
         [sys.executable, "-B", "-c", staged_script],
         cwd=runtime,
