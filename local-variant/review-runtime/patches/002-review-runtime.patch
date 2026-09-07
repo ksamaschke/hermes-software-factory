@@ -1,0 +1,1893 @@
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -101,6 +101,31 @@
+ 
+ VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+ VALID_INITIAL_STATUSES = {"running", "blocked"}
++
++# Runtime classes are selected from durable task state or an explicit
++# dispatcher entrypoint. They are never inferred from comments or prose.
++RUNTIME_CLASS_IMPLEMENTATION = "implementation"
++RUNTIME_CLASS_REVIEW = "review"
++RUNTIME_CLASS_EVIDENCE_RECOVERY = "evidence_recovery"
++VALID_RUNTIME_CLASSES = frozenset({
++    RUNTIME_CLASS_IMPLEMENTATION,
++    RUNTIME_CLASS_REVIEW,
++    RUNTIME_CLASS_EVIDENCE_RECOVERY,
++})
++
++# Review/evidence workers are not allowed to turn a missing or expired
++# verification window into an approval.  These values are deliberately
++# exported as plain strings so the DB, CLI, and terminal boundary can preserve
++# one typed failure vocabulary without importing one another.
++REVIEW_INCOMPLETE_CODE = "REVIEW-INCOMPLETE"
++REVIEW_INCOMPLETE_BLOCK_KIND = "needs_input"
++_REVIEW_FAILURE_OUTCOMES = frozenset({
++    "timed_out",
++    "crashed",
++    "reclaimed",
++    "spawn_failed",
++    "gave_up",
++})
+ 
+ # Typed block reasons. Distinguishes the two fundamentally different things a
+ # worker (or human) means by "blocked", so each can be routed differently
+@@ -1141,6 +1166,18 @@
+     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
+     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
+     block_recurrences: int = 0
++    # Durable dispatch class. Legacy rows migrate to implementation; review
++    # claims promote this to review in the same CAS that claims the task.
++    runtime_class: str = RUNTIME_CLASS_IMPLEMENTATION
++    # Effective per-run values populated by the claiming dispatcher. These are
++    # intentionally not persisted on the task row; task_runs is authoritative.
++    evidence_budget_seconds: Optional[int] = None
++    command_timeout_seconds: Optional[int] = None
++    # Absolute deadline for the active review/evidence run. This is populated
++    # by the claiming CAS and copied into the detached worker environment; it
++    # is intentionally transient on Task because the durable claimed event is
++    # the source of truth for recovery/audit.
++    evidence_deadline: Optional[float] = None
+ 
+     @classmethod
+     def from_row(cls, row: sqlite3.Row) -> "Task":
+@@ -1235,6 +1272,11 @@
+                 if "block_recurrences" in keys and row["block_recurrences"] is not None
+                 else 0
+             ),
++            runtime_class=(
++                str(row["runtime_class"]).strip()
++                if "runtime_class" in keys and row["runtime_class"]
++                else RUNTIME_CLASS_IMPLEMENTATION
++            ),
+         )
+ 
+ 
+@@ -1362,6 +1404,7 @@
+     -- Short excerpt of the most recent failure's error text.
+     last_failure_error   TEXT,
+     max_runtime_seconds  INTEGER,
++    runtime_class        TEXT NOT NULL DEFAULT 'implementation',
+     last_heartbeat_at    INTEGER,
+     -- Pointer into task_runs for the currently-active run (NULL if no
+     -- run is in-flight). Denormalised for cheap reads.
+@@ -2605,6 +2648,11 @@
+         _add_column_if_missing(
+             conn, "tasks", "max_runtime_seconds", "max_runtime_seconds INTEGER"
+         )
++    if "runtime_class" not in cols:
++        _add_column_if_missing(
++            conn, "tasks", "runtime_class",
++            "runtime_class TEXT NOT NULL DEFAULT 'implementation'",
++        )
+     if "last_heartbeat_at" not in cols:
+         _add_column_if_missing(
+             conn, "tasks", "last_heartbeat_at", "last_heartbeat_at INTEGER"
+@@ -3182,6 +3230,7 @@
+     triage: bool = False,
+     idempotency_key: Optional[str] = None,
+     max_runtime_seconds: Optional[int] = None,
++    runtime_class: str = RUNTIME_CLASS_IMPLEMENTATION,
+     skills: Optional[Iterable[str]] = None,
+     max_retries: Optional[int] = None,
+     model_override: Optional[str] = None,
+@@ -3245,6 +3294,11 @@
+     if initial_status not in VALID_INITIAL_STATUSES:
+         raise ValueError(
+             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
++        )
++    runtime_class = str(runtime_class or RUNTIME_CLASS_IMPLEMENTATION).strip().lower()
++    if runtime_class not in VALID_RUNTIME_CLASSES:
++        raise ValueError(
++            f"runtime_class must be one of {sorted(VALID_RUNTIME_CLASSES)}"
+         )
+     if workspace_kind not in VALID_WORKSPACE_KINDS:
+         raise ValueError(
+@@ -3505,11 +3559,11 @@
+                         id, title, body, assignee, status, priority,
+                         created_by, created_at, workspace_kind, workspace_path,
+                         branch_name, project_id, tenant, idempotency_key,
+-                        max_runtime_seconds,
++                        max_runtime_seconds, runtime_class,
+                         skills, max_retries, model_override, provider_override,
+                         reasoning_effort,
+                         goal_mode, goal_max_turns, session_id
+-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     """,
+                     (
+                         task_id,
+@@ -3527,6 +3581,7 @@
+                         tenant,
+                         idempotency_key,
+                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
++                        runtime_class,
+                         json.dumps(skills_list) if skills_list is not None else None,
+                         int(max_retries) if max_retries is not None else None,
+                         model_override,
+@@ -3559,6 +3614,7 @@
+                         "workspace_path": workspace_path,
+                         "branch_name": branch_name,
+                         "project_id": project_id,
++                        "runtime_class": runtime_class,
+                         "skills": list(skills_list) if skills_list else None,
+                         "goal_mode": bool(goal_mode) or None,
+                         "model_override": model_override,
+@@ -4631,6 +4687,7 @@
+     *,
+     ttl_seconds: Optional[int] = None,
+     claimer: Optional[str] = None,
++    runtime_class: Optional[str] = None,
+ ) -> Optional[Task]:
+     """Atomically transition ``ready -> running``.
+ 
+@@ -4704,10 +4761,27 @@
+         # Look up the current task row so we can populate the run with
+         # its assignee / step / runtime cap.
+         trow = conn.execute(
+-            "SELECT assignee, max_runtime_seconds, current_step_key "
++            "SELECT assignee, max_runtime_seconds, current_step_key, runtime_class "
+             "FROM tasks WHERE id = ?",
+             (task_id,),
+         ).fetchone()
++        policy_runtime_class = _dispatch_runtime_class(
++            runtime_class,
++            assignee=trow["assignee"] if trow else None,
++            stored=trow["runtime_class"] if trow else None,
++        )
++        policy = resolve_runtime_policy(
++            policy_runtime_class,
++            source_status="ready",
++        )
++        run_max_runtime = _effective_runtime_seconds(
++            trow["max_runtime_seconds"] if trow else None, policy
++        )
++        evidence_deadline = (
++            time.time() + policy.evidence_budget_seconds
++            if policy.evidence_budget_seconds is not None
++            else None
++        )
+         run_cur = conn.execute(
+             """
+             INSERT INTO task_runs (
+@@ -4722,7 +4796,7 @@
+                 trow["current_step_key"] if trow else None,
+                 lock,
+                 expires,
+-                trow["max_runtime_seconds"] if trow else None,
++                run_max_runtime,
+                 now,
+             ),
+         )
+@@ -4733,10 +4807,23 @@
+         )
+         _append_event(
+             conn, task_id, "claimed",
+-            {"lock": lock, "expires": expires, "run_id": run_id},
++            {
++                "lock": lock, "expires": expires, "run_id": run_id,
++                "runtime_class": policy.runtime_class,
++                "runtime_policy": policy.runtime_class,
++                "max_runtime_seconds": run_max_runtime,
++                "evidence_budget_seconds": policy.evidence_budget_seconds,
++                "command_timeout_seconds": policy.command_timeout_seconds,
++                "evidence_deadline": evidence_deadline,
++            },
+             run_id=run_id,
+         )
+         claimed = get_task(conn, task_id)
++        if claimed is not None:
++            claimed.max_runtime_seconds = run_max_runtime
++            _apply_runtime_policy_to_task(claimed, policy)
++            if policy.evidence_budget_seconds is not None:
++                claimed.evidence_deadline = evidence_deadline
+     _fire_kanban_lifecycle_hook(
+         "kanban_task_claimed",
+         task_id,
+@@ -4745,6 +4832,124 @@
+         run_id=run_id,
+     )
+     return claimed
++
++
++REVIEW_DISPATCH_HARD_CAP_SECONDS = 1200
++
++
++@dataclass(frozen=True)
++class RuntimePolicy:
++    """Boundaries applied to one dispatcher-owned worker attempt."""
++
++    runtime_class: str
++    hard_cap_seconds: Optional[int]
++    evidence_budget_seconds: Optional[int]
++    command_timeout_seconds: Optional[int]
++
++
++IMPLEMENTATION_RUNTIME_POLICY = RuntimePolicy(
++    RUNTIME_CLASS_IMPLEMENTATION, None, None, None
++)
++REVIEW_RUNTIME_POLICY = RuntimePolicy(
++    RUNTIME_CLASS_REVIEW, REVIEW_DISPATCH_HARD_CAP_SECONDS, 600, 120
++)
++EVIDENCE_RECOVERY_RUNTIME_POLICY = RuntimePolicy(
++    RUNTIME_CLASS_EVIDENCE_RECOVERY, 600, 300, 60
++)
++_RUNTIME_POLICIES = {
++    policy.runtime_class: policy
++    for policy in (
++        IMPLEMENTATION_RUNTIME_POLICY,
++        REVIEW_RUNTIME_POLICY,
++        EVIDENCE_RECOVERY_RUNTIME_POLICY,
++    )
++}
++
++
++def resolve_runtime_policy(
++    runtime_class: Optional[str] = None,
++    *,
++    source_status: Optional[str] = None,
++) -> RuntimePolicy:
++    """Resolve a canonical class without inspecting task prose.
++
++    A review source phase is authoritative for review claims. Otherwise an
++    explicit entrypoint/class wins, falling back to implementation for legacy
++    rows. Invalid durable values fail closed rather than silently receiving a
++    more permissive implementation budget.
++    """
++    if source_status == "review":
++        selected = RUNTIME_CLASS_REVIEW
++    else:
++        selected = str(runtime_class or RUNTIME_CLASS_IMPLEMENTATION).strip().lower()
++    try:
++        return _RUNTIME_POLICIES[selected]
++    except KeyError as exc:
++        raise ValueError(
++            f"unknown kanban runtime class: {selected!r}; "
++            f"expected one of {sorted(VALID_RUNTIME_CLASSES)}"
++        ) from exc
++
++
++def _dispatch_runtime_class(
++    explicit: Optional[str],
++    *,
++    assignee: Optional[str],
++    stored: Optional[str],
++) -> str:
++    """Resolve ready-lane policy without trusting reviewer prose.
++
++    Review cards can be requeued to ``ready`` after changes are requested and
++    legacy rows may still carry the implementation default. The canonical
++    reviewer profile therefore receives review limits in the ready lane too;
++    an explicit recovery/dispatch class remains authoritative.
++    """
++    if explicit:
++        return explicit
++    if str(assignee or "").strip().lower() in {"review", "reviewer"}:
++        return RUNTIME_CLASS_REVIEW
++    return str(stored or RUNTIME_CLASS_IMPLEMENTATION).strip().lower()
++
++
++def _effective_runtime_seconds(
++    requested: Optional[int], policy: RuntimePolicy
++) -> Optional[int]:
++    try:
++        value = int(requested) if requested is not None else 0
++    except (TypeError, ValueError):
++        value = 0
++    requested_value = value if value > 0 else None
++    if policy.hard_cap_seconds is None:
++        return requested_value
++    if requested_value is None:
++        return policy.hard_cap_seconds
++    return min(requested_value, policy.hard_cap_seconds)
++
++
++def _apply_runtime_policy_to_task(task: Task, policy: RuntimePolicy) -> None:
++    task.runtime_class = policy.runtime_class
++    task.evidence_budget_seconds = policy.evidence_budget_seconds
++    task.command_timeout_seconds = policy.command_timeout_seconds
++
++
++def _bounded_worker_timeout_env(
++    current_timeout: Optional[str], cap_seconds: int
++) -> str:
++    """Keep an inherited worker timeout at or below the policy cap."""
++    try:
++        existing = int(str(current_timeout).strip()) if current_timeout else 0
++    except (TypeError, ValueError):
++        existing = 0
++    if existing > 0:
++        return str(min(existing, int(cap_seconds)))
++    return str(int(cap_seconds))
++
++
++def _review_dispatch_runtime_seconds(max_runtime_seconds: Optional[int]) -> int:
++    """Backward-compatible review cap helper for callers/tests."""
++    result = _effective_runtime_seconds(max_runtime_seconds, REVIEW_RUNTIME_POLICY)
++    assert result is not None
++    return result
+ 
+ 
+ def claim_review_task(
+@@ -4790,6 +4995,7 @@
+             """
+             UPDATE tasks
+                SET status        = 'running',
++                   runtime_class = ?,
+                    claim_lock    = ?,
+                    claim_expires = ?,
+                    started_at    = COALESCE(started_at, ?)
+@@ -4797,15 +5003,24 @@
+                AND status = 'review'
+                AND claim_lock IS NULL
+             """,
+-            (lock, expires, now, task_id),
++            (RUNTIME_CLASS_REVIEW, lock, expires, now, task_id),
+         )
+         if cur.rowcount != 1:
+             return None
+         trow = conn.execute(
+-            "SELECT assignee, max_runtime_seconds, current_step_key "
++            "SELECT assignee, max_runtime_seconds, current_step_key, runtime_class "
+             "FROM tasks WHERE id = ?",
+             (task_id,),
+         ).fetchone()
++        policy = REVIEW_RUNTIME_POLICY
++        run_max_runtime = _effective_runtime_seconds(
++            trow["max_runtime_seconds"] if trow else None, policy
++        )
++        evidence_deadline = (
++            time.time() + policy.evidence_budget_seconds
++            if policy.evidence_budget_seconds is not None
++            else None
++        )
+         run_cur = conn.execute(
+             """
+             INSERT INTO task_runs (
+@@ -4820,7 +5035,7 @@
+                 trow["current_step_key"] if trow else None,
+                 lock,
+                 expires,
+-                trow["max_runtime_seconds"] if trow else None,
++                run_max_runtime,
+                 now,
+             ),
+         )
+@@ -4831,11 +5046,44 @@
+         )
+         _append_event(
+             conn, task_id, "claimed",
+-            {"lock": lock, "expires": expires, "run_id": run_id,
+-             "source_status": "review"},
++            {
++                "lock": lock, "expires": expires, "run_id": run_id,
++                "source_status": "review",
++                "runtime_class": policy.runtime_class,
++                "runtime_policy": policy.runtime_class,
++                "max_runtime_seconds": run_max_runtime,
++                "evidence_budget_seconds": policy.evidence_budget_seconds,
++                "command_timeout_seconds": policy.command_timeout_seconds,
++                "evidence_deadline": evidence_deadline,
++            },
+             run_id=run_id,
+         )
+-        return get_task(conn, task_id)
++        claimed = get_task(conn, task_id)
++        if claimed is not None:
++            claimed.max_runtime_seconds = run_max_runtime
++            _apply_runtime_policy_to_task(claimed, policy)
++            if policy.evidence_budget_seconds is not None:
++                claimed.evidence_deadline = evidence_deadline
++        return claimed
++
++
++def claim_evidence_recovery_task(
++    conn: sqlite3.Connection,
++    task_id: str,
++    *,
++    ttl_seconds: Optional[int] = None,
++    claimer: Optional[str] = None,
++) -> Optional[Task]:
++    """Explicit evidence-only successor entrypoint.
++
++    The runtime class is selected by this API, never inferred from a title or
++    comment. The task row's requested implementation budget remains intact;
++    the active task_runs row receives the recovery cap.
++    """
++    return claim_task(
++        conn, task_id, ttl_seconds=ttl_seconds, claimer=claimer,
++        runtime_class=RUNTIME_CLASS_EVIDENCE_RECOVERY,
++    )
+ 
+ 
+ def _retry_status_for_run(
+@@ -5360,6 +5608,263 @@
+     """Raised when a declared scratch deliverable cannot be preserved."""
+ 
+ 
++class ReviewIncompleteError(ValueError):
++    """Raised when a review/evidence run cannot produce an honest approval."""
++
++    code = REVIEW_INCOMPLETE_CODE
++
++    def __init__(self, task_id: str, reason: str):
++        self.task_id = task_id
++        self.reason = reason
++        super().__init__(f"{self.code}: {reason}; task {task_id} is blocked")
++
++
++def _review_handoff_has_evidence(
++    summary: Optional[str], result: Optional[str], metadata: Optional[dict]
++) -> bool:
++    """Return whether a review completion carries a non-empty handoff."""
++    if isinstance(summary, str) and summary.strip():
++        return True
++    if isinstance(result, str) and result.strip():
++        return True
++    return isinstance(metadata, dict) and bool(metadata)
++
++
++def _claimed_runtime_details(
++    conn: sqlite3.Connection,
++    task_id: str,
++    run_id: Optional[int],
++) -> tuple[str, Optional[int], Optional[int], Optional[str]]:
++    """Return ``(class, evidence_budget, started_at, outcome)`` for a run."""
++    task_row = conn.execute(
++        "SELECT runtime_class FROM tasks WHERE id = ?", (task_id,)
++    ).fetchone()
++    runtime_class = (
++        str(task_row["runtime_class"]).strip().lower()
++        if task_row and task_row["runtime_class"]
++        else RUNTIME_CLASS_IMPLEMENTATION
++    )
++    started_at: Optional[int] = None
++    outcome: Optional[str] = None
++    evidence_budget: Optional[int] = None
++    if run_id is None:
++        return runtime_class, evidence_budget, started_at, outcome
++    run_row = conn.execute(
++        "SELECT started_at, outcome FROM task_runs WHERE id = ? AND task_id = ?",
++        (int(run_id), task_id),
++    ).fetchone()
++    if run_row:
++        started_at = int(run_row["started_at"]) if run_row["started_at"] is not None else None
++        outcome = str(run_row["outcome"]) if run_row["outcome"] else None
++    claimed = conn.execute(
++        "SELECT payload FROM task_events "
++        "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
++        "ORDER BY id DESC LIMIT 1",
++        (task_id, int(run_id)),
++    ).fetchone()
++    try:
++        payload = json.loads(claimed["payload"]) if claimed and claimed["payload"] else {}
++    except (json.JSONDecodeError, TypeError):
++        payload = {}
++    if isinstance(payload, dict):
++        selected = payload.get("runtime_class") or payload.get("runtime_policy")
++        if selected:
++            runtime_class = str(selected).strip().lower()
++        raw_budget = payload.get("evidence_budget_seconds")
++        try:
++            evidence_budget = int(raw_budget) if raw_budget is not None else None
++        except (TypeError, ValueError):
++            evidence_budget = None
++    if evidence_budget is None and runtime_class in VALID_RUNTIME_CLASSES:
++        evidence_budget = resolve_runtime_policy(runtime_class).evidence_budget_seconds
++    return runtime_class, evidence_budget, started_at, outcome
++
++
++def _claimed_evidence_deadline(
++    conn: sqlite3.Connection,
++    task_id: str,
++    run_id: Optional[int],
++) -> Optional[float]:
++    """Read the exact deadline stamped on the active claimed event."""
++    if run_id is None:
++        return None
++    row = conn.execute(
++        "SELECT payload FROM task_events "
++        "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
++        "ORDER BY id DESC LIMIT 1",
++        (task_id, int(run_id)),
++    ).fetchone()
++    try:
++        payload = json.loads(row["payload"]) if row and row["payload"] else {}
++        value = payload.get("evidence_deadline") if isinstance(payload, dict) else None
++        return float(value) if value is not None else None
++    except (TypeError, ValueError, json.JSONDecodeError):
++        return None
++
++
++def _review_completion_rejection(
++    conn: sqlite3.Connection,
++    task_id: str,
++    *,
++    expected_run_id: Optional[int],
++    summary: Optional[str],
++    result: Optional[str],
++    metadata: Optional[dict],
++) -> Optional[str]:
++    """Return a typed rejection reason for an unsafe review completion."""
++    task_row = conn.execute(
++        "SELECT status, current_run_id, runtime_class FROM tasks WHERE id = ?",
++        (task_id,),
++    ).fetchone()
++    if task_row is None:
++        return None
++    current_run_id = task_row["current_run_id"]
++    if expected_run_id is not None:
++        if current_run_id is None or int(current_run_id) != int(expected_run_id):
++            # The CAS in complete_task owns this race. Never block a successor
++            # run when an older worker has lost ownership.
++            return None
++        run_id = int(expected_run_id)
++    else:
++        run_id = int(current_run_id) if current_run_id is not None else None
++
++    runtime_class, evidence_budget, started_at, outcome = _claimed_runtime_details(
++        conn, task_id, run_id
++    )
++    review_like = (
++        task_row["status"] == "review"
++        or runtime_class in {
++            RUNTIME_CLASS_REVIEW,
++            RUNTIME_CLASS_EVIDENCE_RECOVERY,
++        }
++    )
++    if not review_like:
++        return None
++
++    # A task left in review after a timed-out/crashed attempt must be claimed
++    # again before it can be approved. Otherwise a human/CLI close would turn a
++    # failed review into a synthetic approval without a fresh evidence window.
++    if run_id is None and task_row["status"] == "review":
++        latest = conn.execute(
++            "SELECT outcome FROM task_runs WHERE task_id = ? "
++            "ORDER BY id DESC LIMIT 1",
++            (task_id,),
++        ).fetchone()
++        latest_outcome = str(latest["outcome"]) if latest and latest["outcome"] else None
++        if latest_outcome in _REVIEW_FAILURE_OUTCOMES:
++            return (
++                f"the prior review run ended with {latest_outcome}; "
++                "claim a fresh review run before approving"
++            )
++
++    if outcome in _REVIEW_FAILURE_OUTCOMES:
++        return (
++            f"review run already ended with {outcome}; "
++            "a completed review cannot be approved from a failed run"
++        )
++
++    evidence_deadline = _claimed_evidence_deadline(conn, task_id, run_id)
++    if evidence_deadline is not None:
++        elapsed = max(0, int(time.time() - (evidence_deadline - int(evidence_budget or 0))))
++        if time.time() >= evidence_deadline:
++            return (
++                f"evidence budget expired after {int(evidence_budget or 0)}s "
++                f"(elapsed {elapsed}s); no further probes or approval are allowed"
++            )
++    elif evidence_budget is not None and started_at is not None:
++        elapsed = time.time() - int(started_at)
++        if elapsed >= int(evidence_budget):
++            return (
++                f"evidence budget expired after {int(evidence_budget)}s "
++                f"(elapsed {int(elapsed)}s); no further probes or approval are allowed"
++            )
++
++    if not _review_handoff_has_evidence(summary, result, metadata):
++        return "review approval requires a non-empty summary, result, or metadata handoff"
++    return None
++
++
++def _block_review_incomplete(
++    conn: sqlite3.Connection,
++    task_id: str,
++    reason: str,
++    *,
++    expected_run_id: Optional[int],
++) -> bool:
++    """Durably route an unsafe review completion to a typed blocked state."""
++    error = f"{REVIEW_INCOMPLETE_CODE}: {reason}"
++    payload = {
++        "code": REVIEW_INCOMPLETE_CODE,
++        "reason": reason,
++        "status": "blocked",
++        "block_kind": REVIEW_INCOMPLETE_BLOCK_KIND,
++    }
++    with write_txn(conn):
++        row = conn.execute(
++            "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)
++        ).fetchone()
++        if row is None or row["status"] not in {"running", "review"}:
++            return False
++        current_run_id = row["current_run_id"]
++        if expected_run_id is not None:
++            if current_run_id is None or int(current_run_id) != int(expected_run_id):
++                return False
++        run_id = _end_run(
++            conn,
++            task_id,
++            outcome="blocked",
++            status="blocked",
++            error=error,
++            metadata=payload,
++        )
++        cur = conn.execute(
++            "UPDATE tasks SET status = 'blocked', block_kind = ?, "
++            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
++            "current_run_id = NULL WHERE id = ? "
++            "AND status IN ('running', 'review')",
++            (REVIEW_INCOMPLETE_BLOCK_KIND, task_id),
++        )
++        if cur.rowcount != 1:
++            return False
++        if run_id is None:
++            run_id = _synthesize_ended_run(
++                conn,
++                task_id,
++                outcome="blocked",
++                error=error,
++                metadata=payload,
++            )
++        payload["run_id"] = run_id
++        _append_event(conn, task_id, "review_incomplete", payload, run_id=run_id)
++    return True
++
++
++def _reject_incomplete_review_completion(
++    conn: sqlite3.Connection,
++    task_id: str,
++    *,
++    expected_run_id: Optional[int],
++    summary: Optional[str],
++    result: Optional[str],
++    metadata: Optional[dict],
++) -> Optional[ReviewIncompleteError]:
++    reason = _review_completion_rejection(
++        conn,
++        task_id,
++        expected_run_id=expected_run_id,
++        summary=summary,
++        result=result,
++        metadata=metadata,
++    )
++    if reason is None:
++        return None
++    if not _block_review_incomplete(
++        conn, task_id, reason, expected_run_id=expected_run_id
++    ):
++        return None
++    return ReviewIncompleteError(task_id, reason)
++
++
+ def complete_task(
+     conn: sqlite3.Connection,
+     task_id: str,
+@@ -5404,6 +5909,16 @@
+     and never blocks.
+     """
+     now = int(time.time())
++    incomplete = _reject_incomplete_review_completion(
++        conn,
++        task_id,
++        expected_run_id=expected_run_id,
++        summary=summary,
++        result=result,
++        metadata=metadata,
++    )
++    if incomplete is not None:
++        raise incomplete
+     # Fail before validating cards or staging artifacts; re-check inside the
+     # final write transaction below to close the parent-reopen race.
+     if not _parents_satisfied(conn, task_id):
+@@ -6600,19 +7115,24 @@
+         assignee_sql = ", assignee = ?" if reviewer is not None else ""
+         params: tuple[Any, ...]
+         if expected_run_id is None:
+-            params = (reviewer, task_id) if reviewer is not None else (task_id,)
++            params = (
++                (RUNTIME_CLASS_REVIEW, reviewer, task_id)
++                if reviewer is not None
++                else (RUNTIME_CLASS_REVIEW, task_id)
++            )
+             run_guard = ""
+         else:
+             params = (
+-                (reviewer, task_id, int(expected_run_id))
++                (RUNTIME_CLASS_REVIEW, reviewer, task_id, int(expected_run_id))
+                 if reviewer is not None
+-                else (task_id, int(expected_run_id))
++                else (RUNTIME_CLASS_REVIEW, task_id, int(expected_run_id))
+             )
+             run_guard = " AND current_run_id = ?"
+         cur = conn.execute(
+             """
+             UPDATE tasks
+                SET status        = 'review',
++                   runtime_class = ?,
+                    claim_lock    = NULL,
+                    claim_expires = NULL,
+                    worker_pid    = NULL
+@@ -6747,13 +7267,14 @@
+             """
+             UPDATE tasks
+                SET status = ?,
++                   runtime_class = ?,
+                    assignee = COALESCE(?, assignee),
+                    claim_lock = NULL,
+                    claim_expires = NULL,
+                    worker_pid = NULL
+              WHERE id = ? AND status = 'running' AND current_run_id = ?
+             """,
+-            (new_status, implementer, task_id, int(current_run_id)),
++            (new_status, RUNTIME_CLASS_IMPLEMENTATION, implementer, task_id, int(current_run_id)),
+         )
+         if cur.rowcount != 1:
+             return False, "task changed during review handoff"
+@@ -6999,12 +7520,12 @@
+             implementer = None
+         assignee_sql = ", assignee = ?" if implementer else ""
+         params: tuple[Any, ...] = (
+-            (new_status, implementer, task_id)
++            (new_status, RUNTIME_CLASS_IMPLEMENTATION, implementer, task_id)
+             if implementer
+-            else (new_status, task_id)
++            else (new_status, RUNTIME_CLASS_IMPLEMENTATION, task_id)
+         )
+         cur = conn.execute(
+-            "UPDATE tasks SET status = ?, current_run_id = NULL, "
++            "UPDATE tasks SET status = ?, runtime_class = ?, current_run_id = NULL, "
+             "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+             # consecutive_failures deliberately PRESERVED: review reopen is
+             # not a success signal; only complete_task resets the breaker
+@@ -8442,10 +8963,135 @@
+     return True
+ 
+ 
++def _settle_timed_out_run(
++    conn: sqlite3.Connection,
++    *,
++    task_id: str,
++    pid: int,
++    claim_lock: str,
++    expected_run_id: Optional[int],
++    elapsed: int,
++    limit_seconds: int,
++    killed: bool,
++    failure_limit: Optional[int],
++) -> bool:
++    """Atomically settle one fenced timeout attempt.
++
++    The claim, run pointer, failure counter, and terminal events are one
++    transaction. A task/run generation mismatch means another dispatcher has
++    already taken ownership, so the old timeout is discarded without touching
++    the newer attempt.
++    """
++    if expected_run_id is None:
++        return False
++    timeout_error = f"elapsed {int(elapsed)}s > limit {int(limit_seconds)}s"
++    with write_txn(conn):
++        current = conn.execute(
++            "SELECT status, worker_pid, claim_lock, current_run_id, "
++            "consecutive_failures, max_retries "
++            "FROM tasks WHERE id = ?",
++            (task_id,),
++        ).fetchone()
++        if (
++            current is None
++            or current["status"] != "running"
++            or current["worker_pid"] != pid
++            or current["claim_lock"] != claim_lock
++            or current["current_run_id"] != int(expected_run_id)
++        ):
++            return False
++
++        retry_status = _retry_status_for_run(conn, task_id, expected_run_id)
++        failures = int(current["consecutive_failures"] or 0) + 1
++        effective_limit = (
++            int(current["max_retries"])
++            if current["max_retries"] is not None
++            else (
++                int(failure_limit)
++                if failure_limit is not None
++                else DEFAULT_FAILURE_LIMIT
++            )
++        )
++        gave_up = failures >= effective_limit
++        final_status = "blocked" if gave_up else retry_status
++        payload = {
++            "pid": pid,
++            "elapsed_seconds": int(elapsed),
++            "limit_seconds": int(limit_seconds),
++            "sigkill": killed,
++            "retry_status": final_status,
++            "final_status": final_status,
++            "retry_eligible": not gave_up,
++            "current_run_id": int(expected_run_id),
++        }
++        settled_at = int(time.time())
++        run_cur = conn.execute(
++            "UPDATE task_runs SET status = 'timed_out', outcome = 'timed_out', "
++            "error = ?, metadata = ?, ended_at = ?, claim_lock = NULL, "
++            "claim_expires = NULL, worker_pid = NULL "
++            "WHERE id = ? AND task_id = ? AND ended_at IS NULL "
++            "AND claim_lock IS ?",
++            (
++                timeout_error,
++                json.dumps(payload, ensure_ascii=False),
++                settled_at,
++                int(expected_run_id),
++                task_id,
++                claim_lock,
++            ),
++        )
++        if run_cur.rowcount != 1:
++            return False
++        task_cur = conn.execute(
++            "UPDATE tasks SET status = ?, claim_lock = NULL, "
++            "claim_expires = NULL, worker_pid = NULL, "
++            "last_heartbeat_at = NULL, current_run_id = NULL, "
++            "consecutive_failures = ?, last_failure_error = ? "
++            "WHERE id = ? AND status = 'running' AND worker_pid = ? "
++            "AND claim_lock IS ? AND current_run_id = ?",
++            (
++                final_status,
++                failures,
++                timeout_error[:500],
++                task_id,
++                pid,
++                claim_lock,
++                int(expected_run_id),
++            ),
++        )
++        if task_cur.rowcount != 1:
++            raise RuntimeError("timeout settlement lost its run claim")
++        _append_event(conn, task_id, "timed_out", payload, run_id=expected_run_id)
++        if gave_up:
++            _append_event(
++                conn,
++                task_id,
++                "gave_up",
++                {
++                    "failures": failures,
++                    "effective_limit": effective_limit,
++                    "limit_source": (
++                        "task" if current["max_retries"] is not None else "dispatcher"
++                    ),
++                    "error": timeout_error[:500],
++                    "trigger_outcome": "timed_out",
++                    "retry_status": "blocked",
++                    "final_status": "blocked",
++                    "retry_eligible": False,
++                    "current_run_id": int(expected_run_id),
++                    "pid": pid,
++                    "sigkill": killed,
++                },
++                run_id=expected_run_id,
++            )
++    return True
++
++
+ def enforce_max_runtime(
+     conn: sqlite3.Connection,
+     *,
+     signal_fn=None,
++    failure_limit: Optional[int] = None,
+ ) -> list[str]:
+     """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
+ 
+@@ -8467,10 +9113,12 @@
+     rows = conn.execute(
+         "SELECT t.id, t.worker_pid, "
+         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
+-        "       t.max_runtime_seconds, t.claim_lock "
++        "       COALESCE(r.max_runtime_seconds, t.max_runtime_seconds) "
++        "           AS active_max_runtime_seconds, t.current_run_id, t.claim_lock "
+         "FROM tasks t "
+         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
+-        "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
++        "WHERE t.status = 'running' "
++        "  AND COALESCE(r.max_runtime_seconds, t.max_runtime_seconds) IS NOT NULL "
+         "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
+         "  AND t.worker_pid IS NOT NULL"
+     ).fetchall()
+@@ -8482,7 +9130,7 @@
+         # intentionally records the first time a task ever started, so retries
+         # must be measured from the active task_runs row when present.
+         elapsed = now - int(row["active_started_at"])
+-        if elapsed < int(row["max_runtime_seconds"]):
++        if elapsed < int(row["active_max_runtime_seconds"]):
+             continue
+ 
+         pid = int(row["worker_pid"])
+@@ -8513,52 +9161,22 @@
+                 except (ProcessLookupError, OSError):
+                     pass
+ 
+-        with write_txn(conn):
+-            retry_status = _retry_status_for_run(conn, tid)
+-            cur = conn.execute(
+-                "UPDATE tasks SET status = ?, claim_lock = NULL, "
+-                "claim_expires = NULL, worker_pid = NULL, "
+-                "last_heartbeat_at = NULL "
+-                "WHERE id = ? AND status = 'running' "
+-                "  AND worker_pid = ? AND claim_lock IS ?",
+-                (retry_status, tid, pid, row["claim_lock"]),
+-            )
+-            if cur.rowcount == 1:
+-                payload = {
+-                    "pid": pid,
+-                    "elapsed_seconds": int(elapsed),
+-                    "limit_seconds": int(row["max_runtime_seconds"]),
+-                    "sigkill": killed,
+-                    "retry_status": retry_status,
+-                }
+-                run_id = _end_run(
+-                    conn, tid,
+-                    outcome="timed_out", status="timed_out",
+-                    error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
+-                    metadata=payload,
+-                )
+-                _append_event(
+-                    conn, tid, "timed_out", payload, run_id=run_id,
+-                )
+-                timed_out.append(tid)
+-        # Increment the unified failure counter. Outside the write_txn
+-        # above because ``_record_task_failure`` opens its own. If the
+-        # breaker trips, this flips the retried task to ``blocked`` and
+-        # emits a ``gave_up`` event on top of the ``timed_out`` we
+-        # already emitted.
+-        if cur.rowcount == 1:
+-            _record_task_failure(
+-                conn, tid,
+-                error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
+-                outcome="timed_out",
+-                release_claim=False,
+-                end_run=False,
+-                event_payload_extra={
+-                    "pid": pid,
+-                    "sigkill": killed,
+-                    "retry_status": retry_status,
+-                },
+-            )
++        expected_run_id = (
++            int(row["current_run_id"])
++            if row["current_run_id"] is not None else None
++        )
++        if _settle_timed_out_run(
++            conn,
++            task_id=tid,
++            pid=pid,
++            claim_lock=str(row["claim_lock"]),
++            expected_run_id=expected_run_id,
++            elapsed=int(elapsed),
++            limit_seconds=int(row["active_max_runtime_seconds"]),
++            killed=killed,
++            failure_limit=failure_limit,
++        ):
++            timed_out.append(tid)
+     return timed_out
+ 
+ 
+@@ -9288,7 +9906,9 @@
+                         "trigger_outcome": outcome,
+                         "effective_limit": effective_limit,
+                         "limit_source": limit_source,
+-                        "retry_status": retry_status,
++                        "retry_status": "blocked",
++                        "final_status": "blocked",
++                        "retry_eligible": False,
+                     },
+                 )
+             payload = {
+@@ -9297,7 +9917,9 @@
+                 "limit_source": limit_source,
+                 "error": error[:500],
+                 "trigger_outcome": outcome,
+-                "retry_status": retry_status,
++                "retry_status": "blocked",
++                "final_status": "blocked",
++                "retry_eligible": False,
+             }
+             if event_payload_extra:
+                 payload.update(event_payload_extra)
+@@ -9860,6 +10482,7 @@
+     default_assignee: Optional[str] = None,
+     max_in_progress_per_profile: Optional[int] = None,
+     reconcile_orphans: bool = True,
++    runtime_class: Optional[str] = None,
+ ) -> DispatchResult:
+     """Run one dispatcher tick under the board's single-writer lock.
+ 
+@@ -9876,6 +10499,8 @@
+     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
+     cross-process / cross-platform mechanics.
+     """
++    if runtime_class is not None:
++        resolve_runtime_policy(runtime_class)
+     try:
+         db_path = kanban_db_path(board=board)
+     except Exception:
+@@ -9895,6 +10520,7 @@
+             default_assignee=default_assignee,
+             max_in_progress_per_profile=max_in_progress_per_profile,
+             reconcile_orphans=reconcile_orphans,
++            runtime_class=runtime_class,
+         )
+         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+         return result
+@@ -9915,6 +10541,7 @@
+                 default_assignee=default_assignee,
+                 max_in_progress_per_profile=max_in_progress_per_profile,
+                 reconcile_orphans=reconcile_orphans,
++                runtime_class=runtime_class,
+             )
+             # Still under the dispatch lock: run the periodic PASSIVE WAL
+             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
+@@ -9926,6 +10553,15 @@
+     # the lock hold and stall a sibling dispatcher's tick.
+     _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+     return result
++
++
++def dispatch_evidence_recovery_once(
++    conn: sqlite3.Connection,
++    **kwargs: Any,
++) -> DispatchResult:
++    """Run an explicitly evidence-only recovery dispatch tick."""
++    kwargs["runtime_class"] = RUNTIME_CLASS_EVIDENCE_RECOVERY
++    return dispatch_once(conn, **kwargs)
+ 
+ 
+ def _dispatch_once_locked(
+@@ -9942,6 +10578,7 @@
+     default_assignee: Optional[str] = None,
+     max_in_progress_per_profile: Optional[int] = None,
+     reconcile_orphans: bool = True,
++    runtime_class: Optional[str] = None,
+ ) -> DispatchResult:
+     """Run one dispatcher tick.
+ 
+@@ -10009,7 +10646,7 @@
+     )
+     if _crash_rate_limited:
+         result.rate_limited.extend(_crash_rate_limited)
+-    result.timed_out = enforce_max_runtime(conn)
++    result.timed_out = enforce_max_runtime(conn, failure_limit=failure_limit)
+     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+ 
+     # Count tasks already running so max_spawn enforces concurrency rather
+@@ -10074,15 +10711,39 @@
+             )
+             spawn_budget = 1
+ 
+-    ready_rows = conn.execute(
+-        "SELECT id, assignee FROM tasks "
+-        "WHERE status = 'ready' AND claim_lock IS NULL "
+-        "ORDER BY priority DESC, created_at ASC"
+-    ).fetchall()
++    # Keep the three dispatcher lanes disjoint.  In particular, an
++    # evidence-recovery tick must never relabel an ordinary ready task with the
++    # recovery policy, and a normal tick must not consume a durable recovery
++    # successor.  Review cards remain a separate status lane below.
++    selected_runtime_class = (
++        str(runtime_class).strip().lower() if runtime_class is not None else None
++    )
++    if selected_runtime_class == RUNTIME_CLASS_REVIEW:
++        ready_rows = []
++    else:
++        ready_sql = (
++            "SELECT id, assignee, runtime_class FROM tasks "
++            "WHERE status = 'ready' AND claim_lock IS NULL "
++        )
++        ready_params: tuple[Any, ...] = ()
++        if selected_runtime_class == RUNTIME_CLASS_EVIDENCE_RECOVERY:
++            ready_sql += "AND runtime_class = ? "
++            ready_params = (RUNTIME_CLASS_EVIDENCE_RECOVERY,)
++        else:
++            ready_sql += (
++                "AND COALESCE(runtime_class, ?) = ? "
++            )
++            ready_params = (
++                RUNTIME_CLASS_IMPLEMENTATION,
++                RUNTIME_CLASS_IMPLEMENTATION,
++            )
++        ready_sql += "ORDER BY priority DESC, created_at ASC"
++        ready_rows = conn.execute(ready_sql, ready_params).fetchall()
+     # Review rows are enumerated up front (not after the ready loop) so the
+-    # budget split below can see whether review work exists at all.
++    # budget split below can see whether review work exists at all.  An
++    # evidence-only or implementation-only tick never mixes this lane in.
+     review_rows = []
+-    if review_dispatch_enabled():
++    if selected_runtime_class in (None, RUNTIME_CLASS_REVIEW) and review_dispatch_enabled():
+         review_rows = conn.execute(
+             "SELECT id, assignee FROM tasks "
+             "WHERE status = 'review' AND claim_lock IS NULL "
+@@ -10268,7 +10929,14 @@
+                     _per_profile_running.get(row_assignee, 0) + 1
+                 )
+             continue
+-        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
++        claimed = claim_task(
++            conn, row["id"], ttl_seconds=ttl_seconds,
++            runtime_class=_dispatch_runtime_class(
++                runtime_class,
++                assignee=row_assignee,
++                stored=row["runtime_class"],
++            ),
++        )
+         if claimed is None:
+             continue
+         try:
+@@ -10541,6 +11209,102 @@
+         pass
+ 
+ 
++def _review_worker_env(
++    env: Mapping[str, str],
++    *,
++    runtime_root: Path,
++    hermes_argv: Optional[Iterable[str]] = None,
++) -> dict[str, str]:
++    """Return the small, explicit environment allowed for a Kanban worker.
++
++    A dispatcher is a long-lived process and can carry credentials, routing
++    ContextVars, Python startup hooks, and a caller-controlled PATH from an
++    unrelated conversation.  A worker must receive only the values needed to
++    run Hermes and its assigned task.  Provider credential names are admitted
++    from the central environment policy; arbitrary ``*_TOKEN``/``*_SECRET``
++    values are not.
++    """
++    safe_names = {
++        "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "LC_ALL",
++        "LC_CTYPE", "TZ", "TERM", "COLORTERM", "TERM_PROGRAM", "CI",
++        "NO_COLOR", "FORCE_COLOR", "TMP", "TEMP", "TMPDIR", "SYSTEMROOT",
++        "WINDIR", "DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS",
++        "GIT_CONFIG_NOSYSTEM", "GIT_TERMINAL_PROMPT", "GH_HOST", "GH_REPO",
++        "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME",
++        "GIT_COMMITTER_EMAIL", "PAGER", "LESS", "EDITOR", "VISUAL",
++    }
++    safe_prefixes = ("LC_", "XDG_")
++    provider_names: set[str] = set()
++    try:
++        from tools.environments.local import _HERMES_PROVIDER_ENV_BLOCKLIST
++
++        provider_names.update(str(key) for key in _HERMES_PROVIDER_ENV_BLOCKLIST)
++    except Exception:
++        # The worker can still start with profile-configured credentials when
++        # the optional environment policy module is unavailable.
++        pass
++    # A few provider variables are intentionally listed here as a fallback for
++    # older staged runtimes whose blocklist predates a provider integration.
++    provider_names.update({
++        "OPENAI_API_KEY", "OPENAI_BASE_URL", "ANTHROPIC_API_KEY",
++        "ANTHROPIC_BASE_URL", "OPENROUTER_API_KEY", "GEMINI_API_KEY",
++        "GOOGLE_API_KEY", "GROQ_API_KEY", "MISTRAL_API_KEY", "XAI_API_KEY",
++        "DEEPSEEK_API_KEY", "COHERE_API_KEY", "TOGETHER_API_KEY",
++        "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT", "AWS_ACCESS_KEY_ID",
++        "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_REGION",
++    })
++    # These are explicitly forbidden even if a provider policy accidentally
++    # includes a similarly named internal or gateway credential.
++    forbidden = {
++        "HERMES_BIN", "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP",
++        "PYTHONBREAKPOINT", "PYTHONINSPECT", "PYTHONUSERBASE", "PYTHONWARNINGS",
++        "PYTHONNOUSERSITE", "PYTHONSAFEPATH", "PYTHONUTF8", "PATH",
++        "GH_TOKEN", "GITHUB_TOKEN", "TELEGRAM_BOT_TOKEN", "DISCORD_BOT_TOKEN",
++        "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_SIGNING_SECRET",
++        "GATEWAY_ALLOWED_USERS", "GATEWAY_ALLOW_ALL_USERS", "HERMES_TUI",
++    }
++    child: dict[str, str] = {}
++    for raw_key, raw_value in env.items():
++        key = str(raw_key)
++        if key in forbidden or key.startswith("HERMES_SESSION_"):
++            continue
++        if key in safe_names or key in provider_names or key.startswith(safe_prefixes):
++            child[key] = str(raw_value)
++    child["PATH"] = _review_worker_path(runtime_root, hermes_argv)
++    # These flags disable user-site and startup-file injection.  They are set
++    # after the allowlist so an inherited value cannot turn the guard off.
++    child["PYTHONNOUSERSITE"] = "1"
++    child["PYTHONSAFEPATH"] = "1"
++    child["PYTHONUTF8"] = "1"
++    return child
++
++
++def _review_worker_path(runtime_root: Path, hermes_argv: Optional[Iterable[str]] = None) -> str:
++    """Build a deterministic PATH for a detached worker child."""
++    candidates: list[Path] = []
++    if hermes_argv:
++        first = str(next(iter(hermes_argv), ""))
++        if first and os.path.isabs(first) and os.path.isfile(first):
++            candidates.append(Path(first).parent)
++    if sys.executable:
++        candidates.append(Path(sys.executable).resolve().parent)
++    candidates.extend([
++        runtime_root / "bin",
++        Path("/usr/local/bin"),
++        Path("/usr/bin"),
++        Path("/bin"),
++    ])
++    unique: list[str] = []
++    for candidate in candidates:
++        try:
++            value = str(candidate.resolve())
++        except OSError:
++            value = str(candidate)
++        if value not in unique and os.path.isdir(value):
++            unique.append(value)
++    return os.pathsep.join(unique)
++
++
+ def _module_hermes_argv() -> list[str]:
+     """Return the interpreter-bound Hermes CLI invocation."""
+     # ``hermes_cli.main`` is the console-script target declared in
+@@ -10594,8 +11358,13 @@
+         if not raw_dir or raw_dir == ".":
+             continue
+         directory = os.path.expanduser(raw_dir)
++        # Relative PATH entries (including an empty entry) make resolution
++        # depend on the dispatcher's current directory, which is attacker- or
++        # conversation-controlled for a long-lived worker process.
++        if not os.path.isabs(directory):
++            continue
+         for name in _path_search_names(command):
+-            candidate = os.path.join(directory, name)
++            candidate = os.path.abspath(os.path.join(directory, name))
+             if not os.path.isfile(candidate):
+                 continue
+             if _IS_WINDOWS or os.access(candidate, os.X_OK):
+@@ -10640,8 +11409,6 @@
+     local (not imported from gateway) because ``hermes_cli`` sits below
+     ``gateway`` in the dependency order.
+     """
+-    import shutil
+-
+     env_bin = os.environ.get("HERMES_BIN", "").strip()
+     if env_bin:
+         if _looks_like_path(env_bin):
+@@ -10651,7 +11418,7 @@
+             return _hermes_path_argv(resolved_env_bin)
+         return _module_hermes_argv()
+ 
+-    hermes_bin = _safe_which_no_cwd("hermes") if _IS_WINDOWS else shutil.which("hermes")
++    hermes_bin = _safe_which_no_cwd("hermes")
+     if hermes_bin:
+         return _hermes_path_argv(hermes_bin)
+     return _module_hermes_argv()
+@@ -10832,6 +11599,20 @@
+         # This only happens in test fixtures where the isolated
+         # HERMES_HOME never had profiles created.
+         pass
++    # Resolve the executable before replacing the ambient environment.  The
++    # argv is pinned to an absolute PATH entry (or the interpreter module
++    # fallback), while the child receives a deterministic allowlisted PATH and
++    # never receives the launcher's HERMES_BIN/PYTHONPATH values.
++    hermes_argv = _resolve_hermes_argv()
++    profile_home = env.get("HERMES_HOME")
++    runtime_root = Path(profile_home).expanduser() if profile_home else Path.home() / ".hermes"
++    env = _review_worker_env(
++        env,
++        runtime_root=runtime_root,
++        hermes_argv=hermes_argv,
++    )
++    if profile_home:
++        env["HERMES_HOME"] = str(profile_home)
+     if task.tenant:
+         env["HERMES_TENANT"] = task.tenant
+     env["HERMES_KANBAN_TASK"] = task.id
+@@ -10871,18 +11652,47 @@
+         env["HERMES_KANBAN_GOAL_MODE"] = "1"
+         if task.goal_max_turns is not None:
+             env["HERMES_KANBAN_GOAL_MAX_TURNS"] = str(int(task.goal_max_turns))
+-    terminal_timeout = _worker_terminal_timeout_env(
+-        task.max_runtime_seconds,
+-        env.get("TERMINAL_TIMEOUT"),
++    runtime_policy = resolve_runtime_policy(
++        getattr(task, "runtime_class", None),
++        source_status=("review" if getattr(task, "status", None) == "review" else None),
+     )
+-    if terminal_timeout is not None:
+-        env["TERMINAL_TIMEOUT"] = terminal_timeout
+-    foreground_timeout = _worker_terminal_timeout_env(
+-        task.max_runtime_seconds,
+-        env.get("TERMINAL_MAX_FOREGROUND_TIMEOUT"),
+-    )
+-    if foreground_timeout is not None:
+-        env["TERMINAL_MAX_FOREGROUND_TIMEOUT"] = foreground_timeout
++    env["HERMES_KANBAN_RUNTIME_CLASS"] = runtime_policy.runtime_class
++    if runtime_policy.hard_cap_seconds is not None:
++        env["HERMES_KANBAN_RUNTIME_HARD_CAP_SECONDS"] = str(
++            runtime_policy.hard_cap_seconds
++        )
++    if runtime_policy.evidence_budget_seconds is not None:
++        env["HERMES_KANBAN_EVIDENCE_BUDGET_SECONDS"] = str(
++            runtime_policy.evidence_budget_seconds
++        )
++        evidence_deadline = getattr(task, "evidence_deadline", None)
++        if evidence_deadline is None:
++            evidence_deadline = (
++                time.time() + runtime_policy.evidence_budget_seconds
++            )
++        env["HERMES_KANBAN_EVIDENCE_DEADLINE"] = f"{float(evidence_deadline):.6f}"
++    if runtime_policy.command_timeout_seconds is not None:
++        command_cap = runtime_policy.command_timeout_seconds
++        env["HERMES_KANBAN_TOOL_TIMEOUT_SECONDS"] = str(command_cap)
++        env["TERMINAL_TIMEOUT"] = _bounded_worker_timeout_env(
++            env.get("TERMINAL_TIMEOUT"), command_cap
++        )
++        env["TERMINAL_MAX_FOREGROUND_TIMEOUT"] = _bounded_worker_timeout_env(
++            env.get("TERMINAL_MAX_FOREGROUND_TIMEOUT"), command_cap
++        )
++    else:
++        terminal_timeout = _worker_terminal_timeout_env(
++            task.max_runtime_seconds,
++            env.get("TERMINAL_TIMEOUT"),
++        )
++        if terminal_timeout is not None:
++            env["TERMINAL_TIMEOUT"] = terminal_timeout
++        foreground_timeout = _worker_terminal_timeout_env(
++            task.max_runtime_seconds,
++            env.get("TERMINAL_MAX_FOREGROUND_TIMEOUT"),
++        )
++        if foreground_timeout is not None:
++            env["TERMINAL_MAX_FOREGROUND_TIMEOUT"] = foreground_timeout
+     # Pin the shared board + workspaces root the dispatcher resolved, so
+     # that even when the worker activates a profile (`hermes -p <name>`
+     # rewrites HERMES_HOME), its kanban paths still match the
+@@ -10912,7 +11722,7 @@
+     env.pop("HERMES_TUI", None)
+ 
+     cmd = [
+-        *_resolve_hermes_argv(),
++        *hermes_argv,
+         "-p", profile_arg,
+         "--cli",
+         # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
+@@ -11129,13 +11939,30 @@
+     if task.tenant:
+         lines.append(f"Tenant:   {task.tenant}")
+     lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
+-    if task.max_runtime_seconds is not None:
+-        terminal_timeout = _worker_terminal_timeout_env(
+-            task.max_runtime_seconds,
+-            os.environ.get("TERMINAL_TIMEOUT"),
+-        )
+-        effective_terminal_timeout = terminal_timeout or os.environ.get("TERMINAL_TIMEOUT")
+-        lines.append(f"Max runtime: {task.max_runtime_seconds}s")
++    context_policy = resolve_runtime_policy(
++        getattr(task, "runtime_class", None),
++        source_status=("review" if task.status == "review" else None),
++    )
++    effective_runtime = _effective_runtime_seconds(
++        task.max_runtime_seconds, context_policy
++    )
++    if effective_runtime is not None:
++        if context_policy.command_timeout_seconds is not None:
++            effective_terminal_timeout = _bounded_worker_timeout_env(
++                os.environ.get("TERMINAL_TIMEOUT"),
++                context_policy.command_timeout_seconds,
++            )
++        else:
++            terminal_timeout = _worker_terminal_timeout_env(
++                effective_runtime, os.environ.get("TERMINAL_TIMEOUT")
++            )
++            effective_terminal_timeout = terminal_timeout or os.environ.get("TERMINAL_TIMEOUT")
++        lines.append(f"Runtime class: {context_policy.runtime_class}")
++        lines.append(f"Max runtime: {effective_runtime}s")
++        if context_policy.evidence_budget_seconds is not None:
++            lines.append(
++                f"Evidence budget: {context_policy.evidence_budget_seconds}s"
++            )
+         if effective_terminal_timeout:
+             lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
+     if task.branch_name:
+--- a/gateway/kanban_watchers.py
++++ b/gateway/kanban_watchers.py
+@@ -47,6 +47,90 @@
+     if len(reason) > limit:
+         reason = reason[: limit - 1].rstrip() + "…"
+     return reason
++
++
++def _explicit_timeout_run_id(event: Any) -> Optional[int]:
++    """Return the run id carried by an event or its legacy payload."""
++    value = getattr(event, "run_id", None)
++    if value is None:
++        payload = getattr(event, "payload", None)
++        if isinstance(payload, dict):
++            value = payload.get("current_run_id")
++    if value is None:
++        return None
++    try:
++        return int(value)
++    except (TypeError, ValueError):
++        return None
++
++
++def _timeout_event_run_id(
++    events: list[Any], index: int, event: Any
++) -> Optional[int]:
++    """Associate a legacy unbound ``gave_up`` with its preceding timeout.
++
++    Older ``_record_task_failure(end_run=False)`` rows omitted ``run_id`` and
++    ``current_run_id`` from the gave-up event. Terminal events are returned in
++    event-id order, so the nearest preceding identified timeout is the only
++    recoverable attempt boundary. A later identified timeout naturally starts a
++    new boundary and prevents an older unbound gave-up from suppressing it.
++    """
++    explicit = _explicit_timeout_run_id(event)
++    if explicit is not None or getattr(event, "kind", "") != "gave_up":
++        return explicit
++    for prior in reversed(events[:index]):
++        if getattr(prior, "kind", "") != "timed_out":
++            continue
++        prior_run_id = _explicit_timeout_run_id(prior)
++        if prior_run_id is not None:
++            return prior_run_id
++    return None
++
++
++def _latest_timeout_run_events(events: list[Any]) -> list[Any]:
++    """Select one attempt and its final timeout decision.
++
++    A subscription cursor may return history from several attempts at once.
++    Timeout wording must not let an older terminal attempt suppress a later
++    retryable attempt. Legacy NULL-run gave-up rows are associated with the
++    nearest preceding identified timeout by event order. If the selected
++    attempt is exhausted, the final ``gave_up`` decision replaces its earlier
++    timeout notice so consumers cannot render both terminal and retry wording.
++    """
++    resolved: list[tuple[Any, Optional[int]]] = []
++    for index, event in enumerate(events):
++        if getattr(event, "kind", "") not in {"timed_out", "gave_up"}:
++            continue
++        resolved.append((event, _timeout_event_run_id(events, index, event)))
++    if not resolved:
++        return []
++    identified = [run_id for _, run_id in resolved if run_id is not None]
++    if not identified:
++        latest_events = [event for event, _ in resolved]
++    else:
++        latest_run_id = max(identified)
++        latest_events = [
++            event for event, run_id in resolved if run_id == latest_run_id
++        ]
++    if any(event.kind == "gave_up" for event in latest_events):
++        return [event for event in latest_events if event.kind == "gave_up"]
++    return latest_events
++
++
++def _reduce_timeout_notifications(events: list[Any]) -> list[Any]:
++    """Keep unrelated events while reducing timeout history to one decision."""
++    timeout_kinds = {"timed_out", "gave_up"}
++    if not any(getattr(event, "kind", "") in timeout_kinds for event in events):
++        return list(events)
++    selected_ids = {
++        id(event) for event in _latest_timeout_run_events(events)
++    }
++    return [
++        event
++        for event in events
++        if getattr(event, "kind", "") not in timeout_kinds
++        or id(event) in selected_ids
++    ]
+ 
+ 
+ def _resolve_auto_decompose_settings(
+@@ -571,7 +655,13 @@
+                     # exists on the board.
+                     wake_handoff = ""
+                     wake_review_detail = ""
+-                    for ev in d["events"]:
++                    _notification_events = _reduce_timeout_notifications(d["events"])
++                    _timeout_run_events = [
++                        event
++                        for event in _notification_events
++                        if event.kind in {"timed_out", "gave_up"}
++                    ]
++                    for ev in _notification_events:
+                         kind = ev.kind
+                         # Identity prefix: attribute terminal pings to the
+                         # worker that did the work. Makes fleets (where one
+@@ -624,10 +714,22 @@
+                             limit = 0
+                             if ev.payload and ev.payload.get("limit_seconds"):
+                                 limit = int(ev.payload["limit_seconds"])
+-                            msg = (
+-                                f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
+-                                f"(max_runtime={limit}s); will retry"
+-                            )
++                            retry_status = str(
++                                (ev.payload or {}).get("final_status")
++                                or (ev.payload or {}).get("retry_status")
++                                or ""
++                            ).lower()
++                            if retry_status in {"blocked", "triage", "done", "archived"}:
++                                msg = (
++                                    f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
++                                    f"(max_runtime={limit}s); task is {retry_status}, no retry"
++                                )
++                            else:
++                                queued_status = retry_status or "ready"
++                                msg = (
++                                    f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
++                                    f"(max_runtime={limit}s); retry queued ({queued_status})"
++                                )
+                         elif kind == "status":
+                             new_status = ""
+                             if ev.payload and ev.payload.get("status"):
+@@ -844,8 +946,12 @@
+                             "blocked", "review_requested", "changes_requested",
+                             "block_loop_detected",
+                         )
++                        _wake_events = _notification_events
+                         _wake_kinds = (
+-                            {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
++                            {
++                                ev.kind for ev in _wake_events
++                                if ev.kind in _WAKE_KINDS
++                            }
+                             if wake_agent
+                             else set()
+                         )
+@@ -878,8 +984,26 @@
+                             if "completed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.completed"))
+                             if "gave_up" in _wake_kinds: _parts.append(t("gateway.kanban.wake.gave_up"))
+                             if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
+-                            if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
+-                            if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
++                            _timeout_terminal = any(
++                                ev.kind == "gave_up"
++                                or (
++                                    ev.kind == "timed_out"
++                                    and str(
++                                        (ev.payload or {}).get("final_status")
++                                        or (ev.payload or {}).get("retry_status")
++                                        or ""
++                                    ).lower()
++                                    in {"blocked", "triage", "done", "archived"}
++                                )
++                                for ev in _timeout_run_events
++                            )
++                            if "timed_out" in _wake_kinds and not _timeout_terminal:
++                                _parts.append(
++                                    t("gateway.kanban.wake.timed_out")
++                                    + " (retry queued)"
++                                )
++                            elif _timeout_terminal and "gave_up" not in _wake_kinds and "blocked" not in _wake_kinds:
++                                _parts.append(t("gateway.kanban.wake.blocked"))
+                             if "review_requested" in _wake_kinds: _parts.append(t("gateway.kanban.wake.review_requested"))
+                             if "changes_requested" in _wake_kinds: _parts.append(t("gateway.kanban.wake.changes_requested"))
+                             if "block_loop_detected" in _wake_kinds: _parts.append(t("gateway.kanban.wake.block_loop_detected"))
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -12451,6 +12451,80 @@
+             pass
+ 
+ 
++def _explicit_timeout_run_id(event: Any) -> Optional[int]:
++    """Return the run id carried by an event or its legacy payload."""
++    value = getattr(event, "run_id", None)
++    if value is None:
++        payload = getattr(event, "payload", None)
++        if isinstance(payload, dict):
++            value = payload.get("current_run_id")
++    if value is None:
++        return None
++    try:
++        return int(value)
++    except (TypeError, ValueError):
++        return None
++
++
++def _timeout_event_run_id(
++    events: list[Any], index: int, event: Any
++) -> Optional[int]:
++    """Associate a legacy unbound ``gave_up`` with its preceding timeout."""
++    explicit = _explicit_timeout_run_id(event)
++    if explicit is not None or getattr(event, "kind", "") != "gave_up":
++        return explicit
++    for prior in reversed(events[:index]):
++        if getattr(prior, "kind", "") != "timed_out":
++            continue
++        prior_run_id = _explicit_timeout_run_id(prior)
++        if prior_run_id is not None:
++            return prior_run_id
++    return None
++
++
++def _latest_timeout_run_events(events: list[Any]) -> list[Any]:
++    """Select one attempt and its final timeout decision.
++
++    Legacy NULL-run gave-up rows are associated with the nearest preceding
++    identified timeout. If the selected attempt is exhausted, its final
++    ``gave_up`` decision replaces the earlier timeout notice.
++    """
++    resolved: list[tuple[Any, Optional[int]]] = []
++    for index, event in enumerate(events):
++        if getattr(event, "kind", "") not in {"timed_out", "gave_up"}:
++            continue
++        resolved.append((event, _timeout_event_run_id(events, index, event)))
++    if not resolved:
++        return []
++    identified = [run_id for _, run_id in resolved if run_id is not None]
++    if not identified:
++        latest_events = [event for event, _ in resolved]
++    else:
++        latest_run_id = max(identified)
++        latest_events = [
++            event for event, run_id in resolved if run_id == latest_run_id
++        ]
++    if any(event.kind == "gave_up" for event in latest_events):
++        return [event for event in latest_events if event.kind == "gave_up"]
++    return latest_events
++
++
++def _reduce_timeout_notifications(events: list[Any]) -> list[Any]:
++    """Keep unrelated events while reducing timeout history to one decision."""
++    timeout_kinds = {"timed_out", "gave_up"}
++    if not any(getattr(event, "kind", "") in timeout_kinds for event in events):
++        return list(events)
++    selected_ids = {
++        id(event) for event in _latest_timeout_run_events(events)
++    }
++    return [
++        event
++        for event in events
++        if getattr(event, "kind", "") not in timeout_kinds
++        or id(event) in selected_ids
++    ]
++
++
+ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[str]:
+     """Single-line notification text for one kanban event.
+ 
+@@ -12491,7 +12565,19 @@
+             limit = int(payload.get("limit_seconds") or 0)
+         except (TypeError, ValueError):
+             pass
+-        return f"⏱ {board_tag}{tag}Kanban {task_id} timed out (max_runtime={limit}s); will retry"
++        retry_status = str(
++            payload.get("final_status") or payload.get("retry_status") or ""
++        ).lower()
++        if retry_status in {"blocked", "triage", "done", "archived"}:
++            return (
++                f"⏱ {board_tag}{tag}Kanban {task_id} timed out "
++                f"(max_runtime={limit}s); task is {retry_status}, no retry"
++            )
++        queued_status = retry_status or "ready"
++        return (
++            f"⏱ {board_tag}{tag}Kanban {task_id} timed out "
++            f"(max_runtime={limit}s); retry queued ({queued_status})"
++        )
+     if kind == "status":
+         return f"🔄 {board_tag}{tag}Kanban {task_id} → {payload.get('status') or ''}"
+     return None
+@@ -12582,6 +12668,7 @@
+                 if not events:
+                     continue
+                 task = _kb.get_task(conn, sub["task_id"])
++                events = _reduce_timeout_notifications(events)
+                 for ev in events:
+                     text = _format_kanban_event_text(sub, task, ev, slug)
+                     if text:
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -1632,6 +1632,46 @@
+         )
+ 
+ 
++def _kanban_tool_timeout_cap() -> int | None:
++    """Read the dispatcher-selected per-command cap, if this is a worker."""
++    raw = os.environ.get("HERMES_KANBAN_TOOL_TIMEOUT_SECONDS", "").strip()
++    if not raw:
++        return None
++    try:
++        cap = int(raw)
++    except ValueError:
++        return None
++    return cap if cap > 0 else None
++
++
++def _kanban_evidence_remaining() -> float | None:
++    """Return seconds left in the active review/evidence window."""
++    raw = os.environ.get("HERMES_KANBAN_EVIDENCE_DEADLINE", "").strip()
++    if not raw:
++        return None
++    try:
++        deadline = float(raw)
++    except (TypeError, ValueError):
++        # A malformed boundary is fail-closed: this worker must not turn an
++        # invalid deadline into an unbounded evidence session.
++        return 0.0
++    return deadline - time.time()
++
++
++def _review_incomplete_response(reason: str) -> str:
++    """Return the typed terminal error used when evidence cannot continue."""
++    return json.dumps(
++        {
++            "output": "",
++            "exit_code": -1,
++            "error": f"REVIEW-INCOMPLETE: {reason}",
++            "code": "REVIEW-INCOMPLETE",
++            "status": "blocked",
++        },
++        ensure_ascii=False,
++    )
++
++
+ def _safe_getcwd() -> str:
+     """Return the current working directory, tolerating a deleted or
+     permission-restricted CWD.
+@@ -2921,6 +2961,20 @@
+                 "status": "error",
+             }, ensure_ascii=False)
+ 
++        # Review/evidence workers have a dispatcher-owned absolute deadline.
++        # Check it before environment creation or approval/probe logic so an
++        # expired run cannot open one more command after its evidence window.
++        evidence_remaining = _kanban_evidence_remaining()
++        if evidence_remaining is not None:
++            if evidence_remaining <= 0:
++                return _review_incomplete_response(
++                    "evidence budget expired; no further probes or approval are allowed"
++                )
++            if background:
++                return _review_incomplete_response(
++                    "background probes are not allowed inside a bounded evidence window"
++                )
++
+         # Get configuration
+         config = _get_env_config()
+         env_type = "local" if _host_local else config["env_type"]
+@@ -3004,6 +3058,31 @@
+                 f"timeout must be a positive number of seconds (got {timeout})."
+             )
+         effective_timeout = timeout or default_timeout
++
++        # A foreground command cannot outlive the evidence deadline.  Re-read
++        # the clock after configuration work because environment setup itself
++        # consumes part of the bounded review window.
++        if evidence_remaining is not None:
++            evidence_remaining = _kanban_evidence_remaining()
++            if evidence_remaining is None or evidence_remaining <= 0:
++                return _review_incomplete_response(
++                    "evidence budget expired; no further probes or approval are allowed"
++                )
++            effective_timeout = min(float(effective_timeout), evidence_remaining)
++
++        # A dispatcher-owned reviewer/recovery worker may not bypass its
++        # per-command cap by explicitly requesting a longer background wait.
++        tool_timeout_cap = _kanban_tool_timeout_cap()
++        if tool_timeout_cap is not None:
++            try:
++                exceeds_cap = float(effective_timeout) > tool_timeout_cap
++            except (TypeError, ValueError):
++                exceeds_cap = False
++            if exceeds_cap:
++                return tool_error(
++                    f"Kanban worker timeout {effective_timeout}s exceeds the "
++                    f"per-command maximum of {tool_timeout_cap}s."
++                )
+ 
+         # Reject foreground commands where the model explicitly requests
+         # a timeout above FOREGROUND_MAX_TIMEOUT — nudge it toward background.
+@@ -3654,6 +3733,12 @@
+                         "bounded_capture": True,
+                     }
+                     result = env.execute(command, **execute_kwargs)
++                    if evidence_remaining is not None:
++                        evidence_remaining = _kanban_evidence_remaining()
++                        if evidence_remaining is None or evidence_remaining <= 0:
++                            return _review_incomplete_response(
++                                "evidence budget expired while the probe was running"
++                            )
+                 except Exception as e:
+                     error_str = str(e).lower()
+                     if "timeout" in error_str:
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -81,6 +81,8 @@
+         "session_id": t.session_id,
+         "workflow_template_id": t.workflow_template_id,
+         "current_step_key": t.current_step_key,
++        "runtime_class": t.runtime_class,
++        "max_runtime_seconds": t.max_runtime_seconds,
+     }
+ 
+ 
+@@ -392,6 +394,11 @@
+                                "durations (90s, 30m, 2h, 1d). When exceeded, "
+                                "the dispatcher SIGTERMs (then SIGKILLs) the worker "
+                                "and re-queues the task.")
++    p_create.add_argument(
++        "--runtime-class", choices=sorted(kb.VALID_RUNTIME_CLASSES),
++        default=kb.RUNTIME_CLASS_IMPLEMENTATION,
++        help="Canonical worker policy class (default: implementation).",
++    )
+     p_create.add_argument("--created-by", default="user",
+                           help="Author name recorded on the task (default: user)")
+     p_create.add_argument("--skill", action="append", default=[], dest="skills",
+@@ -799,6 +806,12 @@
+                         default=kb.DEFAULT_SPAWN_FAILURE_LIMIT,
+                         help=f"Auto-block a task after this many consecutive non-success attempts "
+                              f"(spawn_failed, timed_out, or crashed; default: {kb.DEFAULT_SPAWN_FAILURE_LIMIT})")
++    p_disp.add_argument(
++        "--runtime-class", choices=sorted(kb.VALID_RUNTIME_CLASSES),
++        default=None,
++        help="Explicitly select a dispatch policy for this tick; use evidence_recovery "
++             "only for an evidence-only successor.",
++    )
+     p_disp.add_argument("--json", action="store_true")
+ 
+     # --- daemon (deprecated) ---
+@@ -1679,6 +1692,9 @@
+             triage=bool(getattr(args, "triage", False)),
+             idempotency_key=getattr(args, "idempotency_key", None),
+             max_runtime_seconds=max_runtime,
++            runtime_class=getattr(
++                args, "runtime_class", kb.RUNTIME_CLASS_IMPLEMENTATION
++            ),
+             skills=getattr(args, "skills", None) or None,
+             max_retries=max_retries,
+             model_override=getattr(args, "model_override", None),
+@@ -2407,13 +2423,19 @@
+                 failed.append(tid)
+                 continue
+ 
+-            if not kb.complete_task(
+-                conn, tid,
+-                result=args.result,
+-                summary=summary,
+-                metadata=metadata,
+-                expected_run_id=_worker_run_id_for(tid),
+-            ):
++            try:
++                completed = kb.complete_task(
++                    conn, tid,
++                    result=args.result,
++                    summary=summary,
++                    metadata=metadata,
++                    expected_run_id=_worker_run_id_for(tid),
++                )
++            except kb.ReviewIncompleteError as exc:
++                failed.append(tid)
++                print(f"kanban: {exc}", file=sys.stderr)
++                continue
++            if not completed:
+                 failed.append(tid)
+                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
+             else:
+@@ -2790,6 +2812,7 @@
+             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
+             default_assignee=default_assignee,
+             max_in_progress_per_profile=max_in_progress_per_profile,
++            runtime_class=getattr(args, "runtime_class", None),
+         )
+     if getattr(args, "json", False):
+         print(json.dumps({

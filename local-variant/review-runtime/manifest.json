@@ -1,0 +1,57 @@
+{
+  "schema": "factory.review-runtime.v1",
+  "artifact_version": "1.0.0",
+  "description": "Runtime overlay for bounded review dispatch and truthful timeout recovery.",
+  "native_boundary_schema": "factory.native-boundary.v1",
+  "native_manifest_sha256": "c15a9c10e499c5cbda6cbbe523162502b8875720f639a42e4a0a48b2ef2c4a01",
+  "native_artifact_version": "1.0.0",
+  "patches": {
+    "patches/002-review-runtime.patch": "c72340e1ef8a213e36d826bb2ee866ace4ef8c7e53f7f8115237b621eb1b28fa"
+  },
+  "patched_paths": [
+    "hermes_cli/kanban_db.py",
+    "gateway/kanban_watchers.py",
+    "tui_gateway/server.py",
+    "tools/terminal_tool.py",
+    "hermes_cli/kanban.py"
+  ],
+  "policy": {
+    "review_dispatch_hard_cap_seconds": 1200,
+    "review": {
+      "hard_worker_cap_seconds": 1200,
+      "evidence_budget_seconds": 600,
+      "per_command_timeout_seconds": 120
+    },
+    "evidence_recovery": {
+      "hard_worker_cap_seconds": 600,
+      "evidence_budget_seconds": 300,
+      "per_command_timeout_seconds": 60
+    },
+    "retryable_statuses": [
+      "ready",
+      "review"
+    ],
+    "terminal_statuses": [
+      "blocked",
+      "triage",
+      "done",
+      "archived"
+    ]
+  },
+  "excluded_copy_entries": [
+    ".git",
+    ".hg",
+    ".svn",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".venv",
+    "node_modules",
+    "dist",
+    "build",
+    "*.pyc",
+    "*.pyo"
+  ]
+}
