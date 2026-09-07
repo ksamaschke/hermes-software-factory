@@ -1821,3 +1821,117 @@ def test_reaper_sanitizes_reservation_exception_text(monkeypatch, tmp_path):
     assert "/private/customer" not in report["reason"]
     assert "super-secret" not in report["reason"]
     assert "z" * 100 not in report["reason"]
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="requires Linux procfs"
+)
+def test_reaper_terminal_cleanup_is_idempotent_after_first_cleanup(tmp_path):
+    """A repeated cleanup readback must be an honest no-op."""
+
+    task_id = "t_reaper_idempotent"
+    board = "factory-reaper-test"
+    kanban_db = tmp_path / "kanban.db"
+    _create_reaper_test_database(kanban_db, task_id)
+    process = _start_task_worker(task_id, board, kanban_db)
+    try:
+        _wait_for_task_process(task_id, board, kanban_db)
+        detail = _terminal_detail(task_id)
+        first = factory.reap_terminal_task_workers(
+            detail,
+            task_id=task_id,
+            board=board,
+            kanban_db=kanban_db,
+            refresh=lambda: detail,
+            grace_seconds=1,
+        )
+        assert first["status"] == "reaped"
+        assert first["survivors"] == []
+
+        second_signals = []
+
+        def observe_second_signal(fd, signum):
+            second_signals.append((fd, signum))
+            reaper._pidfd_send_signal(fd, signum)
+
+        second = factory.reap_terminal_task_workers(
+            detail,
+            task_id=task_id,
+            board=board,
+            kanban_db=kanban_db,
+            refresh=lambda: detail,
+            grace_seconds=1,
+            pidfd_send_signal=observe_second_signal,
+        )
+
+        assert second["status"] == "none"
+        assert second.get("signalled_pids", []) == []
+        assert second.get("survivors", []) == []
+        assert second_signals == []
+    finally:
+        _kill_task_worker(process)
+
+
+def test_reaper_reports_final_membership_readback_failure_as_partial(
+    monkeypatch, tmp_path
+):
+    """A failed final enumeration cannot be reported as a clean reaping."""
+
+    task_id = "t_reaper_final_readback"
+    database = tmp_path / "kanban.db"
+    detail = _bound_detail(task_id)
+    selected = _record_with_run(
+        _synthetic_record(task_id, pid=72000, pgrp=72000, session=72000),
+        41,
+        database,
+    )
+    records = [selected]
+    phase = {"after_kill": False, "post_kill_enumerations": 0}
+
+    def enumerate_records(**kwargs):
+        if phase["after_kill"]:
+            phase["post_kill_enumerations"] += 1
+            if phase["post_kill_enumerations"] == 2:
+                raise OSError(errno.EIO, "final membership enumeration unavailable")
+        return list(records)
+
+    monkeypatch.setattr(reaper, "iter_process_records", enumerate_records)
+    monkeypatch.setattr(
+        reaper,
+        "read_process_record",
+        lambda pid, **kwargs: selected if pid == selected.pid else None,
+    )
+    monkeypatch.setattr(reaper.os, "getpgrp", lambda: 1)
+    monkeypatch.setattr(reaper.os, "getsid", lambda pid: 2)
+    signals = []
+
+    def signal_process(fd, signum):
+        signals.append((fd, signum))
+        if signum == signal.SIGKILL:
+            phase["after_kill"] = True
+
+    report = reaper.reap_terminal_task_workers(
+        detail,
+        task_id=task_id,
+        board="factory-reaper-test",
+        kanban_db=database,
+        proc_root=tmp_path,
+        reservation=_BoundReservationFixture(database, detail),
+        pidfd_open=lambda pid: pid + 100,
+        pidfd_send_signal=signal_process,
+        close_handle=lambda fd: None,
+        grace_seconds=0,
+        sleep=lambda seconds: None,
+        monotonic=lambda: 0,
+    )
+
+    assert signals == [
+        (selected.pid + 100, signal.SIGTERM),
+        (selected.pid + 100, signal.SIGKILL),
+    ]
+    assert report["status"] == "partial"
+    assert report["signalled_pids"] == [selected.pid]
+    assert phase["post_kill_enumerations"] == 2
+    assert report["error_count"] >= 1
+    assert len(report["reason"]) <= reaper.MAX_REPORT_REASON_LENGTH
+    assert "enumeration failed during survivor readback" in report["reason"]
