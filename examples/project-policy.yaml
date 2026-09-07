@@ -91,6 +91,14 @@ decision_contract:
     before_spawn: true
     reused_or_held: true
     new_admission_requires_run: true
+  transition_policy:
+    quarantine: current_phase
+    admit: implementation
+    reuse_existing: current_phase
+    select_independent_lane: implementation
+    repair_artifact: artifact
+    hold_missing_capability: current_phase
+    hold: current_phase
   denied_capability: hold_or_external_gate
 
 operator_bridge:

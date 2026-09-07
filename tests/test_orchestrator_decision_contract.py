@@ -11,10 +11,11 @@ from typing import Any
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "local-variant" / "orchestrator_decision_contract.py"
-spec = importlib.util.spec_from_file_location("orchestrator_decision_contract", MODULE_PATH)
+spec = importlib.util.spec_from_file_location(
+    "orchestrator_decision_contract", MODULE_PATH
+)
 assert spec is not None and spec.loader is not None
 contract = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = contract
@@ -51,7 +52,10 @@ class SyntheticDecisionModel:
             action = "hold_missing_capability"
             next_phase = context["phase"]
             target = None
-        elif source.get("artifact_state") == "failed" and source.get("source_state") == "merged":
+        elif (
+            source.get("artifact_state") == "failed"
+            and source.get("source_state") == "merged"
+        ):
             action = "repair_artifact"
             next_phase = "artifact"
             target = source.get("artifact_task_id")

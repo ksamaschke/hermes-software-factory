@@ -27,6 +27,7 @@ from typing import Any
 try:  # Running as a package is useful to downstream installers.
     from .orchestrator_decision_contract import (
         BlockerState,
+        ContractViolation,
         DecisionContext,
         DecisionModel,
         DecisionPolicy,
@@ -38,11 +39,14 @@ try:  # Running as a package is useful to downstream installers.
         TypedEvidence,
         action_idempotency_key,
         build_input_identity,
+        decision_response_requirements_text,
         evaluate_decision,
+        simulated_action_readback,
     )
 except ImportError:  # Running this file directly is the supported CLI path.
     from orchestrator_decision_contract import (  # type: ignore[no-redef]
         BlockerState,
+        ContractViolation,
         DecisionContext,
         DecisionModel,
         DecisionPolicy,
@@ -54,7 +58,9 @@ except ImportError:  # Running this file directly is the supported CLI path.
         TypedEvidence,
         action_idempotency_key,
         build_input_identity,
+        decision_response_requirements_text,
         evaluate_decision,
+        simulated_action_readback,
     )
 
 
@@ -66,25 +72,34 @@ READ_TOOL_NAMES = (
     "read_capabilities",
     "read_action_readback",
 )
+FIXTURE_TOOL_NAMES = (*READ_TOOL_NAMES, "propose_action")
 
-NATIVE_QUERY_SUFFIX = """
+NATIVE_QUERY_SUFFIX = f"""
 This is a native integration evaluation. Use the read-only MCP fixture tools,
-not assumptions or prose. Call every read_* tool at least once, including
-read_action_readback with the idempotency_key from CONTEXT_JSON. Never call a
-mutation, shell, file, memory, or network tool. Return JSON matching this minimum shape (all five objects and all shown
-fields are required; values must come from the fixture reads):
-{"diagnose":{"summary":"..."},"choose":{"action":"..."},
-"act":{"action":"...","idempotency_key":"..."},
-"read_back":{"idempotency_key":"...","status":"...","current_run_id":null},
-"advance":{"next_phase":"..."}}
+not assumptions or prose. Call every read_* tool at least once. First diagnose
+and choose, then call propose_action exactly once with the chosen action and the
+idempotency_key from CONTEXT_JSON; this records a fixture-only proposal and is
+not a live mutation. Only after that proposal, call read_action_readback with
+the same key. Never call a mutation, shell, file, memory, or network tool.
+Return exactly one JSON object matching this minimum shape; the required fields
+are: {decision_response_requirements_text()}.
+The read_back status and current_run_id must be copied from the post-proposal
+fixture read. The advance.next_phase is derived from the typed transition
+policy and current phase/action (it is not fixture-observed):
+{{"diagnose":{{"summary":"..."}},"choose":{{"action":"..."}},
+"act":{{"action":"...","idempotency_key":"..."}},
+"read_back":{{"idempotency_key":"...","status":"...","current_run_id":null}},
+"advance":{{"next_phase":"..."}}}}
 The ellipses are placeholders for non-empty values, not literal output. The
 allowed actions are quarantine, admit, reuse_existing, select_independent_lane,
 repair_artifact, hold_missing_capability, or hold. The choose and act actions
-and the read_back fields must match the fixture readback. Keep current_run_id
-null unless the fixture explicitly returns a newly admitted run. A denied tool
-or capability is evidence for a bounded hold; do not retry a denied command with
-altered syntax or weaken its approval boundary. Return JSON only, with no
-markdown or explanatory text.
+must match the one proposal and the read_back fields must match the post-proposal
+fixture read. Keep current_run_id null unless the fixture explicitly returns a
+newly admitted run. For select_independent_lane, include choose.target_task_id
+copied exactly from the read_ready_lanes result. A denied tool or capability is
+evidence for a bounded hold; do not retry a denied command with altered syntax
+or weaken its approval boundary. Return JSON only, with no markdown or
+explanatory text.
 """.strip()
 
 
@@ -298,39 +313,16 @@ def _fixture_context(
     )
 
 
-def _readback(action: str, key: str, item_key: str) -> dict[str, Any]:
-    if action == "admit":
-        return {
-            "status": "admitted",
-            "idempotency_key": key,
-            "current_run_id": f"run-{item_key}",
-            "admission_count": 1,
-        }
-    statuses = {
-        "quarantine": "quarantined",
-        "reuse_existing": "reused",
-        "select_independent_lane": "selected",
-        "repair_artifact": "artifact-remediation",
-        "hold_missing_capability": "held",
-    }
-    return {
-        "status": statuses[action],
-        "idempotency_key": key,
-        "current_run_id": None,
-        "admission_count": 0,
-    }
-
-
 def _case_state(
     context: DecisionContext,
-    action: str,
+    _expected_action: str,
     *,
     existing_action: Mapping[str, Any] | None = None,
     ready: list[Mapping[str, Any]] | None = None,
     source: Mapping[str, Any] | None = None,
     missing: list[str] | None = None,
 ) -> dict[str, Any]:
-    key = action_idempotency_key(context)
+    del _expected_action  # The oracle remains outside the model-visible state.
     return {
         "live": {
             "blocker": context.blocker.as_dict(),
@@ -340,7 +332,7 @@ def _case_state(
         "source": dict(source or {"source_state": "open", "artifact_state": "ready"}),
         "ready": copy.deepcopy(ready or []),
         "capabilities": {"missing": list(missing or [])},
-        "readbacks": {key: _readback(action, key, context.source_item.item_key)},
+        "readbacks": {},
     }
 
 
@@ -460,6 +452,7 @@ class _FixtureStore:
     def __init__(self, state_path: Path, trace_path: Path) -> None:
         self.state_path = state_path
         self.trace_path = trace_path
+        self._proposal: dict[str, Any] | None = None
 
     def _state(self) -> dict[str, Any]:
         value = json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -467,27 +460,60 @@ class _FixtureStore:
             raise TypeError("fixture state must be a JSON object")
         return value
 
-    def _record(self, name: str) -> None:
+    def _record(self, name: str, **details: Any) -> None:
         self.trace_path.parent.mkdir(parents=True, exist_ok=True)
+        entry: dict[str, Any] = {"tool": name}
+        entry.update(details)
         with self.trace_path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps({"tool": name}, sort_keys=True) + "\n")
+            stream.write(json.dumps(entry, sort_keys=True) + "\n")
 
     def read(self, name: str, key: str, default: Any) -> Any:
         self._record(name)
         return copy.deepcopy(self._state().get(key, default))
 
+    def propose_action(
+        self,
+        action: str,
+        idempotency_key: str,
+        target_task_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Record one proposal and derive its receipt without changing state."""
+
+        if self._proposal is not None:
+            raise ContractViolation("fixture accepts only one action proposal")
+        # Validate the proposal before recording it; the return value is not
+        # exposed as a future outcome and is only an acknowledgement.
+        simulated_action_readback(action, idempotency_key, target_task_id)
+        self._proposal = {
+            "action": str(action),
+            "idempotency_key": str(idempotency_key),
+            "target_task_id": target_task_id,
+        }
+        self._record(
+            "propose_action",
+            action=str(action),
+            idempotency_key=str(idempotency_key),
+            target_task_id=target_task_id,
+        )
+        return {
+            "status": "proposal_recorded",
+            "action": str(action),
+            "idempotency_key": str(idempotency_key),
+        }
+
     def read_action(self, key: str) -> dict[str, Any]:
-        self._record("read_action_readback")
-        state = self._state()
-        readbacks = state.get("readbacks", {})
-        value = readbacks.get(key)
-        if value is None:
+        self._record("read_action_readback", idempotency_key=key)
+        if self._proposal is None or self._proposal["idempotency_key"] != key:
             return {
                 "status": "not_started",
                 "idempotency_key": key,
                 "current_run_id": None,
             }
-        return copy.deepcopy(value)
+        return simulated_action_readback(
+            self._proposal["action"],
+            key,
+            self._proposal.get("target_task_id"),
+        )
 
 
 def serve_fixture(state_path: str, trace_path: str) -> None:
@@ -536,6 +562,17 @@ def serve_fixture(state_path: str, trace_path: str) -> None:
     )
     def read_capabilities() -> dict[str, Any]:
         return store.read("read_capabilities", "capabilities", {})
+
+    @server.tool(
+        name="propose_action",
+        description="Record one fixture-only action proposal before readback.",
+    )
+    def propose_action(
+        action: str,
+        idempotency_key: str,
+        target_task_id: str | None = None,
+    ) -> dict[str, Any]:
+        return store.propose_action(action, idempotency_key, target_task_id)
 
     @server.tool(
         name="read_action_readback",
@@ -733,21 +770,46 @@ def _hermes_binary(explicit: str | None) -> str:
 
 
 def _parse_json_response(text: str) -> Mapping[str, Any]:
-    """Extract one JSON object from an otherwise harmless model response."""
+    """Extract one framed JSON object and reject ambiguous output."""
 
-    decoder = json.JSONDecoder()
-    for index, character in enumerate(text):
-        if character != "{":
-            continue
+    if not isinstance(text, str) or not text.strip():
+        raise ContractViolation("native model returned an empty response")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ContractViolation(
+                    f"native model response contains duplicate field: {key}"
+                )
+            result[key] = value
+        return result
+
+    decoder = json.JSONDecoder(object_pairs_hook=unique_object)
+    candidates: list[Mapping[str, Any]] = []
+    cursor = 0
+    while True:
+        index = text.find("{", cursor)
+        if index < 0:
+            break
         try:
-            value, end = decoder.raw_decode(text[index:])
+            value, end = decoder.raw_decode(text, index)
         except json.JSONDecodeError:
+            cursor = index + 1
             continue
-        if end and isinstance(value, Mapping):
-            return value
-    raise NativeEvaluationUnavailable(
-        "native model did not return a JSON decision object"
-    )
+        if isinstance(value, Mapping):
+            candidates.append(value)
+        cursor = end
+        if len(candidates) > 1:
+            raise ContractViolation(
+                "native model response contains multiple JSON objects"
+            )
+
+    if not candidates:
+        raise ContractViolation(
+            "native model response does not contain one JSON decision object"
+        )
+    return candidates[0]
 
 
 class HermesSubprocessModel(DecisionModel):
@@ -888,7 +950,7 @@ def run_native_evaluation(
                 if line.strip()
             ]
             tools = [entry.get("tool") for entry in trace]
-            unexpected = sorted(set(tools) - set(READ_TOOL_NAMES))
+            unexpected = sorted(set(tools) - set(FIXTURE_TOOL_NAMES))
             if unexpected:
                 raise NativeEvaluationUnavailable(
                     "native model exercised a non-fixture tool: "
@@ -899,6 +961,45 @@ def run_native_evaluation(
                 raise NativeEvaluationUnavailable(
                     "native model did not exercise required fixture reads: "
                     + ", ".join(missing)
+                )
+            proposal_indices = [
+                index for index, name in enumerate(tools) if name == "propose_action"
+            ]
+            if len(proposal_indices) != 1:
+                raise ContractViolation(
+                    "native model must commit exactly one fixture proposal"
+                )
+            readback_indices = [
+                index
+                for index, name in enumerate(tools)
+                if name == "read_action_readback"
+            ]
+            if not readback_indices or proposal_indices[0] > readback_indices[0]:
+                raise ContractViolation(
+                    "native model read back an action before proposing it"
+                )
+            proposal_entry = trace[proposal_indices[0]]
+            expected_key = action_idempotency_key(case.context)
+            if proposal_entry.get("action") != result.proposal.choose.get("action"):
+                raise ContractViolation(
+                    "native fixture proposal does not match the chosen action"
+                )
+            if proposal_entry.get("idempotency_key") != expected_key:
+                raise ContractViolation(
+                    "native fixture proposal does not match the current identity"
+                )
+            if proposal_entry.get("target_task_id") != result.proposal.choose.get(
+                "target_task_id"
+            ):
+                raise ContractViolation(
+                    "native fixture proposal target does not match the decision"
+                )
+            if any(
+                entry.get("idempotency_key") != expected_key
+                for entry in (trace[index] for index in readback_indices)
+            ):
+                raise ContractViolation(
+                    "native fixture readback used a stale or foreign identity"
                 )
             if adapter.snapshot() != before or adapter.mutation_attempts:
                 raise NativeEvaluationUnavailable(
@@ -916,6 +1017,8 @@ def run_native_evaluation(
                     "action": result.action,
                     "tool_calls": len(tools),
                     "tools": tools,
+                    "proposal_before_readback": proposal_indices[0]
+                    < readback_indices[0],
                     "prompt_chars": result.prompt.prompt_chars,
                     "skill_chars": result.prompt.skill_chars,
                     "new_current_run": result.new_current_run,
@@ -970,6 +1073,9 @@ def main(argv: list[str] | None = None) -> int:
             trace_output=args.trace_output,
             run_budget=args.run_budget,
         )
+    except ContractViolation as exc:
+        print(f"native evaluation contract violation: {exc}", file=sys.stderr)
+        return 3
     except (NativeEvaluationUnavailable, ValueError) as exc:
         print(f"native evaluation unavailable: {exc}", file=sys.stderr)
         return 2

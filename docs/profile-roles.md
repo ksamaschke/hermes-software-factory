@@ -89,7 +89,10 @@ run is not a new execution: it represents not-started, reused, or held work.
 Repeated unchanged blockers stay quarantined, verified resolution/new-contract
 admission allocates one run, and independent ready lanes remain eligible. Profile
 continuity is scoped to the same source/phase/input identity, and worker shared
-memory writes are disabled or isolated. A denied tool or capability is typed
+memory writes are disabled or isolated. The policy declares a transition for each
+allowed action; `advance.next_phase` is derived from that transition and the
+current phase, not copied from fixture text or an unbounded log. A denied tool or
+capability is typed
 evidence: choose a supported permitted tool or surface the exact external gate;
 do not vary a denied command or lower its approval boundary.
 

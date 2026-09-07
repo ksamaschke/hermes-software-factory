@@ -48,7 +48,10 @@ blockers remain quarantined until evidence shows resolution or a deliberate new
 contract. A resolved/new-contract admission creates exactly one run, while an
 existing blocked identity is reused without claiming new progress. Keep
 independent ready lanes selectable and hold only the affected lane when a
-capability or approval is missing.
+capability or approval is missing. The policy declares the next phase for each
+allowed action; `advance.next_phase` is derived from that transition policy and
+the current phase, never copied from an unbounded log or misrepresented as a
+fixture observation.
 
 A denied tool or capability is typed evidence, not permission to lower a safety
 boundary. Choose an actually supported permitted tool for the legitimate

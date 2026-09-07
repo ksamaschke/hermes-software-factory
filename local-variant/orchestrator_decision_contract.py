@@ -18,6 +18,20 @@ from typing import Any, Protocol
 
 CONTRACT_SCHEMA = "factory.decision.v1"
 DECISION_LADDER = ("diagnose", "choose", "act", "read_back", "advance")
+# Each inner tuple is a required field group.  A group with one field requires
+# that field; a group with several fields accepts any one of the alternatives.
+# The compact schema is shared by prompt construction and response ingress.
+DECISION_REQUIRED_FIELDS = {
+    "diagnose": (("summary", "cause"),),
+    "choose": (("action",),),
+    "act": (("action",), ("idempotency_key",)),
+    "read_back": (
+        ("idempotency_key",),
+        ("status",),
+        ("current_run_id",),
+    ),
+    "advance": (("next_phase",),),
+}
 EVIDENCE_KINDS = ("scheduler", "worker", "source", "review")
 ALLOWED_ACTIONS = (
     "quarantine",
@@ -74,6 +88,19 @@ def _safe_value(value: Any, field_name: str = "value") -> Any:
 
 def _compact(text: str) -> str:
     return " ".join(str(text).split())
+
+
+def decision_response_requirements_text() -> str:
+    """Render the one response schema used by prompts and ingress checks."""
+
+    rendered = []
+    for step in DECISION_LADDER:
+        groups = DECISION_REQUIRED_FIELDS[step]
+        fields = []
+        for alternatives in groups:
+            fields.append(" or ".join(f"{step}.{field}" for field in alternatives))
+        rendered.append(f"{step} requires " + " and ".join(fields))
+    return "; ".join(rendered)
 
 
 def _bounded_text(text: str, limit: int) -> tuple[str, bool]:
@@ -271,6 +298,15 @@ class DecisionPolicy:
     repeated_blocker_threshold: int = 3
     conflict_mode: str = "fail_closed"
     allowed_actions: tuple[str, ...] = ALLOWED_ACTIONS
+    transition_policy: tuple[tuple[str, str], ...] = (
+        ("quarantine", "current_phase"),
+        ("admit", "implementation"),
+        ("reuse_existing", "current_phase"),
+        ("select_independent_lane", "implementation"),
+        ("repair_artifact", "artifact"),
+        ("hold_missing_capability", "current_phase"),
+        ("hold", "current_phase"),
+    )
 
     def as_dict(self) -> dict[str, Any]:
         if self.max_prompt_chars <= 0 or self.max_skill_chars < 0:
@@ -282,6 +318,14 @@ class DecisionPolicy:
         allowed = list(self.allowed_actions)
         if not allowed or not set(allowed) <= set(ALLOWED_ACTIONS):
             raise ContractViolation("policy contains an unsupported action")
+        transition = dict(self.transition_policy)
+        if set(allowed) - set(transition):
+            raise ContractViolation("policy has no transition for an allowed action")
+        if any(
+            action not in ALLOWED_ACTIONS or not _compact(next_phase)
+            for action, next_phase in transition.items()
+        ):
+            raise ContractViolation("policy contains an invalid transition")
         return {
             "budgets": {
                 "max_prompt_chars": self.max_prompt_chars,
@@ -291,6 +335,7 @@ class DecisionPolicy:
             "repeated_blocker_threshold": self.repeated_blocker_threshold,
             "conflict_mode": self.conflict_mode,
             "allowed_actions": allowed,
+            "transition_policy": transition,
             "current_run_null": {
                 "before_spawn": True,
                 "reused_or_held": True,
@@ -456,7 +501,10 @@ def prepare_prompt(
         "logs. Return exactly the five ladder objects diagnose, choose, act, "
         "read_back, advance. Diagnose before choosing; choose before acting; "
         "read back the exact idempotent result before advancing. A null current "
-        "run means not started/reused/held, never a new run. Conflicts fail closed."
+        "run means not started/reused/held, never a new run. Conflicts fail closed. "
+        f"Required response fields: {decision_response_requirements_text()}. "
+        "The next phase is derived from the typed transition policy, not inferred "
+        "from an unbounded log."
     )
     prefix = f"{instructions}\n\nCONTEXT_JSON\n{document}\nEND_CONTEXT\n"
     entries = _skill_entries(skills)
@@ -529,6 +577,39 @@ def build_prompt(
     return prepare_prompt(context, skills).prompt
 
 
+def simulated_action_readback(
+    action: str, idempotency_key: str, target_task_id: str | None = None
+) -> dict[str, Any]:
+    """Return a deterministic receipt only after a fixture proposal."""
+
+    action = _required(action, "proposal.action")
+    idempotency_key = _required(idempotency_key, "proposal.idempotency_key")
+    statuses = {
+        "quarantine": "quarantined",
+        "admit": "admitted",
+        "reuse_existing": "reused",
+        "select_independent_lane": "selected",
+        "repair_artifact": "artifact-remediation",
+        "hold_missing_capability": "held",
+        "hold": "held",
+    }
+    if action not in statuses:
+        raise ContractViolation(f"unsupported fixture proposal action: {action}")
+    result: dict[str, Any] = {
+        "status": statuses[action],
+        "idempotency_key": idempotency_key,
+        "current_run_id": (
+            "run-" + hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:16]
+            if action == "admit"
+            else None
+        ),
+        "admission_count": 1 if action == "admit" else 0,
+    }
+    if action == "select_independent_lane" and target_task_id is not None:
+        result["selected_task_id"] = str(target_task_id)
+    return result
+
+
 class NoSideEffectFixtureAdapter:
     """Read-only fixture adapter for behavioral evaluations.
 
@@ -541,6 +622,9 @@ class NoSideEffectFixtureAdapter:
         self._state = copy.deepcopy(dict(state))
         self._baseline = copy.deepcopy(self._state)
         self._reads: list[str] = []
+        self._proposal: dict[str, Any] | None = None
+        self._preproposal_receipt_reads = 0
+        self._proposal_attempts = 0
         self.mutation_attempts = 0
 
     def snapshot(self) -> dict[str, Any]:
@@ -549,6 +633,18 @@ class NoSideEffectFixtureAdapter:
     @property
     def reads(self) -> tuple[str, ...]:
         return tuple(self._reads)
+
+    @property
+    def proposal(self) -> Mapping[str, Any] | None:
+        return copy.deepcopy(self._proposal)
+
+    @property
+    def preproposal_receipt_reads(self) -> int:
+        return self._preproposal_receipt_reads
+
+    @property
+    def proposal_attempts(self) -> int:
+        return self._proposal_attempts
 
     def _read(self, name: str, key: str, default: Any) -> Any:
         self._reads.append(name)
@@ -569,17 +665,58 @@ class NoSideEffectFixtureAdapter:
     def read_capabilities(self) -> dict[str, Any]:
         return self._read("capabilities", "capabilities", {})
 
+    def propose_action(
+        self,
+        action: str,
+        idempotency_key: str,
+        target_task_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Record one simulated proposal without changing fixture state."""
+
+        self._proposal_attempts += 1
+        if self._proposal is not None:
+            raise ContractViolation("fixture accepts only one action proposal")
+        action = _required(action, "proposal.action")
+        idempotency_key = _required(idempotency_key, "proposal.idempotency_key")
+        if action not in ALLOWED_ACTIONS:
+            raise ContractViolation(f"unsupported fixture proposal action: {action}")
+        self._proposal = {
+            "action": action,
+            "idempotency_key": idempotency_key,
+        }
+        if target_task_id is not None:
+            self._proposal["target_task_id"] = str(target_task_id)
+        self._reads.append("propose_action")
+        return {
+            "status": "proposal_recorded",
+            "action": action,
+            "idempotency_key": idempotency_key,
+        }
+
     def read_action_readback(self, idempotency_key: str) -> dict[str, Any]:
         self._reads.append("action_readback")
         readbacks = self._state.get("readbacks", {})
         result = readbacks.get(idempotency_key)
-        if result is None:
+        if result is not None:
+            return copy.deepcopy(result)
+        if self._proposal is None:
+            self._preproposal_receipt_reads += 1
             return {
                 "status": "not_started",
                 "idempotency_key": idempotency_key,
                 "current_run_id": None,
             }
-        return copy.deepcopy(result)
+        if self._proposal["idempotency_key"] != idempotency_key:
+            return {
+                "status": "not_started",
+                "idempotency_key": idempotency_key,
+                "current_run_id": None,
+            }
+        return simulated_action_readback(
+            self._proposal["action"],
+            idempotency_key,
+            self._proposal.get("target_task_id"),
+        )
 
     def _forbid(self, operation: str) -> None:
         self.mutation_attempts += 1
@@ -624,6 +761,23 @@ class DecisionProposal:
                 raise ContractViolation(
                     f"decision step {step} must be a non-empty object"
                 )
+            for alternatives in DECISION_REQUIRED_FIELDS[step]:
+                valid_fields = [
+                    field
+                    for field in alternatives
+                    if field in value
+                    and (
+                        (step == "read_back" and field == "current_run_id")
+                        or (
+                            isinstance(value[field], str) and bool(value[field].strip())
+                        )
+                    )
+                ]
+                if not valid_fields:
+                    expected = " or ".join(f"{step}.{field}" for field in alternatives)
+                    raise ContractViolation(
+                        f"decision step {step} missing required field: {expected}"
+                    )
             values[step] = _safe_value(dict(value), step)
         return cls(**values)
 
@@ -772,6 +926,20 @@ def _validate_action_semantics(
         raise ContractViolation("capability hold lacks a missing capability")
 
     next_phase = _required(proposal.advance.get("next_phase"), "advance.next_phase")
+    transition = dict(context.policy.transition_policy)
+    configured_next_phase = transition.get(action)
+    if configured_next_phase is None:
+        raise ContractViolation(f"policy has no transition for action {action!r}")
+    expected_next_phase = (
+        context.phase
+        if configured_next_phase == "current_phase"
+        else configured_next_phase
+    )
+    if next_phase != expected_next_phase:
+        raise ContractViolation(
+            "advance.next_phase does not match transition policy "
+            f"(expected={expected_next_phase!r}, observed={next_phase!r})"
+        )
     if action == "repair_artifact" and next_phase == "release":
         raise ContractViolation("failed artifact cannot advance to release")
     return action
@@ -793,10 +961,21 @@ def evaluate_decision(
         "read_source_state": adapter.read_source_state,
         "read_ready_lanes": adapter.read_ready_lanes,
         "read_capabilities": adapter.read_capabilities,
+        "propose_action": adapter.propose_action,
         "read_action_readback": adapter.read_action_readback,
     }
     response = model.complete(prompt.prompt, tools)
     proposal = DecisionProposal.from_response(response)
+    if adapter.preproposal_receipt_reads:
+        raise ContractViolation(
+            "action readback was requested before the fixture proposal"
+        )
+    if adapter.proposal is None:
+        adapter.propose_action(
+            proposal.choose["action"],
+            proposal.act["idempotency_key"],
+            proposal.choose.get("target_task_id"),
+        )
     key = action_idempotency_key(context)
     actual_readback = adapter.read_action_readback(key)
     action = _validate_action_semantics(context, proposal, actual_readback, adapter)
@@ -816,6 +995,7 @@ __all__ = [
     "ALLOWED_ACTIONS",
     "CONTRACT_SCHEMA",
     "DECISION_LADDER",
+    "DECISION_REQUIRED_FIELDS",
     "BlockerState",
     "ContractViolation",
     "DecisionContext",
@@ -834,7 +1014,9 @@ __all__ = [
     "build_input_identity",
     "build_prompt",
     "conflict_checks",
+    "decision_response_requirements_text",
     "evaluate_decision",
     "prepare_prompt",
+    "simulated_action_readback",
     "validate_context",
 ]
