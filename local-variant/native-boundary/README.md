@@ -68,48 +68,82 @@ provenance and the public native entry points in an isolated temporary DB.
 
 Activation is intentionally not part of implementation. After the artifact
 has passed exact-head functional/security review and the host operator has
-approved the source and generated manifest, perform the following as a
-separate change-controlled step. Substitute the host's documented runtime
-slot and service unit; never edit `kanban.db` or start a worker manually.
+approved the source and generated manifest, use the existing user-systemd
+`PYTHONPATH` drop-in. The procedure below is parameterized for the current
+profile-scoped gateway; it does not invent an activation wrapper, edit
+`kanban.db`, or start a worker manually.
 
 ```sh
+SERVICE=hermes-gateway-orchestrator.service
+DROPIN=/home/ksamaschke/.config/systemd/user/hermes-gateway-orchestrator.service.d/10-runtime-hotfix.conf
+DROPIN_BACKUP="${DROPIN}.native-boundary.backup"
+STAGE=/absolute/path/to/.native-boundary-stage/runtime
+MANIFEST=/absolute/path/to/.native-boundary-stage/manifest.json
+SOURCE=/absolute/path/to/runtime-hotfix-source
+REVIEWED_DROPIN=/absolute/path/to/reviewed-10-runtime-hotfix.conf
+
 # Re-verify the immutable artifact immediately before activation.
 python3 -B local-variant/native-boundary/build_native_boundary.py verify \
   --manifest "$MANIFEST" \
   --source "$SOURCE"
 
-# The host's activation wrapper must atomically select the verified staged
-# runtime, retain the prior slot as BACKUP, and record MANIFEST as the active
-# artifact. Use the host-approved wrapper rather than ad-hoc cp/symlink edits.
-hermes-factory-runtime activate \
-  --runtime "$STAGE" \
-  --manifest "$MANIFEST" \
-  --backup "$BACKUP" \
-  --service "$FACTORY_GATEWAY_SERVICE"
+# Preserve and then select the reviewed staged runtime through the exact
+# existing drop-in. REVIEWED_DROPIN must contain PYTHONPATH=$STAGE and no
+# unrelated service changes; inspect both files before proceeding.
+install -D -m 0644 "$DROPIN" "$DROPIN_BACKUP"
+install -D -m 0644 "$REVIEWED_DROPIN" "$DROPIN"
+grep -F "PYTHONPATH=$STAGE" "$DROPIN"
+systemctl --user daemon-reload
+test "$(systemctl --user show "$SERVICE" -p KillMode --value)" = mixed
+
+# KillMode=mixed requires an empty worker boundary before the restart. Stop
+# the profile-scoped service, wait for inactive, and inspect its cgroup; do
+# not continue while systemd-cgls shows a live worker below this unit.
+systemctl --user stop "$SERVICE"
+test "$(systemctl --user is-active "$SERVICE" 2>/dev/null || true)" = inactive
+systemd-cgls --user-unit "$SERVICE" --no-pager
+
+# Restart only the supported user-systemd gateway boundary.
+systemctl --user restart "$SERVICE"
+systemctl --user is-active "$SERVICE"
+systemctl --user show "$SERVICE" -p KillMode -p ControlGroup -p DropInPaths
+
+# Read back the active service/lock boundary, full manifest, and import paths;
+# all imported modules must point at STAGE.
+STAGE="$STAGE" MANIFEST="$MANIFEST" PYTHONPATH="$STAGE" python3 -B -c 'import json, os; from pathlib import Path; from hermes_cli import kanban_db, native_boundary; stage=Path(os.environ["STAGE"]).resolve(); manifest_path=Path(os.environ["MANIFEST"]); manifest=json.loads(manifest_path.read_text()); print(manifest_path.read_text()); print(manifest["schema"], Path(kanban_db.__file__).resolve(), Path(native_boundary.__file__).resolve()); assert Path(kanban_db.__file__).resolve().is_relative_to(stage); assert Path(native_boundary.__file__).resolve().is_relative_to(stage)' \
+  </dev/null
 ```
 
-The activation wrapper is a host control-plane command, not supplied or run by
-this source artifact. It must verify the manifest again, stop/restart only the
-approved gateway service, wait for the service health check, and leave the
-normal dispatcher enabled. Once active, the existing B task resumes through
-its ordinary native dispatch tick; no direct worker launch or manual live-DB
-mutation is valid evidence.
+The one-liner passes `STAGE` and `MANIFEST` explicitly. Once active, the existing B task
+resumes through its ordinary native dispatch tick; no direct worker launch or
+manual live-DB mutation is valid evidence.
 
 ## Rollback
 
-If the post-activation health check or the unchanged native contracts fail,
-use the same reviewed host wrapper to restore the recorded prior runtime and
-restart only the approved gateway service. Verify the restored manifest and
-health before declaring rollback complete:
+If the post-activation health check or unchanged native contracts fail, restore
+the exact backed-up drop-in through the same profile-scoped user-systemd
+boundary. Keep the service stopped until the cgroup has no live workers:
 
 ```sh
-hermes-factory-runtime rollback \
-  --backup "$BACKUP" \
-  --manifest "$BACKUP_MANIFEST" \
-  --service "$FACTORY_GATEWAY_SERVICE"
+SERVICE=hermes-gateway-orchestrator.service
+DROPIN=/home/ksamaschke/.config/systemd/user/hermes-gateway-orchestrator.service.d/10-runtime-hotfix.conf
+DROPIN_BACKUP="${DROPIN}.native-boundary.backup"
+BACKUP_MANIFEST=/absolute/path/to/prior-runtime/manifest.json
+BACKUP_SOURCE=/absolute/path/to/prior-runtime-source
 
+systemctl --user stop "$SERVICE"
+test "$(systemctl --user is-active "$SERVICE" 2>/dev/null || true)" = inactive
+systemd-cgls --user-unit "$SERVICE" --no-pager
+install -D -m 0644 "$DROPIN_BACKUP" "$DROPIN"
+systemctl --user daemon-reload
+systemctl --user restart "$SERVICE"
+systemctl --user is-active "$SERVICE"
+systemctl --user show "$SERVICE" -p KillMode -p ControlGroup -p DropInPaths
 python3 -B local-variant/native-boundary/build_native_boundary.py verify \
-  --manifest "$BACKUP_MANIFEST"
+  --manifest "$BACKUP_MANIFEST" \
+  --source "$BACKUP_SOURCE"
 ```
 
-Do not delete the backup until the next reviewed activation is accepted.
+Read back the restored import paths and service state before declaring
+rollback complete. Do not delete `DROPIN_BACKUP` until the next reviewed
+activation is accepted.

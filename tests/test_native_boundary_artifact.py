@@ -2,8 +2,8 @@
 
 The owner contracts under the ESG audit report exercise the complete native
 specify and guard entry points. These tests add artifact integrity, path
-safety, and optional staged-runtime concurrency coverage without contacting a
-provider or touching a live board.
+safety, and optional staged-runtime dispatch, concurrency, and migration
+coverage without contacting a provider or touching a live board.
 """
 
 from __future__ import annotations
@@ -343,3 +343,161 @@ def test_staged_native_direct_callers_have_one_admission():
         check=False,
     )
     assert result.returncode == 0, result.stderr or result.stdout
+
+
+def test_staged_dispatch_tick_uses_guard_before_dry_run_admission(tmp_path):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="Existing source continuation",
+                body="Continue the bounded source work after explicit resolution.",
+                assignee="default",
+                created_by="fixture",
+            )
+            running = kb.claim_task(conn, task_id, claimer="fixture-owner:1")
+            assert running is not None
+            assert kb.block_task(
+                conn,
+                task_id,
+                reason="explicit fixture resolution",
+                kind="needs_input",
+                expected_run_id=running.current_run_id,
+            )
+            assert kb.unblock_task(conn, task_id)
+            kb.add_comment(
+                conn,
+                task_id,
+                "fixture-controller",
+                "Existing pull request remains the source evidence.",
+            )
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            spawned = [item[0] for item in result.spawned]
+            assert task_id in spawned, result
+            assert kb.get_task(conn, task_id).status == "ready"
+        print(json.dumps({"runtime": str(Path(kb.__file__).resolve()), "spawned": spawned}))
+        """
+    )
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(runtime)
+    environment["PYTHONNOUSERSITE"] = "1"
+    environment["HOME"] = str(runtime / ".dispatch-test-home")
+    environment["HERMES_KANBAN_DB"] = str(tmp_path / "native-dispatch.db")
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
+def test_old_runtime_lifecycle_state_is_admitted_by_staged_runtime(tmp_path):
+    runtime = _staged_runtime()
+    old_runtime = Path(
+        os.environ.get(
+            "FACTORY_NATIVE_LEGACY_RUNTIME",
+            "/home/ksamaschke/.hermes/profiles/orchestrator/runtime-hotfix-20260906",
+        )
+    ).resolve()
+    if not old_runtime.is_dir():
+        pytest.skip("FACTORY_NATIVE_LEGACY_RUNTIME is not available")
+    db = tmp_path / "legacy-native.db"
+    task_file = tmp_path / "task-id.txt"
+    old_script = textwrap.dedent(
+        """
+        import os
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="Legacy source continuation",
+                body="Continue the same source after an explicit old-runtime unblock.",
+                assignee="default",
+                created_by="fixture",
+            )
+            running = kb.claim_task(conn, task_id, claimer="fixture-owner:1")
+            assert running is not None
+            assert kb.block_task(
+                conn,
+                task_id,
+                reason="legacy explicit resolution",
+                kind="needs_input",
+                expected_run_id=running.current_run_id,
+            )
+            assert kb.unblock_task(conn, task_id)
+            with kb.write_txn(conn):
+                for _ in range(3):
+                    kb._append_event(conn, task_id, "respawn_guarded", {"reason": "active_pr"})
+            kb.add_comment(conn, task_id, "fixture-controller", "Existing pull request remains.")
+        Path(os.environ["TASK_ID_FILE"]).write_text(task_id, encoding="utf-8")
+        """
+    )
+    old_environment = os.environ.copy()
+    old_environment["PYTHONPATH"] = str(old_runtime)
+    old_environment["PYTHONNOUSERSITE"] = "1"
+    old_environment["HOME"] = str(tmp_path / "old-home")
+    old_environment["HERMES_KANBAN_DB"] = str(db)
+    old_environment["TASK_ID_FILE"] = str(task_file)
+    old_result = subprocess.run(
+        [sys.executable, "-B", "-c", old_script],
+        cwd=old_runtime,
+        env=old_environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert old_result.returncode == 0, old_result.stderr or old_result.stdout
+    staged_script = textwrap.dedent(
+        """
+        import json
+        import os
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        with kb.connect_closing(db) as conn:
+            task_id = Path(os.environ["TASK_ID_FILE"]).read_text(encoding="utf-8")
+            assert kb.check_respawn_guard(conn, task_id, lane="ready") is None
+            resumed = kb.claim_task(conn, task_id, claimer="fixture-owner:2")
+            assert resumed is not None
+            assert resumed.assignee == "default"
+            assert kb.claim_task(conn, task_id, claimer="fixture-owner:3") is None
+        print(json.dumps({"runtime": str(Path(kb.__file__).resolve()), "task_id": task_id}))
+        """
+    )
+    staged_environment = os.environ.copy()
+    staged_environment["PYTHONPATH"] = str(runtime)
+    staged_environment["PYTHONNOUSERSITE"] = "1"
+    staged_environment["HOME"] = str(tmp_path / "staged-home")
+    staged_environment["HERMES_KANBAN_DB"] = str(db)
+    staged_environment["TASK_ID_FILE"] = str(task_file)
+    staged_result = subprocess.run(
+        [sys.executable, "-B", "-c", staged_script],
+        cwd=runtime,
+        env=staged_environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert staged_result.returncode == 0, staged_result.stderr or staged_result.stdout
