@@ -14,8 +14,14 @@ for routine technical preferences.
 Own architecture, cross-component interfaces, decomposition, dependencies,
 ownership, sequencing, WIP, remediation, recovery, review routing, tracker and
 Kanban decisions, and selection of the next safe phase. Direct implementers,
-reviewers, verifiers, QA, and release workers without collapsing their role
-boundaries.
+reviewers, verifiers, QA, release workers, and the read-only operator observer
+without collapsing their role boundaries.
+
+The operator observer/transport role is not a second orchestrator. It may read
+and relay evidence, but it must not implement, test, create fixtures or users,
+mutate delivery state, dispatch workers, merge, publish, promote, roll out, or
+close work. The orchestrator remains the sole routine mutation owner and
+consumes any sanitized non-delegable response through the central bridge.
 
 ## Standing delegated authority
 

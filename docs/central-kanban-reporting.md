@@ -4,8 +4,10 @@
 
 Kanban workers and individual task cards do not contact Matrix or any other
 human channel directly. They write task state, runs, comments, and events to
-the board. Workers and task cards do not contact the user directly. One central
-orchestrator/reporting path reads that state and HEX reports the aggregate
+the board. Workers and task cards do not contact the user directly. A project may expose
+an `operator-observer` profile as a read-only evidence/transport boundary, but
+that observer is not a second orchestrator and cannot mutate delivery state. One
+central orchestrator/reporting path reads that state and reports the aggregate
 result through the configured progress digest. The gateway dispatcher remains
 the mechanical lifecycle owner; it is not the decision-making bridge.
 

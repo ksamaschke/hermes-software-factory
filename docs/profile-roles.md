@@ -99,6 +99,22 @@ do not vary a denied command or lower its approval boundary.
 The complete role boundary is defined here. Other runtime and skill documents
 should reference this contract rather than narrow the orchestrator to routing.
 
+## Operator observer / transport
+
+The operator observer is the read-only human-facing transport boundary. It may
+read exact tracker, Kanban, repository, deployment, scheduler, and sanitized
+runtime evidence exposed by project policy, then report the causal boundary,
+current owner, evidence limits, and one orchestrator-owned next gate.
+
+It must not implement or test source, run stateful product acceptance, create
+fixtures or users, mutate tracker/Kanban/PR/comment/release state, dispatch or
+reassign workers, merge, publish, promote, roll out, close, or bypass a review,
+integrity, approval, credential, security, or deployment gate. Tool capability
+and profile identity do not grant mutation authority. It may carry one sanitized
+response to a central non-delegable clarification; the orchestrator verifies the
+response and performs the allowed mutation. See
+[`skills/operator-observer/SKILL.md`](../skills/operator-observer/SKILL.md).
+
 ## Implementer
 
 The implementer profile is write-capable and works in an isolated worktree:

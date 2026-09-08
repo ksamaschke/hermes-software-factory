@@ -45,6 +45,8 @@ Profiles represent reusable roles, not repositories:
 
 - `orchestrator`: operating and architecture authority for decomposition,
   architecture, routing, WIP, adjudication, recovery, and tracker writes;
+- `operator-observer`: read-only human-facing evidence and transport; never a
+  product mutation owner;
 - `implementer`: TDD-first changes in an isolated worktree;
 - `code-reviewer`: independent, read-only review from a fresh packet;
 - `completion-verifier`: review coverage and board evidence, not code review;

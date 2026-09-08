@@ -15,6 +15,7 @@ tracker:
 
 profiles:
   orchestrator: default
+  operator_observer: null # read-only human-facing evidence/transport profile
   implementer: implementer
   code_reviewer: reviewer # concrete profile name may remain reviewer
   completion_verifier: null # optional concrete profile name
@@ -106,6 +107,10 @@ operator_bridge:
   enabled: true
   request_marker: OPERATOR_INPUT_REQUIRED
   response_marker: DECISION
+  observer_profile: operator_observer
+  orchestrator_profile: orchestrator
+  mutation_owner: orchestrator
+  observer_actions: [read_evidence, transport_decision_response]
   dedupe_on: [source_item, change_request, kanban_task, evidence_fingerprint]
 
 kanban:
