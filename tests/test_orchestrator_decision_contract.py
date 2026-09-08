@@ -337,6 +337,61 @@ def test_prompt_and_skill_budgets_are_effective_and_conflicts_fail_closed():
         contract.validate_context(conflicting)
 
 
+def test_action_key_binds_semantic_lane_and_task_identity():
+    context = _context("key-bindings", {})
+    lane_variant = replace(context, semantic_lane="other-lane")
+    task_variant = replace(
+        context,
+        execution=replace(context.execution, task_id="other-task"),
+    )
+
+    assert contract.action_idempotency_key(context) != contract.action_idempotency_key(
+        lane_variant
+    )
+    assert contract.action_idempotency_key(context) != contract.action_idempotency_key(
+        task_variant
+    )
+
+
+def test_secret_private_path_and_resource_bounds_fail_closed():
+    redacted = contract._redact_text(
+        "Authorization: Basic SENSITIVE ssh://user:password@example.invalid "
+        "path=/opt/private/file"
+    )
+    assert "SENSITIVE" not in redacted
+    assert "password" not in redacted
+    assert "/opt/private/file" not in redacted
+
+    safe = contract._safe_value(
+        {"private_path=/srv/secret.txt": "SENSITIVE", "token": "SENSITIVE"}
+    )
+    encoded = json.dumps(safe)
+    assert "SENSITIVE" not in encoded
+    assert "/srv/secret.txt" not in encoded
+
+    with pytest.raises(contract.ContractViolation, match="text value"):
+        contract._safe_value("x" * (contract._MAX_SAFE_TEXT_CHARS + 1))
+    with pytest.raises(contract.ContractViolation, match="skill input"):
+        contract.prepare_prompt(
+            _context("too-many-skills", {}),
+            [
+                (f"skill-{index}", "safe")
+                for index in range(contract._MAX_INPUT_ITEMS + 1)
+            ],
+        )
+    with pytest.raises(contract.ContractViolation, match="tool input"):
+        contract.prepare_prompt(
+            _context("too-many-tools", {}),
+            tool_catalog=[
+                f"tool-{index}" for index in range(contract._MAX_INPUT_ITEMS + 1)
+            ],
+        )
+    with pytest.raises(contract.ContractViolation, match="trace exceeds"):
+        contract._validate_observation_trace(
+            [{"tool": "read_live_state"}] * (contract._MAX_NATIVE_TRACE_ENTRIES + 1)
+        )
+
+
 def test_model_fixture_path_makes_safe_decisions_for_unseen_ids_without_writes():
     cases = [
         (

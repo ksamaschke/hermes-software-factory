@@ -125,6 +125,30 @@ def test_board_path_inside_inherited_authority_is_rejected(tmp_path: Path):
         )
 
 
+def test_board_path_inside_inherited_workspace_or_attachment_is_rejected(
+    tmp_path: Path,
+):
+    live_board = tmp_path / "live" / "live-kanban.db"
+    live_board.parent.mkdir(parents=True)
+    profile = tmp_path / "eval" / "profile"
+    profile.mkdir(parents=True)
+
+    for key in ("HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_ATTACHMENTS_ROOT"):
+        parent = _contaminated_environment(live_board)
+        inherited_root = tmp_path / key.removeprefix("HERMES_KANBAN_").lower()
+        inherited_root.mkdir()
+        parent[key] = str(inherited_root)
+        with pytest.raises(
+            evaluation.NativeEvaluationUnavailable,
+            match="overlaps inherited board authority",
+        ):
+            evaluation.build_isolated_environment(
+                parent,
+                profile,
+                inherited_root / "child" / "isolated-kanban.db",
+            )
+
+
 def test_native_child_write_cannot_reach_contaminated_live_board(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

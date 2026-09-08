@@ -28,6 +28,8 @@ from typing import Any
 
 try:  # Running as a package is useful to downstream installers.
     from .orchestrator_decision_contract import (
+        _MAX_NATIVE_OUTPUT_CHARS,
+        _MAX_NATIVE_TRACE_BYTES,
         BlockerState,
         ContractViolation,
         DecisionContext,
@@ -51,6 +53,8 @@ try:  # Running as a package is useful to downstream installers.
     )
 except ImportError:  # Running this file directly is the supported CLI path.
     from orchestrator_decision_contract import (  # type: ignore[no-redef]
+        _MAX_NATIVE_OUTPUT_CHARS,
+        _MAX_NATIVE_TRACE_BYTES,
         BlockerState,
         ContractViolation,
         DecisionContext,
@@ -213,6 +217,16 @@ def build_isolated_environment(
             protected_roots.append(Path(inherited_home).expanduser().resolve())
         except OSError:
             pass
+    for key in (
+        "HERMES_KANBAN_WORKSPACES_ROOT",
+        "HERMES_KANBAN_ATTACHMENTS_ROOT",
+    ):
+        inherited_root = str(parent_env.get(key, "")).strip()
+        if inherited_root:
+            try:
+                protected_roots.append(Path(inherited_root).expanduser().resolve())
+            except OSError:
+                pass
     if any(
         board_path == root or root in board_path.parents for root in protected_roots
     ):
@@ -781,8 +795,17 @@ class _FixtureStore:
         if not isinstance(safe_details, dict):
             raise ContractViolation("fixture trace details are malformed")
         entry.update(safe_details)
-        with self.trace_path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(entry, sort_keys=True) + "\n")
+        serialized = (json.dumps(entry, sort_keys=True) + "\n").encode("utf-8")
+        try:
+            current_size = (
+                self.trace_path.stat().st_size if self.trace_path.exists() else 0
+            )
+        except OSError as exc:
+            raise ContractViolation("fixture trace cannot be inspected") from exc
+        if current_size + len(serialized) > _MAX_NATIVE_TRACE_BYTES:
+            raise ContractViolation("fixture trace exceeds the contract bound")
+        with self.trace_path.open("ab") as stream:
+            stream.write(serialized)
 
     def read(self, name: str, key: str, default: Any) -> Any:
         key = _safe_identifier(key, "fixture.state_key")
@@ -1077,6 +1100,13 @@ def _inherited_board_paths(parent_env: Mapping[str, str]) -> tuple[Path, ...]:
         paths.extend(
             home / name for name in ("events", "event-log", "attachments", "workspaces")
         )
+    for key in (
+        "HERMES_KANBAN_WORKSPACES_ROOT",
+        "HERMES_KANBAN_ATTACHMENTS_ROOT",
+    ):
+        raw_root = str(parent_env.get(key, "")).strip()
+        if raw_root:
+            paths.append(Path(raw_root).expanduser())
     return tuple(dict.fromkeys(paths))
 
 
@@ -1257,8 +1287,21 @@ class HermesSubprocessModel(DecisionModel):
             raise NativeEvaluationUnavailable(
                 f"native Hermes one-shot failed with exit code {completed.returncode}"
             )
+        if (
+            len(completed.stdout) > _MAX_NATIVE_OUTPUT_CHARS
+            or len(completed.stderr) > _MAX_NATIVE_OUTPUT_CHARS
+        ):
+            raise ContractViolation("native Hermes output exceeds the contract bound")
         if not self.trace_path.exists():
             return _parse_json_response(completed.stdout)
+        try:
+            trace_size = self.trace_path.stat().st_size
+        except OSError as exc:
+            raise NativeEvaluationUnavailable(
+                "native fixture trace is unreadable"
+            ) from exc
+        if trace_size > _MAX_NATIVE_TRACE_BYTES:
+            raise ContractViolation("native fixture trace exceeds the contract bound")
         trace: list[Mapping[str, Any]] = []
 
         def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

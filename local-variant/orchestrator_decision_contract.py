@@ -46,8 +46,15 @@ ALLOWED_ACTIONS = (
 
 _REDACTED = "[REDACTED]"
 _PRIVATE_PATH = "[PRIVATE_PATH]"
+_MAX_SAFE_VALUE_DEPTH = 32
+_MAX_SAFE_VALUE_ITEMS = 1_024
+_MAX_SAFE_TEXT_CHARS = 32_000
+_MAX_INPUT_ITEMS = 1_024
+_MAX_NATIVE_TRACE_ENTRIES = 512
+_MAX_NATIVE_TRACE_BYTES = 512 * 1024
+_MAX_NATIVE_OUTPUT_CHARS = 256 * 1024
 _SECRET_KEY = re.compile(
-    r"(?<![A-Za-z0-9])(?:token|password|passwd|secret|cookie|authorization|api[_ -]?key|access[_ -]?key|private[_ -]?key|credentials?(?!_verified\b)|raw[_ -]?(?:log|output))(?![A-Za-z0-9_])",
+    r"(?<![A-Za-z0-9])(?:token|password|passwd|secret|cookie|authorization|api[_ -]?key|access[_ -]?key|private[_ -]?(?:key|path)|credentials?(?!_verified\b)|raw[_ -]?(?:log|output))(?![A-Za-z0-9_])",
     re.IGNORECASE,
 )
 _UNSAFE_LOG_KEY = re.compile(r"raw[_ -]?(?:log|output)", re.IGNORECASE)
@@ -56,16 +63,22 @@ _SECRET_ASSIGNMENT = re.compile(
     r"(?P<separator>\s*[:=]\s*)(?P<value>[^\s,;?&#]+)",
     re.IGNORECASE,
 )
+_AUTH_HEADER_VALUE = re.compile(
+    r"(\bauthorization\s*[:=]\s*(?:basic|bearer|token|digest)\s+)[^\s,;?&#]+",
+    re.IGNORECASE,
+)
 _BEARER_VALUE = re.compile(r"(\bbearer\s+)[^\s,;]+", re.IGNORECASE)
 _PRIVATE_PATH_VALUE = re.compile(
-    r"(?<![A-Za-z0-9_])/(?:home|root|operator|Users|private|var/lib|etc/ssh)(?:/[^\s\"']*)?",
+    r"(?<![A-Za-z0-9_])/(?:home|root|operator|Users|private|var/lib|etc/ssh|srv|opt|tmp|mnt|workspace(?:s)?|app)(?:/[^\s\"']*)?",
     re.IGNORECASE,
 )
 _SECRET_QUERY_NAME = re.compile(
     r"(?:token|password|passwd|secret|authorization|cookie|api[_-]?key|access[_-]?key|private[_-]?key|credential)",
     re.IGNORECASE,
 )
-_URL_CREDENTIALS = re.compile(r"(https?://)[^\s/@:]+:[^\s/@]+@", re.IGNORECASE)
+_URI_CREDENTIALS = re.compile(
+    r"([A-Za-z][A-Za-z0-9+.-]*://)[^\s/@:]+:[^\s/@]+@", re.IGNORECASE
+)
 _EVIDENCE_STATUSES = {
     "scheduler": frozenset(
         {
@@ -110,13 +123,11 @@ def _redact_text(text: str) -> str:
     """Redact secret-bearing values while preserving safe identity text."""
 
     value = str(text)
+    if len(value) > _MAX_SAFE_TEXT_CHARS:
+        raise ContractViolation("text value exceeds the contract bound")
+    value = _AUTH_HEADER_VALUE.sub(rf"\1{_REDACTED}", value)
     value = _BEARER_VALUE.sub(rf"\1{_REDACTED}", value)
-    value = re.sub(
-        r"(https?://)[^/@\s]+(?::[^/@\s]*)?@",
-        rf"\1{_REDACTED}@",
-        value,
-        flags=re.IGNORECASE,
-    )
+    value = _URI_CREDENTIALS.sub(rf"\1{_REDACTED}@", value)
     value = _SECRET_ASSIGNMENT.sub(
         lambda match: f"{match.group('name')}{match.group('separator')}{_REDACTED}",
         value,
@@ -187,25 +198,47 @@ def _required(value: Any, field_name: str) -> str:
     value = value.strip()
     if not value:
         raise ContractViolation(f"missing required field: {field_name}")
+    if len(value) > _MAX_SAFE_TEXT_CHARS:
+        raise ContractViolation(f"text value exceeds the contract bound: {field_name}")
     return value
 
 
-def _safe_value(value: Any, field_name: str = "value") -> Any:
+def _safe_value(value: Any, field_name: str = "value", *, _depth: int = 0) -> Any:
     """Copy bounded JSON-like values with value-level secret redaction."""
 
+    if _depth > _MAX_SAFE_VALUE_DEPTH:
+        raise ContractViolation(
+            f"nested value exceeds the contract bound: {field_name}"
+        )
     if isinstance(value, Mapping):
+        if len(value) > _MAX_SAFE_VALUE_ITEMS:
+            raise ContractViolation(f"mapping exceeds the contract bound: {field_name}")
         result = {}
         for key, item in value.items():
             key_text = str(key)
+            if len(key_text) > _MAX_SAFE_TEXT_CHARS:
+                raise ContractViolation(
+                    f"field name exceeds the contract bound: {field_name}"
+                )
             if _UNSAFE_LOG_KEY.search(key_text):
                 raise ContractViolation(f"unsafe field in {field_name}: {key_text}")
+            safe_key = _redact_text(key_text)
             if _SECRET_KEY.search(key_text):
-                result[key_text] = _REDACTED
+                safe_item = _REDACTED
             else:
-                result[key_text] = _safe_value(item, f"{field_name}.{key_text}")
+                safe_item = _safe_value(
+                    item, f"{field_name}.{safe_key}", _depth=_depth + 1
+                )
+            if safe_key in result:
+                raise ContractViolation(f"redacted field collision in {field_name}")
+            result[safe_key] = safe_item
         return result
     if isinstance(value, (list, tuple)):
-        return [_safe_value(item, field_name) for item in value]
+        if len(value) > _MAX_SAFE_VALUE_ITEMS:
+            raise ContractViolation(
+                f"sequence exceeds the contract bound: {field_name}"
+            )
+        return [_safe_value(item, field_name, _depth=_depth + 1) for item in value]
     if value is None or isinstance(value, (bool, int, float)):
         if isinstance(value, float) and not math.isfinite(value):
             raise ContractViolation(f"non-finite value in {field_name}")
@@ -709,6 +742,8 @@ def action_idempotency_key(context: DecisionContext) -> str:
             context.source_item.canonical_key,
             _safe_identifier(context.phase, "phase"),
             _safe_identifier(context.input_identity, "input_identity"),
+            _safe_identifier(context.semantic_lane, "semantic_lane"),
+            _safe_identifier(context.execution.task_id, "current_task.id"),
         )
     )
     return "action-" + hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
@@ -929,18 +964,28 @@ class PromptEnvelope:
         }
 
 
+def _check_input_items(value: Any, field_name: str) -> None:
+    if (
+        isinstance(value, (Mapping, Sequence))
+        and not isinstance(value, (str, bytes, bytearray))
+        and len(value) > _MAX_INPUT_ITEMS
+    ):
+        raise ContractViolation(f"{field_name} input exceeds the contract bound")
+
+
 def _skill_entries(
     skills: Mapping[str, str] | Sequence[tuple[str, str]] | None,
 ) -> list[tuple[str, str]]:
     if skills is None:
         return []
+    _check_input_items(skills, "skill")
     if isinstance(skills, Mapping):
         entries = list(skills.items())
     else:
         entries = list(skills)
     normalized = []
     for name, text in entries:
-        normalized.append((_required(name, "skill.name"), str(text)))
+        normalized.append((_safe_identifier(name, "skill.name"), str(text)))
     return normalized
 
 
@@ -957,6 +1002,7 @@ def prepare_prompt(
     policy = context.policy
     safe_suffix = _redact_text(str(prompt_suffix))
     document = json.dumps(context.as_dict(), sort_keys=True, separators=(",", ":"))
+    _check_input_items(tool_catalog, "tool")
     if tool_catalog is None:
         tool_entries: list[str] = []
     elif isinstance(tool_catalog, Mapping):
@@ -1078,6 +1124,8 @@ def _validate_observation_trace(
 
     if isinstance(trace, (str, bytes)) or not isinstance(trace, Sequence):
         raise ContractViolation("native fixture trace must be a sequence")
+    if len(trace) > _MAX_NATIVE_TRACE_ENTRIES:
+        raise ContractViolation("native fixture trace exceeds the contract bound")
     names: list[str] = []
     allowed = {
         "read_live_state",
