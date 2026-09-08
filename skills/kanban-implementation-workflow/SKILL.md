@@ -76,13 +76,19 @@ Profiles represent reusable roles, permissions, and model routing rather than re
 
 Use task-level model overrides for strength tiers when behavior and permissions are unchanged. Create a separate profile when tools, credentials, memory, safety policy, or write permissions differ. The gateway dispatcher handles mechanical lifecycle work; the orchestrator drives the technical and operational decisions about what should run next.
 
-Use the shared decision ladder in `docs/profile-roles.md` for every selected
+Use the shared decision ladder in
+[the canonical role contract](https://github.com/ksamaschke/hermes-software-factory/blob/main/docs/profile-roles.md#decision-ladder) for every selected
 issue or locked lane. Bind canonical identity and current execution state,
 diagnose the observed cause or uncertainty, choose the next phase, assign
 ownership/dependencies/acceptance/fallback, perform the durable action, read it
 back, preserve the prior decision while newer work is in flight, and report the
 decision separately from liveness. Routine missing preferences are not reasons
 to stop; project policy's non-delegable boundaries are.
+
+Fetch the linked contract with `web_extract` when running from an installed
+skill; no collection checkout is required. If it cannot be fetched, report
+the access gap and hold decisions that need the missing authority or guardrails
+rather than inventing them.
 
 ## Quick reference
 

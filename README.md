@@ -247,6 +247,8 @@ Recommended reusable profile roles:
 - `orchestrator` — operating and architecture authority for decomposition,
   architecture, ownership, sequencing, remediation, recovery, routing, WIP,
   adjudication, and tracker writes; no source-code writes;
+- `operator-observer` — read-only human-facing evidence and transport; never a
+  delivery mutation owner;
 - `implementer` — TDD-first code changes in isolated worktrees;
 - `code-reviewer` — independent read-only review from a fresh typed packet;
 - `completion-verifier` — checks review coverage, acceptance evidence, and board transitions;

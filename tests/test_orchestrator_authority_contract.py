@@ -1,8 +1,9 @@
-from pathlib import Path
 import re
+from pathlib import Path
+from urllib.parse import urlsplit
 
+import pytest
 import yaml
-
 
 ROOT = Path(__file__).resolve().parents[1]
 POLICY = ROOT / "examples" / "project-policy.yaml"
@@ -115,6 +116,38 @@ def test_shared_skills_require_the_common_decision_ladder():
         assert "shared decision ladder" in text
         assert "selected issue or locked lane" in text
 
+
+
+@pytest.mark.parametrize("skill", [
+    "kanban-factory-operations",
+    "kanban-implementation-workflow",
+    "kanban-progress-evidence",
+])
+def test_installed_skill_links_to_canonical_decision_ladder(tmp_path, skill):
+    # Raw SKILL.md installs must work without the collection checkout or siblings.
+    installed = tmp_path / skill / "SKILL.md"
+    installed.parent.mkdir()
+    installed.write_text(
+        (ROOT / "skills" / skill / "SKILL.md").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    text = installed.read_text(encoding="utf-8")
+    links = re.findall(r"\[[^\]]+\]\(([^)]+)\)", text)
+    contract_links = [urlsplit(link) for link in links if "profile-roles.md" in link]
+    assert contract_links, "Installed skill needs a fetchable canonical contract link"
+    for link in contract_links:
+        assert link.scheme == "https"
+        assert link.netloc == "github.com"
+        assert link.path == (
+            "/ksamaschke/hermes-software-factory/blob/main/docs/profile-roles.md"
+        )
+        assert link.fragment == "decision-ladder"
+        assert not link.query
+        # Verify the target and anchor offline; live availability is not a CI gate.
+        assert "### Decision ladder" in PROFILE_ROLES.read_text(encoding="utf-8")
+    assert "`docs/profile-roles.md`" not in text
+    assert "web_extract" in text
+    assert "cannot be fetched" in text
 
 
 def test_central_bridge_requires_recommendation_and_keeps_workers_off_human_channels():

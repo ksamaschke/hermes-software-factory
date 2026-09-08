@@ -45,11 +45,17 @@ readbacks.
 
 The orchestrator owns routine technical and operational decisions. Evidence
 verifies the effect after an action; it does not return routine decisions to the
-operator. Use the shared decision ladder in `docs/profile-roles.md` for every
+operator. Use the shared decision ladder in
+[the canonical role contract](https://github.com/ksamaschke/hermes-software-factory/blob/main/docs/profile-roles.md#decision-ladder) for every
 selected issue or locked lane: bind identity and current state, diagnose cause
 or uncertainty, choose the next phase, assign ownership and dependencies, act,
 read back the mutation, preserve the prior decision while newer work is in
 flight, and report the decision separately from liveness.
+
+Fetch the linked contract with `web_extract` when running from an installed
+skill; no collection checkout is required. If it cannot be fetched, report
+the access gap and hold decisions that need the missing authority or guardrails
+rather than inventing them.
 
 A review verdict is valid only when a fresh review packet records the candidate
 commit, exact scope, independent profile, read-only boundary, focused checks,

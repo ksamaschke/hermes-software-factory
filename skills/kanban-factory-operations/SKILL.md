@@ -51,12 +51,18 @@ operational path, including routine architecture, sequencing, remediation,
 recovery, routing, WIP, and the next safe phase. It does not ask the operator
 because a routine preference is missing.
 
-Use the shared decision ladder in `docs/profile-roles.md` for every selected
+Use the shared decision ladder in
+[the canonical role contract](https://github.com/ksamaschke/hermes-software-factory/blob/main/docs/profile-roles.md#decision-ladder) for every selected
 issue or locked lane: bind canonical identity and current execution state;
 diagnose the observed cause or uncertainty; choose the next phase; assign
 ownership, dependencies, acceptance, and fallback; act; read back the exact
 mutation; preserve the prior decision while newer work is in flight; and report
 the decision separately from liveness.
+
+Fetch the linked contract with `web_extract` when running from an installed
+skill; no collection checkout is required. If it cannot be fetched, report
+the access gap and hold decisions that need the missing authority or guardrails
+rather than inventing them.
 
 Guardrails constrain the action, not the orchestrator's decision ownership:
 preserve useful work, do not bypass independent review or deployment policy,
