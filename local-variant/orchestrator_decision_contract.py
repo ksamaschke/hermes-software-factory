@@ -1939,6 +1939,12 @@ def _validate_action_semantics(
     act_target = proposal.act.get("target_task_id")
     if choose_target != act_target:
         raise ContractViolation("decision conflict: choose and act targets differ")
+    if (
+        action in {"admit", "quarantine", "hold_missing_capability", "hold"}
+        and choose_target is not None
+        and choose_target != context.execution.task_id
+    ):
+        raise ContractViolation(f"{action} target is not bound to the current task")
     if action == "select_independent_lane" and (
         not isinstance(choose_target, str) or not choose_target.strip()
     ):

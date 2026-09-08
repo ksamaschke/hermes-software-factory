@@ -649,3 +649,50 @@ def test_failed_merged_artifact_requires_a_bound_repair_task():
 
     with pytest.raises(contract.ContractViolation, match="repair task identity"):
         contract.evaluate_decision(SyntheticDecisionModel(), context, adapter)
+
+
+def test_admission_rejects_a_foreign_target_task():
+    context = _context(
+        "foreign-admit-target",
+        {
+            "blocker": {
+                "fingerprint": "contract:v2",
+                "previous_fingerprint": "contract:v1",
+                "resolved": True,
+            }
+        },
+    )
+    adapter = contract.NoSideEffectFixtureAdapter(_fixture_state(context))
+
+    class ForeignTargetModel:
+        def complete(self, prompt: str, tools: dict[str, Any]) -> dict[str, Any]:
+            context_json = json.loads(
+                prompt.split("CONTEXT_JSON\n", 1)[1].split("\nEND_CONTEXT", 1)[0]
+            )
+            for name in (
+                "read_live_state",
+                "read_parent_completion",
+                "read_source_state",
+                "read_ready_lanes",
+                "read_capabilities",
+            ):
+                tools[name]()
+            key = context_json["idempotency_key"]
+            tools["propose_action"]("admit", key, "foreign-task")
+            readback = tools["read_action_readback"](key)
+            return {
+                "diagnose": {"summary": "resolved"},
+                "choose": {"action": "admit", "target_task_id": "foreign-task"},
+                "act": {
+                    "action": "admit",
+                    "idempotency_key": key,
+                    "target_task_id": "foreign-task",
+                },
+                "read_back": readback,
+                "advance": {"next_phase": "implementation"},
+            }
+
+    with pytest.raises(
+        contract.ContractViolation, match="target is not bound to the current task"
+    ):
+        contract.evaluate_decision(ForeignTargetModel(), context, adapter)
