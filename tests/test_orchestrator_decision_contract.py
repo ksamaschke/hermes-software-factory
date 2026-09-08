@@ -48,11 +48,7 @@ class SyntheticDecisionModel:
 
         blocker = live.get("blocker", {})
         existing = live.get("existing_action") or {}
-        if capabilities.get("missing"):
-            action = "hold_missing_capability"
-            next_phase = context["phase"]
-            target = None
-        elif (
+        if (
             source.get("artifact_state") == "failed"
             and source.get("source_state") == "merged"
         ):
@@ -63,6 +59,10 @@ class SyntheticDecisionModel:
             action = "select_independent_lane"
             next_phase = "implementation"
             target = ready[0]["task_id"]
+        elif capabilities.get("missing"):
+            action = "hold_missing_capability"
+            next_phase = context["phase"]
+            target = None
         elif (
             existing.get("status") == "blocked"
             and existing.get("current_run_id") is None
@@ -90,6 +90,7 @@ class SyntheticDecisionModel:
             next_phase = context["phase"]
             target = None
 
+        tools["propose_action"](action, key, target)
         readback = tools["read_action_readback"](key)
         return {
             "diagnose": {
@@ -122,8 +123,10 @@ def _context(item_key: str, state: dict[str, Any]):
         item_key=item_key,
         kind="issue",
     )
-    phase = state.get("phase", "triage")
-    blocker = state.get("blocker", {})
+    live_state = state.get("live", {})
+    source_fixture = state.get("source", {})
+    phase = state.get("phase", live_state.get("phase", "triage"))
+    blocker = state.get("blocker", live_state.get("blocker", {}))
     execution = contract.ExecutionIdentity(
         mode="scheduled",
         profile_name="orchestrator-profile",
@@ -152,15 +155,20 @@ def _context(item_key: str, state: dict[str, Any]):
             contract.TypedEvidence(
                 kind="source",
                 subject=source.canonical_key,
-                status=state.get("source_state", "open"),
+                status=state.get(
+                    "source_state", source_fixture.get("source_state", "open")
+                ),
                 reference=f"source-ref-{item_key}",
+                attributes={
+                    "artifact_state": source_fixture.get("artifact_state", "ready")
+                },
             ),
         ),
         review=(
             contract.TypedEvidence(
                 kind="review",
                 subject=source.canonical_key,
-                status=state.get("review_state", "not_required"),
+                status=state.get("review_state", "approved"),
                 reference=f"review-ref-{item_key}",
                 candidate=state.get("candidate"),
             ),
@@ -198,6 +206,8 @@ def _context(item_key: str, state: dict[str, Any]):
 
 
 def _fixture_state(context, **overrides: Any) -> dict[str, Any]:
+    source_evidence = context.evidence.source[0]
+    artifact_state = source_evidence.attributes.get("artifact_state", "ready")
     key = contract.action_idempotency_key(context)
     state: dict[str, Any] = {
         "live": {
@@ -208,9 +218,29 @@ def _fixture_state(context, **overrides: Any) -> dict[str, Any]:
                 "resolved": context.blocker.resolved,
             },
             "existing_action": None,
+            "current_run_id": context.execution.run_id,
+            "source_key": context.source_item.canonical_key,
+            "phase": context.phase,
+            "input_identity": context.input_identity,
+            "semantic_lane": context.semantic_lane,
+            "branch": context.execution.branch,
+            "tenant": context.execution.tenant,
+            "singleton_key": context.execution.singleton_key,
+            "credentials_verified": context.execution.credentials_verified,
+            "production": context.execution.production,
+            "production_approved": context.execution.production_approved,
+            "retry_count": context.execution.retry_count,
         },
         "parent": context.parent_completion.as_dict(),
-        "source": {"source_state": "open", "artifact_state": "ready"},
+        "source": {
+            "source_key": context.source_item.canonical_key,
+            "phase": context.phase,
+            "input_identity": context.input_identity,
+            "semantic_lane": context.semantic_lane,
+            "current_run_id": context.execution.run_id,
+            "source_state": source_evidence.status,
+            "artifact_state": artifact_state,
+        },
         "ready": [],
         "capabilities": {"missing": []},
         "readbacks": {
@@ -221,7 +251,27 @@ def _fixture_state(context, **overrides: Any) -> dict[str, Any]:
             }
         },
     }
-    state.update(overrides)
+
+    def merge(base: dict[str, Any], update: dict[str, Any]) -> None:
+        for name, value in update.items():
+            if isinstance(base.get(name), dict) and isinstance(value, dict):
+                merge(base[name], value)
+            else:
+                base[name] = value
+
+    merge(state, overrides)
+    existing = state["live"].get("existing_action")
+    if isinstance(existing, dict):
+        bound = {
+            "source_key": context.source_item.canonical_key,
+            "phase": context.phase,
+            "input_identity": context.input_identity,
+            "semantic_lane": context.semantic_lane,
+            "blocker_fingerprint": context.blocker.fingerprint,
+            "current_run_id": context.execution.run_id,
+        }
+        bound.update(existing)
+        state["live"]["existing_action"] = bound
     return state
 
 
@@ -315,6 +365,11 @@ def test_model_fixture_path_makes_safe_decisions_for_unseen_ids_without_writes()
         (
             "unseen-case-reuse",
             {
+                "blocker": {
+                    "fingerprint": "existing:blocked",
+                    "previous_fingerprint": "other:blocker",
+                    "occurrences": 1,
+                },
                 "live": {
                     "blocker": {},
                     "existing_action": {
@@ -330,6 +385,10 @@ def test_model_fixture_path_makes_safe_decisions_for_unseen_ids_without_writes()
         (
             "unseen-case-independent",
             {
+                "blocker": {
+                    "fingerprint": "signer:held",
+                    "previous_fingerprint": "signer:old",
+                },
                 "ready": [{"task_id": "independent-ready"}],
                 "live": {"blocker": {"fingerprint": "signer:held"}},
             },
@@ -422,6 +481,11 @@ def test_reused_and_current_run_null_are_not_claimed_as_new_execution():
     context = _context(
         "unseen-case-null-run",
         {
+            "blocker": {
+                "fingerprint": "reuse:blocked",
+                "previous_fingerprint": "reuse:old",
+                "occurrences": 1,
+            },
             "live": {
                 "blocker": {},
                 "existing_action": {
@@ -429,7 +493,7 @@ def test_reused_and_current_run_null_are_not_claimed_as_new_execution():
                     "task_id": "reused-card",
                     "current_run_id": None,
                 },
-            }
+            },
         },
     )
     key = contract.action_idempotency_key(context)
@@ -463,6 +527,53 @@ def test_reused_and_current_run_null_are_not_claimed_as_new_execution():
     assert result.readback["status"] == "reused"
     assert result.readback["current_run_id"] is None
     assert result.new_current_run is False
+
+
+def test_controller_does_not_auto_propose_a_response_without_a_model_commit():
+    context = _context(
+        "causal-no-proposal",
+        {
+            "blocker": {
+                "fingerprint": "provider:capacity",
+                "previous_fingerprint": "provider:capacity",
+                "occurrences": 3,
+            }
+        },
+    )
+    adapter = contract.NoSideEffectFixtureAdapter(_fixture_state(context))
+
+    class ResponseOnlyModel:
+        def complete(self, prompt: str, tools: dict[str, Any]) -> dict[str, Any]:
+            context_json = json.loads(
+                prompt.split("CONTEXT_JSON\n", 1)[1].split("\nEND_CONTEXT", 1)[0]
+            )
+            for name in (
+                "read_live_state",
+                "read_parent_completion",
+                "read_source_state",
+                "read_ready_lanes",
+                "read_capabilities",
+            ):
+                tools[name]()
+            key = context_json["idempotency_key"]
+            return {
+                "diagnose": {"summary": "observed"},
+                "choose": {"action": "quarantine"},
+                "act": {"action": "quarantine", "idempotency_key": key},
+                "read_back": {
+                    "idempotency_key": key,
+                    "status": "not_started",
+                    "current_run_id": None,
+                },
+                "advance": {"next_phase": context_json["phase"]},
+            }
+
+    with pytest.raises(
+        contract.ContractViolation, match="controller will not auto-propose"
+    ):
+        contract.evaluate_decision(ResponseOnlyModel(), context, adapter)
+    assert adapter.proposal is None
+    assert adapter.proposal_attempts == 0
 
 
 def test_contract_surface_is_generic_and_does_not_embed_private_identifiers():
