@@ -222,16 +222,18 @@ def build_isolated_environment(
     if inherited_board:
         try:
             protected_roots.append(Path(inherited_board).expanduser().resolve().parent)
-        except OSError:
-            # An invalid inherited path is still discarded below; it must not
-            # prevent creation of a valid isolated child environment.
-            pass
+        except OSError as exc:
+            raise NativeEvaluationUnavailable(
+                "inherited board path cannot be normalized safely"
+            ) from exc
     inherited_home = str(parent_env.get("HERMES_KANBAN_HOME", "")).strip()
     if inherited_home:
         try:
             protected_roots.append(Path(inherited_home).expanduser().resolve())
-        except OSError:
-            pass
+        except OSError as exc:
+            raise NativeEvaluationUnavailable(
+                "inherited board path cannot be normalized safely"
+            ) from exc
     for key in (
         "HERMES_KANBAN_WORKSPACES_ROOT",
         "HERMES_KANBAN_ATTACHMENTS_ROOT",
@@ -240,8 +242,10 @@ def build_isolated_environment(
         if inherited_root:
             try:
                 protected_roots.append(Path(inherited_root).expanduser().resolve())
-            except OSError:
-                pass
+            except OSError as exc:
+                raise NativeEvaluationUnavailable(
+                    "inherited board path cannot be normalized safely"
+                ) from exc
     isolated_root = board_path.parent
     isolated_paths = (
         profile,
