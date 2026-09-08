@@ -16,10 +16,12 @@ import copy
 import hashlib
 import json
 import os
+import selectors
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -41,12 +43,15 @@ try:  # Running as a package is useful to downstream installers.
         ParentCompletion,
         SourceIdentity,
         TypedEvidence,
+        _action_key_from_decision_identity,
         _receipt_digest,
+        _redact_text,
         _safe_identifier,
         _safe_value,
         _validate_observation_trace,
         action_idempotency_key,
         build_input_identity,
+        decision_identity_key,
         decision_response_requirements_text,
         evaluate_decision,
         simulated_action_readback,
@@ -66,12 +71,15 @@ except ImportError:  # Running this file directly is the supported CLI path.
         ParentCompletion,
         SourceIdentity,
         TypedEvidence,
+        _action_key_from_decision_identity,
         _receipt_digest,
+        _redact_text,
         _safe_identifier,
         _safe_value,
         _validate_observation_trace,
         action_idempotency_key,
         build_input_identity,
+        decision_identity_key,
         decision_response_requirements_text,
         evaluate_decision,
         simulated_action_readback,
@@ -84,6 +92,7 @@ READ_TOOL_NAMES = (
     "read_source_state",
     "read_ready_lanes",
     "read_capabilities",
+    "read_action_key",
     "read_action_readback",
 )
 FIXTURE_TOOL_NAMES = (*READ_TOOL_NAMES, "propose_action")
@@ -95,13 +104,14 @@ _NATIVE_SCANNER_NOTICE = (
 NATIVE_QUERY_SUFFIX = f"""
 This is a native integration evaluation. Use the read-only MCP fixture tools,
 not assumptions or prose. Call every read_* tool at least once. First diagnose
-and choose, then call propose_action exactly once with the chosen action and the
-idempotency_key from CONTEXT_JSON; this records a fixture-only proposal and is
-not a live mutation. Do not call read_action_readback before that proposal. Only
-after the proposal, call read_action_readback with the same key and copy the
-complete returned receipt payload, including action, receipt, receipt_digest,
-admission_count, and any selected_task_id. Never call a mutation, shell, file,
-memory, or network tool.
+and choose, then call read_action_key with the chosen action and exact target
+(or null when the action has no target). Use its returned idempotency_key in
+propose_action exactly once; this records a fixture-only proposal and is not a
+live mutation. Do not call read_action_readback before that proposal. Only
+after the proposal, call read_action_readback with the same returned key and
+copy the complete returned receipt payload, including action, receipt,
+receipt_digest, admission_count, and any selected_task_id. Never call a
+mutation, shell, file, memory, or network tool.
 Return exactly one JSON object matching this minimum shape; the required fields
 are: {decision_response_requirements_text()}.
 The read_back status and current_run_id must be copied from the post-proposal
@@ -123,7 +133,8 @@ repair_artifact, hold_missing_capability, or hold. The choose and act actions
 must match the one proposal and the read_back fields must match the post-proposal
 fixture read. Keep current_run_id null unless the fixture explicitly returns a
 newly admitted run. For select_independent_lane, include choose.target_task_id
-copied exactly from read_ready_lanes. For reuse_existing, copy the bound
+copied exactly from read_ready_lanes. For admit, choose and act.target_task_id
+MUST equal CONTEXT_JSON.current_task.id; never omit it. For reuse_existing, copy the bound
 existing_action.task_id; for repair_artifact, copy source.artifact_task_id.
 The act target must match choose.target_task_id. A denied tool or capability is
 evidence for a bounded hold; do not retry a denied command with altered syntax
@@ -182,6 +193,10 @@ _SAFE_CHILD_ENV_KEYS = frozenset(
 _SAFE_CHILD_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 
+def _paths_overlap(first: Path, second: Path) -> bool:
+    return first == second or first in second.parents or second in first.parents
+
+
 def build_isolated_environment(
     parent_env: Mapping[str, str], profile: Path, board_path: Path
 ) -> dict[str, str]:
@@ -227,8 +242,19 @@ def build_isolated_environment(
                 protected_roots.append(Path(inherited_root).expanduser().resolve())
             except OSError:
                 pass
+    isolated_root = board_path.parent
+    isolated_paths = (
+        profile,
+        isolated_root,
+        board_path,
+        isolated_root / "tmp",
+        isolated_root / "workspaces",
+        isolated_root / "attachments",
+    )
     if any(
-        board_path == root or root in board_path.parents for root in protected_roots
+        _paths_overlap(candidate, root)
+        for candidate in isolated_paths
+        for root in protected_roots
     ):
         raise NativeEvaluationUnavailable(
             "isolated board path overlaps inherited board authority"
@@ -242,7 +268,6 @@ def build_isolated_environment(
     }
     child["PATH"] = _SAFE_CHILD_PATH
 
-    isolated_root = board_path.parent
     child.update(
         {
             "HERMES_HOME": str(profile),
@@ -291,8 +316,8 @@ class NativeEvaluation:
 
     def as_dict(self) -> dict[str, Any]:
         return {
-            "model": self.model,
-            "provider": self.provider,
+            "model": _redact_text(self.model),
+            "provider": _redact_text(self.provider),
             "case_count": len(self.cases),
             "cases": [dict(case) for case in self.cases],
         }
@@ -398,6 +423,7 @@ def _case_state(
 ) -> dict[str, Any]:
     del _expected_action  # The oracle remains outside the model-visible state.
     return {
+        "decision_identity_key": decision_identity_key(context),
         "live": {
             "blocker": context.blocker.as_dict(),
             "existing_action": copy.deepcopy(existing_action),
@@ -813,6 +839,29 @@ class _FixtureStore:
         value = self._state().get(key, default)
         return copy.deepcopy(_safe_value(value, f"fixture.{key}"))
 
+    def read_action_key(
+        self, action: str, target_task_id: str | None = None
+    ) -> dict[str, Any]:
+        action = _safe_identifier(action, "action_key.action")
+        target = (
+            None
+            if target_task_id is None
+            else _safe_identifier(target_task_id, "action_key.target_task_id")
+        )
+        state = self._state()
+        decision_identity = _safe_identifier(
+            state.get("decision_identity_key"), "decision_identity_key"
+        )
+        result = {
+            "action": action,
+            "target_task_id": target,
+            "idempotency_key": _action_key_from_decision_identity(
+                decision_identity, action, target
+            ),
+        }
+        self._record("read_action_key", **result)
+        return result
+
     def propose_action(
         self,
         action: str,
@@ -829,6 +878,15 @@ class _FixtureStore:
         idempotency_key = _safe_identifier(idempotency_key, "proposal.idempotency_key")
         if target_task_id is not None:
             target_task_id = _safe_identifier(target_task_id, "proposal.target_task_id")
+        decision_identity = _safe_identifier(
+            self._state().get("decision_identity_key"), "decision_identity_key"
+        )
+        if idempotency_key != _action_key_from_decision_identity(
+            decision_identity, action, target_task_id
+        ):
+            raise ContractViolation(
+                "fixture proposal key is not bound to action and target"
+            )
         simulated_action_readback(action, idempotency_key, target_task_id)
         self._proposal = {
             "action": action,
@@ -915,6 +973,15 @@ def serve_fixture(state_path: str, trace_path: str) -> None:
     )
     def read_capabilities() -> dict[str, Any]:
         return store.read("read_capabilities", "capabilities", {})
+
+    @server.tool(
+        name="read_action_key",
+        description="Read the exact key bound to one action and target.",
+    )
+    def read_action_key(
+        action: str, target_task_id: str | None = None
+    ) -> dict[str, Any]:
+        return store.read_action_key(action, target_task_id)
 
     @server.tool(
         name="propose_action",
@@ -1110,23 +1177,98 @@ def _inherited_board_paths(parent_env: Mapping[str, str]) -> tuple[Path, ...]:
     return tuple(dict.fromkeys(paths))
 
 
-def snapshot_board_state(parent_env: Mapping[str, str]) -> dict[Path, tuple[Any, ...]]:
-    """Capture metadata for an inherited board without opening or mutating it."""
+_MAX_SNAPSHOT_ENTRIES = 8_192
+_MAX_SNAPSHOT_FILE_BYTES = 64 * 1024 * 1024
 
-    def signature(path: Path) -> tuple[Any, ...]:
-        stat = path.stat()
-        if path.is_file():
-            digest = hashlib.sha256()
-            with path.open("rb") as stream:
-                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            return (True, stat.st_ino, stat.st_size, digest.hexdigest())
-        return (True, stat.st_ino, stat.st_mode)
+
+def _file_digest(path: Path, size: int) -> str:
+    if size > _MAX_SNAPSHOT_FILE_BYTES:
+        raise NativeEvaluationUnavailable("inherited board file exceeds snapshot bound")
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _path_signature(path: Path) -> tuple[Any, ...]:
+    """Fingerprint a file or bounded directory tree without following links."""
+
+    stat = path.lstat()
+    if path.is_symlink():
+        return ("symlink", stat.st_ino, stat.st_mode, os.readlink(path))
+    if not path.is_dir():
+        digest = _file_digest(path, stat.st_size) if path.is_file() else None
+        return (
+            "file",
+            stat.st_ino,
+            stat.st_mode,
+            stat.st_size,
+            stat.st_mtime_ns,
+            digest,
+        )
+
+    records: list[tuple[Any, ...]] = []
+    pending = [path]
+    while pending:
+        current = pending.pop()
+        entries = sorted(os.scandir(current), key=lambda entry: entry.name)
+        for entry in entries:
+            entry_path = Path(entry.path)
+            entry_stat = entry.stat(follow_symlinks=False)
+            relative = entry_path.relative_to(path).as_posix()
+            if entry.is_symlink():
+                record = (relative, "symlink", os.readlink(entry_path))
+            elif entry.is_dir(follow_symlinks=False):
+                record = (
+                    relative,
+                    "directory",
+                    entry_stat.st_ino,
+                    entry_stat.st_mode,
+                    entry_stat.st_mtime_ns,
+                )
+                pending.append(entry_path)
+            elif entry.is_file(follow_symlinks=False):
+                record = (
+                    relative,
+                    "file",
+                    entry_stat.st_ino,
+                    entry_stat.st_mode,
+                    entry_stat.st_size,
+                    entry_stat.st_mtime_ns,
+                    _file_digest(entry_path, entry_stat.st_size),
+                )
+            else:
+                record = (
+                    relative,
+                    "other",
+                    entry_stat.st_ino,
+                    entry_stat.st_mode,
+                    entry_stat.st_size,
+                    entry_stat.st_mtime_ns,
+                )
+            records.append(record)
+            if len(records) > _MAX_SNAPSHOT_ENTRIES:
+                raise NativeEvaluationUnavailable(
+                    "inherited board directory exceeds snapshot bound"
+                )
+    encoded = json.dumps(records, sort_keys=True, separators=(",", ":"))
+    return (
+        "directory",
+        stat.st_ino,
+        stat.st_mode,
+        stat.st_mtime_ns,
+        hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+    )
+
+
+def snapshot_board_state(parent_env: Mapping[str, str]) -> dict[Path, tuple[Any, ...]]:
+    """Capture bounded content fingerprints for inherited board paths."""
 
     snapshot: dict[Path, tuple[Any, ...]] = {}
     for path in _inherited_board_paths(parent_env):
         try:
-            snapshot[path] = signature(path)
+            snapshot[path] = _path_signature(path)
         except FileNotFoundError:
             snapshot[path] = (False,)
         except OSError as exc:
@@ -1135,27 +1277,16 @@ def snapshot_board_state(parent_env: Mapping[str, str]) -> dict[Path, tuple[Any,
 
 
 def verify_board_state_unchanged(snapshot: Mapping[Path, tuple[Any, ...]]) -> None:
-    """Raise if the native child touched an inherited board or SQLite sidecar."""
+    """Raise if the native child touched inherited board or tree contents."""
 
-    def signature(path: Path) -> tuple[Any, ...]:
-        stat = path.stat()
-        if path.is_file():
-            digest = hashlib.sha256()
-            with path.open("rb") as stream:
-                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            return (True, stat.st_ino, stat.st_size, digest.hexdigest())
-        return (True, stat.st_ino, stat.st_mode)
-
-    current: dict[Path, tuple[Any, ...]] = {}
     for path, before in snapshot.items():
         try:
-            current[path] = signature(path)
+            current = _path_signature(path)
         except FileNotFoundError:
-            current[path] = (False,)
+            current = (False,)
         except OSError as exc:
-            current[path] = ("unreadable", type(exc).__name__)
-        if current[path] != before:
+            current = ("unreadable", type(exc).__name__)
+        if current != before:
             raise NativeEvaluationUnavailable(
                 "native evaluation touched inherited board state"
             )
@@ -1208,6 +1339,72 @@ def _parse_json_response(text: str) -> Mapping[str, Any]:
     if payload[end:].strip():
         raise ContractViolation("native model response contains trailing output")
     return value
+
+
+def _run_bounded_process(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: Mapping[str, str],
+    timeout: int,
+) -> tuple[int, str, str]:
+    """Run a child while bounding stdout/stderr before buffering them."""
+
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=dict(env),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    selector = selectors.DefaultSelector()
+    buffers: dict[int, bytearray] = {}
+    try:
+        assert process.stdout is not None and process.stderr is not None
+        stream_fds = (process.stdout.fileno(), process.stderr.fileno())
+        for stream in (process.stdout, process.stderr):
+            selector.register(stream, selectors.EVENT_READ)
+            buffers[stream.fileno()] = bytearray()
+        deadline = time.monotonic() + timeout
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout)
+            events = selector.select(remaining)
+            if not events:
+                continue
+            for selected, _ in events:
+                chunk = os.read(selected.fd, 8192)
+                if not chunk:
+                    selector.unregister(selected.fileobj)
+                    os.close(selected.fd)
+                    continue
+                buffer = buffers[selected.fd]
+                buffer.extend(chunk)
+                if len(buffer) > _MAX_NATIVE_OUTPUT_CHARS:
+                    raise ContractViolation(
+                        "native Hermes output exceeds the contract bound"
+                    )
+        return_code = process.wait(timeout=max(0.1, deadline - time.monotonic()))
+        output = [bytes(buffers[fd]).decode("utf-8") for fd in stream_fds]
+        return return_code, output[0], output[1]
+    except (UnicodeDecodeError, subprocess.TimeoutExpired):
+        raise
+    except BaseException:
+        if process.poll() is None:
+            process.kill()
+        raise
+    finally:
+        try:
+            selector.close()
+        finally:
+            if process.poll() is None:
+                process.kill()
+            try:
+                process.wait(timeout=1)
+            except (subprocess.TimeoutExpired, ChildProcessError):
+                pass
 
 
 class HermesSubprocessModel(DecisionModel):
@@ -1270,30 +1467,22 @@ class HermesSubprocessModel(DecisionModel):
             str(self.run_budget),
         ]
         try:
-            completed = subprocess.run(
+            return_code, stdout, _stderr = _run_bounded_process(
                 command,
                 cwd=self.profile,
                 env=env,
-                capture_output=True,
-                text=True,
                 timeout=self.run_budget + 30,
-                check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise NativeEvaluationUnavailable(
                 "native Hermes one-shot did not finish"
             ) from exc
-        if completed.returncode != 0:
+        if return_code != 0:
             raise NativeEvaluationUnavailable(
-                f"native Hermes one-shot failed with exit code {completed.returncode}"
+                f"native Hermes one-shot failed with exit code {return_code}"
             )
-        if (
-            len(completed.stdout) > _MAX_NATIVE_OUTPUT_CHARS
-            or len(completed.stderr) > _MAX_NATIVE_OUTPUT_CHARS
-        ):
-            raise ContractViolation("native Hermes output exceeds the contract bound")
         if not self.trace_path.exists():
-            return _parse_json_response(completed.stdout)
+            return _parse_json_response(stdout)
         try:
             trace_size = self.trace_path.stat().st_size
         except OSError as exc:
@@ -1342,7 +1531,7 @@ class HermesSubprocessModel(DecisionModel):
             },
             dict(receipt),
         )
-        return _parse_json_response(completed.stdout)
+        return _parse_json_response(stdout)
 
 
 def run_native_evaluation(
@@ -1452,7 +1641,15 @@ def run_native_evaluation(
                 )
             proposal_entry = trace[proposal_indices[0]]
             readback_entry = trace[readback_indices[0]]
-            expected_key = action_idempotency_key(case.context)
+            chosen_action = _safe_identifier(
+                result.proposal.choose.get("action"), "choose.action"
+            )
+            chosen_target = result.proposal.choose.get("target_task_id")
+            if chosen_target is not None:
+                chosen_target = _safe_identifier(chosen_target, "choose.target_task_id")
+            expected_key = action_idempotency_key(
+                case.context, chosen_action, chosen_target
+            )
             if proposal_entry.get("action") != result.proposal.choose.get("action"):
                 raise ContractViolation(
                     "native fixture proposal does not match the chosen action"

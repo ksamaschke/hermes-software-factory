@@ -13,7 +13,7 @@ import hashlib
 import json
 import math
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -48,6 +48,7 @@ _REDACTED = "[REDACTED]"
 _PRIVATE_PATH = "[PRIVATE_PATH]"
 _MAX_SAFE_VALUE_DEPTH = 32
 _MAX_SAFE_VALUE_ITEMS = 1_024
+_MAX_SAFE_VALUE_NODES = 8_192
 _MAX_SAFE_TEXT_CHARS = 32_000
 _MAX_INPUT_ITEMS = 1_024
 _MAX_NATIVE_TRACE_ENTRIES = 512
@@ -69,7 +70,7 @@ _AUTH_HEADER_VALUE = re.compile(
 )
 _BEARER_VALUE = re.compile(r"(\bbearer\s+)[^\s,;]+", re.IGNORECASE)
 _PRIVATE_PATH_VALUE = re.compile(
-    r"(?<![A-Za-z0-9_])/(?:home|root|operator|Users|private|var/lib|etc/ssh|srv|opt|tmp|mnt|workspace(?:s)?|app)(?:/[^\s\"']*)?",
+    r"(?<![A-Za-z0-9_])/(?:home|root|operator|Users|private|run/secrets|var/lib|etc/ssh|srv|opt|tmp|mnt|workspace(?:s)?|app)(?:/[^\s\"']*)?",
     re.IGNORECASE,
 )
 _SECRET_QUERY_NAME = re.compile(
@@ -170,6 +171,15 @@ def _redact_text(text: str) -> str:
     return value
 
 
+def _secret_key_match(key: str) -> bool:
+    """Match snake, kebab, spaced, and camel-case secret field names."""
+
+    candidate = re.split(r"[=:]", key, maxsplit=1)[0]
+    normalized = re.sub(r"(?<!^)(?=[A-Z])", "_", candidate)
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", normalized).casefold()
+    return bool(_SECRET_KEY.search(normalized))
+
+
 def _safe_identifier(value: Any, field_name: str) -> str:
     """Validate an identity and keep secrets/private paths out of context."""
 
@@ -203,14 +213,32 @@ def _required(value: Any, field_name: str) -> str:
     return value
 
 
-def _safe_value(value: Any, field_name: str = "value", *, _depth: int = 0) -> Any:
+def _safe_value(
+    value: Any,
+    field_name: str = "value",
+    *,
+    _depth: int = 0,
+    _nodes: list[int] | None = None,
+    _seen: set[int] | None = None,
+) -> Any:
     """Copy bounded JSON-like values with value-level secret redaction."""
 
+    if _nodes is None:
+        _nodes = [0]
+    if _seen is None:
+        _seen = set()
+    _nodes[0] += 1
+    if _nodes[0] > _MAX_SAFE_VALUE_NODES:
+        raise ContractViolation(f"value exceeds the node bound: {field_name}")
     if _depth > _MAX_SAFE_VALUE_DEPTH:
         raise ContractViolation(
             f"nested value exceeds the contract bound: {field_name}"
         )
     if isinstance(value, Mapping):
+        object_id = id(value)
+        if object_id in _seen:
+            raise ContractViolation(f"cyclic or shared value: {field_name}")
+        _seen.add(object_id)
         if len(value) > _MAX_SAFE_VALUE_ITEMS:
             raise ContractViolation(f"mapping exceeds the contract bound: {field_name}")
         result = {}
@@ -223,22 +251,39 @@ def _safe_value(value: Any, field_name: str = "value", *, _depth: int = 0) -> An
             if _UNSAFE_LOG_KEY.search(key_text):
                 raise ContractViolation(f"unsafe field in {field_name}: {key_text}")
             safe_key = _redact_text(key_text)
-            if _SECRET_KEY.search(key_text):
+            if _secret_key_match(key_text):
                 safe_item = _REDACTED
             else:
                 safe_item = _safe_value(
-                    item, f"{field_name}.{safe_key}", _depth=_depth + 1
+                    item,
+                    f"{field_name}.{safe_key}",
+                    _depth=_depth + 1,
+                    _nodes=_nodes,
+                    _seen=_seen,
                 )
             if safe_key in result:
                 raise ContractViolation(f"redacted field collision in {field_name}")
             result[safe_key] = safe_item
         return result
     if isinstance(value, (list, tuple)):
+        object_id = id(value)
+        if object_id in _seen:
+            raise ContractViolation(f"cyclic or shared value: {field_name}")
+        _seen.add(object_id)
         if len(value) > _MAX_SAFE_VALUE_ITEMS:
             raise ContractViolation(
                 f"sequence exceeds the contract bound: {field_name}"
             )
-        return [_safe_value(item, field_name, _depth=_depth + 1) for item in value]
+        return [
+            _safe_value(
+                item,
+                field_name,
+                _depth=_depth + 1,
+                _nodes=_nodes,
+                _seen=_seen,
+            )
+            for item in value
+        ]
     if value is None or isinstance(value, (bool, int, float)):
         if isinstance(value, float) and not math.isfinite(value):
             raise ContractViolation(f"non-finite value in {field_name}")
@@ -721,7 +766,7 @@ class DecisionContext:
             "phase": _safe_identifier(self.phase, "phase"),
             "input_identity": _safe_identifier(self.input_identity, "input_identity"),
             "semantic_lane": _safe_identifier(self.semantic_lane, "semantic_lane"),
-            "idempotency_key": action_idempotency_key(self),
+            "decision_identity_key": decision_identity_key(self),
             "blocker": self.blocker.as_dict(),
             "parent_completion": self.parent_completion.as_dict(),
             "evidence": self.evidence.as_dict(),
@@ -734,19 +779,61 @@ class DecisionContext:
         return result
 
 
-def action_idempotency_key(context: DecisionContext) -> str:
-    """Derive one stable action key from canonical identity, never title text."""
-
-    value = "\x1f".join(
-        (
-            context.source_item.canonical_key,
-            _safe_identifier(context.phase, "phase"),
-            _safe_identifier(context.input_identity, "input_identity"),
-            _safe_identifier(context.semantic_lane, "semantic_lane"),
-            _safe_identifier(context.execution.task_id, "current_task.id"),
-        )
+def _identity_digest(document: Mapping[str, Any], prefix: str) -> str:
+    encoded = json.dumps(
+        dict(document), sort_keys=True, ensure_ascii=True, separators=(",", ":")
     )
-    return "action-" + hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
+    return prefix + hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:32]
+
+
+def decision_identity_key(context: DecisionContext) -> str:
+    """Derive an injective key for the current typed decision identity."""
+
+    return _identity_digest(
+        {
+            "schema": CONTRACT_SCHEMA,
+            "source_key": context.source_item.canonical_key,
+            "phase": _safe_identifier(context.phase, "phase"),
+            "input_identity": _safe_identifier(
+                context.input_identity, "input_identity"
+            ),
+            "semantic_lane": _safe_identifier(context.semantic_lane, "semantic_lane"),
+            "task_id": _safe_identifier(context.execution.task_id, "current_task.id"),
+        },
+        "decision-",
+    )
+
+
+def _action_key_from_decision_identity(
+    decision_identity: str, action: str, target_task_id: str | None
+) -> str:
+    return _identity_digest(
+        {
+            "schema": CONTRACT_SCHEMA,
+            "decision_identity": _safe_identifier(
+                decision_identity, "decision_identity"
+            ),
+            "action": _safe_identifier(action, "proposal.action"),
+            "target_task_id": (
+                None
+                if target_task_id is None
+                else _safe_identifier(target_task_id, "proposal.target_task_id")
+            ),
+        },
+        "action-",
+    )
+
+
+def action_idempotency_key(
+    context: DecisionContext,
+    action: str,
+    target_task_id: str | None = None,
+) -> str:
+    """Derive an injective key bound to identity, action, and target."""
+
+    return _action_key_from_decision_identity(
+        decision_identity_key(context), action, target_task_id
+    )
 
 
 def _evidence_identity(item: Mapping[str, Any], name: str) -> Any:
@@ -965,6 +1052,12 @@ class PromptEnvelope:
 
 
 def _check_input_items(value: Any, field_name: str) -> None:
+    if isinstance(value, Iterable) and not isinstance(
+        value, (Mapping, Sequence, str, bytes, bytearray)
+    ):
+        raise ContractViolation(
+            f"{field_name} input must be a bounded mapping or sequence"
+        )
     if (
         isinstance(value, (Mapping, Sequence))
         and not isinstance(value, (str, bytes, bytearray))
@@ -1133,6 +1226,7 @@ def _validate_observation_trace(
         "read_source_state",
         "read_ready_lanes",
         "read_capabilities",
+        "read_action_key",
         "propose_action",
         "read_action_readback",
     }
@@ -1167,6 +1261,7 @@ def _validate_observation_trace(
         "read_source_state",
         "read_ready_lanes",
         "read_capabilities",
+        "read_action_key",
     }
     missing = sorted(required_reads - set(names))
     if missing:
@@ -1180,6 +1275,13 @@ def _validate_observation_trace(
             "native fixture proposal precedes a required state observation"
         )
 
+    action_key_reads = [
+        index for index, name in enumerate(names) if name == "read_action_key"
+    ]
+    if len(action_key_reads) != 1 or action_key_reads[0] >= proposals[0]:
+        raise ContractViolation(
+            "native fixture trace must contain one pre-proposal action-key read"
+        )
     proposal = trace[proposals[0]]
     readback = trace[readbacks[0]]
     proposal_fields = {"tool", "action", "idempotency_key"}
@@ -1198,6 +1300,13 @@ def _validate_observation_trace(
     target = proposal.get("target_task_id")
     if target is not None:
         target = _safe_identifier(target, "trace.proposal.target_task_id")
+    action_key_entry = trace[action_key_reads[0]]
+    if (
+        action_key_entry.get("action") != action
+        or action_key_entry.get("target_task_id") != target
+        or action_key_entry.get("idempotency_key") != key
+    ):
+        raise ContractViolation("native fixture action key differs from proposal")
     readback_key = _safe_identifier(
         readback.get("idempotency_key"), "trace.readback.idempotency_key"
     )
@@ -1367,6 +1476,28 @@ class NoSideEffectFixtureAdapter:
             raise ContractViolation("fixture capability state is malformed")
         return dict(value)
 
+    def read_action_key(
+        self, action: str, target_task_id: str | None = None
+    ) -> dict[str, Any]:
+        """Return the action/target-bound key without changing fixture state."""
+
+        if self._context is None:
+            raise ContractViolation("action key requested before context binding")
+        action = _safe_identifier(action, "action_key.action")
+        if action not in self._context.policy.allowed_actions:
+            raise ContractViolation("action key requested for a disallowed action")
+        target = (
+            None
+            if target_task_id is None
+            else _safe_identifier(target_task_id, "action_key.target_task_id")
+        )
+        self._reads.append("action_key")
+        return {
+            "action": action,
+            "target_task_id": target,
+            "idempotency_key": action_idempotency_key(self._context, action, target),
+        }
+
     def propose_action(
         self,
         action: str,
@@ -1388,6 +1519,7 @@ class NoSideEffectFixtureAdapter:
             "source",
             "ready_lanes",
             "capabilities",
+            "action_key",
         }.issubset(self._reads):
             raise ContractViolation(
                 "fixture proposal requires complete pre-proposal observations"
@@ -1397,7 +1529,7 @@ class NoSideEffectFixtureAdapter:
                 "execution mode/profile is not permitted to propose an action"
             )
         if self._context is not None and idempotency_key != action_idempotency_key(
-            self._context
+            self._context, action, target_task_id
         ):
             raise ContractViolation(
                 "proposal idempotency key is not bound to the current context"
@@ -1452,14 +1584,16 @@ class NoSideEffectFixtureAdapter:
             raise ContractViolation(
                 "native fixture proposal action is not allowed by the current policy"
             )
+        target = proposal.get("target_task_id")
+        if target is not None:
+            target = _safe_identifier(target, "proposal.target_task_id")
         key = _safe_identifier(
             proposal.get("idempotency_key"), "proposal.idempotency_key"
         )
-        if key != action_idempotency_key(self._context):
+        if key != action_idempotency_key(self._context, action, target):
             raise ContractViolation(
                 "native fixture proposal key is not bound to the current context"
             )
-        target = proposal.get("target_task_id")
         if trace_proposal.get("action") != action:
             raise ContractViolation("native fixture proposal differs from its trace")
         if trace_proposal.get("idempotency_key") != key:
@@ -1775,6 +1909,10 @@ def _validate_fixture_state(
             _safe_identifier(
                 existing["current_run_id"], "fixture existing action current_run_id"
             )
+        if existing.get("status") == "running" and existing["current_run_id"] is None:
+            raise ContractViolation(
+                "fixture running action must have a current run identity"
+            )
         if "task_id" not in existing or not isinstance(existing["task_id"], str):
             raise ContractViolation("fixture existing action has no task identity")
         _safe_identifier(existing["task_id"], "fixture existing action.task_id")
@@ -1987,8 +2125,10 @@ def _validate_action_semantics(
     act_target = proposal.act.get("target_task_id")
     if choose_target != act_target:
         raise ContractViolation("decision conflict: choose and act targets differ")
+    if action == "admit" and choose_target != context.execution.task_id:
+        raise ContractViolation("admit target is not bound to the current task")
     if (
-        action in {"admit", "quarantine", "hold_missing_capability", "hold"}
+        action in {"quarantine", "hold_missing_capability", "hold"}
         and choose_target is not None
         and choose_target != context.execution.task_id
     ):
@@ -2010,7 +2150,7 @@ def _validate_action_semantics(
                 "artifact repair target is not the failed artifact task"
             )
 
-    expected_key = action_idempotency_key(context)
+    expected_key = action_idempotency_key(context, action, choose_target)
     if proposal.act.get("idempotency_key") != expected_key:
         raise ContractViolation(
             "decision conflict: idempotency key does not match context "
@@ -2182,6 +2322,7 @@ def evaluate_decision(
         "read_source_state": adapter.read_source_state,
         "read_ready_lanes": adapter.read_ready_lanes,
         "read_capabilities": adapter.read_capabilities,
+        "read_action_key": adapter.read_action_key,
         "propose_action": adapter.propose_action,
         "read_action_readback": adapter.read_action_readback,
     }
@@ -2224,7 +2365,7 @@ def evaluate_decision(
         raise ContractViolation("model must commit exactly one fixture proposal")
     if adapter.preproposal_receipt_reads:
         raise ContractViolation("model read action state before proposing")
-    key = action_idempotency_key(context)
+    key = _required(proposal.act.get("idempotency_key"), "act.idempotency_key")
     if external_proposal:
         # The child trace has already proven its one post-proposal read.  The
         # parent adapter performs one corresponding exact receipt readback.
@@ -2271,6 +2412,7 @@ __all__ = [
     "build_input_identity",
     "build_prompt",
     "conflict_checks",
+    "decision_identity_key",
     "decision_response_requirements_text",
     "evaluate_decision",
     "prepare_prompt",

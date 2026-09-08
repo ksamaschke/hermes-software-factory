@@ -36,7 +36,6 @@ class SyntheticDecisionModel:
         source = tools["read_source_state"]()
         ready = tools["read_ready_lanes"]()
         capabilities = tools["read_capabilities"]()
-        key = context["idempotency_key"]
 
         self.calls.append(
             {
@@ -90,6 +89,7 @@ class SyntheticDecisionModel:
             next_phase = context["phase"]
             target = None
 
+        key = tools["read_action_key"](action, target)["idempotency_key"]
         tools["propose_action"](action, key, target)
         readback = tools["read_action_readback"](key)
         return {
@@ -208,7 +208,7 @@ def _context(item_key: str, state: dict[str, Any]):
 def _fixture_state(context, **overrides: Any) -> dict[str, Any]:
     source_evidence = context.evidence.source[0]
     artifact_state = source_evidence.attributes.get("artifact_state", "ready")
-    key = contract.action_idempotency_key(context)
+    key = contract.action_idempotency_key(context, "hold", None)
     state: dict[str, Any] = {
         "live": {
             "blocker": {
@@ -345,12 +345,26 @@ def test_action_key_binds_semantic_lane_and_task_identity():
         execution=replace(context.execution, task_id="other-task"),
     )
 
-    assert contract.action_idempotency_key(context) != contract.action_idempotency_key(
-        lane_variant
+    current_target = context.execution.task_id
+    current_key = contract.action_idempotency_key(context, "admit", current_target)
+    lane_key = contract.action_idempotency_key(
+        lane_variant, "admit", lane_variant.execution.task_id
     )
-    assert contract.action_idempotency_key(context) != contract.action_idempotency_key(
-        task_variant
+    task_key = contract.action_idempotency_key(
+        task_variant, "admit", task_variant.execution.task_id
     )
+    assert current_key != lane_key
+    assert current_key != task_key
+    assert current_key != contract.action_idempotency_key(context, "quarantine", None)
+    assert current_key != contract.action_idempotency_key(
+        context, "admit", "other-task"
+    )
+
+    delimiter_first = replace(context, phase="a\x1fb", input_identity="c")
+    delimiter_second = replace(context, phase="a", input_identity="b\x1fc")
+    assert contract.action_idempotency_key(
+        delimiter_first, "hold", None
+    ) != contract.action_idempotency_key(delimiter_second, "hold", None)
 
 
 def test_secret_private_path_and_resource_bounds_fail_closed():
@@ -386,6 +400,19 @@ def test_secret_private_path_and_resource_bounds_fail_closed():
                 f"tool-{index}" for index in range(contract._MAX_INPUT_ITEMS + 1)
             ],
         )
+    with pytest.raises(contract.ContractViolation, match="bounded mapping or sequence"):
+        contract.prepare_prompt(
+            _context("iterator-skills", {}),
+            skills=((f"skill-{index}", "safe") for index in range(3)),
+        )
+    with pytest.raises(contract.ContractViolation, match="bounded mapping or sequence"):
+        contract.prepare_prompt(
+            _context("iterator-tools", {}),
+            tool_catalog=(f"tool-{index}" for index in range(3)),
+        )
+    shared = {"value": "safe"}
+    with pytest.raises(contract.ContractViolation, match="shared"):
+        contract._safe_value({"first": shared, "second": shared})
     with pytest.raises(contract.ContractViolation, match="trace exceeds"):
         contract._validate_observation_trace(
             [{"tool": "read_live_state"}] * (contract._MAX_NATIVE_TRACE_ENTRIES + 1)
@@ -469,7 +496,15 @@ def test_model_fixture_path_makes_safe_decisions_for_unseen_ids_without_writes()
 
     for item_key, overrides, expected_action in cases:
         context = _context(item_key, overrides)
-        key = contract.action_idempotency_key(context)
+        target_by_action = {
+            "admit": context.execution.task_id,
+            "reuse_existing": "existing-card",
+            "select_independent_lane": "independent-ready",
+            "repair_artifact": "artifact-repair",
+        }
+        key = contract.action_idempotency_key(
+            context, expected_action, target_by_action.get(expected_action)
+        )
         if expected_action == "admit":
             overrides.setdefault("readbacks", {})[key] = {
                 "status": "admitted",
@@ -551,7 +586,7 @@ def test_reused_and_current_run_null_are_not_claimed_as_new_execution():
             },
         },
     )
-    key = contract.action_idempotency_key(context)
+    key = contract.action_idempotency_key(context, "hold", None)
     adapter = contract.NoSideEffectFixtureAdapter(
         _fixture_state(
             context,
@@ -610,7 +645,7 @@ def test_controller_does_not_auto_propose_a_response_without_a_model_commit():
                 "read_capabilities",
             ):
                 tools[name]()
-            key = context_json["idempotency_key"]
+            key = context_json["decision_identity_key"]
             return {
                 "diagnose": {"summary": "observed"},
                 "choose": {"action": "quarantine"},
@@ -687,7 +722,7 @@ def test_failed_merged_artifact_requires_a_bound_repair_task():
         "artifact-without-task",
         {"source": {"source_state": "merged", "artifact_state": "failed"}},
     )
-    key = contract.action_idempotency_key(context)
+    key = contract.action_idempotency_key(context, "hold", None)
     adapter = contract.NoSideEffectFixtureAdapter(
         _fixture_state(
             context,
@@ -721,9 +756,6 @@ def test_admission_rejects_a_foreign_target_task():
 
     class ForeignTargetModel:
         def complete(self, prompt: str, tools: dict[str, Any]) -> dict[str, Any]:
-            context_json = json.loads(
-                prompt.split("CONTEXT_JSON\n", 1)[1].split("\nEND_CONTEXT", 1)[0]
-            )
             for name in (
                 "read_live_state",
                 "read_parent_completion",
@@ -732,7 +764,7 @@ def test_admission_rejects_a_foreign_target_task():
                 "read_capabilities",
             ):
                 tools[name]()
-            key = context_json["idempotency_key"]
+            key = tools["read_action_key"]("admit", "foreign-task")["idempotency_key"]
             tools["propose_action"]("admit", key, "foreign-task")
             readback = tools["read_action_readback"](key)
             return {
@@ -751,3 +783,68 @@ def test_admission_rejects_a_foreign_target_task():
         contract.ContractViolation, match="target is not bound to the current task"
     ):
         contract.evaluate_decision(ForeignTargetModel(), context, adapter)
+
+
+def test_admission_rejects_an_omitted_target_task():
+    context = _context(
+        "omitted-admit-target",
+        {
+            "blocker": {
+                "fingerprint": "contract:v2",
+                "previous_fingerprint": "contract:v1",
+                "resolved": True,
+            }
+        },
+    )
+    adapter = contract.NoSideEffectFixtureAdapter(_fixture_state(context))
+
+    class OmittedTargetModel:
+        def complete(self, prompt: str, tools: dict[str, Any]) -> dict[str, Any]:
+            for name in (
+                "read_live_state",
+                "read_parent_completion",
+                "read_source_state",
+                "read_ready_lanes",
+                "read_capabilities",
+            ):
+                tools[name]()
+            key = tools["read_action_key"]("admit", None)["idempotency_key"]
+            tools["propose_action"]("admit", key, None)
+            readback = tools["read_action_readback"](key)
+            return {
+                "diagnose": {"summary": "resolved"},
+                "choose": {"action": "admit"},
+                "act": {"action": "admit", "idempotency_key": key},
+                "read_back": readback,
+                "advance": {"next_phase": "implementation"},
+            }
+
+    with pytest.raises(contract.ContractViolation, match="admit target"):
+        contract.evaluate_decision(OmittedTargetModel(), context, adapter)
+
+
+def test_running_action_without_a_current_run_fails_closed():
+    context = _context(
+        "malformed-running-action",
+        {
+            "blocker": {
+                "fingerprint": "contract:v2",
+                "previous_fingerprint": "contract:v1",
+                "resolved": True,
+            }
+        },
+    )
+    adapter = contract.NoSideEffectFixtureAdapter(
+        _fixture_state(
+            context,
+            live={
+                "existing_action": {
+                    "status": "running",
+                    "task_id": "running-card",
+                    "current_run_id": None,
+                }
+            },
+        )
+    )
+    with pytest.raises(contract.ContractViolation, match="running action"):
+        contract.evaluate_decision(SyntheticDecisionModel(), context, adapter)

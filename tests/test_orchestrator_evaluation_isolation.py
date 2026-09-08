@@ -7,7 +7,6 @@ import json
 import os
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -160,28 +159,16 @@ def test_native_child_write_cannot_reach_contaminated_live_board(
     isolated_board = tmp_path / "isolated" / "kanban.db"
     captured: dict[str, Any] = {}
 
-    def fake_run(command, *, cwd, env, capture_output, text, timeout, check):
-        captured.update(
-            command=command,
-            cwd=cwd,
-            env=env,
-            capture_output=capture_output,
-            text=text,
-            timeout=timeout,
-            check=check,
-        )
+    def fake_bounded(command, *, cwd, env, timeout):
+        captured.update(command=command, cwd=cwd, env=env, timeout=timeout)
         # A faulty child would write its event through this path. The assertion
         # below proves that path is isolated before any native model is used.
         Path(env["HERMES_KANBAN_DB"]).parent.mkdir(parents=True, exist_ok=True)
         Path(env["HERMES_KANBAN_DB"]).write_bytes(b"child-board")
-        return SimpleNamespace(
-            returncode=0,
-            stdout='{"diagnose": {}}',
-            stderr="",
-        )
+        return 0, '{"diagnose": {}}', ""
 
     monkeypatch.setattr(os, "environ", _contaminated_environment(live_board))
-    monkeypatch.setattr(evaluation.subprocess, "run", fake_run)
+    monkeypatch.setattr(evaluation, "_run_bounded_process", fake_bounded)
 
     model = evaluation.HermesSubprocessModel(
         profile=profile,
@@ -228,6 +215,42 @@ def test_profile_catalog_is_explicitly_fixture_only(tmp_path: Path):
         evaluation.verify_fixture_only_profile(profile)
 
 
+def test_native_summary_redacts_model_and_provider_values():
+    summary = evaluation.NativeEvaluation(
+        "https://user:pw@example.invalid", "token=SECRET", ()
+    ).as_dict()
+    encoded = json.dumps(summary)
+    assert "user:pw" not in encoded
+    assert "token=SECRET" not in encoded
+    assert "[REDACTED]" in encoded
+
+
+def test_directory_snapshot_detects_new_nested_files(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    parent = {"HERMES_KANBAN_WORKSPACES_ROOT": str(workspace)}
+    snapshot = evaluation.snapshot_board_state(parent)
+    (workspace / "foreign-write.txt").write_text("unexpected", encoding="utf-8")
+    with pytest.raises(
+        evaluation.NativeEvaluationUnavailable, match="touched inherited board state"
+    ):
+        evaluation.verify_board_state_unchanged(snapshot)
+
+
+def test_bounded_process_rejects_large_output_before_return(tmp_path: Path):
+    with pytest.raises(contract.ContractViolation, match="output exceeds"):
+        evaluation._run_bounded_process(
+            [
+                sys.executable,
+                "-c",
+                "import sys; sys.stdout.write('x' * 300000)",
+            ],
+            cwd=tmp_path,
+            env={},
+            timeout=10,
+        )
+
+
 def test_malformed_trace_entry_is_a_contract_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -236,10 +259,10 @@ def test_malformed_trace_entry_is_a_contract_failure(
     trace_path = tmp_path / "trace.jsonl"
     trace_path.write_text("[]\n", encoding="utf-8")
 
-    def fake_run(*_args: Any, **_kwargs: Any):
-        return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+    def fake_bounded(*_args: Any, **_kwargs: Any):
+        return 0, "{}", ""
 
-    monkeypatch.setattr(evaluation.subprocess, "run", fake_run)
+    monkeypatch.setattr(evaluation, "_run_bounded_process", fake_bounded)
     model = evaluation.HermesSubprocessModel(
         profile=profile,
         state_path=tmp_path / "state.json",
