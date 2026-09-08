@@ -66,8 +66,11 @@ tree:
 The command creates six fresh synthetic tracker item identities, runs each
 through native Hermes plus the fixture MCP server, and prints secret-safe
 per-case actions, tool calls, and effective prompt/skill sizes. A missing native
-provider or denied capability is an explicit unavailable result, not a passing
-fixture or a reason to weaken command approvals.
+A missing native provider or denied capability is an explicit unavailable result, not a passing
+fixture or a reason to weaken command approvals. Child failures are classified from bounded,
+redacted stdout/stderr: transient provider/time-budget failures receive one exact-identity retry;
+authentication and runtime-configuration failures become actionable holds; unknown failures
+remain fail-closed. No credential is guessed or synthesized.
 
 ## Refreshing this snapshot
 

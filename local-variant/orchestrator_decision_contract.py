@@ -55,16 +55,22 @@ _MAX_PARENT_IDS = 256
 _MAX_EVIDENCE_ENTRIES = 512
 _MAX_POLICY_ITEMS = 64
 _MAX_CONTEXT_CHARS = 64 * 1024
+_MAX_PROMPT_CHARS = 64 * 1024
+_MAX_NATIVE_RESPONSE_CHARS = 256 * 1024
 _MAX_NATIVE_TRACE_ENTRIES = 512
 _MAX_NATIVE_TRACE_BYTES = 512 * 1024
 _MAX_NATIVE_OUTPUT_CHARS = 256 * 1024
 _SECRET_KEY = re.compile(
-    r"(?<![A-Za-z0-9])(?:token|password|passwd|secret|cookie|authorization|api[_ -]?key|access[_ -]?key|private[_ -]?(?:key|path)|credentials?(?!_verified\b)|raw[_ -]?(?:log|output))(?![A-Za-z0-9])",
+    r"(?<![A-Za-z0-9])(?:token|password|passwd|secret|cookie|authorization|"
+    r"api[_ -]?key|access[_ -]?key|private[_ -]?(?:key|path)|credentials?|"
+    r"raw[_ -]?(?:log|output))(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 _UNSAFE_LOG_KEY = re.compile(r"raw[_ -]?(?:log|output)", re.IGNORECASE)
 _SECRET_ASSIGNMENT = re.compile(
-    r"(?P<name>\b(?:[A-Z0-9_ -]*(?:api[_ -]?key|access[_ -]?key|auth(?:orization)?|cookie|passwd|password|private[_ -]?key|secret|token|credential)s?)\b)"
+    r"(?P<name>\b(?:[A-Za-z0-9_ -]*(?:api[_ -]?key|access[_ -]?key|"
+    r"auth(?:orization)?|cookie|passwd|password|private[_ -]?key|secret|"
+    r"token|credential)s?)[A-Za-z0-9_ -]*\b)"
     r"(?P<separator>\s*[:=]\s*)(?P<value>[^\s,;?&#]+)",
     re.IGNORECASE,
 )
@@ -130,6 +136,15 @@ def _redact_text(text: str) -> str:
     value = str(text)
     if len(value) > _MAX_SAFE_TEXT_CHARS:
         raise ContractViolation("text value exceeds the contract bound")
+    stripped = value.strip()
+    if stripped[:1] in {"{", "["}:
+        try:
+            parsed = json.loads(stripped)
+        except (TypeError, ValueError):
+            parsed = None
+        else:
+            safe_parsed = _safe_value(parsed, "json_text")
+            return json.dumps(safe_parsed, ensure_ascii=True, separators=(",", ":"))
     value = _AUTH_HEADER_VALUE.sub(rf"\1{_REDACTED}", value)
     value = _BEARER_VALUE.sub(rf"\1{_REDACTED}", value)
     value = _URI_CREDENTIALS.sub(rf"\1{_REDACTED}@", value)
@@ -175,13 +190,15 @@ def _redact_text(text: str) -> str:
     return value
 
 
-def _secret_key_match(key: str) -> bool:
-    """Match snake, kebab, spaced, and camel-case secret field names."""
+def _secret_key_match(key: str, value: Any = None) -> bool:
+    """Match secret names, allowing only a typed boolean credential guard."""
 
     candidate = re.split(r"[=:]", key, maxsplit=1)[0]
     normalized = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", candidate)
     normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", normalized)
     normalized = re.sub(r"[^A-Za-z0-9]+", "_", normalized).casefold()
+    if normalized == "credentials_verified" and isinstance(value, bool):
+        return False
     return bool(_SECRET_KEY.search(normalized))
 
 
@@ -290,7 +307,7 @@ def _safe_value(
             if _UNSAFE_LOG_KEY.search(key_text):
                 raise ContractViolation(f"unsafe field in {field_name}: {key_text}")
             safe_key = _redact_text(key_text)
-            if _secret_key_match(key_text):
+            if _secret_key_match(key_text, item):
                 safe_item = _REDACTED
             else:
                 safe_item = _safe_value(
@@ -686,6 +703,14 @@ class DecisionPolicy:
         ):
             raise ContractViolation("policy budgets and thresholds are malformed")
         if (
+            self.max_prompt_chars > _MAX_PROMPT_CHARS
+            or self.max_skill_chars > _MAX_SAFE_TEXT_CHARS
+            or self.max_tool_chars > _MAX_SAFE_TEXT_CHARS
+            or self.max_tools > _MAX_INPUT_ITEMS
+            or self.max_skills > _MAX_INPUT_ITEMS
+        ):
+            raise ContractViolation("policy exceeds the hard contract bound")
+        if (
             self.max_prompt_chars <= 0
             or self.max_skill_chars < 0
             or self.max_tool_chars < 0
@@ -819,6 +844,7 @@ class DecisionContext:
         execution = self.execution.as_dict()
         result: dict[str, Any] = {
             "schema": CONTRACT_SCHEMA,
+            "execution": execution,
             "execution_mode": execution["mode"],
             "profile_name": execution["profile_name"],
             "current_task": execution["current_task"],
@@ -853,6 +879,7 @@ def decision_identity_key(context: DecisionContext) -> str:
     return _identity_digest(
         {
             "schema": CONTRACT_SCHEMA,
+            "execution": context.execution.as_dict(),
             "source_key": context.source_item.canonical_key,
             "phase": _safe_identifier(context.phase, "phase"),
             "input_identity": _safe_identifier(
@@ -1313,9 +1340,24 @@ def _validate_observation_trace(
         "propose_action",
         "read_action_readback",
     }
+    trace_fields = {
+        "read_live_state": {"tool"},
+        "read_parent_completion": {"tool"},
+        "read_source_state": {"tool"},
+        "read_ready_lanes": {"tool"},
+        "read_capabilities": {"tool"},
+        "read_action_key": {"tool", "action", "target_task_id", "idempotency_key"},
+        "propose_action": {"tool", "action", "idempotency_key", "target_task_id"},
+        "read_action_readback": {"tool", "idempotency_key", "receipt"},
+    }
     for entry in trace_entries:
         if not isinstance(entry, Mapping) or not isinstance(entry.get("tool"), str):
             raise ContractViolation("native fixture trace contains a malformed entry")
+        tool_name = entry["tool"]
+        if tool_name in trace_fields and set(entry) != trace_fields[tool_name]:
+            raise ContractViolation(
+                f"native fixture {tool_name} payload is malformed"
+            )
         if any(
             key
             not in {"tool", "action", "idempotency_key", "target_task_id", "receipt"}

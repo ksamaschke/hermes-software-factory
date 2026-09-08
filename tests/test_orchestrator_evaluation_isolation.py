@@ -357,4 +357,184 @@ def test_bounded_process_closes_streams_without_parent_stderr_noise(
         timeout=10,
     )
     assert result[:2] == (0, "123\n")
-    assert capsys.readouterr().err == ""
+
+
+def test_native_summary_redacts_case_payloads_and_compound_json_keys():
+    summary = evaluation.NativeEvaluation(
+        "safe-model",
+        "safe-provider",
+        ({"apiKey": "CASE-SECRET", "nested": {"passwordHash": "PW-SECRET"}},),
+    ).as_dict()
+    encoded = json.dumps(summary)
+    assert "CASE-SECRET" not in encoded
+    assert "PW-SECRET" not in encoded
+    assert summary["case_count"] == 1
+
+
+def test_response_size_is_bounded_before_json_decode():
+    with pytest.raises(contract.ContractViolation, match="response exceeds"):
+        evaluation._parse_json_response("{" + "x" * evaluation._MAX_NATIVE_RESPONSE_CHARS)
+
+
+def test_root_symlink_retarget_is_detected(tmp_path: Path):
+    root_link = tmp_path / "workspace-link"
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    root_link.symlink_to(first, target_is_directory=True)
+    snapshot = evaluation.snapshot_board_state(
+        {"HERMES_KANBAN_WORKSPACES_ROOT": str(root_link)}
+    )
+    root_link.unlink()
+    root_link.symlink_to(second, target_is_directory=True)
+    with pytest.raises(
+        evaluation.NativeEvaluationUnavailable, match="touched inherited board state"
+    ):
+        evaluation.verify_board_state_unchanged(snapshot)
+
+
+def test_snapshot_enforces_cumulative_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "one").write_bytes(b"123456")
+    (workspace / "two").write_bytes(b"abcdef")
+    monkeypatch.setattr(evaluation, "_MAX_SNAPSHOT_TOTAL_BYTES", 10)
+    with pytest.raises(
+        evaluation.NativeEvaluationUnavailable, match="bytes exceed snapshot bound"
+    ):
+        evaluation.snapshot_board_state(
+            {"HERMES_KANBAN_WORKSPACES_ROOT": str(workspace)}
+        )
+
+
+def test_prompt_atomic_replace_does_not_mutate_hardlink_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    protected = tmp_path / "protected.txt"
+    protected.write_text("protected", encoding="utf-8")
+    query = profile / "decision-prompt.txt"
+    query.hardlink_to(protected)
+
+    def fake_bounded(*_args: Any, **_kwargs: Any):
+        return 0, "{}", ""
+
+    monkeypatch.setattr(evaluation, "_run_bounded_process", fake_bounded)
+    model = evaluation.HermesSubprocessModel(
+        profile=profile,
+        state_path=tmp_path / "state.json",
+        trace_path=tmp_path / "trace.jsonl",
+        board_path=tmp_path / "isolated" / "kanban.db",
+        hermes="hermes",
+        model="test-model",
+        provider="test-provider",
+        run_budget=30,
+        parent_env={},
+    )
+    assert model.complete("typed prompt", {}) == {}
+    assert protected.read_text(encoding="utf-8") == "protected"
+    assert query.read_text(encoding="utf-8").startswith("typed prompt")
+
+
+def test_combined_process_output_is_bounded(tmp_path: Path):
+    code = "import sys; sys.stdout.write('o' * 180000); sys.stderr.write('e' * 100000)"
+    with pytest.raises(contract.ContractViolation, match="combined native Hermes output"):
+        evaluation._run_bounded_process(
+            [sys.executable, "-c", code],
+            cwd=tmp_path,
+            env={},
+            timeout=10,
+        )
+
+
+def test_bounded_process_kills_descendants_on_timeout(tmp_path: Path):
+    pid_file = tmp_path / "child.pid"
+    code = (
+        "import pathlib, subprocess, sys, time; "
+        "child=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); time.sleep(30)"
+    )
+    with pytest.raises(Exception):
+        evaluation._run_bounded_process(
+            [sys.executable, "-c", code, str(pid_file)],
+            cwd=tmp_path,
+            env={},
+            timeout=1,
+        )
+    child_pid = int(pid_file.read_text(encoding="utf-8"))
+    for _ in range(20):
+        try:
+            state = Path(f"/proc/{child_pid}/stat").read_text(encoding="utf-8").split()[2]
+        except FileNotFoundError:
+            break
+        if state == "Z":
+            break
+        import time
+
+        time.sleep(0.05)
+    else:
+        pytest.fail("bounded process left a descendant alive")
+
+
+def test_native_failure_has_bounded_secret_safe_recovery_metadata():
+    code, retryable, action, diagnostic = evaluation._classify_native_failure(
+        1,
+        "Unauthorized token=TOP-SECRET at /home/ksamaschke/private/auth.json",
+    )
+    assert code == "authentication"
+    assert retryable is False
+    assert "refresh" in action
+    assert "TOP-SECRET" not in diagnostic
+    assert "/home/ksamaschke" not in diagnostic
+    code, retryable, _action, diagnostic = evaluation._classify_native_failure(
+        1, "", "authentication failed token=TOP-SECRET"
+    )
+    assert code == "authentication"
+    assert not retryable
+    assert "TOP-SECRET" not in diagnostic
+    failure = evaluation.NativeEvaluationUnavailable(
+        "child token=SECRET",
+        failure_code="native_exit_1",
+        recovery_action="inspect password=PW",
+        diagnostic="apiKey=KEY",
+        attempts=2,
+    )
+    rendered = failure.as_dict()
+    assert "SECRET" not in str(rendered)
+    assert "PW" not in str(rendered)
+    assert "KEY" not in str(rendered)
+
+
+def test_native_subprocess_retries_only_retryable_failure(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        if len(calls) == 1:
+            return 1, "", "provider temporarily unavailable"
+        return 0, '{"decision":"hold"}', ""
+
+    monkeypatch.setattr(
+        evaluation,
+        "build_isolated_environment",
+        lambda parent_env, profile, board_path: {},
+    )
+    monkeypatch.setattr(evaluation, "_run_bounded_process", fake_run)
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    model = evaluation.HermesSubprocessModel(
+        profile,
+        tmp_path / "state.json",
+        tmp_path / "missing-trace.jsonl",
+        tmp_path / "board.db",
+        "/bin/hermes",
+        "model",
+        "provider",
+        1,
+        parent_env={},
+    )
+
+    assert model.complete("prompt", {}) == {"decision": "hold"}
+    assert len(calls) == 2

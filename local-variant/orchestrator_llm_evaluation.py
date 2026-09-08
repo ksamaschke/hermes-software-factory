@@ -18,6 +18,7 @@ import json
 import os
 import selectors
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -31,6 +32,8 @@ from typing import Any
 try:  # Running as a package is useful to downstream installers.
     from .orchestrator_decision_contract import (
         _MAX_NATIVE_OUTPUT_CHARS,
+        _MAX_NATIVE_RESPONSE_CHARS,
+        _MAX_NATIVE_TRACE_ENTRIES,
         _MAX_NATIVE_TRACE_BYTES,
         BlockerState,
         ContractViolation,
@@ -44,6 +47,7 @@ try:  # Running as a package is useful to downstream installers.
         SourceIdentity,
         TypedEvidence,
         _action_key_from_decision_identity,
+        _bounded_iterable,
         _receipt_digest,
         _redact_text,
         _safe_identifier,
@@ -59,6 +63,8 @@ try:  # Running as a package is useful to downstream installers.
 except ImportError:  # Running this file directly is the supported CLI path.
     from orchestrator_decision_contract import (  # type: ignore[no-redef]
         _MAX_NATIVE_OUTPUT_CHARS,
+        _MAX_NATIVE_RESPONSE_CHARS,
+        _MAX_NATIVE_TRACE_ENTRIES,
         _MAX_NATIVE_TRACE_BYTES,
         BlockerState,
         ContractViolation,
@@ -72,6 +78,7 @@ except ImportError:  # Running this file directly is the supported CLI path.
         SourceIdentity,
         TypedEvidence,
         _action_key_from_decision_identity,
+        _bounded_iterable,
         _receipt_digest,
         _redact_text,
         _safe_identifier,
@@ -100,6 +107,8 @@ _NATIVE_SCANNER_NOTICE = (
     "⚠ tirith security scanner enabled but not available — "
     "command scanning will use pattern matching only"
 )
+_MAX_NATIVE_CASES = 64
+_MAX_NATIVE_COMBINED_OUTPUT_CHARS = 256 * 1024
 
 NATIVE_QUERY_SUFFIX = f"""
 This is a native integration evaluation. Use the read-only MCP fixture tools,
@@ -308,6 +317,126 @@ def build_isolated_environment(
 class NativeEvaluationUnavailable(RuntimeError):
     """Raised when the requested native model path cannot be launched."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        failure_code: str = "native_unavailable",
+        retryable: bool = False,
+        recovery_action: str = "inspect the bounded diagnostic and hold",
+        exit_code: int | None = None,
+        diagnostic: str | None = None,
+        attempts: int = 1,
+    ) -> None:
+        if not isinstance(retryable, bool):
+            raise ContractViolation("native failure retryability is malformed")
+        if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts < 1:
+            raise ContractViolation("native failure attempts are malformed")
+        if exit_code is not None and (
+            not isinstance(exit_code, int) or isinstance(exit_code, bool)
+        ):
+            raise ContractViolation("native failure exit code is malformed")
+        self.failure_code = _redact_text(failure_code)
+        self.retryable = retryable
+        self.recovery_action = _redact_text(recovery_action)
+        self.exit_code = exit_code
+        self.diagnostic = _redact_text(
+            diagnostic or "no sanitized diagnostic available"
+        )
+        self.attempts = attempts
+        super().__init__(_redact_text(message))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "failure_code": self.failure_code,
+            "retryable": self.retryable,
+            "recovery_action": self.recovery_action,
+            "exit_code": self.exit_code,
+            "attempts": self.attempts,
+            "diagnostic": self.diagnostic,
+        }
+
+
+def _sanitize_native_diagnostic(stderr: str) -> str:
+    text = " ".join(str(stderr).split())
+    if not text:
+        return "no sanitized child diagnostic available"
+    if len(text) > 2_048:
+        text = text[:1_024] + " ...[trimmed]... " + text[-1_024:]
+    try:
+        return _redact_text(text)
+    except ContractViolation:
+        return "child diagnostic was rejected by the redaction boundary"
+
+
+def _classify_native_failure(
+    exit_code: int, stderr: str, stdout: str = ""
+) -> tuple[str, bool, str, str]:
+    diagnostic = _sanitize_native_diagnostic(
+        "\n".join(part for part in (stderr, stdout) if str(part).strip())
+    )
+    lowered = diagnostic.casefold()
+    if any(token in lowered for token in ("timeout", "timed out", "deadline")):
+        return (
+            "timeout",
+            True,
+            "retry once with the bounded budget; otherwise hold",
+            diagnostic,
+        )
+    if any(
+        token in lowered
+        for token in (
+            "unauthorized",
+            "authentication",
+            "auth.json",
+            "credential",
+            "login required",
+            "token expired",
+        )
+    ):
+        return (
+            "authentication",
+            False,
+            "refresh the scoped native auth source and rerun; do not guess credentials",
+            diagnostic,
+        )
+    if any(
+        token in lowered
+        for token in (
+            "rate limit",
+            "temporarily unavailable",
+            "service unavailable",
+            "429",
+        )
+    ):
+        return (
+            "provider_unavailable",
+            True,
+            "retry once with the same exact fixture and identity",
+            diagnostic,
+        )
+    if any(
+        token in lowered
+        for token in (
+            "no module named",
+            "configuration",
+            "invalid provider",
+            "not found",
+        )
+    ):
+        return (
+            "runtime_configuration",
+            False,
+            "repair the isolated runtime configuration, then rerun",
+            diagnostic,
+        )
+    return (
+        f"native_exit_{exit_code}",
+        False,
+        "preserve the diagnostic, hold the lane, and route a bounded runtime repair",
+        diagnostic,
+    )
+
 
 @dataclass(frozen=True)
 class EvaluationCase:
@@ -331,11 +460,19 @@ class NativeEvaluation:
     cases: tuple[Mapping[str, Any], ...]
 
     def as_dict(self) -> dict[str, Any]:
+        safe_cases = _safe_value(
+            {
+                "cases": _bounded_iterable(
+                    self.cases, "native.evaluation.cases", _MAX_NATIVE_CASES
+                )
+            },
+            "native.evaluation",
+        )["cases"]
         return {
             "model": _redact_text(self.model),
             "provider": _redact_text(self.provider),
-            "case_count": len(self.cases),
-            "cases": [dict(case) for case in self.cases],
+            "case_count": len(safe_cases),
+            "cases": safe_cases,
         }
 
 
@@ -1162,13 +1299,24 @@ def _auth_source(explicit: str | None) -> Path | None:
     return None
 
 
+def _lexical_absolute_path(path: Path, label: str) -> Path:
+    """Normalize spelling without following symlinks, for root snapshots."""
+
+    try:
+        return Path(os.path.abspath(os.path.expanduser(str(path))))
+    except OSError as exc:
+        raise NativeEvaluationUnavailable(
+            f"{label} cannot be normalized safely"
+        ) from exc
+
+
 def _inherited_board_paths(parent_env: Mapping[str, str]) -> tuple[Path, ...]:
-    """Return inherited board, event, database, and SQLite sidecar paths."""
+    """Return raw inherited roots so root symlink retargets remain observable."""
 
     paths: list[Path] = []
     raw_database = str(parent_env.get("HERMES_KANBAN_DB", "")).strip()
     if raw_database:
-        database = _resolve_path(Path(raw_database), "inherited board path")
+        database = _lexical_absolute_path(Path(raw_database), "inherited board path")
         paths.extend(
             (
                 database,
@@ -1180,34 +1328,39 @@ def _inherited_board_paths(parent_env: Mapping[str, str]) -> tuple[Path, ...]:
         )
     raw_home = str(parent_env.get("HERMES_KANBAN_HOME", "")).strip()
     if raw_home:
-        home = _resolve_path(Path(raw_home), "inherited board path")
-        paths.extend(
-            home / name
-            for name in (
-                ".",
-                "events",
-                "event-log",
-                "attachments",
-                "workspaces",
-            )
-        )
+        paths.append(_lexical_absolute_path(Path(raw_home), "inherited board path"))
     for key in (
         "HERMES_KANBAN_WORKSPACES_ROOT",
         "HERMES_KANBAN_ATTACHMENTS_ROOT",
     ):
         raw_root = str(parent_env.get(key, "")).strip()
         if raw_root:
-            paths.append(_resolve_path(Path(raw_root), "inherited board path"))
+            paths.append(_lexical_absolute_path(Path(raw_root), "inherited board path"))
     return tuple(dict.fromkeys(paths))
 
 
 _MAX_SNAPSHOT_ENTRIES = 8_192
 _MAX_SNAPSHOT_FILE_BYTES = 64 * 1024 * 1024
+_MAX_SNAPSHOT_TOTAL_BYTES = 256 * 1024 * 1024
+_MAX_SNAPSHOT_SYMLINK_TARGETS = 256
 
 
-def _file_digest(path: Path, size: int) -> str:
+def _new_snapshot_budget() -> dict[str, int]:
+    return {"entries": 0, "bytes": 0, "symlink_targets": 0}
+
+
+def _count_snapshot_entry(budget: dict[str, int]) -> None:
+    budget["entries"] += 1
+    if budget["entries"] > _MAX_SNAPSHOT_ENTRIES:
+        raise NativeEvaluationUnavailable("inherited board tree exceeds snapshot bound")
+
+
+def _file_digest(path: Path, size: int, budget: dict[str, int]) -> str:
     if size > _MAX_SNAPSHOT_FILE_BYTES:
         raise NativeEvaluationUnavailable("inherited board file exceeds snapshot bound")
+    budget["bytes"] += size
+    if budget["bytes"] > _MAX_SNAPSHOT_TOTAL_BYTES:
+        raise NativeEvaluationUnavailable("inherited board bytes exceed snapshot bound")
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
@@ -1216,11 +1369,14 @@ def _file_digest(path: Path, size: int) -> str:
 
 
 def _path_signature(
-    path: Path, _symlink_seen: frozenset[Path] | None = None
+    path: Path,
+    _symlink_seen: frozenset[Path] | None = None,
+    _budget: dict[str, int] | None = None,
 ) -> tuple[Any, ...]:
     """Fingerprint a file or bounded directory tree, including link targets."""
 
     symlink_seen = _symlink_seen or frozenset()
+    budget = _budget if _budget is not None else _new_snapshot_budget()
     stat = path.lstat()
     if path.is_symlink():
         target = Path(os.path.realpath(path))
@@ -1229,7 +1385,14 @@ def _path_signature(
         elif not target.exists():
             target_signature = ("missing",)
         else:
-            target_signature = _path_signature(target, symlink_seen | {target})
+            budget["symlink_targets"] += 1
+            if budget["symlink_targets"] > _MAX_SNAPSHOT_SYMLINK_TARGETS:
+                raise NativeEvaluationUnavailable(
+                    "inherited board symlink targets exceed snapshot bound"
+                )
+            target_signature = _path_signature(
+                target, symlink_seen | {target}, budget
+            )
         return (
             "symlink",
             stat.st_ino,
@@ -1239,7 +1402,7 @@ def _path_signature(
             target_signature,
         )
     if not path.is_dir():
-        digest = _file_digest(path, stat.st_size) if path.is_file() else None
+        digest = _file_digest(path, stat.st_size, budget) if path.is_file() else None
         return (
             "file",
             stat.st_ino,
@@ -1252,7 +1415,12 @@ def _path_signature(
     pending = [path]
     while pending:
         current = pending.pop()
-        entries = sorted(os.scandir(current), key=lambda entry: entry.name)
+        entries = []
+        with os.scandir(current) as iterator:
+            for entry in iterator:
+                _count_snapshot_entry(budget)
+                entries.append(entry)
+        entries.sort(key=lambda entry: entry.name)
         for entry in entries:
             entry_path = Path(entry.path)
             entry_stat = entry.stat(follow_symlinks=False)
@@ -1261,7 +1429,7 @@ def _path_signature(
                 record = (
                     relative,
                     "symlink",
-                    _path_signature(entry_path, symlink_seen),
+                    _path_signature(entry_path, symlink_seen, budget),
                 )
             elif entry.is_dir(follow_symlinks=False):
                 record = (
@@ -1280,7 +1448,7 @@ def _path_signature(
                     entry_stat.st_mode,
                     entry_stat.st_size,
                     entry_stat.st_mtime_ns,
-                    _file_digest(entry_path, entry_stat.st_size),
+                    _file_digest(entry_path, entry_stat.st_size, budget),
                 )
             else:
                 record = (
@@ -1292,10 +1460,6 @@ def _path_signature(
                     entry_stat.st_mtime_ns,
                 )
             records.append(record)
-            if len(records) > _MAX_SNAPSHOT_ENTRIES:
-                raise NativeEvaluationUnavailable(
-                    "inherited board directory exceeds snapshot bound"
-                )
     encoded = json.dumps(records, sort_keys=True, separators=(",", ":"))
     return (
         "directory",
@@ -1310,9 +1474,10 @@ def snapshot_board_state(parent_env: Mapping[str, str]) -> dict[Path, tuple[Any,
     """Capture bounded content fingerprints for inherited board paths."""
 
     snapshot: dict[Path, tuple[Any, ...]] = {}
+    budget = _new_snapshot_budget()
     for path in _inherited_board_paths(parent_env):
         try:
-            snapshot[path] = _path_signature(path)
+            snapshot[path] = _path_signature(path, _budget=budget)
         except FileNotFoundError:
             snapshot[path] = (False,)
         except OSError as exc:
@@ -1325,9 +1490,10 @@ def snapshot_board_state(parent_env: Mapping[str, str]) -> dict[Path, tuple[Any,
 def verify_board_state_unchanged(snapshot: Mapping[Path, tuple[Any, ...]]) -> None:
     """Raise if the native child touched inherited board or tree contents."""
 
+    budget = _new_snapshot_budget()
     for path, before in snapshot.items():
         try:
-            current = _path_signature(path)
+            current = _path_signature(path, _budget=budget)
         except FileNotFoundError:
             current = (False,)
         except OSError as exc:
@@ -1354,6 +1520,8 @@ def _parse_json_response(text: str) -> Mapping[str, Any]:
 
     if not isinstance(text, str) or not text.strip():
         raise ContractViolation("native model returned an empty response")
+    if len(text) > _MAX_NATIVE_RESPONSE_CHARS:
+        raise ContractViolation("native model response exceeds the contract bound")
 
     def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
@@ -1389,6 +1557,20 @@ def _parse_json_response(text: str) -> Mapping[str, Any]:
     return value
 
 
+def _kill_process_group(process: subprocess.Popen[Any]) -> None:
+    """Kill the bounded child and descendants without touching the parent."""
+
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        try:
+            process.kill()
+        except (OSError, ProcessLookupError):
+            pass
+
+
 def _run_bounded_process(
     command: list[str],
     *,
@@ -1405,6 +1587,7 @@ def _run_bounded_process(
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        start_new_session=True,
     )
     selector = selectors.DefaultSelector()
     buffers: dict[int, bytearray] = {}
@@ -1437,14 +1620,20 @@ def _run_bounded_process(
                     raise ContractViolation(
                         "native Hermes output exceeds the contract bound"
                     )
+                if (
+                    sum(len(item) for item in buffers.values())
+                    > _MAX_NATIVE_COMBINED_OUTPUT_CHARS
+                ):
+                    raise ContractViolation(
+                        "combined native Hermes output exceeds the contract bound"
+                    )
         return_code = process.wait(timeout=max(0.1, deadline - time.monotonic()))
         output = [bytes(buffers[fd]).decode("utf-8") for fd in stream_fds]
         return return_code, output[0], output[1]
     except (UnicodeDecodeError, subprocess.TimeoutExpired):
         raise
     except BaseException:
-        if process.poll() is None:
-            process.kill()
+        _kill_process_group(process)
         raise
     finally:
         try:
@@ -1457,11 +1646,30 @@ def _run_bounded_process(
                     except OSError:
                         pass
             if process.poll() is None:
-                process.kill()
+                _kill_process_group(process)
             try:
                 process.wait(timeout=1)
             except (subprocess.TimeoutExpired, ChildProcessError):
                 pass
+
+
+def _atomic_write_text(path: Path, text: str, *, label: str) -> None:
+    """Replace a generated file without ever truncating a caller-controlled inode."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    try:
+        with temporary.open("x", encoding="utf-8") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except OSError as exc:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise NativeEvaluationUnavailable(f"{label} cannot be written safely") from exc
 
 
 class HermesSubprocessModel(DecisionModel):
@@ -1500,11 +1708,15 @@ class HermesSubprocessModel(DecisionModel):
         self.native_fixture_receipt = None
         self.native_trace = ()
         env = build_isolated_environment(self.parent_env, self.profile, self.board_path)
-        query_path = self.profile / "decision-prompt.txt"
+        query_path = _ensure_path_not_inherited(
+            self.profile / "decision-prompt.txt",
+            self.parent_env,
+            "native prompt output",
+        )
         query = prompt
         if not query.rstrip().endswith(NATIVE_QUERY_SUFFIX):
             query += "\n\n" + NATIVE_QUERY_SUFFIX
-        query_path.write_text(query, encoding="utf-8")
+        _atomic_write_text(query_path, query, label="native prompt output")
         command = [
             self.hermes,
             "chat",
@@ -1523,20 +1735,54 @@ class HermesSubprocessModel(DecisionModel):
             "--run-budget",
             str(self.run_budget),
         ]
-        try:
-            return_code, stdout, _stderr = _run_bounded_process(
-                command,
-                cwd=self.profile,
-                env=env,
-                timeout=self.run_budget + 30,
+        attempts = 0
+        while True:
+            try:
+                return_code, stdout, stderr = _run_bounded_process(
+                    command,
+                    cwd=self.profile,
+                    env=env,
+                    timeout=self.run_budget + 30,
+                )
+            except subprocess.TimeoutExpired as exc:
+                if attempts == 0:
+                    attempts += 1
+                    continue
+                raise NativeEvaluationUnavailable(
+                    "native Hermes one-shot did not finish",
+                    failure_code="timeout",
+                    retryable=True,
+                    recovery_action="retry exhausted; hold for runtime repair",
+                    attempts=attempts + 1,
+                ) from exc
+            except OSError as exc:
+                raise NativeEvaluationUnavailable(
+                    "native Hermes one-shot could not be launched",
+                    failure_code="launch_error",
+                    recovery_action="repair the isolated executable/runtime and rerun",
+                    diagnostic=_sanitize_native_diagnostic(str(exc)),
+                    attempts=attempts + 1,
+                ) from exc
+            if return_code == 0:
+                break
+            failure_code, retryable, recovery_action, diagnostic = (
+                _classify_native_failure(return_code, stderr, stdout)
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
+            if retryable and attempts == 0:
+                attempts += 1
+                continue
             raise NativeEvaluationUnavailable(
-                "native Hermes one-shot did not finish"
-            ) from exc
-        if return_code != 0:
-            raise NativeEvaluationUnavailable(
-                f"native Hermes one-shot failed with exit code {return_code}"
+                f"native Hermes one-shot failed with exit code {return_code}",
+                failure_code=failure_code,
+                retryable=retryable,
+                recovery_action=(
+                    f"retry exhausted; {recovery_action}"
+                    if attempts
+                    else recovery_action
+                ),
+                exit_code=return_code,
+                diagnostic=diagnostic,
+                attempts=attempts + 1,
             )
         if not self.trace_path.exists():
             return _parse_json_response(stdout)
@@ -1561,8 +1807,14 @@ class HermesSubprocessModel(DecisionModel):
             return result
 
         try:
-            for line in self.trace_path.read_text(encoding="utf-8").splitlines():
-                if line.strip():
+            with self.trace_path.open("r", encoding="utf-8") as stream:
+                for line in stream:
+                    if not line.strip():
+                        continue
+                    if len(trace) >= _MAX_NATIVE_TRACE_ENTRIES:
+                        raise ContractViolation(
+                            "native fixture trace exceeds the contract bound"
+                        )
                     entry = json.loads(line, object_pairs_hook=unique_object)
                     if not isinstance(entry, Mapping):
                         raise ContractViolation("fixture trace entry is not an object")
@@ -1777,10 +2029,10 @@ def run_native_evaluation(
             output = _ensure_path_not_inherited(
                 Path(trace_output), parent_env, "native trace output"
             )
-            output.parent.mkdir(parents=True, exist_ok=True)
-            output.write_text(
+            _atomic_write_text(
+                output,
                 json.dumps(evaluation.as_dict(), indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
+                label="native trace output",
             )
         return evaluation
 
@@ -1825,7 +2077,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"native evaluation contract violation: {exc}", file=sys.stderr)
         return 3
     except (NativeEvaluationUnavailable, ValueError) as exc:
-        print(f"native evaluation unavailable: {exc}", file=sys.stderr)
+        if isinstance(exc, NativeEvaluationUnavailable):
+            detail = json.dumps(exc.as_dict(), sort_keys=True)
+        else:
+            detail = str(exc)
+        print(f"native evaluation unavailable: {detail}", file=sys.stderr)
         return 2
     print(json.dumps(evaluation.as_dict(), indent=2, sort_keys=True))
     return 0

@@ -705,6 +705,22 @@ def test_source_canonical_identity_is_injective_for_delimiter_values():
     assert first.canonical_key == first.canonical_key
 
 
+def test_action_identity_includes_full_execution_binding():
+    context = _context("execution-bound", {})
+    variants = (
+        replace(context, execution=replace(context.execution, run_id="run-b")),
+        replace(context, execution=replace(context.execution, branch="branch-b")),
+        replace(context, execution=replace(context.execution, tenant="tenant-b")),
+        replace(
+            context,
+            execution=replace(context.execution, profile_name="profile-b"),
+        ),
+        replace(context, execution=replace(context.execution, mode="interactive")),
+    )
+    keys = {contract.action_idempotency_key(item, "hold") for item in (context, *variants)}
+    assert len(keys) == 6
+
+
 def test_policy_rejects_duplicate_transition_actions():
     policy = contract.DecisionPolicy(
         transition_policy=(
@@ -869,7 +885,14 @@ def test_compound_secret_keys_are_redacted_case_insensitively():
         "mySecretValue",
     ):
         assert safe[key] == "[REDACTED]"
-    assert safe["credentials_verified"] == "safe-status"
+    assert safe["credentials_verified"] == "[REDACTED]"
+    assert contract._safe_value({"credentials_verified": True})["credentials_verified"] is True
+    encoded = contract._redact_text(
+        '{"apiKey":"API-SECRET","passwordHash":"HASH-SECRET"}'
+    )
+    assert "API-SECRET" not in encoded
+    assert "HASH-SECRET" not in encoded
+    assert "[REDACTED]" in encoded
 
 
 def test_context_and_lying_sequences_are_bounded_without_len_trust():
