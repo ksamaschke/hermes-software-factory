@@ -13,7 +13,7 @@ import hashlib
 import json
 import math
 import re
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -51,11 +51,15 @@ _MAX_SAFE_VALUE_ITEMS = 1_024
 _MAX_SAFE_VALUE_NODES = 8_192
 _MAX_SAFE_TEXT_CHARS = 32_000
 _MAX_INPUT_ITEMS = 1_024
+_MAX_PARENT_IDS = 256
+_MAX_EVIDENCE_ENTRIES = 512
+_MAX_POLICY_ITEMS = 64
+_MAX_CONTEXT_CHARS = 64 * 1024
 _MAX_NATIVE_TRACE_ENTRIES = 512
 _MAX_NATIVE_TRACE_BYTES = 512 * 1024
 _MAX_NATIVE_OUTPUT_CHARS = 256 * 1024
 _SECRET_KEY = re.compile(
-    r"(?<![A-Za-z0-9])(?:token|password|passwd|secret|cookie|authorization|api[_ -]?key|access[_ -]?key|private[_ -]?(?:key|path)|credentials?(?!_verified\b)|raw[_ -]?(?:log|output))(?![A-Za-z0-9_])",
+    r"(?<![A-Za-z0-9])(?:token|password|passwd|secret|cookie|authorization|api[_ -]?key|access[_ -]?key|private[_ -]?(?:key|path)|credentials?(?!_verified\b)|raw[_ -]?(?:log|output))(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 _UNSAFE_LOG_KEY = re.compile(r"raw[_ -]?(?:log|output)", re.IGNORECASE)
@@ -175,7 +179,8 @@ def _secret_key_match(key: str) -> bool:
     """Match snake, kebab, spaced, and camel-case secret field names."""
 
     candidate = re.split(r"[=:]", key, maxsplit=1)[0]
-    normalized = re.sub(r"(?<!^)(?=[A-Z])", "_", candidate)
+    normalized = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", candidate)
+    normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", normalized)
     normalized = re.sub(r"[^A-Za-z0-9]+", "_", normalized).casefold()
     return bool(_SECRET_KEY.search(normalized))
 
@@ -213,6 +218,40 @@ def _required(value: Any, field_name: str) -> str:
     return value
 
 
+def _bounded_iterable(value: Any, field_name: str, limit: int) -> list[Any]:
+    """Materialize an iterable while enforcing a bound without trusting len()."""
+
+    if isinstance(value, (str, bytes, bytearray)):
+        raise ContractViolation(f"{field_name} input must be an iterable of items")
+    try:
+        iterator = iter(value)
+    except TypeError as exc:
+        raise ContractViolation(f"{field_name} input is not iterable") from exc
+    result: list[Any] = []
+    for index, item in enumerate(iterator):
+        if index >= limit:
+            raise ContractViolation(f"{field_name} input exceeds the contract bound")
+        result.append(item)
+    return result
+
+
+def _bounded_mapping_items(
+    value: Mapping[Any, Any], field_name: str, limit: int
+) -> list[tuple[Any, Any]]:
+    try:
+        iterator = iter(value.items())
+    except (AttributeError, TypeError) as exc:
+        raise ContractViolation(f"{field_name} input is not a mapping") from exc
+    result: list[tuple[Any, Any]] = []
+    for index, item in enumerate(iterator):
+        if index >= limit:
+            raise ContractViolation(f"{field_name} input exceeds the contract bound")
+        if not isinstance(item, tuple) or len(item) != 2:
+            raise ContractViolation(f"{field_name} mapping entry is malformed")
+        result.append(item)
+    return result
+
+
 def _safe_value(
     value: Any,
     field_name: str = "value",
@@ -239,10 +278,10 @@ def _safe_value(
         if object_id in _seen:
             raise ContractViolation(f"cyclic or shared value: {field_name}")
         _seen.add(object_id)
-        if len(value) > _MAX_SAFE_VALUE_ITEMS:
-            raise ContractViolation(f"mapping exceeds the contract bound: {field_name}")
         result = {}
-        for key, item in value.items():
+        for key, item in _bounded_mapping_items(
+            value, field_name, _MAX_SAFE_VALUE_ITEMS
+        ):
             key_text = str(key)
             if len(key_text) > _MAX_SAFE_TEXT_CHARS:
                 raise ContractViolation(
@@ -377,7 +416,7 @@ def build_input_identity(
     document = {
         "source_item": source_item.as_dict(),
         "phase": _safe_identifier(phase, "phase"),
-        "input": _safe_value(dict(input_payload), "input"),
+        "input": _safe_value(input_payload, "input"),
     }
     encoded = json.dumps(document, sort_keys=True, separators=(",", ":"))
     return "input-" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:32]
@@ -497,7 +536,9 @@ class ParentCompletion:
             "verified": self.verified,
             "parent_ids": [
                 _safe_identifier(parent_id, "parent_completion.parent_id")
-                for parent_id in self.parent_ids
+                for parent_id in _bounded_iterable(
+                    self.parent_ids, "parent_completion.parent_ids", _MAX_PARENT_IDS
+                )
             ],
         }
         if self.evidence_reference is not None:
@@ -585,9 +626,14 @@ class EvidenceBundle:
             "review": self.review,
         }
         result: dict[str, list[dict[str, Any]]] = {}
+        remaining = _MAX_EVIDENCE_ENTRIES
         for expected_kind, entries in rows.items():
+            bounded_entries = _bounded_iterable(
+                entries, f"evidence.{expected_kind}", remaining
+            )
+            remaining -= len(bounded_entries)
             rendered = []
-            for entry in entries:
+            for entry in bounded_entries:
                 if not isinstance(entry, TypedEvidence):
                     raise ContractViolation(
                         f"evidence.{expected_kind} contains a malformed entry"
@@ -662,8 +708,14 @@ class DecisionPolicy:
         try:
             execution_modes = [
                 _safe_identifier(mode, "policy.execution_mode")
-                for mode in self.allowed_execution_modes
+                for mode in _bounded_iterable(
+                    self.allowed_execution_modes,
+                    "policy.execution_modes",
+                    _MAX_POLICY_ITEMS,
+                )
             ]
+        except ContractViolation:
+            raise
         except TypeError as exc:
             raise ContractViolation("policy execution modes are malformed") from exc
         if not execution_modes:
@@ -675,8 +727,12 @@ class DecisionPolicy:
         try:
             allowed = [
                 _safe_identifier(action, "policy.action")
-                for action in self.allowed_actions
+                for action in _bounded_iterable(
+                    self.allowed_actions, "policy.allowed_actions", _MAX_POLICY_ITEMS
+                )
             ]
+        except ContractViolation:
+            raise
         except TypeError as exc:
             raise ContractViolation("policy actions are malformed") from exc
         if not allowed or not set(allowed) <= set(ALLOWED_ACTIONS):
@@ -684,13 +740,18 @@ class DecisionPolicy:
         if len(set(allowed)) != len(allowed):
             raise ContractViolation("policy actions are duplicated")
         try:
-            transition_entries = list(self.transition_policy)
+            transition_entries = _bounded_iterable(
+                self.transition_policy, "policy.transition_policy", _MAX_POLICY_ITEMS
+            )
             transition_pairs = []
             for entry in transition_entries:
-                if not isinstance(entry, (tuple, list)) or len(entry) != 2:
-                    raise ValueError("transition entry must contain action and phase")
-                transition_pairs.append((entry[0], entry[1]))
-        except (TypeError, ValueError) as exc:
+                if not isinstance(entry, (tuple, list)):
+                    raise TypeError("transition entry must contain action and phase")
+                fields = _bounded_iterable(entry, "policy.transition", 2)
+                if len(fields) != 2:
+                    raise TypeError("transition entry must contain action and phase")
+                transition_pairs.append((fields[0], fields[1]))
+        except (ContractViolation, TypeError, ValueError) as exc:
             raise ContractViolation("policy transition table is malformed") from exc
         transition_pairs = [
             (
@@ -774,7 +835,7 @@ class DecisionContext:
         }
         if self.prior_decision is not None:
             result["prior_decision"] = _safe_value(
-                dict(self.prior_decision), "prior_decision"
+                self.prior_decision, "prior_decision"
             )
         return result
 
@@ -1018,6 +1079,11 @@ def validate_context(context: DecisionContext) -> None:
         _safe_identifier(context.input_identity, "input_identity")
         _safe_identifier(context.semantic_lane, "semantic_lane")
         conflicts = conflict_checks(context)
+        document = json.dumps(context.as_dict(), sort_keys=True, separators=(",", ":"))
+        if len(document) > _MAX_CONTEXT_CHARS:
+            raise ContractViolation(
+                "typed context exceeds the contract character bound"
+            )
     except ContractViolation:
         raise
     except (AttributeError, KeyError, TypeError, ValueError) as exc:
@@ -1052,18 +1118,14 @@ class PromptEnvelope:
 
 
 def _check_input_items(value: Any, field_name: str) -> None:
-    if isinstance(value, Iterable) and not isinstance(
-        value, (Mapping, Sequence, str, bytes, bytearray)
+    if value is None:
+        return
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(
+        value, (Mapping, Sequence)
     ):
         raise ContractViolation(
             f"{field_name} input must be a bounded mapping or sequence"
         )
-    if (
-        isinstance(value, (Mapping, Sequence))
-        and not isinstance(value, (str, bytes, bytearray))
-        and len(value) > _MAX_INPUT_ITEMS
-    ):
-        raise ContractViolation(f"{field_name} input exceeds the contract bound")
 
 
 def _skill_entries(
@@ -1073,11 +1135,14 @@ def _skill_entries(
         return []
     _check_input_items(skills, "skill")
     if isinstance(skills, Mapping):
-        entries = list(skills.items())
+        entries = _bounded_mapping_items(skills, "skill", _MAX_INPUT_ITEMS)
     else:
-        entries = list(skills)
+        entries = _bounded_iterable(skills, "skill", _MAX_INPUT_ITEMS)
     normalized = []
-    for name, text in entries:
+    for entry in entries:
+        if not isinstance(entry, tuple) or len(entry) != 2:
+            raise ContractViolation("skill entry must contain name and text")
+        name, text = entry
         normalized.append((_safe_identifier(name, "skill.name"), str(text)))
     return normalized
 
@@ -1095,13 +1160,23 @@ def prepare_prompt(
     policy = context.policy
     safe_suffix = _redact_text(str(prompt_suffix))
     document = json.dumps(context.as_dict(), sort_keys=True, separators=(",", ":"))
+    if len(document) > _MAX_CONTEXT_CHARS:
+        raise ContractViolation("typed context exceeds the contract character bound")
+    if len(document) > policy.max_prompt_chars:
+        raise ContractViolation("prompt budget is smaller than typed context")
     _check_input_items(tool_catalog, "tool")
     if tool_catalog is None:
-        tool_entries: list[str] = []
+        tool_entries = []
     elif isinstance(tool_catalog, Mapping):
-        tool_entries = [str(name) for name in tool_catalog]
+        tool_entries = [
+            str(name)
+            for name in _bounded_iterable(tool_catalog, "tool", _MAX_INPUT_ITEMS)
+        ]
     else:
-        tool_entries = [str(name) for name in tool_catalog]
+        tool_entries = [
+            str(name)
+            for name in _bounded_iterable(tool_catalog, "tool", _MAX_INPUT_ITEMS)
+        ]
     if len(tool_entries) > policy.max_tools:
         raise ContractViolation("effective tool catalog exceeds tool-count budget")
     if any(not _safe_identifier(name, "tool.name") for name in tool_entries):
@@ -1217,8 +1292,16 @@ def _validate_observation_trace(
 
     if isinstance(trace, (str, bytes)) or not isinstance(trace, Sequence):
         raise ContractViolation("native fixture trace must be a sequence")
-    if len(trace) > _MAX_NATIVE_TRACE_ENTRIES:
-        raise ContractViolation("native fixture trace exceeds the contract bound")
+    try:
+        trace_entries = _bounded_iterable(
+            trace, "native fixture trace", _MAX_NATIVE_TRACE_ENTRIES
+        )
+    except ContractViolation as exc:
+        if "exceeds the contract bound" in str(exc):
+            raise ContractViolation(
+                "native fixture trace exceeds the contract bound"
+            ) from exc
+        raise
     names: list[str] = []
     allowed = {
         "read_live_state",
@@ -1230,7 +1313,7 @@ def _validate_observation_trace(
         "propose_action",
         "read_action_readback",
     }
-    for entry in trace:
+    for entry in trace_entries:
         if not isinstance(entry, Mapping) or not isinstance(entry.get("tool"), str):
             raise ContractViolation("native fixture trace contains a malformed entry")
         if any(
@@ -1282,8 +1365,8 @@ def _validate_observation_trace(
         raise ContractViolation(
             "native fixture trace must contain one pre-proposal action-key read"
         )
-    proposal = trace[proposals[0]]
-    readback = trace[readbacks[0]]
+    proposal = trace_entries[proposals[0]]
+    readback = trace_entries[readbacks[0]]
     proposal_fields = {"tool", "action", "idempotency_key"}
     if "target_task_id" in proposal:
         proposal_fields.add("target_task_id")
@@ -1300,7 +1383,7 @@ def _validate_observation_trace(
     target = proposal.get("target_task_id")
     if target is not None:
         target = _safe_identifier(target, "trace.proposal.target_task_id")
-    action_key_entry = trace[action_key_reads[0]]
+    action_key_entry = trace_entries[action_key_reads[0]]
     if (
         action_key_entry.get("action") != action
         or action_key_entry.get("target_task_id") != target
@@ -1576,9 +1659,12 @@ class NoSideEffectFixtureAdapter:
             raise ContractViolation(
                 "native fixture proposal has no ordered trace proof"
             )
-        proposal_index, readback_index = _validate_observation_trace(trace)
-        trace_proposal = trace[proposal_index]
-        trace_readback = trace[readback_index]
+        trace_entries = _bounded_iterable(
+            trace, "native fixture trace", _MAX_NATIVE_TRACE_ENTRIES
+        )
+        proposal_index, readback_index = _validate_observation_trace(trace_entries)
+        trace_proposal = trace_entries[proposal_index]
+        trace_readback = trace_entries[readback_index]
         action = _safe_identifier(proposal.get("action"), "proposal.action")
         if action not in self._context.policy.allowed_actions:
             raise ContractViolation(
@@ -1909,10 +1995,19 @@ def _validate_fixture_state(
             _safe_identifier(
                 existing["current_run_id"], "fixture existing action current_run_id"
             )
-        if existing.get("status") == "running" and existing["current_run_id"] is None:
-            raise ContractViolation(
-                "fixture running action must have a current run identity"
-            )
+        if existing.get("status") == "running":
+            if existing["current_run_id"] is None:
+                raise ContractViolation(
+                    "fixture running action must have a current run identity"
+                )
+            if context.execution.run_id is None:
+                raise ContractViolation(
+                    "running action cannot be accepted without a current context run"
+                )
+            if existing["current_run_id"] != context.execution.run_id:
+                raise ContractViolation(
+                    "fixture running action is bound to a foreign current run"
+                )
         if "task_id" not in existing or not isinstance(existing["task_id"], str):
             raise ContractViolation("fixture existing action has no task identity")
         _safe_identifier(existing["task_id"], "fixture existing action.task_id")

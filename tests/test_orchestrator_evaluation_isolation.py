@@ -277,3 +277,84 @@ def test_malformed_trace_entry_is_a_contract_failure(
 
     with pytest.raises(contract.ContractViolation, match="not an object"):
         model.complete("typed prompt", {})
+
+
+def test_snapshot_detects_mutation_of_inherited_home_root(tmp_path: Path):
+    home = tmp_path / "kanban-home"
+    home.mkdir()
+    snapshot = evaluation.snapshot_board_state({"HERMES_KANBAN_HOME": str(home)})
+    (home / "foreign-root-write").write_text("unexpected", encoding="utf-8")
+    with pytest.raises(
+        evaluation.NativeEvaluationUnavailable, match="touched inherited board state"
+    ):
+        evaluation.verify_board_state_unchanged(snapshot)
+
+
+def test_snapshot_detects_mutation_through_nested_symlink_target(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    target = tmp_path / "foreign-target"
+    workspace.mkdir()
+    target.mkdir()
+    (workspace / "linked").symlink_to(target, target_is_directory=True)
+    snapshot = evaluation.snapshot_board_state(
+        {"HERMES_KANBAN_WORKSPACES_ROOT": str(workspace)}
+    )
+    (target / "foreign-write.txt").write_text("unexpected", encoding="utf-8")
+    with pytest.raises(
+        evaluation.NativeEvaluationUnavailable, match="touched inherited board state"
+    ):
+        evaluation.verify_board_state_unchanged(snapshot)
+
+
+def test_profile_overlap_is_rejected_before_prompt_write(tmp_path: Path):
+    live_board = tmp_path / "live" / "kanban.db"
+    live_board.parent.mkdir(parents=True)
+    profile = live_board.parent / "profile"
+    profile.mkdir()
+    model = evaluation.HermesSubprocessModel(
+        profile=profile,
+        state_path=tmp_path / "state.json",
+        trace_path=tmp_path / "trace.jsonl",
+        board_path=tmp_path / "isolated" / "kanban.db",
+        hermes="hermes",
+        model="test-model",
+        provider="test-provider",
+        run_budget=30,
+        parent_env=_contaminated_environment(live_board),
+    )
+    with pytest.raises(
+        evaluation.NativeEvaluationUnavailable,
+        match="overlaps inherited board authority",
+    ):
+        model.complete("typed prompt", {})
+    assert not (profile / "decision-prompt.txt").exists()
+
+
+def test_trace_output_inside_inherited_root_is_rejected_before_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    live_board = tmp_path / "live" / "kanban.db"
+    live_board.parent.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(live_board.parent))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(live_board))
+    with pytest.raises(
+        evaluation.NativeEvaluationUnavailable, match="trace output overlaps"
+    ):
+        evaluation.run_native_evaluation(
+            hermes=sys.executable,
+            trace_output=str(live_board),
+        )
+    assert not live_board.exists()
+
+
+def test_bounded_process_closes_streams_without_parent_stderr_noise(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    result = evaluation._run_bounded_process(
+        [sys.executable, "-c", "print(123)"],
+        cwd=tmp_path,
+        env={},
+        timeout=10,
+    )
+    assert result[:2] == (0, "123\n")
+    assert capsys.readouterr().err == ""

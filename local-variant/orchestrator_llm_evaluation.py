@@ -197,6 +197,46 @@ def _paths_overlap(first: Path, second: Path) -> bool:
     return first == second or first in second.parents or second in first.parents
 
 
+def _resolve_path(path: Path, label: str) -> Path:
+    try:
+        return Path(path).expanduser().resolve()
+    except OSError as exc:
+        raise NativeEvaluationUnavailable(
+            f"{label} cannot be normalized safely"
+        ) from exc
+
+
+def _inherited_protected_roots(parent_env: Mapping[str, str]) -> tuple[Path, ...]:
+    roots: list[Path] = []
+    raw_database = str(parent_env.get("HERMES_KANBAN_DB", "")).strip()
+    if raw_database:
+        database = _resolve_path(Path(raw_database), "inherited board path")
+        roots.append(database.parent)
+    raw_home = str(parent_env.get("HERMES_KANBAN_HOME", "")).strip()
+    if raw_home:
+        roots.append(_resolve_path(Path(raw_home), "inherited board path"))
+    for key in (
+        "HERMES_KANBAN_WORKSPACES_ROOT",
+        "HERMES_KANBAN_ATTACHMENTS_ROOT",
+    ):
+        raw_root = str(parent_env.get(key, "")).strip()
+        if raw_root:
+            roots.append(_resolve_path(Path(raw_root), "inherited board path"))
+    return tuple(dict.fromkeys(roots))
+
+
+def _ensure_path_not_inherited(
+    path: Path, parent_env: Mapping[str, str], label: str
+) -> Path:
+    candidate = _resolve_path(path, label)
+    if any(
+        _paths_overlap(candidate, root)
+        for root in _inherited_protected_roots(parent_env)
+    ):
+        raise NativeEvaluationUnavailable(f"{label} overlaps inherited board authority")
+    return candidate
+
+
 def build_isolated_environment(
     parent_env: Mapping[str, str], profile: Path, board_path: Path
 ) -> dict[str, str]:
@@ -210,42 +250,14 @@ def build_isolated_environment(
     makes its isolation contract directly testable before a model is launched.
     """
 
-    profile = Path(profile).expanduser().resolve()
-    board_path = Path(board_path).expanduser().resolve()
+    profile = _resolve_path(profile, "isolated Hermes profile")
+    board_path = _resolve_path(board_path, "isolated board path")
     if not profile.is_dir():
         raise NativeEvaluationUnavailable(
             "isolated Hermes profile directory is missing"
         )
 
-    protected_roots: list[Path] = []
-    inherited_board = str(parent_env.get("HERMES_KANBAN_DB", "")).strip()
-    if inherited_board:
-        try:
-            protected_roots.append(Path(inherited_board).expanduser().resolve().parent)
-        except OSError as exc:
-            raise NativeEvaluationUnavailable(
-                "inherited board path cannot be normalized safely"
-            ) from exc
-    inherited_home = str(parent_env.get("HERMES_KANBAN_HOME", "")).strip()
-    if inherited_home:
-        try:
-            protected_roots.append(Path(inherited_home).expanduser().resolve())
-        except OSError as exc:
-            raise NativeEvaluationUnavailable(
-                "inherited board path cannot be normalized safely"
-            ) from exc
-    for key in (
-        "HERMES_KANBAN_WORKSPACES_ROOT",
-        "HERMES_KANBAN_ATTACHMENTS_ROOT",
-    ):
-        inherited_root = str(parent_env.get(key, "")).strip()
-        if inherited_root:
-            try:
-                protected_roots.append(Path(inherited_root).expanduser().resolve())
-            except OSError as exc:
-                raise NativeEvaluationUnavailable(
-                    "inherited board path cannot be normalized safely"
-                ) from exc
+    protected_roots = list(_inherited_protected_roots(parent_env))
     isolated_root = board_path.parent
     isolated_paths = (
         profile,
@@ -1156,10 +1168,11 @@ def _inherited_board_paths(parent_env: Mapping[str, str]) -> tuple[Path, ...]:
     paths: list[Path] = []
     raw_database = str(parent_env.get("HERMES_KANBAN_DB", "")).strip()
     if raw_database:
-        database = Path(raw_database).expanduser()
+        database = _resolve_path(Path(raw_database), "inherited board path")
         paths.extend(
             (
                 database,
+                database.parent,
                 Path(f"{database}-wal"),
                 Path(f"{database}-shm"),
                 Path(f"{database}-journal"),
@@ -1167,9 +1180,16 @@ def _inherited_board_paths(parent_env: Mapping[str, str]) -> tuple[Path, ...]:
         )
     raw_home = str(parent_env.get("HERMES_KANBAN_HOME", "")).strip()
     if raw_home:
-        home = Path(raw_home).expanduser()
+        home = _resolve_path(Path(raw_home), "inherited board path")
         paths.extend(
-            home / name for name in ("events", "event-log", "attachments", "workspaces")
+            home / name
+            for name in (
+                ".",
+                "events",
+                "event-log",
+                "attachments",
+                "workspaces",
+            )
         )
     for key in (
         "HERMES_KANBAN_WORKSPACES_ROOT",
@@ -1177,7 +1197,7 @@ def _inherited_board_paths(parent_env: Mapping[str, str]) -> tuple[Path, ...]:
     ):
         raw_root = str(parent_env.get(key, "")).strip()
         if raw_root:
-            paths.append(Path(raw_root).expanduser())
+            paths.append(_resolve_path(Path(raw_root), "inherited board path"))
     return tuple(dict.fromkeys(paths))
 
 
@@ -1195,12 +1215,29 @@ def _file_digest(path: Path, size: int) -> str:
     return digest.hexdigest()
 
 
-def _path_signature(path: Path) -> tuple[Any, ...]:
-    """Fingerprint a file or bounded directory tree without following links."""
+def _path_signature(
+    path: Path, _symlink_seen: frozenset[Path] | None = None
+) -> tuple[Any, ...]:
+    """Fingerprint a file or bounded directory tree, including link targets."""
 
+    symlink_seen = _symlink_seen or frozenset()
     stat = path.lstat()
     if path.is_symlink():
-        return ("symlink", stat.st_ino, stat.st_mode, os.readlink(path))
+        target = Path(os.path.realpath(path))
+        if target in symlink_seen:
+            target_signature: tuple[Any, ...] = ("cycle",)
+        elif not target.exists():
+            target_signature = ("missing",)
+        else:
+            target_signature = _path_signature(target, symlink_seen | {target})
+        return (
+            "symlink",
+            stat.st_ino,
+            stat.st_mode,
+            os.readlink(path),
+            str(target),
+            target_signature,
+        )
     if not path.is_dir():
         digest = _file_digest(path, stat.st_size) if path.is_file() else None
         return (
@@ -1211,7 +1248,6 @@ def _path_signature(path: Path) -> tuple[Any, ...]:
             stat.st_mtime_ns,
             digest,
         )
-
     records: list[tuple[Any, ...]] = []
     pending = [path]
     while pending:
@@ -1222,7 +1258,11 @@ def _path_signature(path: Path) -> tuple[Any, ...]:
             entry_stat = entry.stat(follow_symlinks=False)
             relative = entry_path.relative_to(path).as_posix()
             if entry.is_symlink():
-                record = (relative, "symlink", os.readlink(entry_path))
+                record = (
+                    relative,
+                    "symlink",
+                    _path_signature(entry_path, symlink_seen),
+                )
             elif entry.is_dir(follow_symlinks=False):
                 record = (
                     relative,
@@ -1276,7 +1316,9 @@ def snapshot_board_state(parent_env: Mapping[str, str]) -> dict[Path, tuple[Any,
         except FileNotFoundError:
             snapshot[path] = (False,)
         except OSError as exc:
-            snapshot[path] = ("unreadable", type(exc).__name__)
+            raise NativeEvaluationUnavailable(
+                "inherited board state cannot be snapshotted safely"
+            ) from exc
     return snapshot
 
 
@@ -1289,7 +1331,9 @@ def verify_board_state_unchanged(snapshot: Mapping[Path, tuple[Any, ...]]) -> No
         except FileNotFoundError:
             current = (False,)
         except OSError as exc:
-            current = ("unreadable", type(exc).__name__)
+            raise NativeEvaluationUnavailable(
+                "inherited board state cannot be verified safely"
+            ) from exc
         if current != before:
             raise NativeEvaluationUnavailable(
                 "native evaluation touched inherited board state"
@@ -1367,7 +1411,10 @@ def _run_bounded_process(
     try:
         assert process.stdout is not None and process.stderr is not None
         stream_fds = (process.stdout.fileno(), process.stderr.fileno())
-        for stream in (process.stdout, process.stderr):
+        streams = {
+            stream.fileno(): stream for stream in (process.stdout, process.stderr)
+        }
+        for stream in streams.values():
             selector.register(stream, selectors.EVENT_READ)
             buffers[stream.fileno()] = bytearray()
         deadline = time.monotonic() + timeout
@@ -1382,7 +1429,7 @@ def _run_bounded_process(
                 chunk = os.read(selected.fd, 8192)
                 if not chunk:
                     selector.unregister(selected.fileobj)
-                    os.close(selected.fd)
+                    streams[selected.fd].close()
                     continue
                 buffer = buffers[selected.fd]
                 buffer.extend(chunk)
@@ -1403,6 +1450,12 @@ def _run_bounded_process(
         try:
             selector.close()
         finally:
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
             if process.poll() is None:
                 process.kill()
             try:
@@ -1446,12 +1499,12 @@ class HermesSubprocessModel(DecisionModel):
         del tools  # Native Hermes receives the equivalent tools through MCP.
         self.native_fixture_receipt = None
         self.native_trace = ()
+        env = build_isolated_environment(self.parent_env, self.profile, self.board_path)
         query_path = self.profile / "decision-prompt.txt"
         query = prompt
         if not query.rstrip().endswith(NATIVE_QUERY_SUFFIX):
             query += "\n\n" + NATIVE_QUERY_SUFFIX
         query_path.write_text(query, encoding="utf-8")
-        env = build_isolated_environment(self.parent_env, self.profile, self.board_path)
         command = [
             self.hermes,
             "chat",
@@ -1556,6 +1609,10 @@ def run_native_evaluation(
     source_auth = _auth_source(auth_file)
     cases = build_synthetic_cases(seed)
     parent_env = dict(os.environ)
+    if trace_output:
+        _ensure_path_not_inherited(
+            Path(trace_output), parent_env, "native trace output"
+        )
     with tempfile.TemporaryDirectory(prefix="factory-decision-eval-") as directory:
         root = Path(directory)
         state_path = root / "fixture-state.json"
@@ -1717,7 +1774,9 @@ def run_native_evaluation(
             model=model, provider=provider, cases=tuple(result_rows)
         )
         if trace_output:
-            output = Path(trace_output).expanduser()
+            output = _ensure_path_not_inherited(
+                Path(trace_output), parent_env, "native trace output"
+            )
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_text(
                 json.dumps(evaluation.as_dict(), indent=2, sort_keys=True) + "\n",

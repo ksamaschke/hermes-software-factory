@@ -848,3 +848,106 @@ def test_running_action_without_a_current_run_fails_closed():
     )
     with pytest.raises(contract.ContractViolation, match="running action"):
         contract.evaluate_decision(SyntheticDecisionModel(), context, adapter)
+
+
+def test_compound_secret_keys_are_redacted_case_insensitively():
+    safe = contract._safe_value(
+        {
+            "secretValue": "secret-one",
+            "passwordHash": "secret-two",
+            "tokenValue": "secret-three",
+            "API_KEY": "secret-four",
+            "mySecretValue": "secret-five",
+            "credentials_verified": "safe-status",
+        }
+    )
+    for key in (
+        "secretValue",
+        "passwordHash",
+        "tokenValue",
+        "API_KEY",
+        "mySecretValue",
+    ):
+        assert safe[key] == "[REDACTED]"
+    assert safe["credentials_verified"] == "safe-status"
+
+
+def test_context_and_lying_sequences_are_bounded_without_len_trust():
+    class LyingSequence(list):
+        def __len__(self):
+            return 1
+
+    with pytest.raises(contract.ContractViolation, match="skill input"):
+        contract.prepare_prompt(
+            _context("lying-skills", {}),
+            LyingSequence([(f"skill-{index}", "safe") for index in range(1_025)]),
+        )
+    oversized = replace(
+        _context("oversized-context", {}),
+        prior_decision={f"field-{index}": "x" * 80 for index in range(1_024)},
+    )
+    with pytest.raises(contract.ContractViolation, match="context"):
+        contract.validate_context(oversized)
+    policy = replace(
+        oversized.policy,
+        allowed_execution_modes=LyingSequence(
+            ["scheduled"] + [f"mode-{index}" for index in range(100)]
+        ),
+    )
+    with pytest.raises(contract.ContractViolation, match="execution_modes"):
+        contract.validate_context(replace(oversized, policy=policy))
+    with pytest.raises(
+        contract.ContractViolation, match="parent_completion.parent_ids"
+    ):
+        contract.ParentCompletion(
+            state="complete",
+            verified=True,
+            parent_ids=LyingSequence(
+                [f"parent-{index}" for index in range(contract._MAX_PARENT_IDS + 1)]
+            ),
+        ).as_dict()
+    evidence = contract.TypedEvidence(
+        kind="scheduler",
+        subject="subject",
+        status="observed",
+        reference="reference",
+    )
+    with pytest.raises(contract.ContractViolation, match="evidence.scheduler"):
+        contract.EvidenceBundle(
+            scheduler=tuple(evidence for _ in range(contract._MAX_EVIDENCE_ENTRIES + 1))
+        ).as_dict()
+    with pytest.raises(contract.ContractViolation, match="native fixture trace"):
+        contract._validate_observation_trace(
+            LyingSequence(
+                [{"tool": "read_live_state"}] * (contract._MAX_NATIVE_TRACE_ENTRIES + 1)
+            )
+        )
+
+
+def test_foreign_running_action_is_rejected_before_decision():
+    context = _context(
+        "foreign-running-action",
+        {
+            "run_id": "current-run",
+            "blocker": {
+                "fingerprint": "provider:capacity",
+                "previous_fingerprint": "provider:capacity",
+                "occurrences": 3,
+            },
+        },
+    )
+    state = _fixture_state(
+        context,
+        live={
+            "existing_action": {
+                "status": "running",
+                "current_run_id": "foreign-run",
+            }
+        },
+    )
+    with pytest.raises(contract.ContractViolation, match="foreign current run"):
+        contract.evaluate_decision(
+            SyntheticDecisionModel(),
+            context,
+            contract.NoSideEffectFixtureAdapter(state),
+        )
