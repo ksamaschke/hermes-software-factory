@@ -1632,7 +1632,11 @@ def _validate_fixture_state(
         if not isinstance(artifact_task_id, str) or not artifact_task_id.strip():
             raise ContractViolation("fixture artifact task identity is malformed")
         _safe_identifier(artifact_task_id, "fixture source.artifact_task_id")
-    if source_state == "merged" and artifact_state == "failed" and artifact_task_id is None:
+    if (
+        source_state == "merged"
+        and artifact_state == "failed"
+        and artifact_task_id is None
+    ):
         raise ContractViolation("failed merged artifact has no repair task identity")
     source_evidence = context.evidence.source
     if not any(entry.status == source_state for entry in source_evidence):

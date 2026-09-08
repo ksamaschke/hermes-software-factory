@@ -115,7 +115,8 @@ def test_board_path_inside_inherited_authority_is_rejected(tmp_path: Path):
     profile.mkdir(parents=True)
 
     with pytest.raises(
-        evaluation.NativeEvaluationUnavailable, match="overlaps inherited board authority"
+        evaluation.NativeEvaluationUnavailable,
+        match="overlaps inherited board authority",
     ):
         evaluation.build_isolated_environment(
             _contaminated_environment(live_board),
