@@ -595,3 +595,57 @@ def test_contract_surface_is_generic_and_does_not_embed_private_identifiers():
     assert "idempot" in text
     assert "execution_mode" in text
     assert "profile_name" in text
+
+
+def test_source_canonical_identity_is_injective_for_delimiter_values():
+    first = contract.SourceIdentity(
+        tracker="tracker:one",
+        project="two",
+        kind="issue",
+        item_key="42",
+    )
+    second = contract.SourceIdentity(
+        tracker="tracker",
+        project="one:two",
+        kind="issue",
+        item_key="42",
+    )
+
+    assert first.canonical_key != second.canonical_key
+    assert first.canonical_key == first.canonical_key
+
+
+def test_policy_rejects_duplicate_transition_actions():
+    policy = contract.DecisionPolicy(
+        transition_policy=(
+            ("hold", "current_phase"),
+            ("hold", "artifact"),
+        )
+    )
+
+    with pytest.raises(contract.ContractViolation, match="transitions are duplicated"):
+        policy.as_dict()
+
+
+def test_failed_merged_artifact_requires_a_bound_repair_task():
+    context = _context(
+        "artifact-without-task",
+        {"source": {"source_state": "merged", "artifact_state": "failed"}},
+    )
+    key = contract.action_idempotency_key(context)
+    adapter = contract.NoSideEffectFixtureAdapter(
+        _fixture_state(
+            context,
+            source={"source_state": "merged", "artifact_state": "failed"},
+            readbacks={
+                key: {
+                    "status": "artifact-remediation",
+                    "idempotency_key": key,
+                    "current_run_id": None,
+                }
+            },
+        )
+    )
+
+    with pytest.raises(contract.ContractViolation, match="repair task identity"):
+        contract.evaluate_decision(SyntheticDecisionModel(), context, adapter)

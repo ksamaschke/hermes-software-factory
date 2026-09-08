@@ -198,17 +198,27 @@ def build_isolated_environment(
             "isolated Hermes profile directory is missing"
         )
 
+    protected_roots: list[Path] = []
     inherited_board = str(parent_env.get("HERMES_KANBAN_DB", "")).strip()
     if inherited_board:
         try:
-            if Path(inherited_board).expanduser().resolve() == board_path:
-                raise NativeEvaluationUnavailable(
-                    "isolated board path must differ from the inherited board"
-                )
+            protected_roots.append(Path(inherited_board).expanduser().resolve().parent)
         except OSError:
             # An invalid inherited path is still discarded below; it must not
             # prevent creation of a valid isolated child environment.
             pass
+    inherited_home = str(parent_env.get("HERMES_KANBAN_HOME", "")).strip()
+    if inherited_home:
+        try:
+            protected_roots.append(Path(inherited_home).expanduser().resolve())
+        except OSError:
+            pass
+    if any(
+        board_path == root or root in board_path.parents for root in protected_roots
+    ):
+        raise NativeEvaluationUnavailable(
+            "isolated board path overlaps inherited board authority"
+        )
 
     # Use an allow-list rather than a deny-list.  Provider, SCM, cloud,
     # credential, board, session, and private-path variables are all excluded
@@ -1266,8 +1276,10 @@ class HermesSubprocessModel(DecisionModel):
                 if line.strip():
                     entry = json.loads(line, object_pairs_hook=unique_object)
                     if not isinstance(entry, Mapping):
-                        raise TypeError("fixture trace entry is not an object")
+                        raise ContractViolation("fixture trace entry is not an object")
                     trace.append(entry)
+        except ContractViolation:
+            raise
         except (OSError, TypeError, json.JSONDecodeError) as exc:
             raise NativeEvaluationUnavailable(
                 "native fixture trace is missing or malformed"

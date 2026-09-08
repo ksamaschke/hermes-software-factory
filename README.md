@@ -134,7 +134,7 @@ hermes skills install \
 Once installed, load the set explicitly for a session:
 
 ```bash
-hermes --skills kanban-implementation-workflow,kanban-factory-operations,kanban-progress-evidence,kanban-reviewer-contract,tracker-kanban-reconciliation,software-factory-recovery
+hermes --skills kanban-implementation-workflow,kanban-factory-operations,kanban-progress-evidence,operator-observer,kanban-reviewer-contract,tracker-kanban-reconciliation,software-factory-recovery
 ```
 
 The deterministic recovery add-ons are installed separately from the skill

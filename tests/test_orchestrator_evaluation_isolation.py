@@ -68,7 +68,8 @@ def _contaminated_environment(live_board: Path) -> dict[str, str]:
 def test_contaminated_parent_is_rewritten_to_a_private_board_and_profile(
     tmp_path: Path,
 ):
-    live_board = tmp_path / "live-kanban.db"
+    live_board = tmp_path / "live" / "live-kanban.db"
+    live_board.parent.mkdir(parents=True)
     live_board.write_bytes(b"live-board")
     profile = tmp_path / "eval" / "profile"
     profile.mkdir(parents=True)
@@ -107,10 +108,27 @@ def test_contaminated_parent_is_rewritten_to_a_private_board_and_profile(
         assert key not in child
 
 
+def test_board_path_inside_inherited_authority_is_rejected(tmp_path: Path):
+    live_board = tmp_path / "live" / "live-kanban.db"
+    live_board.parent.mkdir(parents=True)
+    profile = tmp_path / "eval" / "profile"
+    profile.mkdir(parents=True)
+
+    with pytest.raises(
+        evaluation.NativeEvaluationUnavailable, match="overlaps inherited board authority"
+    ):
+        evaluation.build_isolated_environment(
+            _contaminated_environment(live_board),
+            profile,
+            live_board.parent / "child" / "isolated-kanban.db",
+        )
+
+
 def test_native_child_write_cannot_reach_contaminated_live_board(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    live_board = tmp_path / "live-kanban.db"
+    live_board = tmp_path / "live" / "live-kanban.db"
+    live_board.parent.mkdir(parents=True)
     live_board.write_bytes(b"live-board")
     profile = tmp_path / "profile"
     profile.mkdir()
@@ -183,3 +201,31 @@ def test_profile_catalog_is_explicitly_fixture_only(tmp_path: Path):
     (profile / "config.yaml").write_text(json.dumps(config), encoding="utf-8")
     with pytest.raises(evaluation.NativeEvaluationUnavailable, match="fixture-only"):
         evaluation.verify_fixture_only_profile(profile)
+
+
+def test_malformed_trace_entry_is_a_contract_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    trace_path = tmp_path / "trace.jsonl"
+    trace_path.write_text("[]\n", encoding="utf-8")
+
+    def fake_run(*_args: Any, **_kwargs: Any):
+        return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(evaluation.subprocess, "run", fake_run)
+    model = evaluation.HermesSubprocessModel(
+        profile=profile,
+        state_path=tmp_path / "state.json",
+        trace_path=trace_path,
+        board_path=tmp_path / "isolated" / "kanban.db",
+        hermes="hermes",
+        model="test-model",
+        provider="test-provider",
+        run_budget=30,
+        parent_env={},
+    )
+
+    with pytest.raises(contract.ContractViolation, match="not an object"):
+        model.complete("typed prompt", {})

@@ -261,13 +261,17 @@ class SourceIdentity:
 
     @property
     def canonical_key(self) -> str:
-        return ":".join(
-            (
+        # JSON string escaping makes the four ordered identity components
+        # injective even when an identifier contains the historical delimiter.
+        return "source.v1:" + json.dumps(
+            [
                 _safe_identifier(self.tracker, "source_item.tracker"),
                 _safe_identifier(self.project, "source_item.project"),
                 _safe_identifier(self.kind, "source_item.kind"),
                 _safe_identifier(self.item_key, "source_item.item_key"),
-            )
+            ],
+            ensure_ascii=True,
+            separators=(",", ":"),
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -599,10 +603,28 @@ class DecisionPolicy:
             raise ContractViolation("policy actions are malformed") from exc
         if not allowed or not set(allowed) <= set(ALLOWED_ACTIONS):
             raise ContractViolation("policy contains an unsupported action")
+        if len(set(allowed)) != len(allowed):
+            raise ContractViolation("policy actions are duplicated")
         try:
-            transition = dict(self.transition_policy)
+            transition_entries = list(self.transition_policy)
+            transition_pairs = []
+            for entry in transition_entries:
+                if not isinstance(entry, (tuple, list)) or len(entry) != 2:
+                    raise ValueError("transition entry must contain action and phase")
+                transition_pairs.append((entry[0], entry[1]))
         except (TypeError, ValueError) as exc:
             raise ContractViolation("policy transition table is malformed") from exc
+        transition_pairs = [
+            (
+                _safe_identifier(action, "policy.transition.action"),
+                _safe_identifier(next_phase, "policy.transition.next_phase"),
+            )
+            for action, next_phase in transition_pairs
+        ]
+        transition_actions = [action for action, _next_phase in transition_pairs]
+        if len(set(transition_actions)) != len(transition_actions):
+            raise ContractViolation("policy transitions are duplicated")
+        transition = dict(transition_pairs)
         if set(allowed) - set(transition):
             raise ContractViolation("policy has no transition for an allowed action")
         if any(
@@ -1605,6 +1627,13 @@ def _validate_fixture_state(
         raise ContractViolation("fixture source state has an unknown status")
     if artifact_state not in {"ready", "failed"}:
         raise ContractViolation("fixture artifact state is unknown or malformed")
+    artifact_task_id = source.get("artifact_task_id")
+    if artifact_task_id is not None:
+        if not isinstance(artifact_task_id, str) or not artifact_task_id.strip():
+            raise ContractViolation("fixture artifact task identity is malformed")
+        _safe_identifier(artifact_task_id, "fixture source.artifact_task_id")
+    if source_state == "merged" and artifact_state == "failed" and artifact_task_id is None:
+        raise ContractViolation("failed merged artifact has no repair task identity")
     source_evidence = context.evidence.source
     if not any(entry.status == source_state for entry in source_evidence):
         raise ContractViolation("fixture source state is not backed by source evidence")
@@ -1916,7 +1945,9 @@ def _validate_action_semantics(
             raise ContractViolation("reuse target is not the bound existing task")
     if action == "repair_artifact":
         artifact_target = source.get("artifact_task_id")
-        if artifact_target is not None and choose_target != artifact_target:
+        if not isinstance(artifact_target, str) or not artifact_target.strip():
+            raise ContractViolation("artifact repair lacks a failed artifact task")
+        if choose_target != artifact_target:
             raise ContractViolation(
                 "artifact repair target is not the failed artifact task"
             )
