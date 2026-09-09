@@ -1,7 +1,7 @@
 --- a/hermes_cli/kanban_db.py
 +++ b/hermes_cli/kanban_db.py
 @@ -101,6 +101,31 @@
- 
+
  VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
  VALID_INITIAL_STATUSES = {"running", "blocked"}
 +
@@ -29,7 +29,7 @@
 +    "spawn_failed",
 +    "gave_up",
 +})
- 
+
  # Typed block reasons. Distinguishes the two fundamentally different things a
  # worker (or human) means by "blocked", so each can be routed differently
 @@ -1141,6 +1166,18 @@
@@ -48,10 +48,10 @@
 +    # is intentionally transient on Task because the durable claimed event is
 +    # the source of truth for recovery/audit.
 +    evidence_deadline: Optional[float] = None
- 
+
      @classmethod
      def from_row(cls, row: sqlite3.Row) -> "Task":
-@@ -1235,6 +1272,11 @@
+@@ -1235,6 +1272,17 @@
                  if "block_recurrences" in keys and row["block_recurrences"] is not None
                  else 0
              ),
@@ -60,10 +60,45 @@
 +                if "runtime_class" in keys and row["runtime_class"]
 +                else RUNTIME_CLASS_IMPLEMENTATION
 +            ),
++            evidence_deadline=(
++                float(row["current_evidence_deadline"])
++                if "current_evidence_deadline" in keys
++                and row["current_evidence_deadline"] is not None
++                else None
++            ),
          )
- 
- 
-@@ -1362,6 +1404,7 @@
+
+
+@@ -1258,6 +1306,7 @@
+     claim_expires: Optional[int]
+     worker_pid: Optional[int]
+     max_runtime_seconds: Optional[int]
++    evidence_deadline: Optional[float]
+     last_heartbeat_at: Optional[int]
+     started_at: int
+     ended_at: Optional[int]
+@@ -1268,6 +1317,7 @@
+
+     @classmethod
+     def from_row(cls, row: sqlite3.Row) -> "Run":
++        keys = set(row.keys())
+         try:
+             meta = json.loads(row["metadata"]) if row["metadata"] else None
+         except Exception:
+@@ -1282,6 +1332,12 @@
+             claim_expires=row["claim_expires"],
+             worker_pid=row["worker_pid"],
+             max_runtime_seconds=row["max_runtime_seconds"],
++            evidence_deadline=(
++                float(row["evidence_deadline"])
++                if "evidence_deadline" in keys
++                and row["evidence_deadline"] is not None
++                else None
++            ),
+             last_heartbeat_at=row["last_heartbeat_at"],
+             started_at=int(row["started_at"]),
+             ended_at=(int(row["ended_at"]) if row["ended_at"] is not None else None),
+@@ -1362,6 +1418,7 @@
      -- Short excerpt of the most recent failure's error text.
      last_failure_error   TEXT,
      max_runtime_seconds  INTEGER,
@@ -71,7 +106,60 @@
      last_heartbeat_at    INTEGER,
      -- Pointer into task_runs for the currently-active run (NULL if no
      -- run is in-flight). Denormalised for cheap reads.
-@@ -2605,6 +2648,11 @@
+@@ -1431,6 +1488,30 @@
+     PRIMARY KEY (parent_id, child_id)
+ );
+
++-- A failed/blocked card may be replaced by exactly one canonical successor.
++-- Incoming dependency edges remain anchored to the predecessor for auditability;
++-- readiness follows this one-to-one chain to its live leaf.  The relation is
++-- explicit and immutable so a recovery cannot silently fork into two writers.
++CREATE TABLE IF NOT EXISTS canonical_task_lanes (
++    lane_key       TEXT PRIMARY KEY,
++    root_task_id   TEXT NOT NULL UNIQUE,
++    leaf_task_id   TEXT NOT NULL UNIQUE,
++    generation     INTEGER NOT NULL DEFAULT 0,
++    updated_at     INTEGER NOT NULL
++);
++
++CREATE TABLE IF NOT EXISTS task_supersessions (
++    predecessor_id      TEXT PRIMARY KEY,
++    successor_id        TEXT NOT NULL UNIQUE,
++    predecessor_run_id  INTEGER NOT NULL,
++    successor_run_id    INTEGER,
++    lane_key            TEXT NOT NULL,
++    generation          INTEGER NOT NULL,
++    reason              TEXT NOT NULL,
++    evidence            TEXT NOT NULL,
++    created_at          INTEGER NOT NULL
++);
++
+ CREATE TABLE IF NOT EXISTS task_comments (
+     id         INTEGER PRIMARY KEY AUTOINCREMENT,
+     task_id    TEXT NOT NULL,
+@@ -1464,9 +1545,10 @@
+     -- status: running | done | blocked | crashed | timed_out | failed | released
+     claim_lock          TEXT,
+     claim_expires       INTEGER,
+-    worker_pid          INTEGER,
++    worker_pid         INTEGER,
+     max_runtime_seconds INTEGER,
+-    last_heartbeat_at   INTEGER,
++    evidence_deadline  REAL,
++    last_heartbeat_at  INTEGER,
+     started_at          INTEGER NOT NULL,
+     ended_at            INTEGER,
+     outcome             TEXT,
+@@ -1518,6 +1600,8 @@
+ CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
+ CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
+ CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
++CREATE INDEX IF NOT EXISTS idx_supersessions_successor ON task_supersessions(successor_id);
++CREATE INDEX IF NOT EXISTS idx_supersessions_lane ON task_supersessions(lane_key, generation);
+ CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
+ CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
+ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
+@@ -2605,6 +2689,11 @@
          _add_column_if_missing(
              conn, "tasks", "max_runtime_seconds", "max_runtime_seconds INTEGER"
          )
@@ -83,7 +171,27 @@
      if "last_heartbeat_at" not in cols:
          _add_column_if_missing(
              conn, "tasks", "last_heartbeat_at", "last_heartbeat_at INTEGER"
-@@ -3182,6 +3230,7 @@
+@@ -2633,6 +2722,19 @@
+         # which is the correct default (they keep the global behaviour
+         # they were getting before the column existed).
+         _add_column_if_missing(conn, "tasks", "max_retries", "max_retries INTEGER")
++
++    runs_exist = conn.execute(
++        "SELECT 1 FROM sqlite_master "
++        "WHERE type='table' AND name='task_runs' LIMIT 1"
++    ).fetchone() is not None
++    if runs_exist:
++        run_cols = {
++            row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")
++        }
++        if "evidence_deadline" not in run_cols:
++            _add_column_if_missing(
++                conn, "task_runs", "evidence_deadline", "evidence_deadline REAL"
++            )
+
+     if "model_override" not in cols:
+         conn.execute("ALTER TABLE tasks ADD COLUMN model_override TEXT")
+@@ -3182,6 +3284,7 @@
      triage: bool = False,
      idempotency_key: Optional[str] = None,
      max_runtime_seconds: Optional[int] = None,
@@ -91,7 +199,7 @@
      skills: Optional[Iterable[str]] = None,
      max_retries: Optional[int] = None,
      model_override: Optional[str] = None,
-@@ -3245,6 +3294,11 @@
+@@ -3245,6 +3348,11 @@
      if initial_status not in VALID_INITIAL_STATUSES:
          raise ValueError(
              f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
@@ -103,7 +211,7 @@
          )
      if workspace_kind not in VALID_WORKSPACE_KINDS:
          raise ValueError(
-@@ -3505,11 +3559,11 @@
+@@ -3505,11 +3613,11 @@
                          id, title, body, assignee, status, priority,
                          created_by, created_at, workspace_kind, workspace_path,
                          branch_name, project_id, tenant, idempotency_key,
@@ -117,7 +225,7 @@
                      """,
                      (
                          task_id,
-@@ -3527,6 +3581,7 @@
+@@ -3527,6 +3635,7 @@
                          tenant,
                          idempotency_key,
                          int(max_runtime_seconds) if max_runtime_seconds is not None else None,
@@ -125,7 +233,7 @@
                          json.dumps(skills_list) if skills_list is not None else None,
                          int(max_retries) if max_retries is not None else None,
                          model_override,
-@@ -3559,6 +3614,7 @@
+@@ -3559,6 +3668,7 @@
                          "workspace_path": workspace_path,
                          "branch_name": branch_name,
                          "project_id": project_id,
@@ -133,15 +241,534 @@
                          "skills": list(skills_list) if skills_list else None,
                          "goal_mode": bool(goal_mode) or None,
                          "model_override": model_override,
-@@ -4631,6 +4687,7 @@
+@@ -3640,7 +3750,16 @@
+
+
+ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
+-    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    row = conn.execute(
++        """
++        SELECT tasks.*,
++               task_runs.evidence_deadline AS current_evidence_deadline
++          FROM tasks
++          LEFT JOIN task_runs ON task_runs.id = tasks.current_run_id
++         WHERE tasks.id = ?
++        """,
++        (task_id,),
++    ).fetchone()
+     return Task.from_row(row) if row else None
+
+
+@@ -3834,8 +3953,42 @@
+
+
+ # ---------------------------------------------------------------------------
+-# Links
++# Links and canonical recovery
+ # ---------------------------------------------------------------------------
++
++def canonical_task_chain(
++    conn: sqlite3.Connection, task_id: str
++) -> tuple[str, ...]:
++    """Return the immutable predecessor-to-leaf supersession chain.
++
++    One predecessor and one successor may appear only once in the relation, so
++    a chain has one canonical leaf. A cycle indicates database corruption and
++    fails closed instead of guessing which card owns delivery.
++    """
++    chain: list[str] = []
++    seen: set[str] = set()
++    current = str(task_id)
++    while True:
++        if current in seen:
++            raise RuntimeError(
++                f"canonical recovery cycle detected while resolving {task_id}"
++            )
++        seen.add(current)
++        chain.append(current)
++        row = conn.execute(
++            "SELECT successor_id FROM task_supersessions "
++            "WHERE predecessor_id = ?",
++            (current,),
++        ).fetchone()
++        if row is None:
++            return tuple(chain)
++        current = str(row["successor_id"])
++
++
++def canonical_task_id(conn: sqlite3.Connection, task_id: str) -> str:
++    """Resolve ``task_id`` to the sole current recovery leaf."""
++    return canonical_task_chain(conn, task_id)[-1]
++
+
+ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
+     if parent_id == child_id:
+@@ -3852,11 +4005,10 @@
+             "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+             (parent_id, child_id),
+         )
+-        # If child was ready but parent is not yet done, demote child to todo.
+-        parent_status = conn.execute(
+-            "SELECT status FROM tasks WHERE id = ?", (parent_id,)
+-        ).fetchone()["status"]
+-        if parent_status != "done":
++        # If child was ready but the parent's canonical recovery leaf is not
++        # yet terminal, demote it to todo.  An archived superseded predecessor
++        # is not itself a satisfied dependency; its sole successor must finish.
++        if not _parents_satisfied(conn, child_id):
+             conn.execute(
+                 "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
+                 (child_id,),
+@@ -3889,6 +4041,301 @@
+         ).fetchall()
+         stack.extend(r["child_id"] for r in rows)
+     return False
++
++
++_CANONICAL_RECOVERY_FAILURE_OUTCOMES = frozenset(
++    {
++        "blocked",
++        "crashed",
++        "failed",
++        "gave_up",
++        "review_incomplete",
++        "spawn_failed",
++        "timed_out",
++    }
++)
++_CANONICAL_RECOVERY_SUCCESSOR_STATUSES = frozenset(
++    {"todo", "scheduled", "ready", "review", "running", "done"}
++)
++
++
++def supersede_task(
++    conn: sqlite3.Connection,
++    predecessor_id: str,
++    successor_id: str,
++    *,
++    lane_key: str,
++    expected_predecessor_run_id: int,
++    expected_successor_run_id: Optional[int] = None,
++    reason: str,
++    evidence: dict,
++) -> dict:
++    """Replace one failed card with one durable canonical successor.
++
++    This is the symmetric recovery transition for fail-closed task graphs.  It
++    never treats an archived predecessor as success by itself: parent gates
++    resolve through ``task_supersessions`` to the current lane leaf.  The
++    transition is fenced to an exact failed predecessor run and, for an
++    already-running/done successor, its exact run.  One immutable ``lane_key``
++    has one leaf and generation, so concurrent recovery attempts cannot fork.
++    """
++    predecessor_id = str(predecessor_id).strip()
++    successor_id = str(successor_id).strip()
++    lane_key = str(lane_key).strip()
++    reason = str(reason).strip()
++    if not predecessor_id or not successor_id:
++        raise ValueError("predecessor_id and successor_id are required")
++    if predecessor_id == successor_id:
++        raise ValueError("a task cannot supersede itself")
++    if not lane_key or len(lane_key) > 512:
++        raise ValueError("lane_key must contain 1..512 characters")
++    if not reason or len(reason) > 2048:
++        raise ValueError("reason must contain 1..2048 characters")
++    if not isinstance(evidence, dict) or not evidence:
++        raise ValueError("non-empty structured evidence is required")
++    try:
++        predecessor_run_id = int(expected_predecessor_run_id)
++    except (TypeError, ValueError) as exc:
++        raise ValueError("expected_predecessor_run_id must be an integer") from exc
++    if predecessor_run_id <= 0:
++        raise ValueError("expected_predecessor_run_id must be positive")
++    successor_run_id = None
++    if expected_successor_run_id is not None:
++        try:
++            successor_run_id = int(expected_successor_run_id)
++        except (TypeError, ValueError) as exc:
++            raise ValueError("expected_successor_run_id must be an integer") from exc
++        if successor_run_id <= 0:
++            raise ValueError("expected_successor_run_id must be positive")
++    try:
++        evidence_json = json.dumps(
++            evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")
++        )
++    except (RecursionError, TypeError, ValueError) as exc:
++        raise ValueError("evidence must be JSON-serializable") from exc
++    if len(evidence_json.encode("utf-8")) > 16 * 1024:
++        raise ValueError("evidence exceeds the 16 KiB canonical recovery limit")
++
++    now = int(time.time())
++    removed_parent_edge = False
++    relation: dict
++    with write_txn(conn):
++        rows = conn.execute(
++            "SELECT id, status, current_run_id, claim_lock, worker_pid "
++            "FROM tasks WHERE id IN (?, ?)",
++            (predecessor_id, successor_id),
++        ).fetchall()
++        by_id = {str(row["id"]): row for row in rows}
++        missing = [
++            task_id
++            for task_id in (predecessor_id, successor_id)
++            if task_id not in by_id
++        ]
++        if missing:
++            raise ValueError(f"unknown task(s): {', '.join(missing)}")
++        predecessor = by_id[predecessor_id]
++        successor = by_id[successor_id]
++
++        existing = conn.execute(
++            "SELECT * FROM task_supersessions WHERE predecessor_id = ?",
++            (predecessor_id,),
++        ).fetchone()
++        if existing is not None:
++            same = (
++                str(existing["successor_id"]) == successor_id
++                and int(existing["predecessor_run_id"]) == predecessor_run_id
++                and (
++                    int(existing["successor_run_id"])
++                    if existing["successor_run_id"] is not None
++                    else None
++                )
++                == successor_run_id
++                and str(existing["lane_key"]) == lane_key
++                and str(existing["reason"]) == reason
++                and str(existing["evidence"]) == evidence_json
++            )
++            if not same:
++                raise RuntimeError(
++                    f"task {predecessor_id} already has a different canonical successor"
++                )
++            return {
++                "changed": False,
++                "lane_key": lane_key,
++                "generation": int(existing["generation"]),
++                "predecessor_id": predecessor_id,
++                "successor_id": successor_id,
++            }
++
++        if predecessor["status"] not in {"blocked", "triage"}:
++            raise RuntimeError(
++                f"predecessor {predecessor_id} must be blocked or triage, "
++                f"not {predecessor['status']}"
++            )
++        if (
++            predecessor["current_run_id"] is not None
++            or predecessor["claim_lock"] is not None
++            or predecessor["worker_pid"] is not None
++        ):
++            raise RuntimeError(
++                f"predecessor {predecessor_id} still has an active owner"
++            )
++        predecessor_run = conn.execute(
++            "SELECT id, outcome, ended_at FROM task_runs "
++            "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
++            (predecessor_id,),
++        ).fetchone()
++        if predecessor_run is None or int(predecessor_run["id"]) != predecessor_run_id:
++            raise RuntimeError(
++                f"predecessor run fence changed for task {predecessor_id}"
++            )
++        predecessor_outcome = (
++            str(predecessor_run["outcome"]) if predecessor_run["outcome"] else ""
++        )
++        if (
++            predecessor_run["ended_at"] is None
++            or predecessor_outcome not in _CANONICAL_RECOVERY_FAILURE_OUTCOMES
++        ):
++            raise RuntimeError(
++                f"predecessor run {predecessor_run_id} is not a terminal failure"
++            )
++
++        successor_status = str(successor["status"])
++        if successor_status not in _CANONICAL_RECOVERY_SUCCESSOR_STATUSES:
++            raise RuntimeError(
++                f"successor {successor_id} is not executable or complete: "
++                f"{successor_status}"
++            )
++        active_successor_run = (
++            int(successor["current_run_id"])
++            if successor["current_run_id"] is not None
++            else None
++        )
++        if successor_status == "running":
++            if successor_run_id is None or active_successor_run != successor_run_id:
++                raise RuntimeError(
++                    f"successor run fence changed for running task {successor_id}"
++                )
++        elif successor_status == "done":
++            if successor_run_id is None:
++                raise RuntimeError(
++                    "expected_successor_run_id is required for a completed successor"
++                )
++            completed_run = conn.execute(
++                "SELECT outcome, ended_at FROM task_runs "
++                "WHERE id = ? AND task_id = ?",
++                (successor_run_id, successor_id),
++            ).fetchone()
++            if (
++                completed_run is None
++                or completed_run["ended_at"] is None
++                or completed_run["outcome"] != "completed"
++            ):
++                raise RuntimeError(
++                    f"successor run {successor_run_id} is not completed"
++                )
++        elif successor_run_id is not None or active_successor_run is not None:
++            raise RuntimeError(
++                f"queued successor {successor_id} must not carry an active run fence"
++            )
++
++        # A recovery card created with the failed card as its own parent can
++        # never run. Remove only that direct obsolete edge. Any remaining
++        # transitive predecessor->successor dependency is ambiguous and fails
++        # closed rather than rewriting unrelated graph structure.
++        removed_parent_edge = bool(
++            conn.execute(
++                "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
++                (predecessor_id, successor_id),
++            ).rowcount
++        )
++        if _would_cycle(conn, successor_id, predecessor_id):
++            raise RuntimeError(
++                f"successor {successor_id} remains transitively dependent on "
++                f"predecessor {predecessor_id}"
++            )
++        if predecessor_id in canonical_task_chain(conn, successor_id):
++            raise RuntimeError("supersession would create a canonical recovery cycle")
++
++        lane = conn.execute(
++            "SELECT * FROM canonical_task_lanes WHERE lane_key = ?",
++            (lane_key,),
++        ).fetchone()
++        occupying_lane = conn.execute(
++            "SELECT lane_key FROM canonical_task_lanes "
++            "WHERE root_task_id = ? OR leaf_task_id = ?",
++            (predecessor_id, predecessor_id),
++        ).fetchone()
++        if occupying_lane is not None and str(occupying_lane["lane_key"]) != lane_key:
++            raise RuntimeError(
++                f"predecessor {predecessor_id} belongs to canonical lane "
++                f"{occupying_lane['lane_key']}"
++            )
++        if lane is None:
++            conn.execute(
++                "INSERT INTO canonical_task_lanes "
++                "(lane_key, root_task_id, leaf_task_id, generation, updated_at) "
++                "VALUES (?, ?, ?, 0, ?)",
++                (lane_key, predecessor_id, predecessor_id, now),
++            )
++            generation = 1
++        else:
++            if str(lane["leaf_task_id"]) != predecessor_id:
++                raise RuntimeError(
++                    f"canonical lane {lane_key} is already owned by "
++                    f"{lane['leaf_task_id']}"
++                )
++            generation = int(lane["generation"]) + 1
++
++        conn.execute(
++            "INSERT INTO task_supersessions "
++            "(predecessor_id, successor_id, predecessor_run_id, "
++            " successor_run_id, lane_key, generation, reason, evidence, created_at) "
++            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
++            (
++                predecessor_id,
++                successor_id,
++                predecessor_run_id,
++                successor_run_id,
++                lane_key,
++                generation,
++                reason,
++                evidence_json,
++                now,
++            ),
++        )
++        lane_update = conn.execute(
++            "UPDATE canonical_task_lanes SET leaf_task_id = ?, generation = ?, "
++            "updated_at = ? WHERE lane_key = ? AND leaf_task_id = ?",
++            (successor_id, generation, now, lane_key, predecessor_id),
++        )
++        if lane_update.rowcount != 1:
++            raise RuntimeError(f"canonical lane {lane_key} changed during recovery")
++        conn.execute(
++            "UPDATE tasks SET status = 'archived', completed_at = COALESCE(completed_at, ?), "
++            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
++            "last_heartbeat_at = NULL, current_run_id = NULL "
++            "WHERE id = ?",
++            (now, predecessor_id),
++        )
++        payload = {
++            "lane_key": lane_key,
++            "generation": generation,
++            "predecessor_id": predecessor_id,
++            "predecessor_run_id": predecessor_run_id,
++            "successor_id": successor_id,
++            "successor_run_id": successor_run_id,
++            "reason": reason,
++            "removed_obsolete_parent_edge": removed_parent_edge,
++        }
++        _append_event(conn, predecessor_id, "superseded", payload)
++        _append_event(conn, successor_id, "canonical_successor", payload)
++        _inherit_notify_subs(conn, successor_id, (predecessor_id,))
++        relation = {"changed": True, **payload}
++
++    notify_task_updated(conn, predecessor_id, ("status",))
++    notify_task_updated(conn, successor_id, ("status",))
++    recompute_ready(conn)
++    return relation
+
+
+ def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
+@@ -3971,19 +4418,30 @@
+     return task_graph_contexts(conn, [task_id])[task_id]
+
+
+-def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Optional[str]]]:
+-    """Return ``(parent_id, result)`` for every done parent of ``task_id``."""
+-    rows = conn.execute(
+-        """
+-        SELECT t.id AS id, t.result AS result
+-        FROM tasks t
+-        JOIN task_links l ON l.parent_id = t.id
+-        WHERE l.child_id = ? AND t.status = 'done'
+-        ORDER BY t.completed_at ASC
+-        """,
+-        (task_id,),
+-    ).fetchall()
+-    return [(r["id"], r["result"]) for r in rows]
++def parent_results(
++    conn: sqlite3.Connection, task_id: str
++) -> list[tuple[str, Optional[str]]]:
++    """Return results from every direct dependency's canonical done leaf."""
++    results: list[tuple[str, Optional[str]]] = []
++    for parent_id in parent_ids(conn, task_id):
++        leaf_id = canonical_task_id(conn, parent_id)
++        row = conn.execute(
++            "SELECT status, result FROM tasks WHERE id = ?", (leaf_id,)
++        ).fetchone()
++        if row is not None and row["status"] == "done":
++            completed_run = conn.execute(
++                "SELECT summary FROM task_runs "
++                "WHERE task_id = ? AND outcome = 'completed' "
++                "ORDER BY ended_at DESC, id DESC LIMIT 1",
++                (leaf_id,),
++            ).fetchone()
++            handoff = (
++                completed_run["summary"]
++                if completed_run is not None and completed_run["summary"]
++                else row["result"]
++            )
++            results.append((leaf_id, handoff))
++    return results
+
+
+ # ---------------------------------------------------------------------------
+@@ -4521,11 +4979,15 @@
+ def recompute_ready(
+     conn: sqlite3.Connection, failure_limit: int = None,
+ ) -> int:
+-    """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
+-
+-    Returns the number of tasks promoted.  Opens its own IMMEDIATE txn, so it
+-    MUST be called OUTSIDE any open write transaction (plain ``write_txn``
+-    raises on nesting); call it after the enclosing txn commits.
++    """Promote waiting tasks when every canonical dependency leaf is terminal.
++
++    Direct dependency edges remain immutable audit history. If a failed
++    parent was explicitly superseded, readiness follows its one fenced
++    successor chain instead of treating the archived predecessor as success.
++    Returns the number of tasks promoted. The function opens its own IMMEDIATE
++    transaction, so it MUST be called OUTSIDE any open write transaction
++    (plain ``write_txn`` raises on nesting); call it after the enclosing
++    transaction commits.
+
+     ``blocked`` tasks are also considered for promotion (so a task
+     blocked purely by a parent dependency unblocks itself when the
+@@ -4567,13 +5029,7 @@
+                 # legitimate exit (it emits ``"unblocked"`` which flips
+                 # this predicate back).
+                 continue
+-            parents = conn.execute(
+-                "SELECT t.status FROM tasks t "
+-                "JOIN task_links l ON l.parent_id = t.id "
+-                "WHERE l.child_id = ?",
+-                (task_id,),
+-            ).fetchall()
+-            if all(p["status"] in ("done", "archived") for p in parents):
++            if _parents_satisfied(conn, task_id):
+                 resume_status = _resume_status_from_events(conn, task_id)
+                 if cur_status == "blocked":
+                     # Don't auto-recover tasks that have hit the
+@@ -4615,14 +5071,24 @@
+ # ---------------------------------------------------------------------------
+
+ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
+-    """Return whether every direct parent is terminal for dependency gating."""
+-    return conn.execute(
+-        "SELECT 1 FROM task_links l "
+-        "JOIN tasks p ON p.id = l.parent_id "
+-        "WHERE l.child_id = ? "
+-        "AND p.status NOT IN ('done', 'archived') LIMIT 1",
++    """Return whether every dependency's canonical leaf is terminal.
++
++    An archived ordinary parent remains terminal. For an explicitly
++    superseded parent, the archived predecessor is only history: dependency
++    gating follows its one canonical successor chain to the current leaf.
++    """
++    rows = conn.execute(
++        "SELECT parent_id FROM task_links WHERE child_id = ?",
+         (task_id,),
+-    ).fetchone() is None
++    ).fetchall()
++    for row in rows:
++        leaf_id = canonical_task_id(conn, str(row["parent_id"]))
++        leaf = conn.execute(
++            "SELECT status FROM tasks WHERE id = ?", (leaf_id,)
++        ).fetchone()
++        if leaf is None or leaf["status"] not in ("done", "archived"):
++            return False
++    return True
+
+
+ def claim_task(
+@@ -4631,6 +5097,7 @@
      *,
      ttl_seconds: Optional[int] = None,
      claimer: Optional[str] = None,
 +    runtime_class: Optional[str] = None,
  ) -> Optional[Task]:
      """Atomically transition ``ready -> running``.
- 
-@@ -4704,10 +4761,27 @@
+
+@@ -4649,21 +5116,17 @@
+         # 'todo' here — recompute_ready will re-promote when the parents
+         # actually finish. See RCA at
+         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
+-        undone = conn.execute(
+-            "SELECT 1 FROM task_links l "
+-            "JOIN tasks p ON p.id = l.parent_id "
+-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+-            (task_id,),
+-        ).fetchone()
+-        if undone:
++        if not _parents_satisfied(conn, task_id):
+             conn.execute(
+                 "UPDATE tasks SET status = 'todo' "
+                 "WHERE id = ? AND status = 'ready'",
+                 (task_id,),
+             )
+             _append_event(
+-                conn, task_id, "claim_rejected",
+-                {"reason": "parents_not_done"},
++                conn,
++                task_id,
++                "claim_rejected",
++                {"reason": "canonical_parents_not_done"},
+             )
+             return None
+         # Defensive: if a prior run somehow leaked (invariant violation from
+@@ -4704,17 +5167,34 @@
          # Look up the current task row so we can populate the run with
          # its assignee / step / runtime cap.
          trow = conn.execute(
@@ -170,16 +797,26 @@
          run_cur = conn.execute(
              """
              INSERT INTO task_runs (
-@@ -4722,7 +4796,7 @@
+                 task_id, profile, step_key, status,
+                 claim_lock, claim_expires, max_runtime_seconds,
+-                started_at
+-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
++                evidence_deadline, started_at
++            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
+             """,
+             (
+                 task_id,
+@@ -4722,7 +5202,8 @@
                  trow["current_step_key"] if trow else None,
                  lock,
                  expires,
 -                trow["max_runtime_seconds"] if trow else None,
 +                run_max_runtime,
++                evidence_deadline,
                  now,
              ),
          )
-@@ -4733,10 +4807,23 @@
+@@ -4733,10 +5214,23 @@
          )
          _append_event(
              conn, task_id, "claimed",
@@ -204,7 +841,7 @@
      _fire_kanban_lifecycle_hook(
          "kanban_task_claimed",
          task_id,
-@@ -4745,6 +4832,124 @@
+@@ -4745,6 +5239,124 @@
          run_id=run_id,
      )
      return claimed
@@ -326,10 +963,10 @@
 +    result = _effective_runtime_seconds(max_runtime_seconds, REVIEW_RUNTIME_POLICY)
 +    assert result is not None
 +    return result
- 
- 
+
+
  def claim_review_task(
-@@ -4790,6 +4995,7 @@
+@@ -4790,6 +5402,7 @@
              """
              UPDATE tasks
                 SET status        = 'running',
@@ -337,7 +974,7 @@
                     claim_lock    = ?,
                     claim_expires = ?,
                     started_at    = COALESCE(started_at, ?)
-@@ -4797,15 +5003,24 @@
+@@ -4797,22 +5410,31 @@
                 AND status = 'review'
                 AND claim_lock IS NULL
              """,
@@ -364,16 +1001,26 @@
          run_cur = conn.execute(
              """
              INSERT INTO task_runs (
-@@ -4820,7 +5035,7 @@
+                 task_id, profile, step_key, status,
+                 claim_lock, claim_expires, max_runtime_seconds,
+-                started_at
+-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
++                evidence_deadline, started_at
++            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
+             """,
+             (
+                 task_id,
+@@ -4820,7 +5442,8 @@
                  trow["current_step_key"] if trow else None,
                  lock,
                  expires,
 -                trow["max_runtime_seconds"] if trow else None,
 +                run_max_runtime,
++                evidence_deadline,
                  now,
              ),
          )
-@@ -4831,11 +5046,44 @@
+@@ -4831,11 +5454,44 @@
          )
          _append_event(
              conn, task_id, "claimed",
@@ -418,13 +1065,13 @@
 +        conn, task_id, ttl_seconds=ttl_seconds, claimer=claimer,
 +        runtime_class=RUNTIME_CLASS_EVIDENCE_RECOVERY,
 +    )
- 
- 
+
+
  def _retry_status_for_run(
-@@ -5360,6 +5608,263 @@
+@@ -5360,6 +6016,261 @@
      """Raised when a declared scratch deliverable cannot be preserved."""
- 
- 
+
+
 +class ReviewIncompleteError(ValueError):
 +    """Raised when a review/evidence run cannot produce an honest approval."""
 +
@@ -502,20 +1149,18 @@
 +    task_id: str,
 +    run_id: Optional[int],
 +) -> Optional[float]:
-+    """Read the exact deadline stamped on the active claimed event."""
++    """Read the absolute deadline persisted on the exact claimed run."""
 +    if run_id is None:
 +        return None
 +    row = conn.execute(
-+        "SELECT payload FROM task_events "
-+        "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
-+        "ORDER BY id DESC LIMIT 1",
-+        (task_id, int(run_id)),
++        "SELECT evidence_deadline FROM task_runs WHERE id = ? AND task_id = ?",
++        (int(run_id), task_id),
 +    ).fetchone()
++    if row is None or row["evidence_deadline"] is None:
++        return None
 +    try:
-+        payload = json.loads(row["payload"]) if row and row["payload"] else {}
-+        value = payload.get("evidence_deadline") if isinstance(payload, dict) else None
-+        return float(value) if value is not None else None
-+    except (TypeError, ValueError, json.JSONDecodeError):
++        return float(row["evidence_deadline"])
++    except (TypeError, ValueError):
 +        return None
 +
 +
@@ -685,7 +1330,7 @@
  def complete_task(
      conn: sqlite3.Connection,
      task_id: str,
-@@ -5404,6 +5909,16 @@
+@@ -5404,6 +6315,16 @@
      and never blocks.
      """
      now = int(time.time())
@@ -702,7 +1347,7 @@
      # Fail before validating cards or staging artifacts; re-check inside the
      # final write transaction below to close the parent-reopen race.
      if not _parents_satisfied(conn, task_id):
-@@ -6600,19 +7115,24 @@
+@@ -6600,19 +7521,24 @@
          assignee_sql = ", assignee = ?" if reviewer is not None else ""
          params: tuple[Any, ...]
          if expected_run_id is None:
@@ -730,7 +1375,7 @@
                     claim_lock    = NULL,
                     claim_expires = NULL,
                     worker_pid    = NULL
-@@ -6747,13 +7267,14 @@
+@@ -6747,13 +7673,14 @@
              """
              UPDATE tasks
                 SET status = ?,
@@ -746,7 +1391,23 @@
          )
          if cur.rowcount != 1:
              return False, "task changed during review handoff"
-@@ -6999,12 +7520,12 @@
+@@ -6888,14 +7815,7 @@
+     kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md. Kept in one place
+     so the two transitions can't drift.
+     """
+-    undone_parents = conn.execute(
+-        "SELECT 1 FROM task_links l "
+-        "JOIN tasks p ON p.id = l.parent_id "
+-        "WHERE l.child_id = ? "
+-        "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+-        (task_id,),
+-    ).fetchone()
+-    return "todo" if undone_parents else "ready"
++    return "ready" if _parents_satisfied(conn, task_id) else "todo"
+
+
+ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+@@ -6999,12 +7919,12 @@
              implementer = None
          assignee_sql = ", assignee = ?" if implementer else ""
          params: tuple[Any, ...] = (
@@ -762,10 +1423,10 @@
              "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
              # consecutive_failures deliberately PRESERVED: review reopen is
              # not a success signal; only complete_task resets the breaker
-@@ -8442,10 +8963,135 @@
+@@ -8442,10 +9362,135 @@
      return True
- 
- 
+
+
 +def _settle_timed_out_run(
 +    conn: sqlite3.Connection,
 +    *,
@@ -897,8 +1558,8 @@
 +    failure_limit: Optional[int] = None,
  ) -> list[str]:
      """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
- 
-@@ -8467,10 +9113,12 @@
+
+@@ -8467,10 +9512,12 @@
      rows = conn.execute(
          "SELECT t.id, t.worker_pid, "
          "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
@@ -913,19 +1574,19 @@
          "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
          "  AND t.worker_pid IS NOT NULL"
      ).fetchall()
-@@ -8482,7 +9130,7 @@
+@@ -8482,7 +9529,7 @@
          # intentionally records the first time a task ever started, so retries
          # must be measured from the active task_runs row when present.
          elapsed = now - int(row["active_started_at"])
 -        if elapsed < int(row["max_runtime_seconds"]):
 +        if elapsed < int(row["active_max_runtime_seconds"]):
              continue
- 
+
          pid = int(row["worker_pid"])
-@@ -8513,52 +9161,22 @@
+@@ -8513,52 +9560,22 @@
                  except (ProcessLookupError, OSError):
                      pass
- 
+
 -        with write_txn(conn):
 -            retry_status = _retry_status_for_run(conn, tid)
 -            cur = conn.execute(
@@ -989,9 +1650,9 @@
 +        ):
 +            timed_out.append(tid)
      return timed_out
- 
- 
-@@ -9288,7 +9906,9 @@
+
+
+@@ -9288,7 +10305,9 @@
                          "trigger_outcome": outcome,
                          "effective_limit": effective_limit,
                          "limit_source": limit_source,
@@ -1002,7 +1663,7 @@
                      },
                  )
              payload = {
-@@ -9297,7 +9917,9 @@
+@@ -9297,7 +10316,9 @@
                  "limit_source": limit_source,
                  "error": error[:500],
                  "trigger_outcome": outcome,
@@ -1013,15 +1674,15 @@
              }
              if event_payload_extra:
                  payload.update(event_payload_extra)
-@@ -9860,6 +10482,7 @@
+@@ -9860,6 +10881,7 @@
      default_assignee: Optional[str] = None,
      max_in_progress_per_profile: Optional[int] = None,
      reconcile_orphans: bool = True,
 +    runtime_class: Optional[str] = None,
  ) -> DispatchResult:
      """Run one dispatcher tick under the board's single-writer lock.
- 
-@@ -9876,6 +10499,8 @@
+
+@@ -9876,6 +10898,8 @@
      boards tick in parallel. See :func:`_dispatch_tick_lock` for the
      cross-process / cross-platform mechanics.
      """
@@ -1030,7 +1691,7 @@
      try:
          db_path = kanban_db_path(board=board)
      except Exception:
-@@ -9895,6 +10520,7 @@
+@@ -9895,6 +10919,7 @@
              default_assignee=default_assignee,
              max_in_progress_per_profile=max_in_progress_per_profile,
              reconcile_orphans=reconcile_orphans,
@@ -1038,7 +1699,7 @@
          )
          _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
          return result
-@@ -9915,6 +10541,7 @@
+@@ -9915,6 +10940,7 @@
                  default_assignee=default_assignee,
                  max_in_progress_per_profile=max_in_progress_per_profile,
                  reconcile_orphans=reconcile_orphans,
@@ -1046,7 +1707,7 @@
              )
              # Still under the dispatch lock: run the periodic PASSIVE WAL
              # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
-@@ -9926,6 +10553,15 @@
+@@ -9926,6 +10952,15 @@
      # the lock hold and stall a sibling dispatcher's tick.
      _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
      return result
@@ -1059,30 +1720,30 @@
 +    """Run an explicitly evidence-only recovery dispatch tick."""
 +    kwargs["runtime_class"] = RUNTIME_CLASS_EVIDENCE_RECOVERY
 +    return dispatch_once(conn, **kwargs)
- 
- 
+
+
  def _dispatch_once_locked(
-@@ -9942,6 +10578,7 @@
+@@ -9942,6 +10977,7 @@
      default_assignee: Optional[str] = None,
      max_in_progress_per_profile: Optional[int] = None,
      reconcile_orphans: bool = True,
 +    runtime_class: Optional[str] = None,
  ) -> DispatchResult:
      """Run one dispatcher tick.
- 
-@@ -10009,7 +10646,7 @@
+
+@@ -10009,7 +11045,7 @@
      )
      if _crash_rate_limited:
          result.rate_limited.extend(_crash_rate_limited)
 -    result.timed_out = enforce_max_runtime(conn)
 +    result.timed_out = enforce_max_runtime(conn, failure_limit=failure_limit)
      result.promoted = recompute_ready(conn, failure_limit=failure_limit)
- 
+
      # Count tasks already running so max_spawn enforces concurrency rather
-@@ -10074,15 +10711,39 @@
+@@ -10074,15 +11110,39 @@
              )
              spawn_budget = 1
- 
+
 -    ready_rows = conn.execute(
 -        "SELECT id, assignee FROM tasks "
 -        "WHERE status = 'ready' AND claim_lock IS NULL "
@@ -1126,7 +1787,7 @@
          review_rows = conn.execute(
              "SELECT id, assignee FROM tasks "
              "WHERE status = 'review' AND claim_lock IS NULL "
-@@ -10268,7 +10929,14 @@
+@@ -10268,7 +11328,14 @@
                      _per_profile_running.get(row_assignee, 0) + 1
                  )
              continue
@@ -1142,10 +1803,10 @@
          if claimed is None:
              continue
          try:
-@@ -10541,6 +11209,102 @@
+@@ -10541,6 +11608,83 @@
          pass
- 
- 
+
+
 +def _review_worker_env(
 +    env: Mapping[str, str],
 +    *,
@@ -1157,41 +1818,22 @@
 +    A dispatcher is a long-lived process and can carry credentials, routing
 +    ContextVars, Python startup hooks, and a caller-controlled PATH from an
 +    unrelated conversation.  A worker must receive only the values needed to
-+    run Hermes and its assigned task.  Provider credential names are admitted
-+    from the central environment policy; arbitrary ``*_TOKEN``/``*_SECRET``
-+    values are not.
++    run Hermes and its assigned task. Credentials come from the selected
++    profile's protected store; no ambient provider, gateway, messaging, cloud,
++    or credential-path secret is copied into the worker environment.
 +    """
 +    safe_names = {
 +        "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "LC_ALL",
 +        "LC_CTYPE", "TZ", "TERM", "COLORTERM", "TERM_PROGRAM", "CI",
 +        "NO_COLOR", "FORCE_COLOR", "TMP", "TEMP", "TMPDIR", "SYSTEMROOT",
 +        "WINDIR", "DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS",
-+        "GIT_CONFIG_NOSYSTEM", "GIT_TERMINAL_PROMPT", "GH_HOST", "GH_REPO",
++        "XDG_RUNTIME_DIR", "GIT_CONFIG_NOSYSTEM", "GIT_TERMINAL_PROMPT",
 +        "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME",
 +        "GIT_COMMITTER_EMAIL", "PAGER", "LESS", "EDITOR", "VISUAL",
 +    }
-+    safe_prefixes = ("LC_", "XDG_")
-+    provider_names: set[str] = set()
-+    try:
-+        from tools.environments.local import _HERMES_PROVIDER_ENV_BLOCKLIST
-+
-+        provider_names.update(str(key) for key in _HERMES_PROVIDER_ENV_BLOCKLIST)
-+    except Exception:
-+        # The worker can still start with profile-configured credentials when
-+        # the optional environment policy module is unavailable.
-+        pass
-+    # A few provider variables are intentionally listed here as a fallback for
-+    # older staged runtimes whose blocklist predates a provider integration.
-+    provider_names.update({
-+        "OPENAI_API_KEY", "OPENAI_BASE_URL", "ANTHROPIC_API_KEY",
-+        "ANTHROPIC_BASE_URL", "OPENROUTER_API_KEY", "GEMINI_API_KEY",
-+        "GOOGLE_API_KEY", "GROQ_API_KEY", "MISTRAL_API_KEY", "XAI_API_KEY",
-+        "DEEPSEEK_API_KEY", "COHERE_API_KEY", "TOGETHER_API_KEY",
-+        "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT", "AWS_ACCESS_KEY_ID",
-+        "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_REGION",
-+    })
-+    # These are explicitly forbidden even if a provider policy accidentally
-+    # includes a similarly named internal or gateway credential.
++    safe_prefixes = ("LC_",)
++    # These are explicitly forbidden even if a future safe-name list gains a
++    # similarly named routing or interpreter variable.
 +    forbidden = {
 +        "HERMES_BIN", "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP",
 +        "PYTHONBREAKPOINT", "PYTHONINSPECT", "PYTHONUSERBASE", "PYTHONWARNINGS",
@@ -1205,7 +1847,7 @@
 +        key = str(raw_key)
 +        if key in forbidden or key.startswith("HERMES_SESSION_"):
 +            continue
-+        if key in safe_names or key in provider_names or key.startswith(safe_prefixes):
++        if key in safe_names or key.startswith(safe_prefixes):
 +            child[key] = str(raw_value)
 +    child["PATH"] = _review_worker_path(runtime_root, hermes_argv)
 +    # These flags disable user-site and startup-file injection.  They are set
@@ -1245,7 +1887,7 @@
  def _module_hermes_argv() -> list[str]:
      """Return the interpreter-bound Hermes CLI invocation."""
      # ``hermes_cli.main`` is the console-script target declared in
-@@ -10594,8 +11358,13 @@
+@@ -10594,8 +11738,13 @@
          if not raw_dir or raw_dir == ".":
              continue
          directory = os.path.expanduser(raw_dir)
@@ -1260,25 +1902,58 @@
              if not os.path.isfile(candidate):
                  continue
              if _IS_WINDOWS or os.access(candidate, os.X_OK):
-@@ -10640,8 +11409,6 @@
-     local (not imported from gateway) because ``hermes_cli`` sits below
-     ``gateway`` in the dependency order.
-     """
+@@ -10617,43 +11766,13 @@
+
+
+ def _resolve_hermes_argv() -> list[str]:
+-    """Resolve the ``hermes`` invocation as argv parts for ``Popen``.
+-
+-    Tries in order:
+-
+-    1. ``$HERMES_BIN`` — explicit operator override. Path-like values are
+-       normalized to absolute paths; bare command names keep normal PATH
+-       semantics and never prefer a same-directory file before ``PATH``.
+-    2. ``shutil.which("hermes")`` — the console-script shim, normalized to
+-       an absolute path. On Windows, ``which`` can return a relative
+-       ``.\\hermes.CMD`` when the current directory is on ``PATH``; directly
+-       launching batch shims is also unsafe with task-derived argv. The
+-       dispatcher therefore falls back to the interpreter-bound module form
+-       for implicit ``.cmd`` / ``.bat`` shims.
+-    3. ``sys.executable -m hermes_cli.main`` — fallback for setups where
+-       Hermes is launched from a venv and the ``hermes`` shim is not on
+-       the dispatcher's ``$PATH`` (cron, systemd ``User=`` services,
+-       launchd jobs, detached processes, etc.). Goes through the running
+-       interpreter so the result is independent of ``$PATH``.
+-
+-    Mirrors ``gateway.run._resolve_hermes_bin`` for the same reason. Kept
+-    local (not imported from gateway) because ``hermes_cli`` sits below
+-    ``gateway`` in the dependency order.
+-    """
 -    import shutil
 -
-     env_bin = os.environ.get("HERMES_BIN", "").strip()
-     if env_bin:
-         if _looks_like_path(env_bin):
-@@ -10651,7 +11418,7 @@
-             return _hermes_path_argv(resolved_env_bin)
-         return _module_hermes_argv()
- 
+-    env_bin = os.environ.get("HERMES_BIN", "").strip()
+-    if env_bin:
+-        if _looks_like_path(env_bin):
+-            return _hermes_path_argv(env_bin)
+-        resolved_env_bin = _safe_which_no_cwd(env_bin)
+-        if resolved_env_bin:
+-            return _hermes_path_argv(resolved_env_bin)
+-        return _module_hermes_argv()
+-
 -    hermes_bin = _safe_which_no_cwd("hermes") if _IS_WINDOWS else shutil.which("hermes")
-+    hermes_bin = _safe_which_no_cwd("hermes")
-     if hermes_bin:
-         return _hermes_path_argv(hermes_bin)
+-    if hermes_bin:
+-        return _hermes_path_argv(hermes_bin)
++    """Return the interpreter-bound invocation for a detached worker.
++
++    Neither ambient ``PATH`` nor inherited ``HERMES_BIN`` is an executable
++    trust boundary. The running interpreter has already imported this reviewed
++    runtime and is therefore the only accepted child entrypoint.
++    """
++    assert sys.executable, "dispatcher has no Python executable"
      return _module_hermes_argv()
-@@ -10832,6 +11599,20 @@
+
+
+@@ -10832,6 +11951,20 @@
          # This only happens in test fixtures where the isolated
          # HERMES_HOME never had profiles created.
          pass
@@ -1299,7 +1974,7 @@
      if task.tenant:
          env["HERMES_TENANT"] = task.tenant
      env["HERMES_KANBAN_TASK"] = task.id
-@@ -10871,18 +11652,47 @@
+@@ -10871,18 +12004,51 @@
          env["HERMES_KANBAN_GOAL_MODE"] = "1"
          if task.goal_max_turns is not None:
              env["HERMES_KANBAN_GOAL_MAX_TURNS"] = str(int(task.goal_max_turns))
@@ -1329,8 +2004,12 @@
 +        )
 +        evidence_deadline = getattr(task, "evidence_deadline", None)
 +        if evidence_deadline is None:
-+            evidence_deadline = (
-+                time.time() + runtime_policy.evidence_budget_seconds
++            raise RuntimeError(
++                "review/evidence worker is missing its durable evidence deadline"
++            )
++        if float(evidence_deadline) <= time.time():
++            raise RuntimeError(
++                "review/evidence worker deadline expired before spawn"
 +            )
 +        env["HERMES_KANBAN_EVIDENCE_DEADLINE"] = f"{float(evidence_deadline):.6f}"
 +    if runtime_policy.command_timeout_seconds is not None:
@@ -1358,16 +2037,16 @@
      # Pin the shared board + workspaces root the dispatcher resolved, so
      # that even when the worker activates a profile (`hermes -p <name>`
      # rewrites HERMES_HOME), its kanban paths still match the
-@@ -10912,7 +11722,7 @@
+@@ -10912,7 +12078,7 @@
      env.pop("HERMES_TUI", None)
- 
+
      cmd = [
 -        *_resolve_hermes_argv(),
 +        *hermes_argv,
          "-p", profile_arg,
          "--cli",
          # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
-@@ -11129,13 +11939,30 @@
+@@ -11129,13 +12295,30 @@
      if task.tenant:
          lines.append(f"Tenant:   {task.tenant}")
      lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
@@ -1405,6 +2084,40 @@
          if effective_terminal_timeout:
              lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
      if task.branch_name:
+@@ -11215,11 +12398,14 @@
+         "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
+         (task_id,),
+     ).fetchall()
+-    parent_ids = [r["parent_id"] for r in parent_rows]
+-
+-    if parent_ids:
++    parent_refs = [
++        (str(row["parent_id"]), canonical_task_id(conn, str(row["parent_id"])))
++        for row in parent_rows
++    ]
++
++    if parent_refs:
+         wrote_header = False
+-        for pid in parent_ids:
++        for direct_pid, pid in parent_refs:
+             pt = get_task(conn, pid)
+             if not pt or pt.status != "done":
+                 continue
+@@ -11246,7 +12432,13 @@
+             elif pt.completed_at:
+                 done_ts = pt.completed_at
+             age = _relative_age(done_ts, _now)
+-            lines.append(f"### {pid}" + (f" (completed {age})" if age else ""))
++            relation = (
++                f"; canonical successor for {direct_pid}"
++                if direct_pid != pid
++                else ""
++            )
++            age_text = f"completed {age}" if age else "completed"
++            lines.append(f"### {pid} ({age_text}{relation})")
+
+             body_lines: list[str] = []
+             if run is not None and run.summary and run.summary.strip():
 --- a/gateway/kanban_watchers.py
 +++ b/gateway/kanban_watchers.py
 @@ -47,6 +47,90 @@
@@ -1495,8 +2208,8 @@
 +        if getattr(event, "kind", "") not in timeout_kinds
 +        or id(event) in selected_ids
 +    ]
- 
- 
+
+
  def _resolve_auto_decompose_settings(
 @@ -571,7 +655,13 @@
                      # exists on the board.
@@ -1587,8 +2300,8 @@
 +++ b/tui_gateway/server.py
 @@ -12451,6 +12451,80 @@
              pass
- 
- 
+
+
 +def _explicit_timeout_run_id(event: Any) -> Optional[int]:
 +    """Return the run id carried by an event or its legacy payload."""
 +    value = getattr(event, "run_id", None)
@@ -1665,7 +2378,7 @@
 +
  def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[str]:
      """Single-line notification text for one kanban event.
- 
+
 @@ -12491,7 +12565,19 @@
              limit = int(payload.get("limit_seconds") or 0)
          except (TypeError, ValueError):
@@ -1699,8 +2412,8 @@
 +++ b/tools/terminal_tool.py
 @@ -1632,6 +1632,46 @@
          )
- 
- 
+
+
 +def _kanban_tool_timeout_cap() -> int | None:
 +    """Read the dispatcher-selected per-command cap, if this is a worker."""
 +    raw = os.environ.get("HERMES_KANBAN_TOOL_TIMEOUT_SECONDS", "").strip()
@@ -1747,7 +2460,7 @@
 @@ -2921,6 +2961,20 @@
                  "status": "error",
              }, ensure_ascii=False)
- 
+
 +        # Review/evidence workers have a dispatcher-owned absolute deadline.
 +        # Check it before environment creation or approval/probe logic so an
 +        # expired run cannot open one more command after its evidence window.
@@ -1794,7 +2507,7 @@
 +                    f"Kanban worker timeout {effective_timeout}s exceeds the "
 +                    f"per-command maximum of {tool_timeout_cap}s."
 +                )
- 
+
          # Reject foreground commands where the model explicitly requests
          # a timeout above FOREGROUND_MAX_TIMEOUT — nudge it toward background.
 @@ -3654,6 +3733,12 @@
@@ -1819,8 +2532,8 @@
 +        "runtime_class": t.runtime_class,
 +        "max_runtime_seconds": t.max_runtime_seconds,
      }
- 
- 
+
+
 @@ -392,6 +394,11 @@
                                 "durations (90s, 30m, 2h, 1d). When exceeded, "
                                 "the dispatcher SIGTERMs (then SIGKILLs) the worker "
@@ -1833,7 +2546,37 @@
      p_create.add_argument("--created-by", default="user",
                            help="Author name recorded on the task (default: user)")
      p_create.add_argument("--skill", action="append", default=[], dest="skills",
-@@ -799,6 +806,12 @@
+@@ -584,13 +591,28 @@
+         help="Emit JSON (structured) instead of the default human table",
+     )
+
+-    # --- link / unlink ---
++    # --- link / unlink / supersede ---
+     p_link = sub.add_parser("link", help="Add a parent->child dependency")
+     p_link.add_argument("parent_id")
+     p_link.add_argument("child_id")
+     p_unlink = sub.add_parser("unlink", help="Remove a parent->child dependency")
+     p_unlink.add_argument("parent_id")
+     p_unlink.add_argument("child_id")
++    p_supersede = sub.add_parser(
++        "supersede",
++        help="Replace one terminal failed task with one canonical successor",
++    )
++    p_supersede.add_argument("predecessor_id")
++    p_supersede.add_argument("successor_id")
++    p_supersede.add_argument("--lane-key", required=True)
++    p_supersede.add_argument("--predecessor-run-id", required=True, type=int)
++    p_supersede.add_argument("--successor-run-id", type=int, default=None)
++    p_supersede.add_argument("--reason", required=True)
++    p_supersede.add_argument(
++        "--evidence",
++        required=True,
++        help="Sanitized non-empty JSON object with immutable recovery evidence",
++    )
+
+     # --- claim ---
+     p_claim = sub.add_parser(
+@@ -799,6 +821,12 @@
                          default=kb.DEFAULT_SPAWN_FAILURE_LIMIT,
                          help=f"Auto-block a task after this many consecutive non-success attempts "
                               f"(spawn_failed, timed_out, or crashed; default: {kb.DEFAULT_SPAWN_FAILURE_LIMIT})")
@@ -1844,9 +2587,25 @@
 +             "only for an evidence-only successor.",
 +    )
      p_disp.add_argument("--json", action="store_true")
- 
+
      # --- daemon (deprecated) ---
-@@ -1679,6 +1692,9 @@
+@@ -1158,6 +1186,7 @@
+             "diag":     _cmd_diagnostics,
+             "link":     _cmd_link,
+             "unlink":   _cmd_unlink,
++            "supersede": _cmd_supersede,
+             "claim":    _cmd_claim,
+             "comment":  _cmd_comment,
+             "attach":   _cmd_attach,
+@@ -1227,6 +1256,7 @@
+     "reassign",
+     "link",
+     "unlink",
++    "supersede",
+     "claim",
+     "comment",
+     "attach",
+@@ -1679,6 +1709,9 @@
              triage=bool(getattr(args, "triage", False)),
              idempotency_key=getattr(args, "idempotency_key", None),
              max_runtime_seconds=max_runtime,
@@ -1856,10 +2615,39 @@
              skills=getattr(args, "skills", None) or None,
              max_retries=max_retries,
              model_override=getattr(args, "model_override", None),
-@@ -2407,13 +2423,19 @@
+@@ -2166,6 +2199,28 @@
+     return 0
+
+
++def _cmd_supersede(args: argparse.Namespace) -> int:
++    try:
++        evidence = json.loads(args.evidence)
++    except json.JSONDecodeError as exc:
++        raise ValueError(f"--evidence must be valid JSON: {exc}") from exc
++    if not isinstance(evidence, dict) or not evidence:
++        raise ValueError("--evidence must be a non-empty JSON object")
++    with kb.connect_closing() as conn:
++        relation = kb.supersede_task(
++            conn,
++            args.predecessor_id,
++            args.successor_id,
++            lane_key=args.lane_key,
++            expected_predecessor_run_id=args.predecessor_run_id,
++            expected_successor_run_id=args.successor_run_id,
++            reason=args.reason,
++            evidence=evidence,
++        )
++    print(json.dumps(relation, ensure_ascii=False, sort_keys=True))
++    return 0
++
++
+ def _cmd_link(args: argparse.Namespace) -> int:
+     with kb.connect_closing() as conn:
+         kb.link_tasks(conn, args.parent_id, args.child_id)
+@@ -2407,13 +2462,19 @@
                  failed.append(tid)
                  continue
- 
+
 -            if not kb.complete_task(
 -                conn, tid,
 -                result=args.result,
@@ -1883,7 +2671,7 @@
                  failed.append(tid)
                  print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
              else:
-@@ -2790,6 +2812,7 @@
+@@ -2790,6 +2851,7 @@
              failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
              default_assignee=default_assignee,
              max_in_progress_per_profile=max_in_progress_per_profile,
@@ -1891,3 +2679,148 @@
          )
      if getattr(args, "json", False):
          print(json.dumps({
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1661,6 +1661,55 @@
+         return tool_error(f"kanban_unblock: {e}")
+
+
++def _handle_supersede(args: dict, **kw) -> str:
++    """Replace one terminal failed card with one fenced canonical successor."""
++    delegated_err = _reject_delegated_child_mutation("kanban_supersede")
++    if delegated_err:
++        return delegated_err
++    guard = _require_orchestrator_tool("kanban_supersede")
++    if guard:
++        return guard
++    predecessor_id = args.get("predecessor_id")
++    successor_id = args.get("successor_id")
++    lane_key = args.get("lane_key")
++    predecessor_run_id = args.get("expected_predecessor_run_id")
++    if not predecessor_id or not successor_id or not lane_key:
++        return tool_error(
++            "predecessor_id, successor_id, and lane_key are required"
++        )
++    if predecessor_run_id is None:
++        return tool_error("expected_predecessor_run_id is required")
++    evidence = args.get("evidence")
++    if not isinstance(evidence, dict) or not evidence:
++        return tool_error("non-empty structured evidence is required")
++    board = args.get("board")
++    try:
++        kb, conn = _connect(board=board)
++        try:
++            relation = kb.supersede_task(
++                conn,
++                str(predecessor_id),
++                str(successor_id),
++                lane_key=str(lane_key),
++                expected_predecessor_run_id=int(predecessor_run_id),
++                expected_successor_run_id=(
++                    int(args["expected_successor_run_id"])
++                    if args.get("expected_successor_run_id") is not None
++                    else None
++                ),
++                reason=str(args.get("reason") or ""),
++                evidence=evidence,
++            )
++            return _ok(**relation)
++        finally:
++            conn.close()
++    except (TypeError, ValueError, RuntimeError) as e:
++        return tool_error(f"kanban_supersede: {e}")
++    except Exception as e:
++        logger.exception("kanban_supersede failed")
++        return tool_error(f"kanban_supersede: {e}")
++
++
+ def _handle_link(args: dict, **kw) -> str:
+     """Add a parent→child dependency edge after the fact."""
+     delegated_err = _reject_delegated_child_mutation("kanban_link")
+@@ -2350,6 +2399,70 @@
+     },
+ }
+
++KANBAN_SUPERSEDE_SCHEMA = {
++    "name": "kanban_supersede",
++    "description": (
++        "Orchestrator-only canonical recovery transition. Replace one blocked "
++        "or triaged task whose exact latest run ended in failure with one "
++        "existing executable or completed successor. The predecessor becomes "
++        "archived audit history, incoming dependencies follow the sole "
++        "successor leaf, and the immutable lane key prevents recovery forks. "
++        "Use only sanitized evidence; never put credentials or raw PII here."
++    ),
++    "parameters": {
++        "type": "object",
++        "properties": {
++            "predecessor_id": {
++                "type": "string",
++                "description": "Blocked/triaged task being replaced.",
++            },
++            "successor_id": {
++                "type": "string",
++                "description": "Existing canonical successor task.",
++            },
++            "lane_key": {
++                "type": "string",
++                "description": (
++                    "Immutable semantic lane identity, including source, phase, "
++                    "and exact input identity. One lane has one leaf."
++                ),
++            },
++            "expected_predecessor_run_id": {
++                "type": "integer",
++                "description": "Exact terminal failed run that authorizes replacement.",
++            },
++            "expected_successor_run_id": {
++                "type": "integer",
++                "description": (
++                    "Exact active or completed successor run. Required when "
++                    "the successor is running or done; omit while queued."
++                ),
++            },
++            "reason": {
++                "type": "string",
++                "description": "Sanitized causal reason for the replacement.",
++            },
++            "evidence": {
++                "type": "object",
++                "description": (
++                    "Non-empty sanitized immutable evidence, such as exact "
++                    "candidate SHA and review/verdict handle."
++                ),
++                "additionalProperties": True,
++            },
++            "board": _board_schema_prop(),
++        },
++        "required": [
++            "predecessor_id",
++            "successor_id",
++            "lane_key",
++            "expected_predecessor_run_id",
++            "reason",
++            "evidence",
++        ],
++    },
++}
++
+ KANBAN_LINK_SCHEMA = {
+     "name": "kanban_link",
+     "description": (
+@@ -2491,6 +2604,15 @@
+ )
+
+ registry.register(
++    name="kanban_supersede",
++    toolset="kanban",
++    schema=KANBAN_SUPERSEDE_SCHEMA,
++    handler=_handle_supersede,
++    check_fn=_check_kanban_orchestrator_mode,
++    emoji="⏭",
++)
++
++registry.register(
+     name="kanban_link",
+     toolset="kanban",
+     schema=KANBAN_LINK_SCHEMA,

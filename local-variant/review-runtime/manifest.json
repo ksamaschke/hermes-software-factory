@@ -1,19 +1,20 @@
 {
   "schema": "factory.review-runtime.v1",
   "artifact_version": "1.0.0",
-  "description": "Runtime overlay for bounded review dispatch and truthful timeout recovery.",
+  "description": "Runtime overlay for bounded review dispatch, durable deadlines, and single-path canonical recovery.",
   "native_boundary_schema": "factory.native-boundary.v1",
-  "native_manifest_sha256": "c15a9c10e499c5cbda6cbbe523162502b8875720f639a42e4a0a48b2ef2c4a01",
+  "native_artifact_identity_sha256": "feaffd82904b7cce43285ec0a038a3e7c8f85f467cb8c99ae07075a6f59918ab",
   "native_artifact_version": "1.0.0",
   "patches": {
-    "patches/002-review-runtime.patch": "c72340e1ef8a213e36d826bb2ee866ace4ef8c7e53f7f8115237b621eb1b28fa"
+    "patches/002-review-runtime.patch": "e41d60497b84a93f8a97d1b0baee0d6b26687c0fefab7ddcfda2a66da0c59d24"
   },
   "patched_paths": [
     "hermes_cli/kanban_db.py",
     "gateway/kanban_watchers.py",
     "tui_gateway/server.py",
     "tools/terminal_tool.py",
-    "hermes_cli/kanban.py"
+    "hermes_cli/kanban.py",
+    "tools/kanban_tools.py"
   ],
   "policy": {
     "review_dispatch_hard_cap_seconds": 1200,
@@ -26,6 +27,11 @@
       "hard_worker_cap_seconds": 600,
       "evidence_budget_seconds": 300,
       "per_command_timeout_seconds": 60
+    },
+    "canonical_recovery": {
+      "terminal_failure_run_fence": true,
+      "one_leaf_per_lane": true,
+      "dependency_resolution": "canonical_leaf"
     },
     "retryable_statuses": [
       "ready",

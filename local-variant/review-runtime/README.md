@@ -24,6 +24,15 @@ The overlay has three responsibilities:
   blocked/no retry. Legacy `gave_up` rows with a NULL run id are associated
   with the nearest preceding identified timeout; a later identified timeout
   starts a new notification boundary.
+- Persist one absolute evidence deadline on the claimed `task_runs` row. A
+  reconnect or event-compaction gap rehydrates that same value; missing or
+  expired deadline state fails closed instead of silently minting more time.
+- Provide the symmetric recovery transition `kanban_supersede`: an
+  orchestrator may replace one blocked/triaged card only when its exact latest
+  run is a terminal failure. One immutable lane key has one successor leaf,
+  recovery forks are rejected, and downstream dependencies follow that leaf
+  until it reaches a terminal state. The failed predecessor remains archived
+  audit history rather than an eternal dependency gate.
 
 Inputs and commands:
 
@@ -31,16 +40,29 @@ Inputs and commands:
 python3 local-variant/review-runtime/build_review_runtime.py stage \
   --native-runtime /path/to/native-boundary-stage/runtime8 \
   --native-manifest /path/to/native-boundary-stage/manifest8.json \
-  --output /tmp/review-runtime/runtime8 \
-  --manifest-output /tmp/review-runtime/runtime8.manifest.json
+  --output /path/to/durable/review-runtime/runtime8 \
+  --manifest-output /path/to/durable/review-runtime/runtime8.manifest.json
 
 python3 local-variant/review-runtime/build_review_runtime.py verify \
-  --runtime /tmp/review-runtime/runtime8 \
-  --manifest /tmp/review-runtime/runtime8.manifest.json
+  --runtime /path/to/durable/review-runtime/runtime8 \
+  --manifest /path/to/durable/review-runtime/runtime8.manifest.json
 ```
 
 `manifest.json` pins the patch hash, target allowlist, native-boundary schema,
-and review policy. The generated manifest records the native input manifest
-hash, patched output hashes, syntax probe, and complete runtime tree hash.
+review policy, and a path-independent native artifact identity. The identity
+covers every content-bearing native-manifest field while allowing the same
+reviewed tree to be rebuilt at a different absolute output path. The generated
+manifest still records the exact native input-manifest hash, patched output
+hashes, syntax probe, and complete runtime tree hash.
+
+The manifest destination must be new, non-symlinked, and outside every source,
+artifact, and staged-runtime tree. Publication is an exclusive atomic create;
+`--force` may replace the staged runtime but never overwrites prior evidence.
+
+The builder invokes only root-owned `/usr/bin/git` with a scrubbed environment.
+The staged worker launcher uses the active reviewed Python interpreter rather
+than an executable selected from ambient `PATH`; ambient configuration roots
+such as `XDG_CONFIG_HOME` are not inherited by worker children.
+
 The native-boundary stage is a prerequisite dependency; do not edit it in this
 worktree.

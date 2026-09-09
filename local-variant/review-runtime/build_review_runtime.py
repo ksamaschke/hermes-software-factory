@@ -13,10 +13,12 @@ import ast
 import fnmatch
 import hashlib
 import json
+import os
 import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +39,32 @@ TARGET_PATHS = (
     "tui_gateway/server.py",
     "tools/terminal_tool.py",
     "hermes_cli/kanban.py",
+    "tools/kanban_tools.py",
+)
+_GIT_EXECUTABLE = Path("/usr/bin/git")
+_GIT_ENVIRONMENT = {
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_OPTIONAL_LOCKS": "0",
+    "GIT_TERMINAL_PROMPT": "0",
+    "HOME": "/nonexistent",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "PATH": "/usr/bin:/bin",
+}
+NATIVE_ARTIFACT_IDENTITY_SHA256 = (
+    "feaffd82904b7cce43285ec0a038a3e7c8f85f467cb8c99ae07075a6f59918ab"
+)
+_NATIVE_IDENTITY_FIELDS = (
+    "artifact_version",
+    "excluded_copy_entries",
+    "patched_paths",
+    "patches",
+    "schema",
+    "source_files",
+    "source_tree",
+    "staged_tree",
+    "verification",
 )
 
 
@@ -56,6 +84,64 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _native_artifact_identity_sha256(manifest: dict[str, Any]) -> str:
+    """Return a path-independent identity for one complete native artifact.
+
+    Native manifests contain absolute build and output paths. Those locations
+    are provenance, not artifact identity: rebuilding the same reviewed tree
+    elsewhere must remain valid. Every content-bearing field stays in the
+    digest, while import-probe paths are normalized relative to output_runtime.
+    """
+    missing = [key for key in _NATIVE_IDENTITY_FIELDS if key not in manifest]
+    if missing:
+        raise SystemExit(
+            "native manifest is missing identity fields: " + ", ".join(missing)
+        )
+    output_value = manifest.get("output_runtime")
+    probes = manifest.get("import_probe")
+    if not isinstance(output_value, str) or not output_value.strip():
+        raise SystemExit("native manifest has no output_runtime for identity")
+    if not isinstance(probes, dict):
+        raise SystemExit("native manifest has no import_probe map for identity")
+    output = Path(output_value).expanduser().resolve(strict=False)
+    normalized_probes: dict[str, str] = {}
+    for raw_name, raw_path in sorted(probes.items()):
+        if not isinstance(raw_name, str) or not isinstance(raw_path, str):
+            raise SystemExit("native manifest import_probe identity is invalid")
+        probe = Path(raw_path).expanduser().resolve(strict=False)
+        try:
+            normalized_probes[raw_name] = probe.relative_to(output).as_posix()
+        except ValueError as exc:
+            raise SystemExit(
+                f"native manifest import_probe escapes output_runtime: {raw_name}"
+            ) from exc
+    payload = {key: manifest[key] for key in _NATIVE_IDENTITY_FIELDS}
+    payload["import_probe"] = normalized_probes
+    canonical = json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _trusted_git_executable() -> Path:
+    """Return the fixed system Git only when its metadata is trustworthy."""
+    try:
+        info = _GIT_EXECUTABLE.lstat()
+    except OSError as exc:
+        raise SystemExit(f"trusted git executable is unavailable: {exc}") from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or not bool(info.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
+    ):
+        raise SystemExit(
+            "trusted git executable must be root-owned, regular, executable, "
+            "and not group/world writable"
+        )
+    return _GIT_EXECUTABLE
 
 
 def _excluded(relative: Path, patterns: list[str]) -> bool:
@@ -129,12 +215,12 @@ def _static_manifest() -> dict[str, Any]:
         )
     if manifest.get("native_boundary_schema") != NATIVE_SCHEMA:
         raise SystemExit("review manifest native boundary schema changed unexpectedly")
-    if (
-        manifest.get("native_manifest_sha256")
-        != "c15a9c10e499c5cbda6cbbe523162502b8875720f639a42e4a0a48b2ef2c4a01"
+    if "native_manifest_sha256" in manifest or (
+        manifest.get("native_artifact_identity_sha256")
+        != NATIVE_ARTIFACT_IDENTITY_SHA256
     ):
         raise SystemExit(
-            "review manifest is not pinned to the reviewed native manifest"
+            "review manifest is not pinned to the reviewed native artifact identity"
         )
     if manifest.get("native_artifact_version") != "1.0.0":
         raise SystemExit("review manifest native artifact version changed unexpectedly")
@@ -152,6 +238,11 @@ def _static_manifest() -> dict[str, Any]:
             "hard_worker_cap_seconds": EVIDENCE_RECOVERY_CAP_SECONDS,
             "evidence_budget_seconds": EVIDENCE_RECOVERY_EVIDENCE_BUDGET_SECONDS,
             "per_command_timeout_seconds": EVIDENCE_RECOVERY_COMMAND_TIMEOUT_SECONDS,
+        },
+        "canonical_recovery": {
+            "terminal_failure_run_fence": True,
+            "one_leaf_per_lane": True,
+            "dependency_resolution": "canonical_leaf",
         },
         "retryable_statuses": ["ready", "review"],
         "terminal_statuses": ["blocked", "triage", "done", "archived"],
@@ -181,7 +272,7 @@ def _validate_native_input(
     native_runtime: Path,
     native_manifest_path: Path,
     *,
-    expected_manifest_sha256: str | None = None,
+    expected_artifact_identity_sha256: str | None = None,
     expected_exclusions: list[str] | None = None,
     expected_artifact_version: str | None = None,
 ) -> dict[str, Any]:
@@ -189,11 +280,6 @@ def _validate_native_input(
     manifest_info = native_manifest_path.lstat()
     if not stat.S_ISREG(manifest_info.st_mode) or manifest_info.st_nlink != 1:
         raise SystemExit("native manifest must be a regular, non-hard-linked file")
-    if (
-        expected_manifest_sha256
-        and _sha256(native_manifest_path) != expected_manifest_sha256
-    ):
-        raise SystemExit("native manifest hash does not match the reviewed boundary")
     native_manifest = _load_json(native_manifest_path)
     if native_manifest.get("schema") != NATIVE_SCHEMA:
         raise SystemExit(
@@ -350,6 +436,14 @@ def _validate_native_input(
         or Path(output_runtime).expanduser().resolve(strict=False) != native_runtime
     ):
         raise SystemExit("native manifest output_runtime does not match staged runtime")
+    identity = _native_artifact_identity_sha256(native_manifest)
+    if (
+        expected_artifact_identity_sha256
+        and identity != expected_artifact_identity_sha256
+    ):
+        raise SystemExit(
+            "native artifact identity does not match the reviewed boundary"
+        )
     return native_manifest
 
 
@@ -410,13 +504,15 @@ def _apply_patch(output: Path, patch_path: Path) -> None:
         raise SystemExit(
             f"patch target set {targets!r} is outside the review allowlist"
         )
-    command = ["git", "apply", "--whitespace=nowarn", str(patch_path)]
+    git = str(_trusted_git_executable())
+    command = [git, "apply", "--whitespace=nowarn", str(patch_path)]
     check = subprocess.run(
-        ["git", "apply", "--check", "--whitespace=nowarn", str(patch_path)],
+        [git, "apply", "--check", "--whitespace=nowarn", str(patch_path)],
         cwd=output,
         check=False,
         capture_output=True,
         text=True,
+        env=_GIT_ENVIRONMENT,
     )
     if check.returncode:
         detail = (check.stdout + check.stderr).strip()
@@ -427,6 +523,7 @@ def _apply_patch(output: Path, patch_path: Path) -> None:
         check=False,
         capture_output=True,
         text=True,
+        env=_GIT_ENVIRONMENT,
     )
     if result.returncode:
         detail = (result.stdout + result.stderr).strip()
@@ -447,7 +544,7 @@ def _syntax_probe(output: Path) -> list[str]:
 
 def _manifest_output(output: Path, explicit: str | None) -> Path:
     return (
-        Path(explicit).resolve()
+        Path(explicit).expanduser()
         if explicit
         else output.parent / f"{output.name}.manifest.json"
     )
@@ -469,6 +566,71 @@ def _path_overlaps(left: Path, right: Path) -> bool:
         return False
 
 
+def _validate_manifest_destination(
+    destination: Path,
+    protected_roots: tuple[Path, ...],
+) -> Path:
+    """Authenticate a new, separate manifest destination before any write.
+
+    The raw final component is checked before resolution so an existing or
+    dangling symlink cannot be hidden by ``Path.resolve``. Resolved ancestors
+    are then compared in both directions: a manifest may neither live inside a
+    protected input/output nor be an ancestor that would contain one.
+    """
+    raw = destination.expanduser()
+    if os.path.lexists(raw):
+        raise SystemExit(f"manifest destination already exists: {raw}")
+    resolved = raw.resolve(strict=False)
+    for protected in protected_roots:
+        if _path_overlaps(resolved, protected):
+            raise SystemExit(
+                f"manifest destination overlaps protected input/output: {resolved}"
+            )
+    return resolved
+
+
+def _write_json_exclusive(destination: Path, value: dict[str, Any]) -> None:
+    """Publish one private JSON file atomically without clobbering a path.
+
+    Bytes are fsynced to a private temporary regular file in the destination
+    directory. A hard-link publishes the final name with create-if-absent
+    semantics; an existing file, directory, or symlink therefore wins and the
+    builder fails closed instead of replacing it.
+    """
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    payload = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    fd, raw_temp = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+    )
+    temporary = Path(raw_temp)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb", closefd=True) as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        fd = -1
+        try:
+            os.link(temporary, destination, follow_symlinks=False)
+        except FileExistsError as exc:
+            raise SystemExit(
+                f"manifest destination already exists: {destination}"
+            ) from exc
+        temporary.unlink()
+        directory_fd = os.open(destination.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def build(
     native_runtime: Path,
     native_manifest_path: Path,
@@ -485,12 +647,11 @@ def build(
     native_manifest = _validate_native_input(
         native_runtime,
         native_manifest_path,
-        expected_manifest_sha256=static["native_manifest_sha256"],
+        expected_artifact_identity_sha256=static["native_artifact_identity_sha256"],
         expected_exclusions=patterns,
         expected_artifact_version=static["native_artifact_version"],
     )
     output = output.resolve(strict=False)
-    manifest_output = manifest_output.resolve(strict=False)
     source_runtime = (
         Path(native_manifest["source_runtime"]).expanduser().resolve(strict=False)
     )
@@ -499,10 +660,10 @@ def build(
             raise SystemExit(
                 f"review runtime output collides with protected input/artifact path: {output}"
             )
-    if _path_overlaps(manifest_output, output):
-        raise SystemExit(
-            "generated manifest must not be inside the runtime output tree"
-        )
+    manifest_output = _validate_manifest_destination(
+        manifest_output,
+        (native_runtime, source_runtime, ARTIFACT_ROOT, output),
+    )
     if output.exists():
         if not force:
             raise SystemExit(
@@ -524,6 +685,9 @@ def build(
         "native_boundary_schema": NATIVE_SCHEMA,
         "native_manifest": str(native_manifest_path),
         "native_manifest_sha256": _sha256(native_manifest_path),
+        "native_artifact_identity_sha256": _native_artifact_identity_sha256(
+            native_manifest
+        ),
         "native_source_runtime": native_manifest.get("source_runtime"),
         "native_source_tree_sha256": _tree_digest(source_runtime, patterns),
         "native_staged_tree_sha256": _tree_digest(native_runtime, patterns),
@@ -537,21 +701,24 @@ def build(
         "syntax_probe": probed,
         "runtime_tree_sha256": _tree_digest(output, patterns),
     }
-    manifest_output.parent.mkdir(parents=True, exist_ok=True)
-    manifest_output.write_text(
-        json.dumps(generated, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    _write_json_exclusive(manifest_output, generated)
     return manifest_output
 
 
 def verify(output: Path, manifest_path: Path) -> None:
     static = _static_manifest()
+    manifest_info = manifest_path.lstat()
+    if not stat.S_ISREG(manifest_info.st_mode) or manifest_info.st_nlink != 1:
+        raise SystemExit("generated manifest must be a regular, non-hard-linked file")
     manifest = _load_json(manifest_path)
     if manifest.get("schema") != STATIC_SCHEMA:
         raise SystemExit("generated manifest has an unexpected schema")
-    if manifest.get("native_manifest_sha256") != static["native_manifest_sha256"]:
+    if (
+        manifest.get("native_artifact_identity_sha256")
+        != static["native_artifact_identity_sha256"]
+    ):
         raise SystemExit(
-            "generated manifest is not bound to the reviewed native manifest"
+            "generated manifest is not bound to the reviewed native artifact identity"
         )
     native_manifest_path_value = manifest.get("native_manifest")
     if not isinstance(native_manifest_path_value, str):
@@ -566,10 +733,12 @@ def verify(output: Path, manifest_path: Path) -> None:
     checked_native = _validate_native_input(
         native_runtime,
         native_manifest_path,
-        expected_manifest_sha256=static["native_manifest_sha256"],
+        expected_artifact_identity_sha256=static["native_artifact_identity_sha256"],
         expected_exclusions=patterns,
         expected_artifact_version=static["native_artifact_version"],
     )
+    if manifest.get("native_manifest_sha256") != _sha256(native_manifest_path):
+        raise SystemExit("generated manifest native manifest hash mismatch")
     if checked_native.get("verification") != manifest.get("native_verification"):
         raise SystemExit(
             "generated manifest native verification does not match the boundary"
