@@ -29,6 +29,22 @@ def _builder_module():
     return module
 
 
+def _clear_delegated_context(monkeypatch) -> None:
+    delegated_keys = {
+        "HERMES_DELEGATION_PARENT_ID",
+        "HERMES_DELEGATION_DEPTH",
+        "HERMES_PARENT_SESSION_ID",
+    }
+    for key in tuple(os.environ):
+        if key.startswith("HERMES_DELEGATED_") or key in delegated_keys:
+            monkeypatch.delenv(key, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _private_fixture_is_not_a_delegated_worker(monkeypatch) -> None:
+    _clear_delegated_context(monkeypatch)
+
+
 def test_review_manifest_pins_policy_patch_and_targets():
     manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
     expected_hash = hashlib.sha256(PATCH_PATH.read_bytes()).hexdigest()
@@ -343,6 +359,85 @@ def test_force_build_restores_prior_runtime_on_failure(
     assert not generated.exists()
     assert not list(tmp_path.glob(".review-runtime.stage.*"))
     assert not list(tmp_path.glob(".review-runtime.rollback.*"))
+
+
+@pytest.mark.parametrize("symlink_kind", ["output", "parent"])
+def test_force_build_rejects_symlinked_runtime_destination_before_staging(
+    tmp_path, monkeypatch, symlink_kind
+):
+    builder = _builder_module()
+    native_runtime = tmp_path / "native"
+    native_runtime.mkdir()
+    source_runtime = tmp_path / "source"
+    source_runtime.mkdir()
+    native_manifest = tmp_path / "native.manifest.json"
+    native_manifest.write_text("{}", encoding="utf-8")
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    real_output = real_parent / "review-runtime"
+    real_output.mkdir()
+    sentinel = real_output / "sentinel"
+    sentinel.write_text("preserve-me", encoding="utf-8")
+
+    if symlink_kind == "output":
+        output = tmp_path / "output-alias"
+        output.symlink_to(real_output, target_is_directory=True)
+    else:
+        parent_alias = tmp_path / "parent-alias"
+        parent_alias.symlink_to(real_parent, target_is_directory=True)
+        output = parent_alias / "review-runtime"
+
+    monkeypatch.setattr(
+        builder,
+        "_validate_native_input",
+        lambda *_args, **_kwargs: {
+            "source_runtime": str(source_runtime),
+            "verification": {},
+        },
+    )
+
+    with pytest.raises(SystemExit, match="runtime output path contains a symlink"):
+        builder.build(
+            native_runtime,
+            native_manifest,
+            output,
+            tmp_path / "review.manifest.json",
+            force=True,
+        )
+
+    assert sentinel.read_text(encoding="utf-8") == "preserve-me"
+    assert not list(real_parent.glob(".review-runtime.stage.*"))
+    assert not list(real_parent.glob(".review-runtime.rollback.*"))
+    assert not (tmp_path / "review.manifest.json").exists()
+
+
+def test_runtime_output_parent_replacement_cannot_redirect_sibling_reservation(
+    tmp_path,
+):
+    builder = _builder_module()
+    parent = tmp_path / "runtime-parent"
+    parent.mkdir()
+    output = parent / "review-runtime"
+    output, directory_fd, output_existed = builder._validate_runtime_output_destination(
+        output, force=False
+    )
+    assert output_existed is False
+
+    moved_parent = tmp_path / "original-runtime-parent"
+    attacker_target = tmp_path / "attacker-target"
+    attacker_target.mkdir()
+    parent.rename(moved_parent)
+    parent.symlink_to(attacker_target, target_is_directory=True)
+    try:
+        with pytest.raises(SystemExit, match="runtime output parent changed"):
+            builder._reserve_private_sibling_directory(
+                output, "stage", directory_fd=directory_fd
+            )
+    finally:
+        os.close(directory_fd)
+
+    assert not list(attacker_target.iterdir())
+    assert not list(moved_parent.iterdir())
 
 
 def test_review_claim_caps_active_run_without_rewriting_task_row(tmp_path, monkeypatch):
@@ -862,5 +957,145 @@ def test_review_completion_fails_closed_for_invalid_persisted_deadline(
         assert json.loads(event["payload"])["code"] == "REVIEW-INCOMPLETE"
     finally:
         sys.modules.pop("hermes_cli.kanban_db", None)
+        sys.path.remove(source_value)
+        sys.path.remove(runtime_value)
+
+
+@pytest.mark.parametrize(
+    "deadline_kind",
+    ["missing", "malformed", "nan", "infinite", "extended"],
+)
+def test_worker_boundary_rejects_invalid_persisted_deadline_before_spawn(
+    tmp_path, monkeypatch, deadline_kind
+):
+    runtime_value = os.environ.get("FACTORY_REVIEW_RUNTIME")
+    source_value = os.environ.get("FACTORY_SOURCE_RUNTIME")
+    if not runtime_value or not source_value:
+        pytest.skip("set FACTORY_REVIEW_RUNTIME and FACTORY_SOURCE_RUNTIME")
+
+    sys.path.insert(0, runtime_value)
+    sys.path.insert(1, source_value)
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "hermes_cli.kanban_db", Path(runtime_value) / "hermes_cli/kanban_db.py"
+        )
+        assert spec is not None and spec.loader is not None
+        import hermes_cli  # noqa: F401
+
+        sys.modules.pop("hermes_cli.kanban_db", None)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["hermes_cli.kanban_db"] = module
+        spec.loader.exec_module(module)
+
+        db_path = tmp_path / f"worker-deadline-{deadline_kind}.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+        module.init_db()
+        conn = module.connect()
+        task_id = module.create_task(
+            conn, title="worker deadline gate", assignee="reviewer"
+        )
+        with module.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='review' WHERE id=?", (task_id,))
+        claimed = module.claim_review_task(conn, task_id, claimer="reviewer")
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+        started_at = conn.execute(
+            "SELECT started_at FROM task_runs WHERE id=?", (run_id,)
+        ).fetchone()["started_at"]
+        invalid_deadline = {
+            "missing": None,
+            "malformed": "not-a-deadline",
+            "nan": "nan",
+            "infinite": float("inf"),
+            "extended": float(started_at + 3600),
+        }[deadline_kind]
+        with module.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET evidence_deadline=? WHERE id=?",
+                (invalid_deadline, run_id),
+            )
+
+        rehydrated = module.get_task(conn, task_id)
+        assert rehydrated is not None
+        policy = module.resolve_runtime_policy(module.RUNTIME_CLASS_REVIEW)
+        with pytest.raises(module.ReviewIncompleteError, match="REVIEW-INCOMPLETE"):
+            module._validated_worker_evidence_deadline(rehydrated, policy)
+    finally:
+        sys.modules.pop("hermes_cli.kanban_db", None)
+        sys.path.remove(source_value)
+        sys.path.remove(runtime_value)
+
+
+@pytest.mark.parametrize(
+    ("deadline", "started_at", "budget"),
+    [
+        ("nan", "1000", "600"),
+        ("inf", "1000", "600"),
+        ("4600", "1000", "600"),
+        ("1600.5", None, "600"),
+        ("1600.5", "not-a-time", "600"),
+        ("1600.5", "1000", "0"),
+    ],
+)
+def test_terminal_boundary_rejects_invalid_or_extended_evidence_window(
+    monkeypatch, deadline, started_at, budget
+):
+    runtime_value = os.environ.get("FACTORY_REVIEW_RUNTIME")
+    source_value = os.environ.get("FACTORY_SOURCE_RUNTIME")
+    if not runtime_value or not source_value:
+        pytest.skip("set FACTORY_REVIEW_RUNTIME and FACTORY_SOURCE_RUNTIME")
+
+    sys.path.insert(0, runtime_value)
+    sys.path.insert(1, source_value)
+    module_name = "factory_review_terminal_tool_test"
+    try:
+        spec = importlib.util.spec_from_file_location(
+            module_name, Path(runtime_value) / "tools/terminal_tool.py"
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        monkeypatch.setenv("HERMES_KANBAN_EVIDENCE_DEADLINE", deadline)
+        if started_at is None:
+            monkeypatch.delenv("HERMES_KANBAN_EVIDENCE_STARTED_AT", raising=False)
+        else:
+            monkeypatch.setenv("HERMES_KANBAN_EVIDENCE_STARTED_AT", started_at)
+        monkeypatch.setenv("HERMES_KANBAN_EVIDENCE_BUDGET_SECONDS", budget)
+        monkeypatch.setattr(module.time, "time", lambda: 1200.0)
+
+        assert module._kanban_evidence_remaining() == 0.0
+    finally:
+        sys.modules.pop(module_name, None)
+        sys.path.remove(source_value)
+        sys.path.remove(runtime_value)
+
+
+def test_terminal_boundary_accepts_exact_valid_evidence_window(monkeypatch):
+    runtime_value = os.environ.get("FACTORY_REVIEW_RUNTIME")
+    source_value = os.environ.get("FACTORY_SOURCE_RUNTIME")
+    if not runtime_value or not source_value:
+        pytest.skip("set FACTORY_REVIEW_RUNTIME and FACTORY_SOURCE_RUNTIME")
+
+    sys.path.insert(0, runtime_value)
+    sys.path.insert(1, source_value)
+    module_name = "factory_review_terminal_tool_valid_test"
+    try:
+        spec = importlib.util.spec_from_file_location(
+            module_name, Path(runtime_value) / "tools/terminal_tool.py"
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        monkeypatch.setenv("HERMES_KANBAN_EVIDENCE_DEADLINE", "1600.5")
+        monkeypatch.setenv("HERMES_KANBAN_EVIDENCE_STARTED_AT", "1000")
+        monkeypatch.setenv("HERMES_KANBAN_EVIDENCE_BUDGET_SECONDS", "600")
+        monkeypatch.setattr(module.time, "time", lambda: 1200.0)
+
+        assert module._kanban_evidence_remaining() == pytest.approx(400.5)
+    finally:
+        sys.modules.pop(module_name, None)
         sys.path.remove(source_value)
         sys.path.remove(runtime_value)

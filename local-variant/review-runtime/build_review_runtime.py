@@ -798,17 +798,89 @@ def _write_json_exclusive(
         os.close(directory_fd)
 
 
-def _reserve_private_sibling_directory(output: Path, purpose: str) -> Path:
-    """Reserve a private same-filesystem directory beside ``output``."""
-    output.parent.mkdir(parents=True, exist_ok=True)
-    for _ in range(128):
-        candidate = output.parent / (
-            f".{output.name}.{purpose}.{secrets.token_hex(16)}"
-        )
+def _runtime_entry_exists(directory_fd: int, relative: str) -> bool:
+    try:
+        os.stat(relative, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _runtime_directory_identity_at(directory_fd: int, relative: str) -> tuple[int, int]:
+    info = os.stat(relative, dir_fd=directory_fd, follow_symlinks=False)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise SystemExit(f"expected a real runtime directory: {relative}")
+    return info.st_dev, info.st_ino
+
+
+def _assert_runtime_parent_identity(output: Path, directory_fd: int) -> None:
+    try:
+        _assert_manifest_parent_identity(output.parent, directory_fd)
+    except SystemExit as exc:
+        raise SystemExit(
+            "runtime output parent changed or became unsafe during publication"
+        ) from exc
+
+
+def _validate_runtime_output_destination(
+    output: Path, *, force: bool
+) -> tuple[Path, int, bool]:
+    """Open and retain the lexical output parent without following symlinks."""
+    absolute = _absolute_lexical_path(output)
+    if not absolute.name:
+        raise SystemExit("runtime output must name a directory")
+    try:
+        directory_fd = _open_directory_chain(absolute.parent, create=True)
+    except SystemExit as exc:
+        raise SystemExit(
+            f"runtime output path contains a symlink or unsafe parent: {absolute}"
+        ) from exc
+    try:
+        _assert_runtime_parent_identity(absolute, directory_fd)
         try:
-            candidate.mkdir(mode=0o700)
+            info = os.stat(absolute.name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return absolute, directory_fd, False
+        if stat.S_ISLNK(info.st_mode):
+            raise SystemExit(f"runtime output path contains a symlink: {absolute}")
+        if not stat.S_ISDIR(info.st_mode):
+            raise SystemExit(f"runtime output is not a directory: {absolute}")
+        if not force:
+            raise SystemExit(
+                f"output already exists; use --force to replace it: {absolute}"
+            )
+        _assert_runtime_parent_identity(absolute, directory_fd)
+        return absolute, directory_fd, True
+    except (Exception, SystemExit, KeyboardInterrupt):
+        os.close(directory_fd)
+        raise
+
+
+def _reserve_private_sibling_directory(
+    output: Path, purpose: str, *, directory_fd: int
+) -> Path:
+    """Reserve a private same-filesystem directory beside ``output``."""
+    _assert_runtime_parent_identity(output, directory_fd)
+    for _ in range(128):
+        name = f".{output.name}.{purpose}.{secrets.token_hex(16)}"
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=directory_fd)
         except FileExistsError:
             continue
+        candidate = output.parent / name
+        try:
+            _assert_runtime_parent_identity(output, directory_fd)
+            identity = _runtime_directory_identity_at(directory_fd, name)
+            if _directory_identity(candidate) != identity:
+                raise SystemExit(
+                    f"private {purpose} directory path changed during reservation"
+                )
+        except (Exception, SystemExit, KeyboardInterrupt):
+            try:
+                os.rmdir(name, dir_fd=directory_fd)
+            except OSError:
+                pass
+            raise
         return candidate
     raise SystemExit(f"cannot reserve private {purpose} directory beside {output}")
 
@@ -820,13 +892,33 @@ def _directory_identity(path: Path) -> tuple[int, int]:
     return info.st_dev, info.st_ino
 
 
-def _remove_owned_directory(path: Path, identity: tuple[int, int]) -> None:
+def _remove_owned_directory(
+    path: Path,
+    identity: tuple[int, int],
+    *,
+    output: Path | None = None,
+    directory_fd: int | None = None,
+) -> None:
     """Remove only the exact directory inode created by this build."""
-    if not os.path.lexists(path):
+    if directory_fd is not None:
+        if output is None:
+            raise SystemExit("anchored runtime cleanup requires the output path")
+        _assert_runtime_parent_identity(output, directory_fd)
+        if not _runtime_entry_exists(directory_fd, path.name):
+            return
+        if _runtime_directory_identity_at(directory_fd, path.name) != identity:
+            raise SystemExit(f"refusing to remove replaced build directory: {path}")
+    elif not os.path.lexists(path):
         return
     if _directory_identity(path) != identity:
         raise SystemExit(f"refusing to remove replaced build directory: {path}")
     shutil.rmtree(path)
+    if directory_fd is not None:
+        if output is None:
+            raise SystemExit("anchored runtime cleanup requires the output path")
+        _assert_runtime_parent_identity(output, directory_fd)
+        if _runtime_entry_exists(directory_fd, path.name):
+            raise SystemExit(f"owned build directory survived cleanup: {path}")
 
 
 def build(
@@ -849,37 +941,39 @@ def build(
         expected_exclusions=patterns,
         expected_artifact_version=static["native_artifact_version"],
     )
-    output = output.resolve(strict=False)
-    source_runtime = (
-        Path(native_manifest["source_runtime"]).expanduser().resolve(strict=False)
+    output, output_parent_fd, output_existed = _validate_runtime_output_destination(
+        output, force=force
     )
-    for protected in (native_runtime, source_runtime, ARTIFACT_ROOT):
-        if _path_overlaps(output, protected):
-            raise SystemExit(
-                f"review runtime output collides with protected input/artifact path: {output}"
-            )
-    manifest_protected_roots = (
-        native_runtime,
-        source_runtime,
-        ARTIFACT_ROOT,
-        output,
-    )
-    manifest_output = _validate_manifest_destination(
-        manifest_output, manifest_protected_roots
-    )
-    output_existed = output.exists()
-    if output_existed:
-        if not force:
-            raise SystemExit(
-                f"output already exists; use --force to replace it: {output}"
-            )
-        if output.is_symlink() or not output.is_dir():
-            raise SystemExit(
-                "existing output must be a real directory when --force is used"
-            )
-    staging = _reserve_private_sibling_directory(output, "stage")
-    staging_identity = _directory_identity(staging)
+    try:
+        source_runtime = (
+            Path(native_manifest["source_runtime"]).expanduser().resolve(strict=False)
+        )
+        for protected in (native_runtime, source_runtime, ARTIFACT_ROOT):
+            if _path_overlaps(output, protected):
+                raise SystemExit(
+                    "review runtime output collides with protected "
+                    f"input/artifact path: {output}"
+                )
+        manifest_protected_roots = (
+            native_runtime,
+            source_runtime,
+            ARTIFACT_ROOT,
+            output,
+        )
+        manifest_output = _validate_manifest_destination(
+            manifest_output, manifest_protected_roots
+        )
+        staging = _reserve_private_sibling_directory(
+            output, "stage", directory_fd=output_parent_fd
+        )
+        staging_identity = _runtime_directory_identity_at(
+            output_parent_fd, staging.name
+        )
+    except (Exception, SystemExit, KeyboardInterrupt):
+        os.close(output_parent_fd)
+        raise
     backup_root: Path | None = None
+    backup_root_identity: tuple[int, int] | None = None
     backup_output: Path | None = None
     prior_identity: tuple[int, int] | None = None
     runtime_published = False
@@ -914,26 +1008,65 @@ def build(
         if output_existed:
             # Keep the prior runtime intact until the complete replacement has
             # passed copy, patch, equivalence, and syntax verification.
-            prior_identity = _directory_identity(output)
-            backup_root = _reserve_private_sibling_directory(output, "rollback")
+            _assert_runtime_parent_identity(output, output_parent_fd)
+            prior_identity = _runtime_directory_identity_at(
+                output_parent_fd, output.name
+            )
+            if _directory_identity(output) != prior_identity:
+                raise SystemExit("prior runtime path changed before backup")
+            backup_root = _reserve_private_sibling_directory(
+                output, "rollback", directory_fd=output_parent_fd
+            )
+            backup_root_identity = _runtime_directory_identity_at(
+                output_parent_fd, backup_root.name
+            )
             backup_output = backup_root / "previous-runtime"
+            backup_relative = f"{backup_root.name}/{backup_output.name}"
             try:
-                output.rename(backup_output)
-                if _directory_identity(backup_output) != prior_identity:
+                os.rename(
+                    output.name,
+                    backup_relative,
+                    src_dir_fd=output_parent_fd,
+                    dst_dir_fd=output_parent_fd,
+                )
+                _assert_runtime_parent_identity(output, output_parent_fd)
+                if (
+                    _runtime_directory_identity_at(output_parent_fd, backup_relative)
+                    != prior_identity
+                    or _directory_identity(backup_output) != prior_identity
+                ):
                     raise SystemExit("prior runtime identity changed during backup")
             except (Exception, SystemExit, KeyboardInterrupt):
-                if os.path.lexists(backup_output) and not os.path.lexists(output):
-                    backup_output.rename(output)
+                if _runtime_entry_exists(
+                    output_parent_fd, backup_relative
+                ) and not _runtime_entry_exists(output_parent_fd, output.name):
+                    os.rename(
+                        backup_relative,
+                        output.name,
+                        src_dir_fd=output_parent_fd,
+                        dst_dir_fd=output_parent_fd,
+                    )
                 raise
 
         try:
-            if os.path.lexists(output):
+            _assert_runtime_parent_identity(output, output_parent_fd)
+            if _runtime_entry_exists(output_parent_fd, output.name):
                 raise SystemExit(
                     f"runtime output appeared during publication: {output}"
                 )
-            staging.rename(output)
+            os.rename(
+                staging.name,
+                output.name,
+                src_dir_fd=output_parent_fd,
+                dst_dir_fd=output_parent_fd,
+            )
             runtime_published = True
-            if _directory_identity(output) != staging_identity:
+            _assert_runtime_parent_identity(output, output_parent_fd)
+            if (
+                _runtime_directory_identity_at(output_parent_fd, output.name)
+                != staging_identity
+                or _directory_identity(output) != staging_identity
+            ):
                 raise SystemExit("published runtime identity check failed")
             _write_json_exclusive(
                 manifest_output,
@@ -944,24 +1077,42 @@ def build(
             rollback_errors: list[str] = []
             if runtime_published:
                 try:
-                    _remove_owned_directory(output, staging_identity)
+                    _remove_owned_directory(
+                        output,
+                        staging_identity,
+                        output=output,
+                        directory_fd=output_parent_fd,
+                    )
                     runtime_published = False
                 except (OSError, SystemExit) as exc:
                     rollback_errors.append(f"cannot remove failed replacement: {exc}")
-            if backup_output is not None and os.path.lexists(backup_output):
-                try:
-                    if os.path.lexists(output):
-                        raise SystemExit(
-                            "replacement path is occupied; refusing unsafe rollback"
+            if backup_output is not None and backup_root is not None:
+                backup_relative = f"{backup_root.name}/{backup_output.name}"
+                if _runtime_entry_exists(output_parent_fd, backup_relative):
+                    try:
+                        _assert_runtime_parent_identity(output, output_parent_fd)
+                        if _runtime_entry_exists(output_parent_fd, output.name):
+                            raise SystemExit(
+                                "replacement path is occupied; refusing unsafe rollback"
+                            )
+                        os.rename(
+                            backup_relative,
+                            output.name,
+                            src_dir_fd=output_parent_fd,
+                            dst_dir_fd=output_parent_fd,
                         )
-                    backup_output.rename(output)
-                    if (
-                        prior_identity is None
-                        or _directory_identity(output) != prior_identity
-                    ):
-                        raise SystemExit("restored runtime identity check failed")
-                except (OSError, SystemExit) as exc:
-                    rollback_errors.append(f"cannot restore prior runtime: {exc}")
+                        _assert_runtime_parent_identity(output, output_parent_fd)
+                        if (
+                            prior_identity is None
+                            or _runtime_directory_identity_at(
+                                output_parent_fd, output.name
+                            )
+                            != prior_identity
+                            or _directory_identity(output) != prior_identity
+                        ):
+                            raise SystemExit("restored runtime identity check failed")
+                    except (OSError, SystemExit) as exc:
+                        rollback_errors.append(f"cannot restore prior runtime: {exc}")
             if rollback_errors:
                 location = str(backup_output) if backup_output else "none"
                 raise SystemExit(
@@ -970,24 +1121,47 @@ def build(
                 ) from publish_error
             raise
 
-        if backup_root is not None:
+        if backup_root is not None and backup_root_identity is not None:
             try:
+                _assert_runtime_parent_identity(output, output_parent_fd)
+                if (
+                    _runtime_directory_identity_at(output_parent_fd, backup_root.name)
+                    != backup_root_identity
+                    or _directory_identity(backup_root) != backup_root_identity
+                ):
+                    raise SystemExit("prior-runtime backup identity changed")
                 shutil.rmtree(backup_root)
-            except OSError as exc:
+                _assert_runtime_parent_identity(output, output_parent_fd)
+            except (OSError, SystemExit) as exc:
                 print(
                     f"warning: verified prior-runtime backup remains at {backup_root}: {exc}",
                     file=sys.stderr,
                 )
         return manifest_output
     finally:
-        if os.path.lexists(staging):
-            _remove_owned_directory(staging, staging_identity)
-        if (
-            backup_root is not None
-            and backup_root.exists()
-            and not any(backup_root.iterdir())
-        ):
-            backup_root.rmdir()
+        try:
+            if _runtime_entry_exists(output_parent_fd, staging.name):
+                _remove_owned_directory(
+                    staging,
+                    staging_identity,
+                    output=output,
+                    directory_fd=output_parent_fd,
+                )
+            if (
+                backup_root is not None
+                and backup_root_identity is not None
+                and _runtime_entry_exists(output_parent_fd, backup_root.name)
+            ):
+                _assert_runtime_parent_identity(output, output_parent_fd)
+                if (
+                    _runtime_directory_identity_at(output_parent_fd, backup_root.name)
+                    != backup_root_identity
+                ):
+                    raise SystemExit("rollback directory identity changed")
+                if not any(backup_root.iterdir()):
+                    os.rmdir(backup_root.name, dir_fd=output_parent_fd)
+        finally:
+            os.close(output_parent_fd)
 
 
 def verify(output: Path, manifest_path: Path) -> None:
@@ -1106,12 +1280,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
     if args.command == "stage":
+        output = _absolute_lexical_path(args.output)
         manifest = build(
-            args.native_runtime.resolve(),
-            args.native_manifest.resolve(),
-            args.output.resolve(),
+            args.native_runtime,
+            args.native_manifest,
+            output,
             _manifest_output(
-                args.output.resolve(),
+                output,
                 str(args.manifest_output) if args.manifest_output else None,
             ),
             args.force,
@@ -1120,7 +1295,7 @@ def main(argv: list[str] | None = None) -> int:
             json.dumps(
                 {
                     "status": "staged",
-                    "runtime": str(args.output.resolve()),
+                    "runtime": str(output),
                     "manifest": str(manifest),
                 }
             )
