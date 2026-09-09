@@ -25,11 +25,12 @@ ARTIFACT_VERSION = "1.0.0"
 ROOT = Path(__file__).resolve().parent
 STATIC_MANIFEST = ROOT / "manifest.json"
 _PATCH_EXECUTABLE = Path("/usr/bin/patch")
+_FIXED_EXECUTABLE_PATH = "/usr/bin:/bin"
 _PATCH_ENVIRONMENT = {
     "HOME": "/nonexistent",
     "LANG": "C",
     "LC_ALL": "C",
-    "PATH": "/usr/bin:/bin",
+    "PATH": _FIXED_EXECUTABLE_PATH,
 }
 
 _COPY_IGNORE_NAMES = frozenset(
@@ -451,7 +452,7 @@ def _import_probe(runtime: Path) -> dict[str, str]:
     )
     environment = {
         "HERMES_HOME": str(runtime / ".probe-home"),
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "PATH": _FIXED_EXECUTABLE_PATH,
         "PYTHONPATH": str(runtime),
         "PYTHONNOUSERSITE": "1",
         "PYTHONHASHSEED": "0",

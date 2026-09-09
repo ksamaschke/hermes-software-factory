@@ -149,6 +149,47 @@ def test_patch_application_uses_fixed_tool_and_scrubbed_environment(
     assert not marker.exists()
 
 
+def test_import_probe_uses_fixed_path_and_scrubbed_environment(tmp_path, monkeypatch):
+    runtime = tmp_path / "runtime"
+    package = runtime / "hermes_cli"
+    package.mkdir(parents=True)
+    imported = {
+        "kanban_db": str(package / "kanban_db.py"),
+        "kanban_specify": str(package / "kanban_specify.py"),
+        "native_boundary": str(package / "native_boundary.py"),
+    }
+    for path in imported.values():
+        Path(path).write_text("# fixture\n", encoding="utf-8")
+
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = list(command)
+        captured["environment"] = dict(kwargs["env"])
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout=json.dumps(imported),
+            stderr="",
+        )
+
+    monkeypatch.setenv("PATH", str(tmp_path / "attacker-controlled"))
+    monkeypatch.setenv("PYTHONHOME", str(tmp_path / "attacker-python-home"))
+    monkeypatch.setenv("PYTHONSTARTUP", str(tmp_path / "attacker-startup.py"))
+    monkeypatch.setenv("NATIVE_SECRET_SENTINEL", "review-secret")
+    monkeypatch.setattr(builder.subprocess, "run", fake_run)
+
+    assert builder._import_probe(runtime) == imported
+    assert captured["command"][:4] == [sys.executable, "-B", "-S", "-c"]
+    assert captured["environment"] == {
+        "HERMES_HOME": str(runtime / ".probe-home"),
+        "PATH": "/usr/bin:/bin",
+        "PYTHONPATH": str(runtime),
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONHASHSEED": "0",
+    }
+
+
 def test_documented_cgroup_reader_fails_closed_on_find_error(tmp_path):
     readme = (ARTIFACT / "README.md").read_text(encoding="utf-8")
     start = readme.index("read_extra_pids() {")

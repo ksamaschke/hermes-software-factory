@@ -80,7 +80,9 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONDONTWRITEBYTECODE=1 \
 
 The repository artifact tests cover manifest pins, complete-tree tamper
 detection, patch-target/path safety, hardlink/symlink rejection, isolated
-import provenance, and the native decision helpers. When
+import provenance with a fixed `/usr/bin:/bin` executable search path and no
+ambient `PATH`, `PYTHONHOME`, startup-hook, or credential inheritance, and the
+native decision helpers. When
 `FACTORY_NATIVE_RUNTIME` is set, they additionally exercise staged import
 provenance, old-runtime-to-candidate migration, the real PR-URL guard seam,
 and one-admission concurrency in private temporary databases.
