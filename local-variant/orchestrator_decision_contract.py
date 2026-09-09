@@ -449,7 +449,7 @@ class ExecutionIdentity:
     run_id: str | None = None
     branch: str | None = None
     tenant: str | None = None
-    credentials_verified: bool = True
+    credentials_verified: bool = False
     production: bool = False
     production_approved: bool = False
     retry_count: int = 0
@@ -1355,9 +1355,7 @@ def _validate_observation_trace(
             raise ContractViolation("native fixture trace contains a malformed entry")
         tool_name = entry["tool"]
         if tool_name in trace_fields and set(entry) != trace_fields[tool_name]:
-            raise ContractViolation(
-                f"native fixture {tool_name} payload is malformed"
-            )
+            raise ContractViolation(f"native fixture {tool_name} payload is malformed")
         if any(
             key
             not in {"tool", "action", "idempotency_key", "target_task_id", "receipt"}
@@ -1505,7 +1503,10 @@ class NoSideEffectFixtureAdapter:
     def __init__(self, state: Mapping[str, Any]) -> None:
         if not isinstance(state, Mapping):
             raise ContractViolation("fixture state must be a JSON object")
-        self._state = copy.deepcopy(dict(state))
+        bounded_state = _safe_value(state, "fixture state")
+        if not isinstance(bounded_state, dict):
+            raise ContractViolation("fixture state must be a JSON object")
+        self._state = bounded_state
         self._baseline = copy.deepcopy(self._state)
         self._reads: list[str] = []
         self._proposal: dict[str, Any] | None = None

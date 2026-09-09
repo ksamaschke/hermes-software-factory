@@ -21,20 +21,21 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
+from stat import S_IMODE, S_ISDIR, S_ISLNK, S_ISVTX
 from typing import Any
 
 try:  # Running as a package is useful to downstream installers.
     from .orchestrator_decision_contract import (
         _MAX_NATIVE_OUTPUT_CHARS,
         _MAX_NATIVE_RESPONSE_CHARS,
-        _MAX_NATIVE_TRACE_ENTRIES,
         _MAX_NATIVE_TRACE_BYTES,
+        _MAX_NATIVE_TRACE_ENTRIES,
         BlockerState,
         ContractViolation,
         DecisionContext,
@@ -64,8 +65,8 @@ except ImportError:  # Running this file directly is the supported CLI path.
     from orchestrator_decision_contract import (  # type: ignore[no-redef]
         _MAX_NATIVE_OUTPUT_CHARS,
         _MAX_NATIVE_RESPONSE_CHARS,
-        _MAX_NATIVE_TRACE_ENTRIES,
         _MAX_NATIVE_TRACE_BYTES,
+        _MAX_NATIVE_TRACE_ENTRIES,
         BlockerState,
         ContractViolation,
         DecisionContext,
@@ -227,6 +228,13 @@ def _inherited_protected_roots(parent_env: Mapping[str, str]) -> tuple[Path, ...
     for key in (
         "HERMES_KANBAN_WORKSPACES_ROOT",
         "HERMES_KANBAN_ATTACHMENTS_ROOT",
+        "HERMES_KANBAN_WORKSPACE",
+        "HERMES_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "TERMINAL_CWD",
     ):
         raw_root = str(parent_env.get(key, "")).strip()
         if raw_root:
@@ -244,6 +252,138 @@ def _ensure_path_not_inherited(
     ):
         raise NativeEvaluationUnavailable(f"{label} overlaps inherited board authority")
     return candidate
+
+
+def _real_directory_without_symlinks(path: Path, label: str) -> Path:
+    """Require an existing absolute directory with no symlinked component."""
+
+    try:
+        absolute = Path(os.path.abspath(os.path.expanduser(str(path))))
+    except OSError as exc:
+        raise NativeEvaluationUnavailable(
+            f"{label} cannot be normalized safely"
+        ) from exc
+    current = Path(absolute.anchor)
+    for component in absolute.parts[1:]:
+        current /= component
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            raise NativeEvaluationUnavailable(
+                f"{label} is missing or unreadable"
+            ) from exc
+        if S_ISLNK(info.st_mode):
+            raise NativeEvaluationUnavailable(f"{label} contains a symlink")
+    try:
+        info = absolute.lstat()
+    except OSError as exc:
+        raise NativeEvaluationUnavailable(f"{label} is missing or unreadable") from exc
+    if not S_ISDIR(info.st_mode):
+        raise NativeEvaluationUnavailable(f"{label} is not a directory")
+    return absolute
+
+
+def _validated_temporary_parent(parent_env: Mapping[str, str]) -> Path:
+    """Resolve and validate the parent before creating any evaluation artifact."""
+
+    configured = next(
+        (
+            str(parent_env[key]).strip()
+            for key in ("TMPDIR", "TEMP", "TMP")
+            if str(parent_env.get(key, "")).strip()
+        ),
+        None,
+    )
+    if configured is None:
+        if os.name != "posix":
+            raise NativeEvaluationUnavailable(
+                "native evaluation requires an explicit temporary parent"
+            )
+        configured = "/tmp"
+    parent = _real_directory_without_symlinks(
+        Path(configured), "native evaluation temporary parent"
+    )
+    parent = _ensure_path_not_inherited(
+        parent, parent_env, "native evaluation temporary parent"
+    )
+    info = parent.lstat()
+    mode = S_IMODE(info.st_mode)
+    if info.st_uid not in {0, os.geteuid()}:
+        raise NativeEvaluationUnavailable(
+            "native evaluation temporary parent has an untrusted owner"
+        )
+    if mode & 0o022 and not mode & S_ISVTX:
+        raise NativeEvaluationUnavailable(
+            "native evaluation temporary parent is writable without sticky isolation"
+        )
+    return parent
+
+
+def _validate_evaluation_layout(root: Path, parent_env: Mapping[str, str]) -> None:
+    """Validate every derived setup path before profile/state/auth writes."""
+
+    derived_paths = (
+        (root, "native evaluation root"),
+        (root / "profile", "native evaluation profile"),
+        (root / "profile" / "auth.json", "native evaluation credential copy"),
+        (root / "profile" / "decision-prompt.txt", "native evaluation prompt"),
+        (root / "fixture-state.json", "native evaluation fixture state"),
+        (root / "fixture-trace.jsonl", "native evaluation fixture trace"),
+        (root / "isolated-kanban.db", "native evaluation board"),
+        (root / "tmp", "native evaluation child temporary root"),
+        (root / "workspaces", "native evaluation child workspace root"),
+        (root / "attachments", "native evaluation child attachment root"),
+    )
+    for path, label in derived_paths:
+        _ensure_path_not_inherited(path, parent_env, label)
+
+
+@contextmanager
+def _private_evaluation_root(parent_env: Mapping[str, str]) -> Iterator[Path]:
+    """Create one identity-checked private root under a validated parent."""
+
+    parent = _validated_temporary_parent(parent_env)
+    root: Path | None = None
+    for _ in range(128):
+        candidate = parent / f"factory-decision-eval-{uuid.uuid4().hex}"
+        _ensure_path_not_inherited(candidate, parent_env, "native evaluation root")
+        try:
+            candidate.mkdir(mode=0o700)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise NativeEvaluationUnavailable(
+                "native evaluation root cannot be created safely"
+            ) from exc
+        root = candidate
+        break
+    if root is None:
+        raise NativeEvaluationUnavailable("native evaluation root cannot be reserved")
+    opened = root.lstat()
+    identity = (opened.st_dev, opened.st_ino)
+    if S_ISLNK(opened.st_mode) or not S_ISDIR(opened.st_mode):
+        raise NativeEvaluationUnavailable(
+            "native evaluation root is not a real directory"
+        )
+    try:
+        _validate_evaluation_layout(root, parent_env)
+        yield root
+    finally:
+        try:
+            current = root.lstat()
+        except OSError as exc:
+            raise NativeEvaluationUnavailable(
+                "native evaluation root changed before cleanup"
+            ) from exc
+        if (
+            S_ISLNK(current.st_mode)
+            or not S_ISDIR(current.st_mode)
+            or (current.st_dev, current.st_ino) != identity
+        ):
+            raise NativeEvaluationUnavailable(
+                "native evaluation root changed before cleanup"
+            )
+        shutil.rmtree(root)
 
 
 def build_isolated_environment(
@@ -497,6 +637,7 @@ def _fixture_context(
         profile_name="factory-orchestrator",
         task_id=f"task-{item_key}",
         run_id=None,
+        credentials_verified=True,
     )
     evidence = EvidenceBundle(
         scheduler=(
@@ -1390,9 +1531,7 @@ def _path_signature(
                 raise NativeEvaluationUnavailable(
                     "inherited board symlink targets exceed snapshot bound"
                 )
-            target_signature = _path_signature(
-                target, symlink_seen | {target}, budget
-            )
+            target_signature = _path_signature(target, symlink_seen | {target}, budget)
         return (
             "symlink",
             stat.st_ino,
@@ -1857,16 +1996,15 @@ def run_native_evaluation(
 
     if run_budget < 30:
         raise ValueError("run_budget must be at least 30 seconds")
+    parent_env = dict(os.environ)
     binary = _hermes_binary(hermes)
     source_auth = _auth_source(auth_file)
     cases = build_synthetic_cases(seed)
-    parent_env = dict(os.environ)
     if trace_output:
         _ensure_path_not_inherited(
             Path(trace_output), parent_env, "native trace output"
         )
-    with tempfile.TemporaryDirectory(prefix="factory-decision-eval-") as directory:
-        root = Path(directory)
+    with _private_evaluation_root(parent_env) as root:
         state_path = root / "fixture-state.json"
         trace_path = root / "fixture-trace.jsonl"
         board_path = root / "isolated-kanban.db"

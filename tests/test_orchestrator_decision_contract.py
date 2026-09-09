@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+from collections.abc import Iterator, Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -132,6 +133,7 @@ def _context(item_key: str, state: dict[str, Any]):
         profile_name="orchestrator-profile",
         task_id=f"task-{item_key}",
         run_id=state.get("run_id"),
+        credentials_verified=True,
     )
     evidence = contract.EvidenceBundle(
         scheduler=(
@@ -273,6 +275,36 @@ def _fixture_state(context, **overrides: Any) -> dict[str, Any]:
         bound.update(existing)
         state["live"]["existing_action"] = bound
     return state
+
+
+def test_admission_requires_explicit_credential_verification_evidence():
+    context = _context(
+        "omitted-credential-verification",
+        {
+            "blocker": {
+                "fingerprint": "contract:v2",
+                "previous_fingerprint": "contract:v1",
+                "resolved": True,
+            }
+        },
+    )
+    execution = contract.ExecutionIdentity(
+        mode=context.execution.mode,
+        profile_name=context.execution.profile_name,
+        task_id=context.execution.task_id,
+    )
+    assert execution.credentials_verified is False
+    context = replace(context, execution=execution)
+    state = _fixture_state(context)
+
+    with pytest.raises(
+        contract.ContractViolation, match="admission requires verified credentials"
+    ):
+        contract._validate_admission_guards(
+            context,
+            state["live"],
+            state["source"],
+        )
 
 
 def test_context_separates_mode_profile_and_preserves_typed_evidence():
@@ -417,6 +449,33 @@ def test_secret_private_path_and_resource_bounds_fail_closed():
         contract._validate_observation_trace(
             [{"tool": "read_live_state"}] * (contract._MAX_NATIVE_TRACE_ENTRIES + 1)
         )
+
+
+def test_fixture_adapter_bounds_hostile_mapping_before_materialization():
+    class HostileMapping(Mapping[str, Any]):
+        def __init__(self, item_count: int) -> None:
+            self.item_count = item_count
+            self.yielded = 0
+            self.lookups = 0
+
+        def __getitem__(self, key: str) -> Any:
+            self.lookups += 1
+            return key
+
+        def __iter__(self) -> Iterator[str]:
+            for index in range(self.item_count):
+                self.yielded += 1
+                yield f"key-{index}"
+
+        def __len__(self) -> int:
+            return self.item_count
+
+    state = HostileMapping(contract._MAX_SAFE_VALUE_ITEMS * 4)
+    with pytest.raises(contract.ContractViolation, match="exceeds the contract bound"):
+        contract.NoSideEffectFixtureAdapter(state)
+    expected_consumption = contract._MAX_SAFE_VALUE_ITEMS + 1
+    assert state.yielded == expected_consumption
+    assert state.lookups == expected_consumption
 
 
 def test_model_fixture_path_makes_safe_decisions_for_unseen_ids_without_writes():
@@ -717,7 +776,9 @@ def test_action_identity_includes_full_execution_binding():
         ),
         replace(context, execution=replace(context.execution, mode="interactive")),
     )
-    keys = {contract.action_idempotency_key(item, "hold") for item in (context, *variants)}
+    keys = {
+        contract.action_idempotency_key(item, "hold") for item in (context, *variants)
+    }
     assert len(keys) == 6
 
 
@@ -886,7 +947,10 @@ def test_compound_secret_keys_are_redacted_case_insensitively():
     ):
         assert safe[key] == "[REDACTED]"
     assert safe["credentials_verified"] == "[REDACTED]"
-    assert contract._safe_value({"credentials_verified": True})["credentials_verified"] is True
+    assert (
+        contract._safe_value({"credentials_verified": True})["credentials_verified"]
+        is True
+    )
     encoded = contract._redact_text(
         '{"apiKey":"API-SECRET","passwordHash":"HASH-SECRET"}'
     )

@@ -5,7 +5,9 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -347,6 +349,79 @@ def test_trace_output_inside_inherited_root_is_rejected_before_write(
     assert not live_board.exists()
 
 
+def test_tmpdir_overlap_is_rejected_before_any_evaluation_setup_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    inherited_root = tmp_path / "live"
+    inherited_root.mkdir()
+    live_board = inherited_root / "kanban.db"
+    live_board.write_bytes(b"live-board")
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text("{}", encoding="utf-8")
+    parent = _contaminated_environment(live_board)
+    parent["TMPDIR"] = str(inherited_root)
+    monkeypatch.setattr(os, "environ", parent)
+    monkeypatch.setattr(tempfile, "tempdir", None)
+    setup_roots: list[Path] = []
+
+    def setup_write_observer(root: Path, **_: Any) -> Path:
+        setup_roots.append(root)
+        raise AssertionError("evaluation setup wrote before isolation validation")
+
+    monkeypatch.setattr(evaluation, "_write_profile", setup_write_observer)
+
+    with pytest.raises(
+        evaluation.NativeEvaluationUnavailable,
+        match="temporary parent overlaps inherited board authority",
+    ):
+        evaluation.run_native_evaluation(
+            hermes=sys.executable,
+            auth_file=str(auth_file),
+            run_budget=30,
+        )
+
+    assert setup_roots == []
+    assert list(inherited_root.iterdir()) == [live_board]
+
+
+@pytest.mark.parametrize(
+    "authority_key",
+    [
+        "HERMES_HOME",
+        "HERMES_KANBAN_WORKSPACE",
+        "HERMES_KANBAN_WORKSPACES_ROOT",
+        "HERMES_KANBAN_ATTACHMENTS_ROOT",
+    ],
+)
+def test_temporary_parent_rejects_each_inherited_private_authority(
+    tmp_path: Path, authority_key: str
+):
+    inherited_root = tmp_path / authority_key.lower()
+    inherited_root.mkdir()
+    parent = {"TMPDIR": str(inherited_root), authority_key: str(inherited_root)}
+
+    with pytest.raises(
+        evaluation.NativeEvaluationUnavailable,
+        match="temporary parent overlaps inherited board authority",
+    ):
+        evaluation._validated_temporary_parent(parent)
+    assert list(inherited_root.iterdir()) == []
+
+
+def test_private_evaluation_root_is_mode_private_and_removed(tmp_path: Path):
+    temporary_parent = tmp_path / "temporary-parent"
+    temporary_parent.mkdir(mode=0o700)
+    parent = {"TMPDIR": str(temporary_parent)}
+
+    with evaluation._private_evaluation_root(parent) as root:
+        created_root = root
+        assert root.parent == temporary_parent
+        assert root.stat().st_mode & 0o077 == 0
+        (root / "bounded-fixture").write_text("fixture", encoding="utf-8")
+
+    assert not created_root.exists()
+
+
 def test_bounded_process_closes_streams_without_parent_stderr_noise(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ):
@@ -373,7 +448,9 @@ def test_native_summary_redacts_case_payloads_and_compound_json_keys():
 
 def test_response_size_is_bounded_before_json_decode():
     with pytest.raises(contract.ContractViolation, match="response exceeds"):
-        evaluation._parse_json_response("{" + "x" * evaluation._MAX_NATIVE_RESPONSE_CHARS)
+        evaluation._parse_json_response(
+            "{" + "x" * evaluation._MAX_NATIVE_RESPONSE_CHARS
+        )
 
 
 def test_root_symlink_retarget_is_detected(tmp_path: Path):
@@ -394,7 +471,9 @@ def test_root_symlink_retarget_is_detected(tmp_path: Path):
         evaluation.verify_board_state_unchanged(snapshot)
 
 
-def test_snapshot_enforces_cumulative_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_snapshot_enforces_cumulative_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / "one").write_bytes(b"123456")
@@ -440,7 +519,9 @@ def test_prompt_atomic_replace_does_not_mutate_hardlink_target(
 
 def test_combined_process_output_is_bounded(tmp_path: Path):
     code = "import sys; sys.stdout.write('o' * 180000); sys.stderr.write('e' * 100000)"
-    with pytest.raises(contract.ContractViolation, match="combined native Hermes output"):
+    with pytest.raises(
+        contract.ContractViolation, match="combined native Hermes output"
+    ):
         evaluation._run_bounded_process(
             [sys.executable, "-c", code],
             cwd=tmp_path,
@@ -456,7 +537,7 @@ def test_bounded_process_kills_descendants_on_timeout(tmp_path: Path):
         "child=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
         "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); time.sleep(30)"
     )
-    with pytest.raises(Exception):
+    with pytest.raises(subprocess.TimeoutExpired):
         evaluation._run_bounded_process(
             [sys.executable, "-c", code, str(pid_file)],
             cwd=tmp_path,
@@ -466,7 +547,9 @@ def test_bounded_process_kills_descendants_on_timeout(tmp_path: Path):
     child_pid = int(pid_file.read_text(encoding="utf-8"))
     for _ in range(20):
         try:
-            state = Path(f"/proc/{child_pid}/stat").read_text(encoding="utf-8").split()[2]
+            state = (
+                Path(f"/proc/{child_pid}/stat").read_text(encoding="utf-8").split()[2]
+            )
         except FileNotFoundError:
             break
         if state == "Z":

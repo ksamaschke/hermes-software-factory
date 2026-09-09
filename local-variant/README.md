@@ -27,9 +27,13 @@ not a scheduler or a tracker client.
 installs `docs/orchestrator-soul-template.md` into a temporary profile, disables
 profile memory, exposes only read-only synthetic MCP tools, invokes the selected
 native Hermes model, and validates the returned decision against the fixture.
-The harness never writes source or fixture state; credentials, when explicitly
-provided for a native run, are copied only to the temporary profile and removed
-with it.
+Admission defaults credential verification to false and requires callers to
+supply an explicit verified result. Before any profile, fixture, trace, board,
+or credential-copy write, the harness validates the selected temporary parent
+and every derived path against inherited board, profile, workspace, and
+attachment authority; the private root is identity-checked through cleanup.
+Credentials, when explicitly provided for a native run, are copied only to that
+private profile and removed with it.
 
 ## Relationship to the live installation
 
