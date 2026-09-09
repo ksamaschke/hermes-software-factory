@@ -1068,7 +1068,7 @@
 
 
  def _retry_status_for_run(
-@@ -5360,6 +6016,261 @@
+@@ -5360,6 +6016,256 @@
      """Raised when a declared scratch deliverable cannot be preserved."""
 
 
@@ -1120,26 +1120,10 @@
 +    if run_row:
 +        started_at = int(run_row["started_at"]) if run_row["started_at"] is not None else None
 +        outcome = str(run_row["outcome"]) if run_row["outcome"] else None
-+    claimed = conn.execute(
-+        "SELECT payload FROM task_events "
-+        "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
-+        "ORDER BY id DESC LIMIT 1",
-+        (task_id, int(run_id)),
-+    ).fetchone()
-+    try:
-+        payload = json.loads(claimed["payload"]) if claimed and claimed["payload"] else {}
-+    except (json.JSONDecodeError, TypeError):
-+        payload = {}
-+    if isinstance(payload, dict):
-+        selected = payload.get("runtime_class") or payload.get("runtime_policy")
-+        if selected:
-+            runtime_class = str(selected).strip().lower()
-+        raw_budget = payload.get("evidence_budget_seconds")
-+        try:
-+            evidence_budget = int(raw_budget) if raw_budget is not None else None
-+        except (TypeError, ValueError):
-+            evidence_budget = None
-+    if evidence_budget is None and runtime_class in VALID_RUNTIME_CLASSES:
++    # The durable task runtime class is authoritative. Claimed-event payloads
++    # are audit/notification data and may be compacted or malformed; they must
++    # never extend or reclassify an approval window.
++    if runtime_class in VALID_RUNTIME_CLASSES:
 +        evidence_budget = resolve_runtime_policy(runtime_class).evidence_budget_seconds
 +    return runtime_class, evidence_budget, started_at, outcome
 +
@@ -1159,9 +1143,12 @@
 +    if row is None or row["evidence_deadline"] is None:
 +        return None
 +    try:
-+        return float(row["evidence_deadline"])
++        deadline = float(row["evidence_deadline"])
 +    except (TypeError, ValueError):
 +        return None
++    if not (float("-inf") < deadline < float("inf")):
++        return None
++    return deadline
 +
 +
 +def _review_completion_rejection(
@@ -1225,21 +1212,29 @@
 +            "a completed review cannot be approved from a failed run"
 +        )
 +
++    if run_id is None:
++        return "review approval requires an active claimed run with a persisted deadline"
 +    evidence_deadline = _claimed_evidence_deadline(conn, task_id, run_id)
-+    if evidence_deadline is not None:
-+        elapsed = max(0, int(time.time() - (evidence_deadline - int(evidence_budget or 0))))
-+        if time.time() >= evidence_deadline:
-+            return (
-+                f"evidence budget expired after {int(evidence_budget or 0)}s "
-+                f"(elapsed {elapsed}s); no further probes or approval are allowed"
-+            )
-+    elif evidence_budget is not None and started_at is not None:
-+        elapsed = time.time() - int(started_at)
-+        if elapsed >= int(evidence_budget):
-+            return (
-+                f"evidence budget expired after {int(evidence_budget)}s "
-+                f"(elapsed {int(elapsed)}s); no further probes or approval are allowed"
-+            )
++    if evidence_deadline is None:
++        return "review run has no valid persisted evidence deadline"
++    if evidence_budget is None or evidence_budget <= 0 or started_at is None:
++        return "review run has incomplete persisted evidence-window state"
++    persisted_window = evidence_deadline - float(started_at)
++    if not (
++        float(evidence_budget)
++        <= persisted_window
++        <= float(evidence_budget) + 2.0
++    ):
++        return (
++            "review run has an inconsistent persisted evidence deadline "
++            f"for its {int(evidence_budget)}s budget"
++        )
++    elapsed = max(0, int(time.time() - float(started_at)))
++    if time.time() >= evidence_deadline:
++        return (
++            f"evidence budget expired after {int(evidence_budget)}s "
++            f"(elapsed {elapsed}s); no further probes or approval are allowed"
++        )
 +
 +    if not _review_handoff_has_evidence(summary, result, metadata):
 +        return "review approval requires a non-empty summary, result, or metadata handoff"

@@ -26,7 +26,8 @@ The overlay has three responsibilities:
   starts a new notification boundary.
 - Persist one absolute evidence deadline on the claimed `task_runs` row. A
   reconnect or event-compaction gap rehydrates that same value; missing or
-  expired deadline state fails closed instead of silently minting more time.
+  malformed, non-finite, inconsistent, or expired deadline state produces a
+  typed `REVIEW-INCOMPLETE` block instead of silently minting more time.
 - Provide the symmetric recovery transition `kanban_supersede`: an
   orchestrator may replace one blocked/triaged card only when its exact latest
   run is a terminal failure. One immutable lane key has one successor leaf,
@@ -55,9 +56,12 @@ reviewed tree to be rebuilt at a different absolute output path. The generated
 manifest still records the exact native input-manifest hash, patched output
 hashes, syntax probe, and complete runtime tree hash.
 
-The manifest destination must be new, non-symlinked, and outside every source,
-artifact, and staged-runtime tree. Publication is an exclusive atomic create;
-`--force` may replace the staged runtime but never overwrites prior evidence.
+The manifest destination must be new, outside every source, artifact, and
+staged-runtime tree, and contain no symlink in any existing path component.
+Publication traverses and pins the parent with directory descriptors plus
+`O_NOFOLLOW`, then performs an exclusive atomic create relative to that pinned
+directory. `--force` builds and verifies in a private sibling before swapping;
+publication failure restores the prior runtime and never overwrites evidence.
 
 The builder invokes only root-owned `/usr/bin/git` with a scrubbed environment.
 The staged worker launcher uses the active reviewed Python interpreter rather

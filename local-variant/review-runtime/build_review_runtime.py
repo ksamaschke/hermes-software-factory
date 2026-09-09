@@ -10,15 +10,16 @@ from __future__ import annotations
 
 import argparse
 import ast
+import errno
 import fnmatch
 import hashlib
 import json
 import os
+import secrets
 import shutil
 import stat
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -566,69 +567,266 @@ def _path_overlaps(left: Path, right: Path) -> bool:
         return False
 
 
+def _absolute_lexical_path(path: Path) -> Path:
+    """Return an absolute normalized path without resolving symlinks."""
+    expanded = path.expanduser()
+    if not expanded.is_absolute():
+        expanded = Path.cwd() / expanded
+    return Path(os.path.abspath(os.fspath(expanded)))
+
+
+def _manifest_directory_flags() -> int:
+    """Return the fail-closed flags required for directory traversal."""
+    required = ("O_DIRECTORY", "O_NOFOLLOW")
+    missing = [name for name in required if not hasattr(os, name)]
+    if missing:
+        raise SystemExit(
+            "secure manifest publication is unsupported: missing " + ", ".join(missing)
+        )
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+
+
+def _open_directory_chain(path: Path, *, create: bool) -> int:
+    """Open an absolute directory one non-symlink component at a time."""
+    absolute = _absolute_lexical_path(path)
+    flags = _manifest_directory_flags()
+    current_fd = os.open(os.sep, flags)
+    completed = False
+    try:
+        for component in absolute.parts[1:]:
+            try:
+                next_fd = os.open(component, flags, dir_fd=current_fd)
+            except FileNotFoundError:
+                if not create:
+                    raise SystemExit(
+                        f"manifest destination parent disappeared: {absolute}"
+                    ) from None
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=current_fd)
+                except FileExistsError:
+                    # A concurrent creator won. The no-follow open below must
+                    # authenticate the winner as a real directory.
+                    pass
+                try:
+                    next_fd = os.open(component, flags, dir_fd=current_fd)
+                except OSError as exc:
+                    raise SystemExit(
+                        "manifest destination parent contains a symlink or "
+                        f"non-directory component: {absolute}"
+                    ) from exc
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    raise SystemExit(
+                        "manifest destination parent contains a symlink or "
+                        f"non-directory component: {absolute}"
+                    ) from exc
+                raise SystemExit(
+                    f"cannot open manifest destination parent {absolute}: {exc}"
+                ) from exc
+            os.close(current_fd)
+            current_fd = next_fd
+        completed = True
+        return current_fd
+    finally:
+        if not completed:
+            os.close(current_fd)
+
+
+def _manifest_entry_exists(directory_fd: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _assert_manifest_parent_identity(parent: Path, expected_fd: int) -> None:
+    """Require the pathname to still identify the opened directory."""
+    try:
+        current_fd = _open_directory_chain(parent, create=False)
+    except SystemExit as exc:
+        raise SystemExit(
+            "manifest destination parent changed or became unsafe during publication"
+        ) from exc
+    try:
+        expected = os.fstat(expected_fd)
+        current = os.fstat(current_fd)
+        if (expected.st_dev, expected.st_ino) != (current.st_dev, current.st_ino):
+            raise SystemExit("manifest destination parent changed during publication")
+    finally:
+        os.close(current_fd)
+
+
 def _validate_manifest_destination(
     destination: Path,
     protected_roots: tuple[Path, ...],
 ) -> Path:
     """Authenticate a new, separate manifest destination before any write.
 
-    The raw final component is checked before resolution so an existing or
-    dangling symlink cannot be hidden by ``Path.resolve``. Resolved ancestors
-    are then compared in both directions: a manifest may neither live inside a
-    protected input/output nor be an ancestor that would contain one.
+    Every parent component is opened with ``O_NOFOLLOW`` before the final name
+    is checked. The lexical absolute path is retained so validation never
+    silently converts a caller-supplied symlink into an accepted destination.
     """
-    raw = destination.expanduser()
-    if os.path.lexists(raw):
-        raise SystemExit(f"manifest destination already exists: {raw}")
-    resolved = raw.resolve(strict=False)
-    for protected in protected_roots:
-        if _path_overlaps(resolved, protected):
-            raise SystemExit(
-                f"manifest destination overlaps protected input/output: {resolved}"
-            )
-    return resolved
+    absolute = _absolute_lexical_path(destination)
+    if not absolute.name:
+        raise SystemExit("manifest destination must name a file")
+    directory_fd = _open_directory_chain(absolute.parent, create=True)
+    try:
+        _assert_manifest_parent_identity(absolute.parent, directory_fd)
+        if _manifest_entry_exists(directory_fd, absolute.name):
+            raise SystemExit(f"manifest destination already exists: {absolute}")
+        for protected in protected_roots:
+            if _path_overlaps(absolute, protected):
+                raise SystemExit(
+                    f"manifest destination overlaps protected input/output: {absolute}"
+                )
+        _assert_manifest_parent_identity(absolute.parent, directory_fd)
+        return absolute
+    finally:
+        os.close(directory_fd)
 
 
-def _write_json_exclusive(destination: Path, value: dict[str, Any]) -> None:
+def _write_json_exclusive(
+    destination: Path,
+    value: dict[str, Any],
+    protected_roots: tuple[Path, ...] = (),
+) -> None:
     """Publish one private JSON file atomically without clobbering a path.
 
-    Bytes are fsynced to a private temporary regular file in the destination
-    directory. A hard-link publishes the final name with create-if-absent
-    semantics; an existing file, directory, or symlink therefore wins and the
-    builder fails closed instead of replacing it.
+    Directory-descriptor-relative operations keep publication anchored to the
+    exact parent inode authenticated above. A hard-link publishes the final
+    name with create-if-absent semantics; an existing file, directory, or
+    symlink therefore wins and the builder fails closed instead of replacing
+    it. Parent replacement never redirects the write.
     """
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination = _validate_manifest_destination(destination, protected_roots)
     payload = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    fd, raw_temp = tempfile.mkstemp(
-        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
-    )
-    temporary = Path(raw_temp)
+    directory_fd = _open_directory_chain(destination.parent, create=False)
+    temporary_name: str | None = None
+    payload_identity: tuple[int, int] | None = None
+    published = False
+    fd = -1
     try:
+        _assert_manifest_parent_identity(destination.parent, directory_fd)
+        if _manifest_entry_exists(directory_fd, destination.name):
+            raise SystemExit(f"manifest destination already exists: {destination}")
+
+        for _ in range(128):
+            candidate = f".{destination.name}.{secrets.token_hex(16)}.tmp"
+            try:
+                fd = os.open(
+                    candidate,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_NOFOLLOW
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=directory_fd,
+                )
+            except FileExistsError:
+                continue
+            temporary_name = candidate
+            break
+        if fd < 0 or temporary_name is None:
+            raise SystemExit("cannot reserve a private manifest staging file")
+
         os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "wb", closefd=True) as handle:
+        payload_stat = os.fstat(fd)
+        payload_identity = (payload_stat.st_dev, payload_stat.st_ino)
+        payload_fd = fd
+        fd = -1
+        with os.fdopen(payload_fd, "wb", closefd=True) as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        fd = -1
+        _assert_manifest_parent_identity(destination.parent, directory_fd)
         try:
-            os.link(temporary, destination, follow_symlinks=False)
+            os.link(
+                temporary_name,
+                destination.name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
         except FileExistsError as exc:
             raise SystemExit(
                 f"manifest destination already exists: {destination}"
             ) from exc
-        temporary.unlink()
-        directory_fd = os.open(destination.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        published = True
+        final_stat = os.stat(
+            destination.name, dir_fd=directory_fd, follow_symlinks=False
+        )
+        if (
+            not stat.S_ISREG(final_stat.st_mode)
+            or (final_stat.st_dev, final_stat.st_ino) != payload_identity
+        ):
+            raise SystemExit("manifest publication identity check failed")
+        _assert_manifest_parent_identity(destination.parent, directory_fd)
+        os.unlink(temporary_name, dir_fd=directory_fd)
+        temporary_name = None
+        final_stat = os.stat(
+            destination.name, dir_fd=directory_fd, follow_symlinks=False
+        )
+        if final_stat.st_nlink != 1:
+            raise SystemExit("published manifest must have exactly one hard link")
+        os.fsync(directory_fd)
+        _assert_manifest_parent_identity(destination.parent, directory_fd)
     finally:
         if fd >= 0:
             os.close(fd)
+        if published and payload_identity is not None:
+            try:
+                final_stat = os.stat(
+                    destination.name, dir_fd=directory_fd, follow_symlinks=False
+                )
+            except FileNotFoundError:
+                final_stat = None
+            if (
+                sys.exc_info()[0] is not None
+                and final_stat is not None
+                and (final_stat.st_dev, final_stat.st_ino) == payload_identity
+            ):
+                # Keep the successfully published file only when no exception
+                # is active. On an identity/race failure, remove only our inode.
+                os.unlink(destination.name, dir_fd=directory_fd)
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+        os.close(directory_fd)
+
+
+def _reserve_private_sibling_directory(output: Path, purpose: str) -> Path:
+    """Reserve a private same-filesystem directory beside ``output``."""
+    output.parent.mkdir(parents=True, exist_ok=True)
+    for _ in range(128):
+        candidate = output.parent / (
+            f".{output.name}.{purpose}.{secrets.token_hex(16)}"
+        )
         try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+            candidate.mkdir(mode=0o700)
+        except FileExistsError:
+            continue
+        return candidate
+    raise SystemExit(f"cannot reserve private {purpose} directory beside {output}")
+
+
+def _directory_identity(path: Path) -> tuple[int, int]:
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise SystemExit(f"expected a real private directory: {path}")
+    return info.st_dev, info.st_ino
+
+
+def _remove_owned_directory(path: Path, identity: tuple[int, int]) -> None:
+    """Remove only the exact directory inode created by this build."""
+    if not os.path.lexists(path):
+        return
+    if _directory_identity(path) != identity:
+        raise SystemExit(f"refusing to remove replaced build directory: {path}")
+    shutil.rmtree(path)
 
 
 def build(
@@ -660,11 +858,17 @@ def build(
             raise SystemExit(
                 f"review runtime output collides with protected input/artifact path: {output}"
             )
-    manifest_output = _validate_manifest_destination(
-        manifest_output,
-        (native_runtime, source_runtime, ARTIFACT_ROOT, output),
+    manifest_protected_roots = (
+        native_runtime,
+        source_runtime,
+        ARTIFACT_ROOT,
+        output,
     )
-    if output.exists():
+    manifest_output = _validate_manifest_destination(
+        manifest_output, manifest_protected_roots
+    )
+    output_existed = output.exists()
+    if output_existed:
         if not force:
             raise SystemExit(
                 f"output already exists; use --force to replace it: {output}"
@@ -673,36 +877,117 @@ def build(
             raise SystemExit(
                 "existing output must be a real directory when --force is used"
             )
-        shutil.rmtree(output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    _copy_runtime(native_runtime, output, patterns)
-    _apply_patch(output, ARTIFACT_ROOT / PATCH_RELATIVE)
-    _assert_overlay_equivalence(native_runtime, output, patterns)
-    probed = _syntax_probe(output)
-    generated = {
-        "schema": STATIC_SCHEMA,
-        "artifact_version": static["artifact_version"],
-        "native_boundary_schema": NATIVE_SCHEMA,
-        "native_manifest": str(native_manifest_path),
-        "native_manifest_sha256": _sha256(native_manifest_path),
-        "native_artifact_identity_sha256": _native_artifact_identity_sha256(
-            native_manifest
-        ),
-        "native_source_runtime": native_manifest.get("source_runtime"),
-        "native_source_tree_sha256": _tree_digest(source_runtime, patterns),
-        "native_staged_tree_sha256": _tree_digest(native_runtime, patterns),
-        "native_verification": native_manifest["verification"],
-        "output_runtime": str(output),
-        "patches": {PATCH_RELATIVE: _sha256(ARTIFACT_ROOT / PATCH_RELATIVE)},
-        "patched_paths": {
-            relative: _sha256(output / relative) for relative in TARGET_PATHS
-        },
-        "policy": static["policy"],
-        "syntax_probe": probed,
-        "runtime_tree_sha256": _tree_digest(output, patterns),
-    }
-    _write_json_exclusive(manifest_output, generated)
-    return manifest_output
+    staging = _reserve_private_sibling_directory(output, "stage")
+    staging_identity = _directory_identity(staging)
+    backup_root: Path | None = None
+    backup_output: Path | None = None
+    prior_identity: tuple[int, int] | None = None
+    runtime_published = False
+    try:
+        _copy_runtime(native_runtime, staging, patterns)
+        _apply_patch(staging, ARTIFACT_ROOT / PATCH_RELATIVE)
+        _assert_overlay_equivalence(native_runtime, staging, patterns)
+        probed = _syntax_probe(staging)
+        generated = {
+            "schema": STATIC_SCHEMA,
+            "artifact_version": static["artifact_version"],
+            "native_boundary_schema": NATIVE_SCHEMA,
+            "native_manifest": str(native_manifest_path),
+            "native_manifest_sha256": _sha256(native_manifest_path),
+            "native_artifact_identity_sha256": _native_artifact_identity_sha256(
+                native_manifest
+            ),
+            "native_source_runtime": native_manifest.get("source_runtime"),
+            "native_source_tree_sha256": _tree_digest(source_runtime, patterns),
+            "native_staged_tree_sha256": _tree_digest(native_runtime, patterns),
+            "native_verification": native_manifest["verification"],
+            "output_runtime": str(output),
+            "patches": {PATCH_RELATIVE: _sha256(ARTIFACT_ROOT / PATCH_RELATIVE)},
+            "patched_paths": {
+                relative: _sha256(staging / relative) for relative in TARGET_PATHS
+            },
+            "policy": static["policy"],
+            "syntax_probe": probed,
+            "runtime_tree_sha256": _tree_digest(staging, patterns),
+        }
+
+        if output_existed:
+            # Keep the prior runtime intact until the complete replacement has
+            # passed copy, patch, equivalence, and syntax verification.
+            prior_identity = _directory_identity(output)
+            backup_root = _reserve_private_sibling_directory(output, "rollback")
+            backup_output = backup_root / "previous-runtime"
+            try:
+                output.rename(backup_output)
+                if _directory_identity(backup_output) != prior_identity:
+                    raise SystemExit("prior runtime identity changed during backup")
+            except (Exception, SystemExit, KeyboardInterrupt):
+                if os.path.lexists(backup_output) and not os.path.lexists(output):
+                    backup_output.rename(output)
+                raise
+
+        try:
+            if os.path.lexists(output):
+                raise SystemExit(
+                    f"runtime output appeared during publication: {output}"
+                )
+            staging.rename(output)
+            runtime_published = True
+            if _directory_identity(output) != staging_identity:
+                raise SystemExit("published runtime identity check failed")
+            _write_json_exclusive(
+                manifest_output,
+                generated,
+                protected_roots=manifest_protected_roots + (staging,),
+            )
+        except (Exception, SystemExit, KeyboardInterrupt) as publish_error:
+            rollback_errors: list[str] = []
+            if runtime_published:
+                try:
+                    _remove_owned_directory(output, staging_identity)
+                    runtime_published = False
+                except (OSError, SystemExit) as exc:
+                    rollback_errors.append(f"cannot remove failed replacement: {exc}")
+            if backup_output is not None and os.path.lexists(backup_output):
+                try:
+                    if os.path.lexists(output):
+                        raise SystemExit(
+                            "replacement path is occupied; refusing unsafe rollback"
+                        )
+                    backup_output.rename(output)
+                    if (
+                        prior_identity is None
+                        or _directory_identity(output) != prior_identity
+                    ):
+                        raise SystemExit("restored runtime identity check failed")
+                except (OSError, SystemExit) as exc:
+                    rollback_errors.append(f"cannot restore prior runtime: {exc}")
+            if rollback_errors:
+                location = str(backup_output) if backup_output else "none"
+                raise SystemExit(
+                    "runtime publication failed and rollback was incomplete; "
+                    f"backup={location}; {'; '.join(rollback_errors)}"
+                ) from publish_error
+            raise
+
+        if backup_root is not None:
+            try:
+                shutil.rmtree(backup_root)
+            except OSError as exc:
+                print(
+                    f"warning: verified prior-runtime backup remains at {backup_root}: {exc}",
+                    file=sys.stderr,
+                )
+        return manifest_output
+    finally:
+        if os.path.lexists(staging):
+            _remove_owned_directory(staging, staging_identity)
+        if (
+            backup_root is not None
+            and backup_root.exists()
+            and not any(backup_root.iterdir())
+        ):
+            backup_root.rmdir()
 
 
 def verify(output: Path, manifest_path: Path) -> None:

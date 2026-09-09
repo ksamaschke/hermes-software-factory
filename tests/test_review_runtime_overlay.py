@@ -154,6 +154,16 @@ def test_manifest_destination_rejects_overlap_existing_and_symlink(tmp_path):
     with pytest.raises(SystemExit, match="already exists"):
         builder._validate_manifest_destination(link, (protected,))
 
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    parent_link = tmp_path / "parent-link"
+    parent_link.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(SystemExit, match="parent contains a symlink"):
+        builder._validate_manifest_destination(
+            parent_link / "review.manifest.json", (protected,)
+        )
+    assert not (outside / "review.manifest.json").exists()
+
     allowed = tmp_path / "new.manifest.json"
     assert builder._validate_manifest_destination(allowed, (protected,)) == allowed
 
@@ -170,6 +180,32 @@ def test_exclusive_manifest_write_never_overwrites_and_is_private(tmp_path):
     with pytest.raises(SystemExit, match="already exists"):
         builder._write_json_exclusive(destination, {"schema": "overwritten"})
     assert json.loads(destination.read_text(encoding="utf-8")) == {"schema": "fixture"}
+
+
+def test_exclusive_manifest_write_is_not_redirected_by_parent_replacement(
+    tmp_path, monkeypatch
+):
+    builder = _builder_module()
+    parent = tmp_path / "manifest-parent"
+    parent.mkdir()
+    moved_parent = tmp_path / "original-parent"
+    attacker_target = tmp_path / "attacker-target"
+    attacker_target.mkdir()
+    destination = parent / "review.manifest.json"
+    real_link = builder.os.link
+
+    def replace_parent_before_publish(source, target, **kwargs):
+        parent.rename(moved_parent)
+        parent.symlink_to(attacker_target, target_is_directory=True)
+        return real_link(source, target, **kwargs)
+
+    monkeypatch.setattr(builder.os, "link", replace_parent_before_publish)
+
+    with pytest.raises(SystemExit, match="parent changed or became unsafe"):
+        builder._write_json_exclusive(destination, {"schema": "fixture"})
+
+    assert not (attacker_target / destination.name).exists()
+    assert not (moved_parent / destination.name).exists()
 
 
 def test_patch_application_uses_trusted_git_and_scrubbed_environment(
@@ -255,6 +291,58 @@ def test_builder_stages_prerequisite_when_paths_are_provided(tmp_path):
     assert result["native_source_tree_sha256"]
     assert result["native_staged_tree_sha256"]
     assert result["syntax_probe"] == list(builder.TARGET_PATHS)
+
+
+@pytest.mark.parametrize("failure_phase", ["patch", "manifest"])
+def test_force_build_restores_prior_runtime_on_failure(
+    tmp_path, monkeypatch, failure_phase
+):
+    native_runtime_value = os.environ.get("FACTORY_NATIVE_BOUNDARY_RUNTIME")
+    native_manifest_value = os.environ.get("FACTORY_NATIVE_BOUNDARY_MANIFEST")
+    if not native_runtime_value or not native_manifest_value:
+        pytest.skip(
+            "set FACTORY_NATIVE_BOUNDARY_RUNTIME and FACTORY_NATIVE_BOUNDARY_MANIFEST"
+        )
+
+    builder = _builder_module()
+    output = tmp_path / "review-runtime"
+    output.mkdir()
+    sentinel = output / "prior-runtime.txt"
+    sentinel.write_text("preserve-me", encoding="utf-8")
+    prior_identity = builder._directory_identity(output)
+    generated = tmp_path / "review-runtime.manifest.json"
+
+    if failure_phase == "patch":
+        monkeypatch.setattr(
+            builder,
+            "_apply_patch",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                SystemExit("synthetic patch failure")
+            ),
+        )
+    else:
+        monkeypatch.setattr(
+            builder,
+            "_write_json_exclusive",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                SystemExit("synthetic manifest failure")
+            ),
+        )
+
+    with pytest.raises(SystemExit, match=f"synthetic {failure_phase} failure"):
+        builder.build(
+            Path(native_runtime_value),
+            Path(native_manifest_value),
+            output,
+            generated,
+            force=True,
+        )
+
+    assert builder._directory_identity(output) == prior_identity
+    assert sentinel.read_text(encoding="utf-8") == "preserve-me"
+    assert not generated.exists()
+    assert not list(tmp_path.glob(".review-runtime.stage.*"))
+    assert not list(tmp_path.glob(".review-runtime.rollback.*"))
 
 
 def test_review_claim_caps_active_run_without_rewriting_task_row(tmp_path, monkeypatch):
@@ -684,6 +772,94 @@ def test_review_evidence_deadline_survives_event_loss_and_reconnect(
             module._claimed_evidence_deadline(conn, task_id, claimed.current_run_id)
             == expected_deadline
         )
+    finally:
+        sys.modules.pop("hermes_cli.kanban_db", None)
+        sys.path.remove(source_value)
+        sys.path.remove(runtime_value)
+
+
+@pytest.mark.parametrize(
+    "deadline_kind",
+    ["missing", "malformed", "nan", "infinite", "extended"],
+)
+def test_review_completion_fails_closed_for_invalid_persisted_deadline(
+    tmp_path, monkeypatch, deadline_kind
+):
+    runtime_value = os.environ.get("FACTORY_REVIEW_RUNTIME")
+    source_value = os.environ.get("FACTORY_SOURCE_RUNTIME")
+    if not runtime_value or not source_value:
+        pytest.skip("set FACTORY_REVIEW_RUNTIME and FACTORY_SOURCE_RUNTIME")
+
+    sys.path.insert(0, runtime_value)
+    sys.path.insert(1, source_value)
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "hermes_cli.kanban_db", Path(runtime_value) / "hermes_cli/kanban_db.py"
+        )
+        assert spec is not None and spec.loader is not None
+        import hermes_cli  # noqa: F401
+
+        sys.modules.pop("hermes_cli.kanban_db", None)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["hermes_cli.kanban_db"] = module
+        spec.loader.exec_module(module)
+
+        db_path = tmp_path / f"deadline-{deadline_kind}.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+        module.init_db()
+        conn = module.connect()
+        task_id = module.create_task(
+            conn, title="invalid review deadline", assignee="reviewer"
+        )
+        with module.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='review' WHERE id=?", (task_id,))
+        claimed = module.claim_review_task(conn, task_id, claimer="reviewer")
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+        started_at = conn.execute(
+            "SELECT started_at FROM task_runs WHERE id=?", (run_id,)
+        ).fetchone()["started_at"]
+        invalid_deadline = {
+            "missing": None,
+            "malformed": "not-a-deadline",
+            "nan": "nan",
+            "infinite": float("inf"),
+            "extended": float(started_at + 3600),
+        }[deadline_kind]
+        with module.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET evidence_deadline=? WHERE id=?",
+                (invalid_deadline, run_id),
+            )
+
+        with pytest.raises(module.ReviewIncompleteError, match="REVIEW-INCOMPLETE"):
+            module.complete_task(
+                conn,
+                task_id,
+                summary="APPROVE exact head",
+                expected_run_id=run_id,
+                fire_lifecycle_hook=False,
+            )
+
+        task_row = conn.execute(
+            "SELECT status, block_kind, current_run_id FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        assert tuple(task_row) == ("blocked", "needs_input", None)
+        run_row = conn.execute(
+            "SELECT status, outcome, error FROM task_runs WHERE id=?", (run_id,)
+        ).fetchone()
+        assert run_row["status"] == "blocked"
+        assert run_row["outcome"] == "blocked"
+        assert str(run_row["error"]).startswith("REVIEW-INCOMPLETE:")
+        event = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id=? AND kind='review_incomplete' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        assert event is not None
+        assert json.loads(event["payload"])["code"] == "REVIEW-INCOMPLETE"
     finally:
         sys.modules.pop("hermes_cli.kanban_db", None)
         sys.path.remove(source_value)
