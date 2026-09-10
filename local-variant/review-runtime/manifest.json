@@ -6,15 +6,23 @@
   "native_artifact_identity_sha256": "feaffd82904b7cce43285ec0a038a3e7c8f85f467cb8c99ae07075a6f59918ab",
   "native_artifact_version": "1.0.0",
   "patches": {
-    "patches/002-review-runtime.patch": "4885c5a33f9f569836879480996413d938ec8c348ad1100fac2ec3a09139894c"
+    "patches/002-review-runtime.patch": "1809ee56dac3cc5ec1803abc21c37d0e2f700d62665d6586d56fce217c635596"
   },
   "patched_paths": [
-    "hermes_cli/kanban_db.py",
     "gateway/kanban_watchers.py",
-    "tui_gateway/server.py",
-    "tools/terminal_tool.py",
     "hermes_cli/kanban.py",
-    "tools/kanban_tools.py"
+    "hermes_cli/kanban_db.py",
+    "tools/code_execution_tool.py",
+    "tools/code_kernel_remote.py",
+    "tools/environments/base.py",
+    "tools/evidence_window.py",
+    "tools/file_operations.py",
+    "tools/image_source.py",
+    "tools/kanban_tools.py",
+    "tools/process_registry.py",
+    "tools/terminal_tool.py",
+    "tools/tool_result_storage.py",
+    "tui_gateway/server.py"
   ],
   "policy": {
     "review_dispatch_hard_cap_seconds": 1200,

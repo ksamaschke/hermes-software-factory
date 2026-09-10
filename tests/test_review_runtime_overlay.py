@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import ast
 import copy
 import hashlib
 import importlib.util
 import json
 import os
+import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -75,12 +78,20 @@ def test_review_manifest_pins_policy_patch_and_targets():
     }
     assert manifest["patches"]["patches/002-review-runtime.patch"] == expected_hash
     assert manifest["patched_paths"] == [
-        "hermes_cli/kanban_db.py",
         "gateway/kanban_watchers.py",
-        "tui_gateway/server.py",
-        "tools/terminal_tool.py",
         "hermes_cli/kanban.py",
+        "hermes_cli/kanban_db.py",
+        "tools/code_execution_tool.py",
+        "tools/code_kernel_remote.py",
+        "tools/environments/base.py",
+        "tools/evidence_window.py",
+        "tools/file_operations.py",
+        "tools/image_source.py",
         "tools/kanban_tools.py",
+        "tools/process_registry.py",
+        "tools/terminal_tool.py",
+        "tools/tool_result_storage.py",
+        "tui_gateway/server.py",
     ]
 
 
@@ -243,16 +254,77 @@ def test_patch_application_uses_trusted_git_and_scrubbed_environment(
 
     def fake_run(command, **kwargs):
         captured.append((list(command), kwargs))
-        return subprocess.CompletedProcess(command, 0, "", "")
+        return subprocess.CompletedProcess(
+            command, 1 if "rev-parse" in command else 0, "", ""
+        )
 
     monkeypatch.setattr(builder.subprocess, "run", fake_run)
     builder._apply_patch(output, patch_path)
 
-    assert len(captured) == 2
-    for command, kwargs in captured:
+    assert len(captured) == 3
+    assert "rev-parse" in captured[0][0]
+    expected_environment = dict(builder._GIT_ENVIRONMENT)
+    expected_environment["GIT_CEILING_DIRECTORIES"] = str(output.parent.resolve())
+    expected_environment["GIT_DISCOVERY_ACROSS_FILESYSTEM"] = "0"
+    for _command, kwargs in captured:
+        assert kwargs["env"] == expected_environment
+    assert captured[0][1]["cwd"] == output
+    assert captured[0][1]["env"]["GIT_CEILING_DIRECTORIES"] == str(
+        output.parent.resolve()
+    )
+    for command, kwargs in captured[1:]:
         assert command[0] == "/usr/bin/git"
+        assert "--whitespace=error" in command
         assert kwargs["cwd"] == output
-        assert kwargs["env"] == builder._GIT_ENVIRONMENT
+        assert kwargs["env"]["GIT_CEILING_DIRECTORIES"] == str(output.parent.resolve())
+
+
+def test_overlay_equivalence_rejects_noop_or_partial_application(tmp_path):
+    builder = _builder_module()
+    native = tmp_path / "native"
+    output = tmp_path / "output"
+    native.mkdir()
+    output.mkdir()
+    for relative in builder.TARGET_PATHS:
+        if relative == "tools/evidence_window.py":
+            continue
+        for root in (native, output):
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("same\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="did not change every declared target"):
+        builder._assert_overlay_equivalence(native, output, [])
+
+
+def test_patch_application_rejects_added_trailing_whitespace(tmp_path):
+    native_value = os.environ.get("FACTORY_NATIVE_BOUNDARY_RUNTIME")
+    if not native_value:
+        pytest.skip("set FACTORY_NATIVE_BOUNDARY_RUNTIME")
+
+    builder = _builder_module()
+    output = tmp_path / "output"
+    output.mkdir()
+    for relative in builder.TARGET_PATHS:
+        if relative == "tools/evidence_window.py":
+            continue
+        path = output / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(Path(native_value) / relative, path)
+    patch_text = PATCH_PATH.read_text(encoding="utf-8")
+    lines = patch_text.splitlines(keepends=True)
+    changed = False
+    for index, line in enumerate(lines):
+        if line.startswith("+") and not line.startswith("+++"):
+            lines[index] = line.rstrip("\r\n") + " \n"
+            changed = True
+            break
+    assert changed
+    bad_patch = tmp_path / "trailing.patch"
+    bad_patch.write_text("".join(lines), encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="exact git apply check"):
+        builder._apply_patch(output, bad_patch)
 
 
 def test_builder_rejects_non_native_boundary_input(tmp_path):
@@ -266,7 +338,7 @@ def test_builder_rejects_non_native_boundary_input(tmp_path):
         builder._validate_native_input(native_runtime, manifest)
 
 
-def test_builder_stages_prerequisite_when_paths_are_provided(tmp_path):
+def test_builder_stages_prerequisite_when_paths_are_provided():
     """Exercise the real layered build when the prerequisite artifact is present."""
     native_runtime_value = os.environ.get("FACTORY_NATIVE_BOUNDARY_RUNTIME")
     native_manifest_value = os.environ.get("FACTORY_NATIVE_BOUNDARY_MANIFEST")
@@ -276,37 +348,44 @@ def test_builder_stages_prerequisite_when_paths_are_provided(tmp_path):
         )
 
     builder = _builder_module()
-    output = tmp_path / "review-runtime"
-    generated = tmp_path / "review-runtime.manifest.json"
-    manifest_path = builder.build(
-        Path(native_runtime_value),
-        Path(native_manifest_value),
-        output,
-        generated,
-        force=False,
-    )
-
-    assert manifest_path == generated
-    builder.verify(output, generated)
-    result = json.loads(generated.read_text(encoding="utf-8"))
-    assert result["policy"]["review_dispatch_hard_cap_seconds"] == 1200
-    assert result["policy"]["review"]["evidence_budget_seconds"] == 600
-    assert result["policy"]["evidence_recovery"] == {
-        "hard_worker_cap_seconds": 600,
-        "evidence_budget_seconds": 300,
-        "per_command_timeout_seconds": 60,
-    }
-    assert (
-        result["native_artifact_identity_sha256"]
-        == (
-            json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))[
-                "native_artifact_identity_sha256"
-            ]
+    nested_root = Path(__file__).parents[1] / ".review-builder-nested-test"
+    shutil.rmtree(nested_root, ignore_errors=True)
+    nested_root.mkdir()
+    output = nested_root / "review-runtime"
+    generated = nested_root / "review-runtime.manifest.json"
+    try:
+        manifest_path = builder.build(
+            Path(native_runtime_value),
+            Path(native_manifest_value),
+            output,
+            generated,
+            force=False,
         )
-    )
-    assert result["native_source_tree_sha256"]
-    assert result["native_staged_tree_sha256"]
-    assert result["syntax_probe"] == list(builder.TARGET_PATHS)
+
+        assert manifest_path == generated
+        builder.verify(output, generated)
+        result = json.loads(generated.read_text(encoding="utf-8"))
+        assert result["policy"]["review_dispatch_hard_cap_seconds"] == 1200
+        assert result["policy"]["review"]["evidence_budget_seconds"] == 600
+        assert result["policy"]["evidence_recovery"] == {
+            "hard_worker_cap_seconds": 600,
+            "evidence_budget_seconds": 300,
+            "per_command_timeout_seconds": 60,
+        }
+        assert (
+            result["native_artifact_identity_sha256"]
+            == (
+                json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))[
+                    "native_artifact_identity_sha256"
+                ]
+            )
+        )
+        assert result["native_source_tree_sha256"]
+        assert result["native_staged_tree_sha256"]
+        assert result["syntax_probe"] == list(builder.TARGET_PATHS)
+        assert all((output / relative).is_file() for relative in builder.TARGET_PATHS)
+    finally:
+        shutil.rmtree(nested_root, ignore_errors=True)
 
 
 @pytest.mark.parametrize("failure_phase", ["patch", "manifest"])
@@ -1285,7 +1364,7 @@ def test_terminal_rechecks_deadline_after_environment_creation_before_execute(
         sys.modules[module_name] = module
         spec.loader.exec_module(module)
 
-        remaining = iter((5.0, 5.0, 0.0))
+        remaining = iter((5.0, 5.0, 5.0, 5.0, 0.0))
         executed: list[tuple[str, dict[str, Any]]] = []
 
         class FakeEnvironment:
@@ -1332,6 +1411,535 @@ def test_terminal_rechecks_deadline_after_environment_creation_before_execute(
         assert created == [True]
         assert result["code"] == "REVIEW-INCOMPLETE"
         assert executed == []
+    finally:
+        sys.modules.pop(module_name, None)
+        sys.path.remove(source_value)
+        sys.path.remove(runtime_value)
+
+
+def _load_overlay_kanban_module(runtime_value: str, source_value: str):
+    sys.path.insert(0, runtime_value)
+    sys.path.insert(1, source_value)
+    spec = importlib.util.spec_from_file_location(
+        "hermes_cli.kanban_db", Path(runtime_value) / "hermes_cli/kanban_db.py"
+    )
+    assert spec is not None and spec.loader is not None
+    import hermes_cli  # noqa: F401
+
+    sys.modules.pop("hermes_cli.kanban_db", None)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["hermes_cli.kanban_db"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _unload_overlay_kanban_module(runtime_value: str, source_value: str) -> None:
+    sys.modules.pop("hermes_cli.kanban_db", None)
+    sys.path.remove(source_value)
+    sys.path.remove(runtime_value)
+
+
+def test_no_run_completion_fence_rejects_null_run_aba(tmp_path, monkeypatch):
+    runtime_value = os.environ.get("FACTORY_REVIEW_RUNTIME")
+    source_value = os.environ.get("FACTORY_SOURCE_RUNTIME")
+    if not runtime_value or not source_value:
+        pytest.skip("set FACTORY_REVIEW_RUNTIME and FACTORY_SOURCE_RUNTIME")
+
+    module = _load_overlay_kanban_module(runtime_value, source_value)
+    try:
+        db_path = tmp_path / "null-run-aba.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+        module.init_db()
+        conn = module.connect()
+        task_id = module.create_task(conn, title="no-run ABA", assignee="worker")
+        assert (
+            conn.execute(
+                "SELECT current_run_id FROM tasks WHERE id=?", (task_id,)
+            ).fetchone()["current_run_id"]
+            is None
+        )
+
+        real_merge = module._merge_completion_prose_artifacts
+        interleaved = False
+
+        def interleave(*args, **kwargs):
+            nonlocal interleaved
+            if not interleaved:
+                interleaved = True
+                other = module.connect()
+                try:
+                    fresh = module.claim_task(other, task_id, claimer="aba-worker")
+                    assert fresh is not None and fresh.current_run_id is not None
+                    assert module.reclaim_task(
+                        other,
+                        task_id,
+                        reason="fresh attempt released",
+                    )
+                finally:
+                    other.close()
+            return real_merge(*args, **kwargs)
+
+        monkeypatch.setattr(module, "_merge_completion_prose_artifacts", interleave)
+        assert (
+            module.complete_task(
+                conn,
+                task_id,
+                result="stale no-run completion",
+                fire_lifecycle_hook=False,
+            )
+            is False
+        )
+        row = conn.execute(
+            "SELECT status, result, current_run_id FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        assert tuple(row) == ("ready", None, None)
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM task_runs WHERE task_id=?", (task_id,)
+            ).fetchone()[0]
+            == 1
+        )
+    finally:
+        _unload_overlay_kanban_module(runtime_value, source_value)
+
+
+def test_reclaimed_evidence_recovery_cannot_complete_without_a_run(
+    tmp_path, monkeypatch
+):
+    runtime_value = os.environ.get("FACTORY_REVIEW_RUNTIME")
+    source_value = os.environ.get("FACTORY_SOURCE_RUNTIME")
+    if not runtime_value or not source_value:
+        pytest.skip("set FACTORY_REVIEW_RUNTIME and FACTORY_SOURCE_RUNTIME")
+
+    module = _load_overlay_kanban_module(runtime_value, source_value)
+    try:
+        db_path = tmp_path / "reclaimed-evidence.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+        module.init_db()
+        conn = module.connect()
+        task_id = module.create_task(
+            conn,
+            title="reclaimed evidence",
+            assignee="reviewer",
+            runtime_class=module.RUNTIME_CLASS_IMPLEMENTATION,
+        )
+        claimed = module.claim_evidence_recovery_task(
+            conn, task_id, claimer="evidence-worker"
+        )
+        assert claimed is not None and claimed.current_run_id is not None
+        assert module.reclaim_task(conn, task_id, reason="worker lost")
+        state = conn.execute(
+            "SELECT status, runtime_class, current_run_id FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        assert state["status"] == "ready"
+        assert state["runtime_class"] == module.RUNTIME_CLASS_EVIDENCE_RECOVERY
+        assert state["current_run_id"] is None
+
+        with pytest.raises(module.ReviewIncompleteError, match="REVIEW-INCOMPLETE"):
+            module.complete_task(
+                conn,
+                task_id,
+                summary="approve without a recovered run",
+                fire_lifecycle_hook=False,
+            )
+        assert (
+            conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()[
+                "status"
+            ]
+            != "done"
+        )
+    finally:
+        _unload_overlay_kanban_module(runtime_value, source_value)
+
+
+def test_stale_reclaim_cas_preserves_new_attempt_with_same_claimer(
+    tmp_path, monkeypatch
+):
+    runtime_value = os.environ.get("FACTORY_REVIEW_RUNTIME")
+    source_value = os.environ.get("FACTORY_SOURCE_RUNTIME")
+    if not runtime_value or not source_value:
+        pytest.skip("set FACTORY_REVIEW_RUNTIME and FACTORY_SOURCE_RUNTIME")
+
+    module = _load_overlay_kanban_module(runtime_value, source_value)
+    try:
+        db_path = tmp_path / "stale-cas.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+        module.init_db()
+        conn = module.connect()
+        task_id = module.create_task(conn, title="stale CAS", assignee="worker")
+        claimer = f"{socket.gethostname()}:{os.getpid()}"
+        old = module.claim_task(conn, task_id, claimer=claimer)
+        assert old is not None and old.current_run_id is not None
+        with module.write_txn(conn):
+            conn.execute("UPDATE tasks SET claim_expires=0 WHERE id=?", (task_id,))
+            conn.execute(
+                "UPDATE task_runs SET claim_expires=0 WHERE id=?",
+                (old.current_run_id,),
+            )
+
+        def delayed_reclaim(_pid, _lock, *, signal_fn=None):
+            other = module.connect()
+            try:
+                with module.write_txn(other):
+                    other.execute(
+                        "UPDATE tasks SET status='ready', claim_lock=NULL, "
+                        "claim_expires=NULL, worker_pid=NULL, current_run_id=NULL "
+                        "WHERE id=?",
+                        (task_id,),
+                    )
+                fresh = module.claim_task(other, task_id, claimer=claimer)
+                assert fresh is not None and fresh.current_run_id is not None
+                with module.write_txn(other):
+                    other.execute(
+                        "UPDATE tasks SET claim_expires=0 WHERE id=?", (task_id,)
+                    )
+                    other.execute(
+                        "UPDATE task_runs SET claim_expires=0 WHERE id=?",
+                        (fresh.current_run_id,),
+                    )
+            finally:
+                other.close()
+            return {"termination_attempted": False, "host_local": False}
+
+        monkeypatch.setattr(module, "_terminate_reclaimed_worker", delayed_reclaim)
+        assert module.release_stale_claims(conn) == 0
+        current = conn.execute(
+            "SELECT status, current_run_id, claim_lock FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        assert current["status"] == "running"
+        assert current["current_run_id"] != old.current_run_id
+        assert current["claim_lock"] == claimer
+    finally:
+        _unload_overlay_kanban_module(runtime_value, source_value)
+
+
+def test_manual_reclaim_cas_preserves_new_attempt_with_same_claimer(
+    tmp_path, monkeypatch
+):
+    runtime_value = os.environ.get("FACTORY_REVIEW_RUNTIME")
+    source_value = os.environ.get("FACTORY_SOURCE_RUNTIME")
+    if not runtime_value or not source_value:
+        pytest.skip("set FACTORY_REVIEW_RUNTIME and FACTORY_SOURCE_RUNTIME")
+
+    module = _load_overlay_kanban_module(runtime_value, source_value)
+    try:
+        db_path = tmp_path / "manual-reclaim-cas.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+        module.init_db()
+        conn = module.connect()
+        task_id = module.create_task(
+            conn, title="manual reclaim CAS", assignee="worker"
+        )
+        claimer = f"{socket.gethostname()}:{os.getpid()}"
+        old = module.claim_task(conn, task_id, claimer=claimer)
+        assert old is not None and old.current_run_id is not None
+
+        def delayed_reclaim(_pid, _lock, *, signal_fn=None):
+            other = module.connect()
+            try:
+                with module.write_txn(other):
+                    other.execute(
+                        "UPDATE tasks SET status='ready', claim_lock=NULL, "
+                        "claim_expires=NULL, worker_pid=NULL, current_run_id=NULL "
+                        "WHERE id=?",
+                        (task_id,),
+                    )
+                fresh = module.claim_task(other, task_id, claimer=claimer)
+                assert fresh is not None and fresh.current_run_id != old.current_run_id
+            finally:
+                other.close()
+            return {"termination_attempted": False, "host_local": False}
+
+        monkeypatch.setattr(module, "_terminate_reclaimed_worker", delayed_reclaim)
+        assert (
+            module.reclaim_task(conn, task_id, reason="delayed operator reclaim")
+            is False
+        )
+        current = conn.execute(
+            "SELECT status, current_run_id, claim_lock FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        assert current["status"] == "running"
+        assert current["current_run_id"] != old.current_run_id
+        assert current["claim_lock"] == claimer
+    finally:
+        _unload_overlay_kanban_module(runtime_value, source_value)
+
+
+def test_detect_stale_running_cas_preserves_new_attempt_with_same_claimer(
+    tmp_path, monkeypatch
+):
+    runtime_value = os.environ.get("FACTORY_REVIEW_RUNTIME")
+    source_value = os.environ.get("FACTORY_SOURCE_RUNTIME")
+    if not runtime_value or not source_value:
+        pytest.skip("set FACTORY_REVIEW_RUNTIME and FACTORY_SOURCE_RUNTIME")
+
+    module = _load_overlay_kanban_module(runtime_value, source_value)
+    try:
+        db_path = tmp_path / "heartbeat-reclaim-cas.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+        module.init_db()
+        conn = module.connect()
+        task_id = module.create_task(
+            conn, title="heartbeat reclaim CAS", assignee="worker"
+        )
+        claimer = f"{socket.gethostname()}:{os.getpid()}"
+        old = module.claim_task(conn, task_id, claimer=claimer)
+        assert old is not None and old.current_run_id is not None
+        with module.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET started_at=0, last_heartbeat_at=0 WHERE id=?",
+                (task_id,),
+            )
+            conn.execute(
+                "UPDATE task_runs SET started_at=0 WHERE id=?",
+                (old.current_run_id,),
+            )
+
+        def delayed_reclaim(_pid, _lock, *, signal_fn=None):
+            other = module.connect()
+            try:
+                with module.write_txn(other):
+                    other.execute(
+                        "UPDATE tasks SET status='ready', claim_lock=NULL, "
+                        "claim_expires=NULL, worker_pid=NULL, current_run_id=NULL "
+                        "WHERE id=?",
+                        (task_id,),
+                    )
+                fresh = module.claim_task(other, task_id, claimer=claimer)
+                assert fresh is not None and fresh.current_run_id != old.current_run_id
+            finally:
+                other.close()
+            return {"termination_attempted": False, "host_local": False}
+
+        monkeypatch.setattr(module, "_terminate_reclaimed_worker", delayed_reclaim)
+        assert module.detect_stale_running(conn, stale_timeout_seconds=1) == []
+        current = conn.execute(
+            "SELECT status, current_run_id, claim_lock FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        assert current["status"] == "running"
+        assert current["current_run_id"] != old.current_run_id
+        assert current["claim_lock"] == claimer
+    finally:
+        _unload_overlay_kanban_module(runtime_value, source_value)
+
+
+def test_bounded_policy_clamps_all_requested_timeouts_and_fails_closed(monkeypatch):
+    runtime_value = os.environ.get("FACTORY_REVIEW_RUNTIME")
+    source_value = os.environ.get("FACTORY_SOURCE_RUNTIME")
+    if not runtime_value or not source_value:
+        pytest.skip("set FACTORY_REVIEW_RUNTIME and FACTORY_SOURCE_RUNTIME")
+
+    sys.path.insert(0, runtime_value)
+    sys.path.insert(1, source_value)
+    module_name = "factory_review_policy_boundary_test"
+    try:
+        spec = importlib.util.spec_from_file_location(
+            module_name, Path(runtime_value) / "tools/terminal_tool.py"
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        monkeypatch.setenv("HERMES_KANBAN_RUNTIME_CLASS", "review")
+        monkeypatch.setenv("HERMES_KANBAN_TOOL_TIMEOUT_SECONDS", "120")
+        monkeypatch.setenv("HERMES_KANBAN_EVIDENCE_DEADLINE", "1600")
+        monkeypatch.setenv("HERMES_KANBAN_EVIDENCE_STARTED_AT", "1000")
+        monkeypatch.setenv("HERMES_KANBAN_EVIDENCE_BUDGET_SECONDS", "600")
+        monkeypatch.setattr(module.time, "time", lambda: 1100.0)
+        assert module._evidence_execute_timeout(999) == pytest.approx(120.0)
+        assert module._evidence_execute_timeout(30) == pytest.approx(30.0)
+
+        monkeypatch.delenv("HERMES_KANBAN_EVIDENCE_DEADLINE")
+        with pytest.raises(module._ReviewEvidenceDeadlineExpired):
+            module._evidence_execute_timeout(30)
+
+        monkeypatch.delenv("HERMES_KANBAN_RUNTIME_CLASS")
+        monkeypatch.delenv("HERMES_KANBAN_EVIDENCE_STARTED_AT")
+        monkeypatch.delenv("HERMES_KANBAN_EVIDENCE_BUDGET_SECONDS")
+        assert module._evidence_execute_timeout(999) == pytest.approx(999.0)
+    finally:
+        sys.modules.pop(module_name, None)
+        sys.path.remove(source_value)
+        sys.path.remove(runtime_value)
+
+
+def test_evidence_window_is_import_neutral_and_expiry_only_allows_cleanup(monkeypatch):
+    runtime_value = os.environ.get("FACTORY_REVIEW_RUNTIME")
+    source_value = os.environ.get("FACTORY_SOURCE_RUNTIME")
+    if not runtime_value or not source_value:
+        pytest.skip("set FACTORY_REVIEW_RUNTIME and FACTORY_SOURCE_RUNTIME")
+
+    sys.path.insert(0, runtime_value)
+    sys.path.insert(1, source_value)
+    module_name = "tools.evidence_window"
+    previous = sys.modules.pop(module_name, None)
+    try:
+        import builtins
+
+        real_import = builtins.__import__
+
+        def reject_terminal_import(name, *args, **kwargs):
+            if name == "tools.terminal_tool":
+                raise AssertionError("evidence guard imported terminal_tool")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", reject_terminal_import)
+        spec = importlib.util.spec_from_file_location(
+            module_name, Path(runtime_value) / "tools/evidence_window.py"
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+
+        monkeypatch.setenv("HERMES_KANBAN_RUNTIME_CLASS", "review")
+        monkeypatch.setenv("HERMES_KANBAN_TOOL_TIMEOUT_SECONDS", "120")
+        monkeypatch.setenv("HERMES_KANBAN_EVIDENCE_DEADLINE", "1")
+        monkeypatch.setenv("HERMES_KANBAN_EVIDENCE_STARTED_AT", "0")
+        monkeypatch.setenv("HERMES_KANBAN_EVIDENCE_BUDGET_SECONDS", "1")
+        calls: list[tuple[str, dict[str, Any]]] = []
+
+        class FakeEnvironment:
+            def execute(self, command, **kwargs):
+                calls.append((command, kwargs))
+                return {"output": "cleaned", "returncode": 0}
+
+        with pytest.raises(module.ReviewEvidenceDeadlineExpired):
+            module.execute_with_evidence_window(
+                FakeEnvironment(), "user-work", timeout=30, phase="work"
+            )
+        assert calls == []
+
+        result = module.execute_with_evidence_window(
+            FakeEnvironment(), "kill 123", timeout=30, phase="cleanup"
+        )
+        assert result["returncode"] == 0
+        assert calls == [("kill 123", {"timeout": 30.0, "evidence_phase": "cleanup"})]
+    finally:
+        sys.modules.pop(module_name, None)
+        if previous is not None:
+            sys.modules[module_name] = previous
+        sys.path.remove(source_value)
+        sys.path.remove(runtime_value)
+
+
+def test_environment_backend_execute_inventory_has_no_unwrapped_calls():
+    runtime_value = os.environ.get("FACTORY_REVIEW_RUNTIME")
+    source_value = os.environ.get("FACTORY_SOURCE_RUNTIME")
+    if not runtime_value or not source_value:
+        pytest.skip("set FACTORY_REVIEW_RUNTIME and FACTORY_SOURCE_RUNTIME")
+
+    builder = _builder_module()
+    runtime = Path(runtime_value)
+    backend_paths = {
+        "tools/code_execution_tool.py",
+        "tools/code_kernel_remote.py",
+        "tools/environments/base.py",
+        "tools/file_operations.py",
+        "tools/image_source.py",
+        "tools/process_registry.py",
+        "tools/terminal_tool.py",
+        "tools/tool_result_storage.py",
+    }
+    violations: list[str] = []
+
+    class Visitor(ast.NodeVisitor):
+        def __init__(self, relative: str) -> None:
+            self.relative = relative
+            self.stack: list[str] = []
+
+        def visit_FunctionDef(self, node):
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Call(self, node):
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "execute":
+                receiver = ast.unparse(node.func.value)
+                if receiver == "env" or receiver.endswith((".env", ".env_ref")):
+                    violations.append(
+                        f"{self.relative}:{node.lineno}:{receiver}.execute "
+                        f"inside {'/'.join(self.stack)}"
+                    )
+            self.generic_visit(node)
+
+    for relative in sorted(backend_paths):
+        path = runtime / relative
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        Visitor(relative).visit(tree)
+
+    assert violations == []
+    assert "tools/evidence_window.py" in builder.TARGET_PATHS
+
+
+def test_evidence_window_default_caps_and_partial_tuple_are_fail_closed(monkeypatch):
+    runtime_value = os.environ.get("FACTORY_REVIEW_RUNTIME")
+    source_value = os.environ.get("FACTORY_SOURCE_RUNTIME")
+    if not runtime_value or not source_value:
+        pytest.skip("set FACTORY_REVIEW_RUNTIME and FACTORY_SOURCE_RUNTIME")
+
+    sys.path.insert(0, runtime_value)
+    sys.path.insert(1, source_value)
+    module_name = "tools.evidence_window_caps_test"
+    try:
+        spec = importlib.util.spec_from_file_location(
+            module_name, Path(runtime_value) / "tools/evidence_window.py"
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        monkeypatch.setattr(module.time, "time", lambda: 0.0)
+        monkeypatch.setenv("HERMES_KANBAN_EVIDENCE_DEADLINE", "1000")
+        monkeypatch.setenv("HERMES_KANBAN_EVIDENCE_STARTED_AT", "0")
+        monkeypatch.setenv("HERMES_KANBAN_EVIDENCE_BUDGET_SECONDS", "1000")
+        monkeypatch.delenv("HERMES_KANBAN_TOOL_TIMEOUT_SECONDS", raising=False)
+
+        for runtime_class, expected_cap in (("review", 120), ("evidence_recovery", 60)):
+            monkeypatch.setenv("HERMES_KANBAN_RUNTIME_CLASS", runtime_class)
+            assert module.kanban_tool_timeout_cap() == expected_cap
+            assert module.evidence_execute_timeout(999) == expected_cap
+
+            monkeypatch.setenv("HERMES_KANBAN_TOOL_TIMEOUT_SECONDS", "999999")
+            assert module.kanban_tool_timeout_cap() == expected_cap
+            monkeypatch.setenv("HERMES_KANBAN_TOOL_TIMEOUT_SECONDS", "not-a-cap")
+            assert module.kanban_tool_timeout_cap() == expected_cap
+            monkeypatch.setenv("HERMES_KANBAN_TOOL_TIMEOUT_SECONDS", "0")
+            assert module.kanban_tool_timeout_cap() == expected_cap
+            monkeypatch.delenv("HERMES_KANBAN_TOOL_TIMEOUT_SECONDS")
+
+        monkeypatch.delenv("HERMES_KANBAN_RUNTIME_CLASS")
+        monkeypatch.delenv("HERMES_KANBAN_EVIDENCE_DEADLINE")
+        assert module.kanban_tool_timeout_cap() == 60
+        assert module.evidence_execute_timeout(None, phase="cleanup") == 60
+        with pytest.raises(module.ReviewEvidenceDeadlineExpired):
+            module.evidence_execute_timeout(30)
+        monkeypatch.setenv("HERMES_KANBAN_EVIDENCE_DEADLINE", "1000")
+        monkeypatch.delenv("HERMES_KANBAN_EVIDENCE_STARTED_AT")
+        assert module.kanban_tool_timeout_cap() == 60
+        assert module.evidence_execute_timeout(None, phase="observe") == 60
+        with pytest.raises(module.ReviewEvidenceDeadlineExpired):
+            module.evidence_execute_timeout(30)
+
+        monkeypatch.setenv("HERMES_KANBAN_EVIDENCE_STARTED_AT", "0")
+        monkeypatch.setattr(module.time, "time", lambda: float("nan"))
+        assert module.kanban_evidence_remaining() == 0.0
+        with pytest.raises(module.ReviewEvidenceDeadlineExpired):
+            module.evidence_execute_timeout(30)
+        assert module.evidence_execute_timeout(None, phase="cleanup") == 60
+        with pytest.raises(ValueError, match="unknown evidence execution phase"):
+            module.evidence_execute_timeout(30, phase="unknown")
     finally:
         sys.modules.pop(module_name, None)
         sys.path.remove(source_value)

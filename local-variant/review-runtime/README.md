@@ -30,7 +30,20 @@ The overlay has three responsibilities:
   malformed, non-finite, inconsistent, or expired deadline state produces a
   typed `REVIEW-INCOMPLETE` block instead of silently minting more time. Worker
   setup authenticates the persisted start/deadline/budget tuple before spawn,
-  and the terminal boundary rechecks the same tuple before every probe.
+  and the shared terminal policy boundary rechecks it before every command.
+  The same policy is applied to local/remote `execute_code`, remote kernels,
+  shell file operations, image-source reads, process-registry background
+  launches, persisted result storage, and the final `Environment.execute`
+  boundary; the import-neutral `tools/evidence_window.py` helper classifies work,
+  observation, settlement, and cleanup phases. Ordinary implementation/interactive
+  calls remain unchanged.
+- Fence completion with the durable monotonic `MAX(task_runs.id)` watermark as
+  well as `current_run_id`, closing the no-run NULL -> new run -> NULL ABA.
+  Evidence-recovery completion is fail-closed after reclaim, and review
+  blocking never falls through to `done` when a ready/blocked row cannot be
+  transitioned. Stale-claim release, operator reclaim, heartbeat stale
+  detection, deferred reclaim, and their `_end_run` calls capture and compare
+  the exact run pointer before changing or closing a task.
 - Provide the symmetric recovery transition `kanban_supersede`: an
   orchestrator may replace one blocked/triaged card only when its exact latest
   run is a terminal failure. One immutable lane key has one successor leaf,

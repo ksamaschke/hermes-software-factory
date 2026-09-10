@@ -35,12 +35,20 @@ EVIDENCE_RECOVERY_EVIDENCE_BUDGET_SECONDS = 300
 REVIEW_COMMAND_TIMEOUT_SECONDS = 120
 EVIDENCE_RECOVERY_COMMAND_TIMEOUT_SECONDS = 60
 TARGET_PATHS = (
-    "hermes_cli/kanban_db.py",
     "gateway/kanban_watchers.py",
-    "tui_gateway/server.py",
-    "tools/terminal_tool.py",
     "hermes_cli/kanban.py",
+    "hermes_cli/kanban_db.py",
+    "tools/code_execution_tool.py",
+    "tools/code_kernel_remote.py",
+    "tools/environments/base.py",
+    "tools/evidence_window.py",
+    "tools/file_operations.py",
+    "tools/image_source.py",
     "tools/kanban_tools.py",
+    "tools/process_registry.py",
+    "tools/terminal_tool.py",
+    "tools/tool_result_storage.py",
+    "tui_gateway/server.py",
 )
 _GIT_EXECUTABLE = Path("/usr/bin/git")
 _GIT_ENVIRONMENT = {
@@ -261,11 +269,17 @@ def _static_manifest() -> dict[str, Any]:
 
 
 def _patch_targets(patch_path: Path) -> tuple[str, ...]:
+    """Read one canonical target header per modified or added file."""
     targets: list[str] = []
-    for line in patch_path.read_text(encoding="utf-8").splitlines():
+    lines = patch_path.read_text(encoding="utf-8").splitlines()
+    for index, line in enumerate(lines):
         if line.startswith("--- a/"):
             target = line[6:].split("\t", 1)[0]
             targets.append(target)
+        elif line == "--- /dev/null" and index + 1 < len(lines):
+            added = lines[index + 1]
+            if added.startswith("+++ b/"):
+                targets.append(added[6:].split("\t", 1)[0])
     return tuple(targets)
 
 
@@ -483,11 +497,19 @@ def _assert_overlay_equivalence(
     """Ensure the overlay changed only the declared target files."""
     native_hashes = _tree_hashes(native_runtime, patterns)
     output_hashes = _tree_hashes(output, patterns)
-    if set(native_hashes) != set(output_hashes):
-        raise SystemExit("review overlay changed the native runtime file set")
+    native_paths = set(native_hashes)
+    output_paths = set(output_hashes)
+    added = output_paths - native_paths
+    removed = native_paths - output_paths
+    if removed or added - set(TARGET_PATHS):
+        unexpected = sorted(removed | (added - set(TARGET_PATHS)))
+        raise SystemExit(
+            "review overlay changed the native runtime file set outside the allowlist: "
+            + ", ".join(unexpected)
+        )
     changed = {
         relative
-        for relative in native_hashes
+        for relative in native_paths & output_paths
         if native_hashes[relative] != output_hashes[relative]
     }
     if changed - set(TARGET_PATHS):
@@ -495,7 +517,20 @@ def _assert_overlay_equivalence(
             "review overlay changed files outside the target allowlist: "
             + ", ".join(sorted(changed - set(TARGET_PATHS)))
         )
-    if not set(TARGET_PATHS).issubset(output_hashes):
+    effective = added | changed
+    expected = set(TARGET_PATHS)
+    if effective != expected:
+        missing = sorted(expected - effective)
+        unexpected = sorted(effective - expected)
+        detail = []
+        if missing:
+            detail.append("missing/unmodified=" + ", ".join(missing))
+        if unexpected:
+            detail.append("unexpected=" + ", ".join(unexpected))
+        raise SystemExit(
+            "review overlay did not change every declared target: " + "; ".join(detail)
+        )
+    if not set(TARGET_PATHS).issubset(output_paths):
         raise SystemExit("review overlay target file is missing from the output")
 
 
@@ -506,14 +541,31 @@ def _apply_patch(output: Path, patch_path: Path) -> None:
             f"patch target set {targets!r} is outside the review allowlist"
         )
     git = str(_trusted_git_executable())
-    command = [git, "apply", "--whitespace=nowarn", str(patch_path)]
-    check = subprocess.run(
-        [git, "apply", "--check", "--whitespace=nowarn", str(patch_path)],
+    apply_environment = dict(_GIT_ENVIRONMENT)
+    # The builder may run inside an enclosing worktree.  Git discovery must
+    # stop at the private output parent so patch paths stay relative to output.
+    apply_environment["GIT_CEILING_DIRECTORIES"] = str(output.parent.resolve())
+    apply_environment["GIT_DISCOVERY_ACROSS_FILESYSTEM"] = "0"
+    discovery = subprocess.run(
+        [git, "rev-parse", "--show-toplevel"],
         cwd=output,
         check=False,
         capture_output=True,
         text=True,
-        env=_GIT_ENVIRONMENT,
+        env=apply_environment,
+    )
+    if discovery.returncode == 0:
+        raise SystemExit(
+            "review patch output unexpectedly discovered an enclosing Git repository"
+        )
+    command = [git, "apply", "--whitespace=error", str(patch_path)]
+    check = subprocess.run(
+        [git, "apply", "--check", "--whitespace=error", str(patch_path)],
+        cwd=output,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=apply_environment,
     )
     if check.returncode:
         detail = (check.stdout + check.stderr).strip()
@@ -524,7 +576,7 @@ def _apply_patch(output: Path, patch_path: Path) -> None:
         check=False,
         capture_output=True,
         text=True,
-        env=_GIT_ENVIRONMENT,
+        env=apply_environment,
     )
     if result.returncode:
         detail = (result.stdout + result.stderr).strip()
