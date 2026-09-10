@@ -12,10 +12,20 @@ import copy
 import hashlib
 import json
 import math
+import os
 import re
+import threading
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from pathlib import Path
+from types import MappingProxyType
+from typing import Any, ClassVar, Protocol
+
+try:  # POSIX-only file fencing is optional for the in-memory fixture path.
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no local process proof
+    fcntl = None  # type: ignore[assignment]
 
 CONTRACT_SCHEMA = "factory.decision.v1"
 DECISION_LADDER = ("diagnose", "choose", "act", "read_back", "advance")
@@ -133,7 +143,9 @@ _EVIDENCE_STATUSES = {
 def _redact_text(text: str) -> str:
     """Redact secret-bearing values while preserving safe identity text."""
 
-    value = str(text)
+    if type(text) is not str:
+        raise ContractViolation("text value must be a built-in string")
+    value = text
     if len(value) > _MAX_SAFE_TEXT_CHARS:
         raise ContractViolation("text value exceeds the contract bound")
     stripped = value.strip()
@@ -197,7 +209,7 @@ def _secret_key_match(key: str, value: Any = None) -> bool:
     normalized = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", candidate)
     normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", normalized)
     normalized = re.sub(r"[^A-Za-z0-9]+", "_", normalized).casefold()
-    if normalized == "credentials_verified" and isinstance(value, bool):
+    if normalized == "credentials_verified" and type(value) is bool:
         return False
     return bool(_SECRET_KEY.search(normalized))
 
@@ -225,7 +237,7 @@ class DecisionModel(Protocol):
 
 
 def _required(value: Any, field_name: str) -> str:
-    if not isinstance(value, str):
+    if type(value) is not str:
         raise ContractViolation(f"missing or malformed field: {field_name}")
     value = value.strip()
     if not value:
@@ -236,21 +248,20 @@ def _required(value: Any, field_name: str) -> str:
 
 
 def _bounded_iterable(value: Any, field_name: str, limit: int) -> list[Any]:
-    """Materialize an iterable while enforcing a bound without trusting len()."""
+    """Materialize an exact built-in container without invoking subclass hooks."""
 
-    if isinstance(value, (str, bytes, bytearray)):
-        raise ContractViolation(f"{field_name} input must be an iterable of items")
-    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
+    if type(limit) is not int or limit < 0:
         raise ContractViolation(f"{field_name} input bound is malformed")
-    try:
-        if isinstance(value, list):
-            iterator = list.__iter__(value)
-        elif isinstance(value, tuple):
-            iterator = tuple.__iter__(value)
-        else:
-            iterator = iter(value)
-    except Exception:  # noqa: BLE001 - hostile iterables must become contract errors
-        raise ContractViolation(f"{field_name} input is not iterable") from None
+    if type(value) is dict:
+        iterator = dict.__iter__(value)
+    elif type(value) is list:
+        iterator = list.__iter__(value)
+    elif type(value) is tuple:
+        iterator = tuple.__iter__(value)
+    else:
+        raise ContractViolation(
+            f"{field_name} input must be an exact dict, list, or tuple"
+        )
     result: list[Any] = []
     for index in range(limit + 1):
         try:
@@ -266,14 +277,13 @@ def _bounded_iterable(value: Any, field_name: str, limit: int) -> list[Any]:
 
 
 def _bounded_mapping_items(
-    value: Mapping[Any, Any], field_name: str, limit: int
+    value: dict[Any, Any], field_name: str, limit: int
 ) -> list[tuple[Any, Any]]:
-    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
+    if type(limit) is not int or limit < 0:
         raise ContractViolation(f"{field_name} mapping bound is malformed")
-    try:
-        iterator = iter(value)
-    except Exception:  # noqa: BLE001 - hostile mappings must become contract errors
-        raise ContractViolation(f"{field_name} input is not a mapping") from None
+    if type(value) is not dict:
+        raise ContractViolation(f"{field_name} input must be an exact dict")
+    iterator = dict.__iter__(value)
     result: list[tuple[Any, Any]] = []
     for index in range(limit + 1):
         try:
@@ -285,8 +295,8 @@ def _bounded_mapping_items(
         if index >= limit:
             raise ContractViolation(f"{field_name} input exceeds the contract bound")
         try:
-            item = value[key]
-        except Exception:  # noqa: BLE001 - hostile lookups must become contract errors
+            item = dict.__getitem__(value, key)
+        except Exception:  # noqa: BLE001 - malformed lookups become contract errors
             raise ContractViolation(f"{field_name} mapping lookup failed") from None
         result.append((key, item))
     raise ContractViolation(f"{field_name} input exceeds the contract bound")
@@ -295,10 +305,10 @@ def _bounded_mapping_items(
 def _safe_mapping(value: Any, field_name: str = "mapping") -> dict[str, Any]:
     """Normalize one untrusted mapping before any materialization or lookup."""
 
-    if not isinstance(value, Mapping):
-        raise ContractViolation(f"{field_name} must be a mapping")
+    if type(value) is not dict:
+        raise ContractViolation(f"{field_name} must be an exact dict")
     normalized = _safe_value(value, field_name)
-    if not isinstance(normalized, dict):
+    if type(normalized) is not dict:
         raise ContractViolation(f"{field_name} must be a JSON object")
     return normalized
 
@@ -324,7 +334,7 @@ def _safe_value(
         raise ContractViolation(
             f"nested value exceeds the contract bound: {field_name}"
         )
-    if isinstance(value, Mapping):
+    if type(value) is dict:
         object_id = id(value)
         if object_id in _seen:
             raise ContractViolation(f"cyclic or shared value: {field_name}")
@@ -357,7 +367,7 @@ def _safe_value(
                 raise ContractViolation(f"redacted field collision in {field_name}")
             result[safe_key] = safe_item
         return result
-    if isinstance(value, (list, tuple)):
+    if type(value) in {list, tuple}:
         object_id = id(value)
         if object_id in _seen:
             raise ContractViolation(f"cyclic or shared value: {field_name}")
@@ -380,17 +390,62 @@ def _safe_value(
             )
             for item in items
         ]
-    if value is None or isinstance(value, (bool, int, float)):
-        if isinstance(value, float) and not math.isfinite(value):
+    if value is None or type(value) in {bool, int, float}:
+        if type(value) is float and not math.isfinite(value):
             raise ContractViolation(f"non-finite value in {field_name}")
         return value
-    if isinstance(value, str):
+    if type(value) is str:
         return _redact_text(value)
     raise ContractViolation(f"unsupported value in {field_name}")
 
 
+def _freeze_snapshot(value: Any) -> Any:
+    """Freeze an already-normalized JSON value for later trusted reads."""
+
+    if type(value) is dict:
+        return MappingProxyType(
+            {key: _freeze_snapshot(item) for key, item in value.items()}
+        )
+    if type(value) is list:
+        return tuple(_freeze_snapshot(item) for item in value)
+    return value
+
+
+def _thaw_snapshot(value: Any) -> Any:
+    """Return ordinary built-ins from an immutable normalized snapshot."""
+
+    if isinstance(value, Mapping):
+        return {key: _thaw_snapshot(item) for key, item in value.items()}
+    if type(value) is tuple:
+        return [_thaw_snapshot(item) for item in value]
+    return value
+
+
+def _exact_json_equal(left: Any, right: Any) -> bool:
+    """Compare trusted JSON trees without Python's bool/int equivalence."""
+
+    if type(left) is not type(right):
+        return False
+    if type(left) is dict:
+        if set(left) != set(right):
+            return False
+        return all(_exact_json_equal(left[key], right[key]) for key in left)
+    if type(left) in {list, tuple}:
+        if len(left) != len(right):
+            return False
+        return all(
+            _exact_json_equal(left_item, right_item)
+            for left_item, right_item in zip(left, right, strict=True)
+        )
+    if type(left) not in {str, int, float, bool, type(None)}:
+        return False
+    return left == right
+
+
 def _compact(text: str) -> str:
-    return " ".join(str(text).split())
+    if type(text) is not str:
+        raise ContractViolation("text value must be a built-in string")
+    return " ".join(text.split())
 
 
 def decision_response_requirements_text() -> str:
@@ -449,17 +504,37 @@ class SourceIdentity:
         )
 
     def as_dict(self) -> dict[str, Any]:
+        tracker = _safe_identifier(self.tracker, "source_item.tracker")
+        project = _safe_identifier(self.project, "source_item.project")
+        kind = _safe_identifier(self.kind, "source_item.kind")
+        item_key = _safe_identifier(self.item_key, "source_item.item_key")
+        canonical_key = "source.v1:" + json.dumps(
+            [tracker, project, kind, item_key],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
         result: dict[str, Any] = {
-            "tracker": _safe_identifier(self.tracker, "source_item.tracker"),
-            "project": _safe_identifier(self.project, "source_item.project"),
-            "kind": _safe_identifier(self.kind, "source_item.kind"),
-            "item_key": _safe_identifier(self.item_key, "source_item.item_key"),
-            "canonical_key": self.canonical_key,
+            "tracker": tracker,
+            "project": project,
+            "kind": kind,
+            "item_key": item_key,
+            "canonical_key": canonical_key,
         }
-        if self.url is not None:
-            if not isinstance(self.url, str):
+        url = self.url
+        if url is not None:
+            if type(url) is not str:
                 raise ContractViolation("source_item.url is malformed")
-            result["url"] = _redact_text(self.url)
+            url = _redact_text(url)
+            result["url"] = url
+        for field_name, original, canonical in (
+            ("tracker", self.tracker, tracker),
+            ("project", self.project, project),
+            ("kind", self.kind, kind),
+            ("item_key", self.item_key, item_key),
+            ("url", self.url, url),
+        ):
+            if original != canonical:
+                raise ContractViolation(f"source_item.{field_name} must be canonical")
         return result
 
 
@@ -470,6 +545,8 @@ def build_input_identity(
 ) -> str:
     """Return a stable identity for one source/phase/input observation."""
 
+    if type(source_item) is not SourceIdentity:
+        raise ContractViolation("source_item must be an exact SourceIdentity")
     document = {
         "source_item": source_item.as_dict(),
         "phase": _safe_identifier(phase, "phase"),
@@ -496,43 +573,67 @@ class ExecutionIdentity:
     singleton_key: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        if self.run_id is not None and not isinstance(self.run_id, str):
+        if self.run_id is not None and type(self.run_id) is not str:
             raise ContractViolation("current_run.id is malformed")
-        if (
-            not isinstance(self.retry_count, int)
-            or isinstance(self.retry_count, bool)
-            or self.retry_count < 0
-        ):
+        if type(self.retry_count) is not int or self.retry_count < 0:
             raise ContractViolation("execution retry count is invalid")
-        if not isinstance(self.credentials_verified, bool):
+        if type(self.credentials_verified) is not bool:
             raise ContractViolation("credential verification guard is malformed")
-        if not isinstance(self.production, bool) or not isinstance(
-            self.production_approved, bool
+        if (
+            type(self.production) is not bool
+            or type(self.production_approved) is not bool
         ):
             raise ContractViolation("production guard is malformed")
-        return {
-            "mode": _safe_identifier(self.mode, "execution_mode"),
-            "profile_name": _safe_identifier(self.profile_name, "profile_name"),
-            "current_task": {"id": _safe_identifier(self.task_id, "current_task.id")},
-            "current_run": {"id": _safe_identifier(self.run_id, "current_run.id")}
+
+        mode = _safe_identifier(self.mode, "execution_mode")
+        profile_name = _safe_identifier(self.profile_name, "profile_name")
+        task_id = _safe_identifier(self.task_id, "current_task.id")
+        run_id = (
+            _safe_identifier(self.run_id, "current_run.id")
             if self.run_id is not None
-            else None,
+            else None
+        )
+        branch = (
+            _safe_identifier(self.branch, "execution.branch")
+            if self.branch is not None
+            else None
+        )
+        tenant = (
+            _safe_identifier(self.tenant, "execution.tenant")
+            if self.tenant is not None
+            else None
+        )
+        singleton_key = (
+            _safe_identifier(self.singleton_key, "execution.singleton_key")
+            if self.singleton_key is not None
+            else None
+        )
+        for field_name, original, canonical in (
+            ("mode", self.mode, mode),
+            ("profile_name", self.profile_name, profile_name),
+            ("task_id", self.task_id, task_id),
+            ("run_id", self.run_id, run_id),
+            ("branch", self.branch, branch),
+            ("tenant", self.tenant, tenant),
+            ("singleton_key", self.singleton_key, singleton_key),
+        ):
+            if original != canonical:
+                raise ContractViolation(
+                    f"current execution {field_name} must be canonical"
+                )
+        return {
+            "mode": mode,
+            "profile_name": profile_name,
+            "current_task": {"id": task_id},
+            "current_run": {"id": run_id} if run_id is not None else None,
             "guards": {
-                "branch": _safe_identifier(self.branch, "execution.branch")
-                if self.branch is not None
-                else None,
-                "tenant": _safe_identifier(self.tenant, "execution.tenant")
-                if self.tenant is not None
-                else None,
+                "branch": branch,
+                "tenant": tenant,
                 "credentials_verified": self.credentials_verified,
                 "production": self.production,
                 "production_approved": self.production_approved,
                 "retry_count": self.retry_count,
-                "singleton_key": _safe_identifier(
-                    self.singleton_key, "execution.singleton_key"
-                )
-                if self.singleton_key is not None
-                else None,
+                "singleton_key": singleton_key,
             },
         }
 
@@ -547,31 +648,29 @@ class BlockerState:
     resolved: bool = False
 
     def as_dict(self) -> dict[str, Any]:
-        if (
-            not isinstance(self.occurrences, int)
-            or isinstance(self.occurrences, bool)
-            or self.occurrences < 0
-        ):
+        if type(self.occurrences) is not int or self.occurrences < 0:
             raise ContractViolation("blocker occurrences are malformed")
-        if not isinstance(self.resolved, bool):
+        if type(self.resolved) is not bool:
             raise ContractViolation("blocker resolution is malformed")
-        for field_name, value in (
-            ("blocker.fingerprint", self.fingerprint),
-            ("blocker.previous_fingerprint", self.previous_fingerprint),
-        ):
-            if value is not None:
-                _safe_identifier(value, field_name)
-        return {
-            "fingerprint": _safe_identifier(self.fingerprint, "blocker.fingerprint")
+        fingerprint = (
+            _safe_identifier(self.fingerprint, "blocker.fingerprint")
             if self.fingerprint is not None
-            else None,
-            "previous_fingerprint": _safe_identifier(
-                self.previous_fingerprint, "blocker.previous_fingerprint"
-            )
+            else None
+        )
+        previous_fingerprint = (
+            _safe_identifier(self.previous_fingerprint, "blocker.previous_fingerprint")
             if self.previous_fingerprint is not None
-            else None,
+            else None
+        )
+        if self.fingerprint != fingerprint:
+            raise ContractViolation("blocker fingerprint must be canonical")
+        if self.previous_fingerprint != previous_fingerprint:
+            raise ContractViolation("previous blocker fingerprint must be canonical")
+        return {
+            "fingerprint": fingerprint,
+            "previous_fingerprint": previous_fingerprint,
             "occurrences": self.occurrences,
-            "resolved": bool(self.resolved),
+            "resolved": self.resolved,
         }
 
 
@@ -582,28 +681,41 @@ class ParentCompletion:
     parent_ids: tuple[str, ...] = ()
     evidence_reference: str | None = None
 
-    def as_dict(self) -> dict[str, Any]:
+    def __post_init__(self) -> None:
         state = _safe_identifier(self.state, "parent_completion.state")
         if state not in {"complete", "incomplete", "none", "unknown"}:
             raise ContractViolation(f"invalid parent completion state: {state}")
-        if not isinstance(self.verified, bool):
+        if type(self.verified) is not bool:
             raise ContractViolation("parent completion verification is malformed")
-        result: dict[str, Any] = {
-            "state": state,
-            "verified": self.verified,
-            "parent_ids": [
-                _safe_identifier(parent_id, "parent_completion.parent_id")
-                for parent_id in _bounded_iterable(
-                    self.parent_ids, "parent_completion.parent_ids", _MAX_PARENT_IDS
-                )
-            ],
-        }
-        if self.evidence_reference is not None:
-            if not isinstance(self.evidence_reference, str):
+        if type(self.parent_ids) is not tuple:
+            raise ContractViolation(
+                "parent_completion.parent_ids must be an exact tuple"
+            )
+        parent_ids = tuple(
+            _safe_identifier(parent_id, "parent_completion.parent_id")
+            for parent_id in _bounded_iterable(
+                self.parent_ids, "parent_completion.parent_ids", _MAX_PARENT_IDS
+            )
+        )
+        evidence_reference = self.evidence_reference
+        if evidence_reference is not None:
+            if type(evidence_reference) is not str:
                 raise ContractViolation(
                     "parent completion evidence reference is malformed"
                 )
-            result["evidence_reference"] = _redact_text(self.evidence_reference)
+            evidence_reference = _redact_text(evidence_reference)
+        object.__setattr__(self, "state", state)
+        object.__setattr__(self, "parent_ids", parent_ids)
+        object.__setattr__(self, "evidence_reference", evidence_reference)
+
+    def as_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "state": self.state,
+            "verified": self.verified,
+            "parent_ids": list(self.parent_ids),
+        }
+        if self.evidence_reference is not None:
+            result["evidence_reference"] = self.evidence_reference
         return result
 
 
@@ -623,8 +735,36 @@ class TypedEvidence:
     task_id: str | None = None
     source_key: str | None = None
     semantic_lane: str | None = None
+    _snapshot: Mapping[str, Any] | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+
+    @classmethod
+    def _from_normalized(cls, item: Mapping[str, Any]) -> TypedEvidence:
+        attributes = item.get("attributes", {})
+        evidence = cls(
+            kind=item["kind"],
+            subject=item["subject"],
+            status=item["status"],
+            reference=item["reference"],
+            run_id=item.get("run_id"),
+            candidate=item.get("candidate"),
+            attributes=_freeze_snapshot(attributes),
+            phase=item.get("phase"),
+            input_identity=item.get("input_identity"),
+            task_id=item.get("task_id"),
+            source_key=item.get("source_key"),
+            semantic_lane=item.get("semantic_lane"),
+        )
+        object.__setattr__(evidence, "_snapshot", _freeze_snapshot(dict(item)))
+        return evidence
 
     def as_dict(self) -> dict[str, Any]:
+        if self._snapshot is not None:
+            snapshot = _thaw_snapshot(self._snapshot)
+            if not isinstance(snapshot, dict):
+                raise ContractViolation("normalized evidence snapshot is malformed")
+            return snapshot
         kind = _safe_identifier(self.kind, "evidence.kind")
         if kind not in EVIDENCE_KINDS:
             raise ContractViolation(f"invalid evidence kind: {kind}")
@@ -672,34 +812,55 @@ class EvidenceBundle:
     source: tuple[TypedEvidence, ...] = ()
     review: tuple[TypedEvidence, ...] = ()
 
-    def as_dict(self) -> dict[str, list[dict[str, Any]]]:
+    def __post_init__(self) -> None:
         rows = {
             "scheduler": self.scheduler,
             "worker": self.worker,
             "source": self.source,
             "review": self.review,
         }
-        result: dict[str, list[dict[str, Any]]] = {}
+        normalized_rows: dict[str, tuple[TypedEvidence, ...]] = {}
         remaining = _MAX_EVIDENCE_ENTRIES
         for expected_kind, entries in rows.items():
+            if type(entries) is not tuple:
+                raise ContractViolation(
+                    f"evidence.{expected_kind} must be an exact tuple"
+                )
             bounded_entries = _bounded_iterable(
                 entries, f"evidence.{expected_kind}", remaining
             )
             remaining -= len(bounded_entries)
-            rendered = []
+            normalized: list[TypedEvidence] = []
             for entry in bounded_entries:
-                if not isinstance(entry, TypedEvidence):
+                if type(entry) is not TypedEvidence:
                     raise ContractViolation(
                         f"evidence.{expected_kind} contains a malformed entry"
                     )
-                item = entry.as_dict()
+                try:
+                    item = entry.as_dict()
+                except Exception as exc:
+                    raise ContractViolation(
+                        f"evidence.{expected_kind} contains a malformed entry"
+                    ) from exc
                 if item["kind"] != expected_kind:
                     raise ContractViolation(
                         f"evidence kind {item['kind']} is in {expected_kind} bundle"
                     )
-                rendered.append(item)
-            result[expected_kind] = rendered
-        return result
+                normalized.append(TypedEvidence._from_normalized(item))
+            normalized_rows[expected_kind] = tuple(normalized)
+        for kind, entries in normalized_rows.items():
+            object.__setattr__(self, kind, entries)
+
+    def as_dict(self) -> dict[str, list[dict[str, Any]]]:
+        return {
+            kind: [entry.as_dict() for entry in entries]
+            for kind, entries in (
+                ("scheduler", self.scheduler),
+                ("worker", self.worker),
+                ("source", self.source),
+                ("review", self.review),
+            )
+        }
 
 
 @dataclass(frozen=True)
@@ -724,8 +885,16 @@ class DecisionPolicy:
     require_independent_review: bool = True
     require_exact_reuse_binding: bool = True
     allowed_execution_modes: tuple[str, ...] = ("scheduled", "interactive")
+    _snapshot: Mapping[str, Any] | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     def as_dict(self) -> dict[str, Any]:
+        if self._snapshot is not None:
+            snapshot = _thaw_snapshot(self._snapshot)
+            if type(snapshot) is not dict:
+                raise ContractViolation("normalized policy snapshot is malformed")
+            return snapshot
         integer_fields = (
             self.max_prompt_chars,
             self.max_skill_chars,
@@ -734,10 +903,7 @@ class DecisionPolicy:
             self.max_tool_chars,
             self.max_tools,
         )
-        if any(
-            not isinstance(value, int) or isinstance(value, bool)
-            for value in integer_fields
-        ):
+        if any(type(value) is not int for value in integer_fields):
             raise ContractViolation("policy budgets and thresholds are malformed")
         if (
             self.max_prompt_chars > _MAX_PROMPT_CHARS
@@ -759,14 +925,16 @@ class DecisionPolicy:
             or self.repeated_blocker_threshold < 1
         ):
             raise ContractViolation("invalid skill or blocker policy bound")
-        if not isinstance(self.require_independent_review, bool) or not isinstance(
-            self.require_exact_reuse_binding, bool
+        if (
+            type(self.require_independent_review) is not bool
+            or type(self.require_exact_reuse_binding) is not bool
         ):
             raise ContractViolation("policy guard flags are malformed")
-        if self.conflict_mode != "fail_closed":
+        conflict_mode = _safe_identifier(self.conflict_mode, "policy.conflict_mode")
+        if conflict_mode != "fail_closed":
             raise ContractViolation("conflict mode must be fail_closed")
-        if isinstance(self.allowed_execution_modes, (str, bytes)):
-            raise ContractViolation("policy execution modes are malformed")
+        if type(self.allowed_execution_modes) is not tuple:
+            raise ContractViolation("policy.execution_modes must be an exact tuple")
         try:
             execution_modes = [
                 _safe_identifier(mode, "policy.execution_mode")
@@ -784,8 +952,8 @@ class DecisionPolicy:
             raise ContractViolation("policy has no valid execution mode")
         if len(set(execution_modes)) != len(execution_modes):
             raise ContractViolation("policy execution modes are duplicated")
-        if isinstance(self.allowed_actions, (str, bytes)):
-            raise ContractViolation("policy actions are malformed")
+        if type(self.allowed_actions) is not tuple:
+            raise ContractViolation("policy.allowed_actions must be an exact tuple")
         try:
             allowed = [
                 _safe_identifier(action, "policy.action")
@@ -801,19 +969,23 @@ class DecisionPolicy:
             raise ContractViolation("policy contains an unsupported action")
         if len(set(allowed)) != len(allowed):
             raise ContractViolation("policy actions are duplicated")
+        if type(self.transition_policy) is not tuple:
+            raise ContractViolation("policy.transition_policy must be an exact tuple")
         try:
             transition_entries = _bounded_iterable(
                 self.transition_policy, "policy.transition_policy", _MAX_POLICY_ITEMS
             )
             transition_pairs = []
             for entry in transition_entries:
-                if not isinstance(entry, (tuple, list)):
+                if type(entry) is not tuple:
                     raise TypeError("transition entry must contain action and phase")
                 fields = _bounded_iterable(entry, "policy.transition", 2)
                 if len(fields) != 2:
                     raise TypeError("transition entry must contain action and phase")
                 transition_pairs.append((fields[0], fields[1]))
-        except (ContractViolation, TypeError, ValueError) as exc:
+        except ContractViolation:
+            raise
+        except (TypeError, ValueError) as exc:
             raise ContractViolation("policy transition table is malformed") from exc
         transition_pairs = [
             (
@@ -830,7 +1002,7 @@ class DecisionPolicy:
             raise ContractViolation("policy has no transition for an allowed action")
         if any(
             action not in ALLOWED_ACTIONS
-            or not isinstance(next_phase, str)
+            or type(next_phase) is not str
             or not _compact(next_phase)
             for action, next_phase in transition.items()
         ):
@@ -841,7 +1013,7 @@ class DecisionPolicy:
             )
             for action, next_phase in transition.items()
         }
-        return {
+        snapshot = {
             "budgets": {
                 "max_prompt_chars": self.max_prompt_chars,
                 "max_skill_chars": self.max_skill_chars,
@@ -850,7 +1022,7 @@ class DecisionPolicy:
                 "max_tools": self.max_tools,
             },
             "repeated_blocker_threshold": self.repeated_blocker_threshold,
-            "conflict_mode": self.conflict_mode,
+            "conflict_mode": conflict_mode,
             "require_independent_review": self.require_independent_review,
             "require_exact_reuse_binding": self.require_exact_reuse_binding,
             "allowed_execution_modes": execution_modes,
@@ -862,6 +1034,37 @@ class DecisionPolicy:
                 "new_admission_requires_run": True,
             },
         }
+        object.__setattr__(self, "_snapshot", _freeze_snapshot(snapshot))
+        return _thaw_snapshot(self._snapshot)
+
+    def execution_modes_snapshot(self) -> tuple[str, ...]:
+        self.as_dict()
+        if self._snapshot is None:
+            raise ContractViolation("policy snapshot is missing")
+        modes = self._snapshot.get("allowed_execution_modes")
+        if type(modes) is not tuple or any(type(mode) is not str for mode in modes):
+            raise ContractViolation("policy execution-mode snapshot is malformed")
+        return modes
+
+    def actions_snapshot(self) -> tuple[str, ...]:
+        self.as_dict()
+        if self._snapshot is None:
+            raise ContractViolation("policy snapshot is missing")
+        actions = self._snapshot.get("allowed_actions")
+        if type(actions) is not tuple or any(
+            type(action) is not str for action in actions
+        ):
+            raise ContractViolation("policy action snapshot is malformed")
+        return actions
+
+    def transitions_snapshot(self) -> Mapping[str, str]:
+        self.as_dict()
+        if self._snapshot is None:
+            raise ContractViolation("policy snapshot is missing")
+        transitions = self._snapshot.get("transition_policy")
+        if not isinstance(transitions, Mapping):
+            raise ContractViolation("policy transition snapshot is malformed")
+        return transitions
 
 
 @dataclass(frozen=True)
@@ -876,9 +1079,71 @@ class DecisionContext:
     policy: DecisionPolicy = field(default_factory=DecisionPolicy)
     prior_decision: Mapping[str, Any] | None = None
     semantic_lane: str = "current"
+    _prior_snapshot: Mapping[str, Any] | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    _snapshot: Mapping[str, Any] | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    _component_ids: tuple[int, ...] | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
-    def as_dict(self) -> dict[str, Any]:
+    def _exact_components(self) -> tuple[tuple[str, Any, type[Any]], ...]:
+        return (
+            ("execution", self.execution, ExecutionIdentity),
+            ("source_item", self.source_item, SourceIdentity),
+            ("blocker", self.blocker, BlockerState),
+            ("parent_completion", self.parent_completion, ParentCompletion),
+            ("evidence", self.evidence, EvidenceBundle),
+            ("policy", self.policy, DecisionPolicy),
+        )
+
+    def __post_init__(self) -> None:
+        exact_types = self._exact_components()
+        for field_name, value, expected_type in exact_types:
+            if type(value) is not expected_type:
+                raise ContractViolation(
+                    f"decision context {field_name} must be an exact "
+                    f"{expected_type.__name__}"
+                )
+        object.__setattr__(
+            self,
+            "_component_ids",
+            tuple(id(value) for _, value, _ in exact_types),
+        )
+
+        phase = _safe_identifier(self.phase, "phase")
+        input_identity = _safe_identifier(self.input_identity, "input_identity")
+        semantic_lane = _safe_identifier(self.semantic_lane, "semantic_lane")
+        object.__setattr__(self, "phase", phase)
+        object.__setattr__(self, "input_identity", input_identity)
+        object.__setattr__(self, "semantic_lane", semantic_lane)
+
+        prior_snapshot: Mapping[str, Any] | None = None
+        if self.prior_decision is not None:
+            normalized_prior = _safe_mapping(self.prior_decision, "prior_decision")
+            frozen_prior = _freeze_snapshot(normalized_prior)
+            if not isinstance(frozen_prior, Mapping):
+                raise ContractViolation("prior_decision snapshot is malformed")
+            prior_snapshot = frozen_prior
+            object.__setattr__(self, "prior_decision", frozen_prior)
+        object.__setattr__(self, "_prior_snapshot", prior_snapshot)
+
         execution = self.execution.as_dict()
+        source_item = self.source_item.as_dict()
+        identity_key = _identity_digest(
+            {
+                "schema": CONTRACT_SCHEMA,
+                "execution": execution,
+                "source_key": source_item["canonical_key"],
+                "phase": phase,
+                "input_identity": input_identity,
+                "semantic_lane": semantic_lane,
+                "task_id": execution["current_task"]["id"],
+            },
+            "decision-",
+        )
         result: dict[str, Any] = {
             "schema": CONTRACT_SCHEMA,
             "execution": execution,
@@ -886,47 +1151,394 @@ class DecisionContext:
             "profile_name": execution["profile_name"],
             "current_task": execution["current_task"],
             "current_run": execution["current_run"],
-            "source_item": self.source_item.as_dict(),
-            "phase": _safe_identifier(self.phase, "phase"),
-            "input_identity": _safe_identifier(self.input_identity, "input_identity"),
-            "semantic_lane": _safe_identifier(self.semantic_lane, "semantic_lane"),
-            "decision_identity_key": decision_identity_key(self),
+            "source_item": source_item,
+            "phase": phase,
+            "input_identity": input_identity,
+            "semantic_lane": semantic_lane,
+            "decision_identity_key": identity_key,
             "blocker": self.blocker.as_dict(),
             "parent_completion": self.parent_completion.as_dict(),
             "evidence": self.evidence.as_dict(),
             "policy": self.policy.as_dict(),
         }
-        if self.prior_decision is not None:
-            result["prior_decision"] = _safe_value(
-                self.prior_decision, "prior_decision"
+        if prior_snapshot is not None:
+            result["prior_decision"] = _thaw_snapshot(prior_snapshot)
+        object.__setattr__(self, "_snapshot", _freeze_snapshot(result))
+
+    def _live_policy_document(self) -> dict[str, Any]:
+        policy = self.policy
+        integer_fields = (
+            policy.max_prompt_chars,
+            policy.max_skill_chars,
+            policy.max_skills,
+            policy.repeated_blocker_threshold,
+            policy.max_tool_chars,
+            policy.max_tools,
+        )
+        if any(type(value) is not int for value in integer_fields):
+            raise ContractViolation("decision context policy scalar type changed")
+        if (
+            type(policy.require_independent_review) is not bool
+            or type(policy.require_exact_reuse_binding) is not bool
+        ):
+            raise ContractViolation("decision context policy guard type changed")
+        if type(policy.allowed_execution_modes) is not tuple:
+            raise ContractViolation("decision context policy execution modes changed")
+        if type(policy.allowed_actions) is not tuple:
+            raise ContractViolation("decision context policy actions changed")
+        if type(policy.transition_policy) is not tuple:
+            raise ContractViolation("decision context policy transitions changed")
+
+        execution_modes = [
+            _safe_identifier(mode, "policy.execution_mode")
+            for mode in tuple.__iter__(policy.allowed_execution_modes)
+        ]
+        actions = [
+            _safe_identifier(action, "policy.action")
+            for action in tuple.__iter__(policy.allowed_actions)
+        ]
+        transition_pairs: list[tuple[str, str]] = []
+        for entry in tuple.__iter__(policy.transition_policy):
+            if type(entry) is not tuple or tuple.__len__(entry) != 2:
+                raise ContractViolation("decision context policy transition changed")
+            transition_pairs.append(
+                (
+                    _safe_identifier(
+                        tuple.__getitem__(entry, 0), "policy.transition.action"
+                    ),
+                    _safe_identifier(
+                        tuple.__getitem__(entry, 1), "policy.transition.next_phase"
+                    ),
+                )
             )
+        transitions = dict(transition_pairs)
+        if len(transitions) != len(transition_pairs):
+            raise ContractViolation("decision context policy transition changed")
+        return {
+            "budgets": {
+                "max_prompt_chars": policy.max_prompt_chars,
+                "max_skill_chars": policy.max_skill_chars,
+                "max_skills": policy.max_skills,
+                "max_tool_chars": policy.max_tool_chars,
+                "max_tools": policy.max_tools,
+            },
+            "repeated_blocker_threshold": policy.repeated_blocker_threshold,
+            "conflict_mode": _safe_identifier(
+                policy.conflict_mode, "policy.conflict_mode"
+            ),
+            "require_independent_review": policy.require_independent_review,
+            "require_exact_reuse_binding": policy.require_exact_reuse_binding,
+            "allowed_execution_modes": execution_modes,
+            "allowed_actions": actions,
+            "transition_policy": transitions,
+            "current_run_null": {
+                "before_spawn": True,
+                "reused_or_held": True,
+                "new_admission_requires_run": True,
+            },
+        }
+
+    def _live_evidence_document(self) -> dict[str, Any]:
+        def live_entry(entry: TypedEvidence, field_name: str) -> dict[str, Any]:
+            if type(entry) is not TypedEvidence:
+                raise ContractViolation(
+                    f"decision context {field_name} contains a non-exact TypedEvidence"
+                )
+            if type(entry.attributes) is not MappingProxyType:
+                raise ContractViolation(
+                    f"decision context {field_name} attributes are not frozen"
+                )
+            attributes = _thaw_snapshot(entry.attributes)
+            if type(attributes) is not dict:
+                raise ContractViolation(
+                    f"decision context {field_name} attributes are malformed"
+                )
+            return TypedEvidence(
+                kind=entry.kind,
+                subject=entry.subject,
+                status=entry.status,
+                reference=entry.reference,
+                run_id=entry.run_id,
+                candidate=entry.candidate,
+                attributes=attributes,
+                phase=entry.phase,
+                input_identity=entry.input_identity,
+                task_id=entry.task_id,
+                source_key=entry.source_key,
+                semantic_lane=entry.semantic_lane,
+            ).as_dict()
+
+        result: dict[str, Any] = {}
+        for field_name in EVIDENCE_KINDS:
+            entries = getattr(self.evidence, field_name)
+            if type(entries) is not tuple:
+                raise ContractViolation(
+                    f"decision context evidence.{field_name} is not frozen"
+                )
+            result[field_name] = [
+                live_entry(entry, f"evidence.{field_name}") for entry in entries
+            ]
         return result
+
+    def assert_integrity(self) -> None:
+        if type(self) is not DecisionContext:
+            raise ContractViolation("context must be an exact DecisionContext")
+        components = self._exact_components()
+        for field_name, value, expected_type in components:
+            if type(value) is not expected_type:
+                raise ContractViolation(
+                    f"decision context {field_name} must remain an exact "
+                    f"{expected_type.__name__}"
+                )
+        current_ids = tuple(id(value) for _, value, _ in components)
+        if self._component_ids is None or current_ids != self._component_ids:
+            raise ContractViolation(
+                "decision context components changed after snapshot"
+            )
+
+        snapshot = self.as_dict()
+        scalar_pairs = (
+            (self.phase, snapshot.get("phase"), "phase"),
+            (self.input_identity, snapshot.get("input_identity"), "input_identity"),
+            (self.semantic_lane, snapshot.get("semantic_lane"), "semantic_lane"),
+        )
+        for live_value, snapshot_value, field_name in scalar_pairs:
+            if type(live_value) is not str or not _exact_json_equal(
+                live_value, snapshot_value
+            ):
+                raise ContractViolation(
+                    f"decision context {field_name} changed after snapshot"
+                )
+
+        execution = self.execution
+        if (
+            type(execution.credentials_verified) is not bool
+            or type(execution.production) is not bool
+            or type(execution.production_approved) is not bool
+            or type(execution.retry_count) is not int
+        ):
+            raise ContractViolation("decision context execution scalar type changed")
+        live_execution = {
+            "mode": execution.mode,
+            "profile_name": execution.profile_name,
+            "current_task": {"id": execution.task_id},
+            "current_run": (
+                {"id": execution.run_id} if execution.run_id is not None else None
+            ),
+            "guards": {
+                "branch": execution.branch,
+                "tenant": execution.tenant,
+                "credentials_verified": execution.credentials_verified,
+                "production": execution.production,
+                "production_approved": execution.production_approved,
+                "retry_count": execution.retry_count,
+                "singleton_key": execution.singleton_key,
+            },
+        }
+        source = self.source_item
+        source_values = (source.tracker, source.project, source.kind, source.item_key)
+        if any(type(value) is not str for value in source_values):
+            raise ContractViolation("decision context source identity type changed")
+        live_source: dict[str, Any] = {
+            "tracker": source.tracker,
+            "project": source.project,
+            "kind": source.kind,
+            "item_key": source.item_key,
+            "canonical_key": "source.v1:"
+            + json.dumps(
+                list(source_values),
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ),
+        }
+        if source.url is not None:
+            if type(source.url) is not str:
+                raise ContractViolation("decision context source URL type changed")
+            live_source["url"] = source.url
+        blocker = self.blocker
+        if type(blocker.occurrences) is not int or type(blocker.resolved) is not bool:
+            raise ContractViolation("decision context blocker scalar type changed")
+        live_blocker = {
+            "fingerprint": blocker.fingerprint,
+            "previous_fingerprint": blocker.previous_fingerprint,
+            "occurrences": blocker.occurrences,
+            "resolved": blocker.resolved,
+        }
+        parent = self.parent_completion
+        if (
+            type(parent.state) is not str
+            or type(parent.verified) is not bool
+            or type(parent.parent_ids) is not tuple
+            or any(type(parent_id) is not str for parent_id in parent.parent_ids)
+        ):
+            raise ContractViolation("decision context parent completion type changed")
+        live_parent: dict[str, Any] = {
+            "state": parent.state,
+            "verified": parent.verified,
+            "parent_ids": list(parent.parent_ids),
+        }
+        if parent.evidence_reference is not None:
+            if type(parent.evidence_reference) is not str:
+                raise ContractViolation(
+                    "decision context parent evidence reference type changed"
+                )
+            live_parent["evidence_reference"] = parent.evidence_reference
+        live_documents = {
+            "execution": live_execution,
+            "source_item": live_source,
+            "blocker": live_blocker,
+            "parent_completion": live_parent,
+            "evidence": self._live_evidence_document(),
+            "policy": self._live_policy_document(),
+        }
+        for field_name, live_document in live_documents.items():
+            if not _exact_json_equal(live_document, snapshot.get(field_name)):
+                raise ContractViolation(
+                    f"decision context {field_name} changed after snapshot"
+                )
+
+        if "prior_decision" not in snapshot:
+            if self.prior_decision is not None or self._prior_snapshot is not None:
+                raise ContractViolation(
+                    "decision context prior_decision changed after snapshot"
+                )
+        else:
+            if (
+                self._prior_snapshot is None
+                or self.prior_decision is not self._prior_snapshot
+                or not _exact_json_equal(
+                    _thaw_snapshot(self._prior_snapshot), snapshot["prior_decision"]
+                )
+            ):
+                raise ContractViolation(
+                    "decision context prior_decision changed after snapshot"
+                )
+
+    def _copy_from_snapshot(self) -> DecisionContext:
+        document = self.as_dict()
+        execution = document["execution"]
+        guards = execution["guards"]
+        source = document["source_item"]
+        blocker = document["blocker"]
+        parent = document["parent_completion"]
+        evidence = document["evidence"]
+        policy = document["policy"]
+        budgets = policy["budgets"]
+
+        def evidence_entries(field_name: str) -> tuple[TypedEvidence, ...]:
+            return tuple(
+                TypedEvidence._from_normalized(entry) for entry in evidence[field_name]
+            )
+
+        copied = DecisionContext(
+            execution=ExecutionIdentity(
+                mode=execution["mode"],
+                profile_name=execution["profile_name"],
+                task_id=execution["current_task"]["id"],
+                run_id=(
+                    execution["current_run"]["id"]
+                    if execution["current_run"] is not None
+                    else None
+                ),
+                retry_count=guards["retry_count"],
+                branch=guards["branch"],
+                tenant=guards["tenant"],
+                singleton_key=guards["singleton_key"],
+                credentials_verified=guards["credentials_verified"],
+                production=guards["production"],
+                production_approved=guards["production_approved"],
+            ),
+            source_item=SourceIdentity(
+                tracker=source["tracker"],
+                project=source["project"],
+                kind=source["kind"],
+                item_key=source["item_key"],
+                url=source.get("url"),
+            ),
+            phase=document["phase"],
+            input_identity=document["input_identity"],
+            semantic_lane=document["semantic_lane"],
+            blocker=BlockerState(
+                fingerprint=blocker.get("fingerprint"),
+                previous_fingerprint=blocker.get("previous_fingerprint"),
+                occurrences=blocker["occurrences"],
+                resolved=blocker["resolved"],
+            ),
+            parent_completion=ParentCompletion(
+                state=parent["state"],
+                verified=parent["verified"],
+                parent_ids=tuple(parent["parent_ids"]),
+                evidence_reference=parent.get("evidence_reference"),
+            ),
+            evidence=EvidenceBundle(
+                scheduler=evidence_entries("scheduler"),
+                worker=evidence_entries("worker"),
+                source=evidence_entries("source"),
+                review=evidence_entries("review"),
+            ),
+            policy=DecisionPolicy(
+                max_prompt_chars=budgets["max_prompt_chars"],
+                max_skill_chars=budgets["max_skill_chars"],
+                max_tool_chars=budgets["max_tool_chars"],
+                max_tools=budgets["max_tools"],
+                max_skills=budgets["max_skills"],
+                conflict_mode=policy["conflict_mode"],
+                allowed_execution_modes=tuple(policy["allowed_execution_modes"]),
+                allowed_actions=tuple(policy["allowed_actions"]),
+                transition_policy=tuple(
+                    (action, next_phase)
+                    for action, next_phase in policy["transition_policy"].items()
+                ),
+                repeated_blocker_threshold=policy["repeated_blocker_threshold"],
+                require_independent_review=policy["require_independent_review"],
+                require_exact_reuse_binding=policy["require_exact_reuse_binding"],
+            ),
+            prior_decision=document.get("prior_decision"),
+        )
+        if not _exact_json_equal(copied.as_dict(), document):
+            raise ContractViolation("decision context snapshot reconstruction drifted")
+        return copied
+
+    def trusted_copy(self) -> DecisionContext:
+        self.assert_integrity()
+        return self._copy_from_snapshot()
+
+    def prior_decision_snapshot(self) -> Mapping[str, Any] | None:
+        return self._prior_snapshot
+
+    def decision_identity_snapshot(self) -> str:
+        if self._snapshot is None:
+            raise ContractViolation("decision context snapshot is missing")
+        value = self._snapshot.get("decision_identity_key")
+        if type(value) is not str:
+            raise ContractViolation("decision identity snapshot is malformed")
+        return value
+
+    def as_dict(self) -> dict[str, Any]:
+        if self._snapshot is None:
+            raise ContractViolation("decision context snapshot is missing")
+        snapshot = _thaw_snapshot(self._snapshot)
+        if type(snapshot) is not dict:
+            raise ContractViolation("decision context snapshot is malformed")
+        return snapshot
 
 
 def _identity_digest(document: Mapping[str, Any], prefix: str) -> str:
+    if type(document) is not dict:
+        raise ContractViolation("identity document must be a trusted built-in mapping")
     encoded = json.dumps(
-        dict(document), sort_keys=True, ensure_ascii=True, separators=(",", ":")
+        document, sort_keys=True, ensure_ascii=True, separators=(",", ":")
     )
     return prefix + hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:32]
 
 
 def decision_identity_key(context: DecisionContext) -> str:
-    """Derive an injective key for the current typed decision identity."""
+    """Return the identity frozen with the typed decision context."""
 
-    return _identity_digest(
-        {
-            "schema": CONTRACT_SCHEMA,
-            "execution": context.execution.as_dict(),
-            "source_key": context.source_item.canonical_key,
-            "phase": _safe_identifier(context.phase, "phase"),
-            "input_identity": _safe_identifier(
-                context.input_identity, "input_identity"
-            ),
-            "semantic_lane": _safe_identifier(context.semantic_lane, "semantic_lane"),
-            "task_id": _safe_identifier(context.execution.task_id, "current_task.id"),
-        },
-        "decision-",
-    )
+    if type(context) is not DecisionContext:
+        raise ContractViolation("context must be an exact DecisionContext")
+    context.assert_integrity()
+    return context.decision_identity_snapshot()
 
 
 def _action_key_from_decision_identity(
@@ -990,7 +1602,7 @@ def _reference_binds_context(
     exact identities are accepted for provider adapters that use them directly.
     """
 
-    if not isinstance(reference, str) or not reference.startswith(f"{kind}-"):
+    if type(reference) is not str or not reference.startswith(f"{kind}-"):
         return False
     suffix = reference[len(kind) + 1 :]
     accepted = {
@@ -1090,14 +1702,11 @@ def _validate_evidence_for_context(context: DecisionContext) -> tuple[str, ...]:
 def conflict_checks(context: DecisionContext) -> tuple[str, ...]:
     """Return contradictions that must prevent a model call."""
 
+    if type(context) is not DecisionContext:
+        return ("malformed decision context: context must be an exact DecisionContext",)
     conflicts: list[str] = []
     try:
-        context.execution.as_dict()
-        context.source_item.as_dict()
-        context.blocker.as_dict()
-        context.parent_completion.as_dict()
-        context.evidence.as_dict()
-        context.policy.as_dict()
+        context = context.trusted_copy()
     except (AttributeError, KeyError, TypeError, ValueError, ContractViolation) as exc:
         return (f"malformed decision context: {exc}",)
 
@@ -1138,6 +1747,9 @@ def conflict_checks(context: DecisionContext) -> tuple[str, ...]:
 def validate_context(context: DecisionContext) -> None:
     """Validate all required context and fail closed on contradictions."""
 
+    if type(context) is not DecisionContext:
+        raise ContractViolation("context must be an exact DecisionContext")
+    context = context.trusted_copy()
     try:
         _safe_identifier(context.phase, "phase")
         _safe_identifier(context.input_identity, "input_identity")
@@ -1184,11 +1796,9 @@ class PromptEnvelope:
 def _check_input_items(value: Any, field_name: str) -> None:
     if value is None:
         return
-    if isinstance(value, (str, bytes, bytearray)) or not isinstance(
-        value, (Mapping, Sequence)
-    ):
+    if type(value) not in {dict, list, tuple}:
         raise ContractViolation(
-            f"{field_name} input must be a bounded mapping or sequence"
+            f"{field_name} input must be an exact dict, list, or tuple"
         )
 
 
@@ -1198,17 +1808,34 @@ def _skill_entries(
     if skills is None:
         return []
     _check_input_items(skills, "skill")
-    if isinstance(skills, Mapping):
+    if type(skills) is dict:
         entries = _bounded_mapping_items(skills, "skill", _MAX_INPUT_ITEMS)
     else:
         entries = _bounded_iterable(skills, "skill", _MAX_INPUT_ITEMS)
     normalized = []
     for entry in entries:
-        if not isinstance(entry, tuple) or len(entry) != 2:
-            raise ContractViolation("skill entry must contain name and text")
-        name, text = entry
-        normalized.append((_safe_identifier(name, "skill.name"), str(text)))
+        if type(entry) is not tuple or tuple.__len__(entry) != 2:
+            raise ContractViolation("skill entry must contain exactly name and text")
+        try:
+            name, text = tuple.__getitem__(entry, 0), tuple.__getitem__(entry, 1)
+        except (IndexError, TypeError):
+            raise ContractViolation("skill entry must contain name and text") from None
+        if type(text) is not str:
+            raise ContractViolation("skill text must be a built-in string")
+        normalized.append((_safe_identifier(name, "skill.name"), text))
     return normalized
+
+
+def _tool_entries(
+    tool_catalog: Mapping[str, Any] | Sequence[str] | None,
+) -> list[str]:
+    if tool_catalog is None:
+        return []
+    _check_input_items(tool_catalog, "tool")
+    entries = _bounded_iterable(tool_catalog, "tool", _MAX_INPUT_ITEMS)
+    if any(type(name) is not str for name in entries):
+        raise ContractViolation("tool names must be built-in strings")
+    return [_safe_identifier(name, "tool.name") for name in entries]
 
 
 def prepare_prompt(
@@ -1220,31 +1847,19 @@ def prepare_prompt(
 ) -> PromptEnvelope:
     """Build an effective bounded prompt and report what was omitted/trimmed."""
 
+    entries = _skill_entries(skills)
+    tool_entries = _tool_entries(tool_catalog)
+    safe_suffix = _redact_text(prompt_suffix)
+    context = context.trusted_copy()
     validate_context(context)
     policy = context.policy
-    safe_suffix = _redact_text(str(prompt_suffix))
     document = json.dumps(context.as_dict(), sort_keys=True, separators=(",", ":"))
     if len(document) > _MAX_CONTEXT_CHARS:
         raise ContractViolation("typed context exceeds the contract character bound")
     if len(document) > policy.max_prompt_chars:
         raise ContractViolation("prompt budget is smaller than typed context")
-    _check_input_items(tool_catalog, "tool")
-    if tool_catalog is None:
-        tool_entries = []
-    elif isinstance(tool_catalog, Mapping):
-        tool_entries = [
-            str(name)
-            for name in _bounded_iterable(tool_catalog, "tool", _MAX_INPUT_ITEMS)
-        ]
-    else:
-        tool_entries = [
-            str(name)
-            for name in _bounded_iterable(tool_catalog, "tool", _MAX_INPUT_ITEMS)
-        ]
     if len(tool_entries) > policy.max_tools:
         raise ContractViolation("effective tool catalog exceeds tool-count budget")
-    if any(not _safe_identifier(name, "tool.name") for name in tool_entries):
-        raise ContractViolation("effective tool catalog contains an empty name")
     tool_text = "\n".join(f"[{name}]" for name in sorted(set(tool_entries)))
     if len(tool_text) > policy.max_tool_chars:
         raise ContractViolation("effective tool catalog exceeds character budget")
@@ -1262,7 +1877,6 @@ def prepare_prompt(
     prefix = (
         f"{instructions}\n\nCONTEXT_JSON\n{document}\nEND_CONTEXT\n\nTOOLS\n{tool_text}"
     )
-    entries = _skill_entries(skills)
     names = [name for name, _ in entries]
     omitted: list[str] = names[policy.max_skills :]
     entries = entries[: policy.max_skills]
@@ -1340,13 +1954,57 @@ def build_prompt(
 def _receipt_digest(receipt: Mapping[str, Any]) -> str:
     """Authenticate the complete sanitized post-proposal receipt payload."""
 
-    document = {key: value for key, value in receipt.items() if key != "receipt_digest"}
-    return (
-        "receipt-"
-        + hashlib.sha256(
-            json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()[:32]
+    normalized = _safe_mapping(receipt, "receipt")
+    document = {
+        key: value for key, value in normalized.items() if key != "receipt_digest"
+    }
+    encoded = json.dumps(
+        document, sort_keys=True, ensure_ascii=True, separators=(",", ":")
     )
+    return "receipt-" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:32]
+
+
+def _validate_receipt_scalar_types(receipt: dict[str, Any], field_name: str) -> None:
+    if type(receipt) is not dict:
+        raise ContractViolation(f"{field_name} must be an exact receipt object")
+    required_fields = {
+        "action",
+        "status",
+        "idempotency_key",
+        "current_run_id",
+        "admission_count",
+        "receipt",
+        "receipt_digest",
+    }
+    allowed_fields = required_fields | {"selected_task_id"}
+    if not required_fields <= set(receipt) or not set(receipt) <= allowed_fields:
+        raise ContractViolation(f"{field_name} receipt fields are malformed")
+    for scalar_name in (
+        "action",
+        "status",
+        "idempotency_key",
+        "receipt",
+        "receipt_digest",
+    ):
+        value = receipt[scalar_name]
+        if type(value) is not str or not value.strip():
+            raise ContractViolation(f"{field_name} {scalar_name} is malformed")
+        _safe_identifier(value, f"{field_name}.{scalar_name}")
+    admission_count = receipt["admission_count"]
+    if type(admission_count) is not int or admission_count < 0:
+        raise ContractViolation(
+            f"{field_name} admission_count must be an exact integer"
+        )
+    current_run_id = receipt["current_run_id"]
+    if current_run_id is not None:
+        if type(current_run_id) is not str:
+            raise ContractViolation(f"{field_name} current_run_id is malformed")
+        _safe_identifier(current_run_id, f"{field_name}.current_run_id")
+    selected_task_id = receipt.get("selected_task_id")
+    if selected_task_id is not None:
+        if type(selected_task_id) is not str:
+            raise ContractViolation(f"{field_name} selected_task_id is malformed")
+        _safe_identifier(selected_task_id, f"{field_name}.selected_task_id")
 
 
 def _validate_observation_trace(
@@ -1354,8 +2012,8 @@ def _validate_observation_trace(
 ) -> tuple[int, int]:
     """Require one ordered proposal and one authenticated receipt payload."""
 
-    if isinstance(trace, (str, bytes)) or not isinstance(trace, Sequence):
-        raise ContractViolation("native fixture trace must be a sequence")
+    if type(trace) not in {list, tuple}:
+        raise ContractViolation("native fixture trace must be an exact list or tuple")
     try:
         trace_entries = _bounded_iterable(
             trace, "native fixture trace", _MAX_NATIVE_TRACE_ENTRIES
@@ -1389,10 +2047,10 @@ def _validate_observation_trace(
     }
     normalized_entries: list[dict[str, Any]] = []
     for index, entry in enumerate(trace_entries):
-        if not isinstance(entry, Mapping):
+        if type(entry) is not dict:
             raise ContractViolation("native fixture trace contains a malformed entry")
         entry = _safe_mapping(entry, f"native fixture trace entry {index}")
-        if not isinstance(entry.get("tool"), str):
+        if type(entry.get("tool")) is not str:
             raise ContractViolation("native fixture trace contains a malformed entry")
         tool_name = entry["tool"]
         if tool_name in trace_fields and set(entry) != trace_fields[tool_name]:
@@ -1477,12 +2135,13 @@ def _validate_observation_trace(
         readback.get("idempotency_key"), "trace.readback.idempotency_key"
     )
     receipt = readback.get("receipt")
-    if not isinstance(receipt, Mapping):
+    if type(receipt) is not dict:
         raise ContractViolation("native fixture trace omitted the receipt payload")
     try:
         receipt_document = _safe_mapping(receipt, "trace.receipt")
     except (TypeError, ValueError, ContractViolation) as exc:
         raise ContractViolation("native fixture trace receipt is malformed") from exc
+    _validate_receipt_scalar_types(receipt_document, "native fixture trace receipt")
     if readback_key != key or receipt_document.get("idempotency_key") != key:
         raise ContractViolation("native fixture trace receipt identity is stale")
     if receipt_document.get("action") != action:
@@ -1535,6 +2194,207 @@ def simulated_action_readback(
     return result
 
 
+def _normalize_native_fixture_receipt(
+    value: Any,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Normalize the native handoff before any tuple operation or reuse."""
+
+    if type(value) is not tuple:
+        raise ContractViolation("native model proposal/receipt handoff is malformed")
+    if tuple.__len__(value) != 2:
+        raise ContractViolation("native model proposal/receipt handoff is malformed")
+    proposal = tuple.__getitem__(value, 0)
+    readback = tuple.__getitem__(value, 1)
+    if type(proposal) is not dict or type(readback) is not dict:
+        raise ContractViolation("native model proposal/receipt handoff is malformed")
+    try:
+        return (
+            _safe_mapping(proposal, "native.proposal"),
+            _safe_mapping(readback, "native.readback"),
+        )
+    except ContractViolation as exc:
+        raise ContractViolation(
+            "native model proposal/receipt handoff is malformed"
+        ) from exc
+
+
+class AtomicActionReservationStore:
+    """Small local CAS store used as the fixture's shared admission authority.
+
+    The default path is thread-safe in-memory state.  Tests that need a
+    process race may provide a temporary JSON path; a stable sidecar lock and
+    atomic replacement then protect the same reservation record across
+    processes without contacting a service or the live board.
+    """
+
+    _STATUSES: ClassVar[dict[str, str]] = {
+        "quarantine": "quarantined",
+        "admit": "admitted",
+        "reuse_existing": "reused",
+        "select_independent_lane": "selected",
+        "repair_artifact": "artifact-remediation",
+        "hold_missing_capability": "held",
+        "hold": "held",
+    }
+
+    def __init__(
+        self,
+        *,
+        current_run_id: str | None = None,
+        state_path: os.PathLike[str] | str | None = None,
+    ) -> None:
+        if current_run_id is not None:
+            _safe_identifier(current_run_id, "reservation.current_run_id")
+        self._initial_current_run_id = current_run_id
+        self._state_path = Path(state_path) if state_path is not None else None
+        self._lock = threading.RLock()
+        self._memory_records: dict[str, dict[str, Any]] = {}
+        self._memory_current_run_id = current_run_id
+
+    @contextmanager
+    def _guard(self):
+        with self._lock:
+            if self._state_path is None:
+                yield
+                return
+            if fcntl is None:
+                raise ContractViolation(
+                    "process-safe reservation fencing is unavailable"
+                )
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(
+                f"{self._state_path}.lock", "a+", encoding="utf-8"
+            ) as lock_stream:
+                fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
+    def _load(self) -> tuple[str | None, dict[str, dict[str, Any]]]:
+        if self._state_path is None:
+            return self._memory_current_run_id, copy.deepcopy(self._memory_records)
+        if not self._state_path.exists():
+            return self._initial_current_run_id, {}
+        try:
+            document = json.loads(self._state_path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError, RecursionError) as exc:
+            raise ContractViolation("reservation state is unreadable") from exc
+        if not isinstance(document, dict):
+            raise ContractViolation("reservation state is malformed")
+        current = document.get("current_run_id")
+        if current is not None:
+            _safe_identifier(current, "reservation.current_run_id")
+        records = document.get("records", {})
+        if not isinstance(records, dict):
+            raise ContractViolation("reservation records are malformed")
+        safe_records = _safe_value(records, "reservation.records")
+        if not isinstance(safe_records, dict):
+            raise ContractViolation("reservation records are malformed")
+        return current, safe_records
+
+    def _save(self, current: str | None, records: Mapping[str, Any]) -> None:
+        if self._state_path is None:
+            self._memory_current_run_id = current
+            self._memory_records = copy.deepcopy(dict(records))
+            return
+        document = {"current_run_id": current, "records": dict(records)}
+        temporary = self._state_path.with_name(
+            f".{self._state_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            temporary.write_text(
+                json.dumps(document, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            os.replace(temporary, self._state_path)
+        except (OSError, TypeError, ValueError) as exc:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+            raise ContractViolation("reservation state cannot be persisted") from exc
+
+    @classmethod
+    def _receipt(
+        cls,
+        action: str,
+        idempotency_key: str,
+        target_task_id: str | None,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "action": action,
+            "status": cls._STATUSES[action],
+            "idempotency_key": idempotency_key,
+            "current_run_id": (
+                "run-"
+                + hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:16]
+                if action == "admit"
+                else None
+            ),
+            "admission_count": 1 if action == "admit" else 0,
+            "receipt": "post_proposal",
+        }
+        if target_task_id is not None:
+            result["selected_task_id"] = target_task_id
+        result["receipt_digest"] = _receipt_digest(result)
+        return result
+
+    def reserve(
+        self,
+        action: str,
+        idempotency_key: str,
+        target_task_id: str | None = None,
+    ) -> dict[str, Any]:
+        action = _safe_identifier(action, "reservation.action")
+        idempotency_key = _safe_identifier(
+            idempotency_key, "reservation.idempotency_key"
+        )
+        if action not in self._STATUSES:
+            raise ContractViolation("reservation action is unsupported")
+        if target_task_id is not None:
+            target_task_id = _safe_identifier(
+                target_task_id, "reservation.target_task_id"
+            )
+        with self._guard():
+            current, records = self._load()
+            existing = records.get(idempotency_key)
+            if existing is not None:
+                if (
+                    existing.get("action") != action
+                    or existing.get("selected_task_id") != target_task_id
+                ):
+                    raise ContractViolation(
+                        "reservation key is bound to another action"
+                    )
+                return copy.deepcopy(existing)
+            if action == "admit" and current is not None:
+                raise ContractViolation(
+                    "atomic admission reservation lost the current-run CAS"
+                )
+            receipt = self._receipt(action, idempotency_key, target_task_id)
+            if action == "admit":
+                current = receipt["current_run_id"]
+            records[idempotency_key] = receipt
+            self._save(current, records)
+            return copy.deepcopy(receipt)
+
+    def read(self, idempotency_key: str) -> dict[str, Any]:
+        idempotency_key = _safe_identifier(
+            idempotency_key, "reservation.readback.idempotency_key"
+        )
+        with self._guard():
+            _current, records = self._load()
+            result = records.get(idempotency_key)
+            if result is None:
+                return {
+                    "status": "not_started",
+                    "idempotency_key": idempotency_key,
+                    "current_run_id": None,
+                }
+            return copy.deepcopy(result)
+
+
 class NoSideEffectFixtureAdapter:
     """Read-only fixture adapter for behavioral evaluations.
 
@@ -1543,14 +2403,38 @@ class NoSideEffectFixtureAdapter:
     attempted write, making accidental side effects observable in tests.
     """
 
-    def __init__(self, state: Mapping[str, Any]) -> None:
-        if not isinstance(state, Mapping):
-            raise ContractViolation("fixture state must be a JSON object")
+    def __init__(
+        self,
+        state: Mapping[str, Any],
+        *,
+        reservation_store: AtomicActionReservationStore | None = None,
+        shared_state: AtomicActionReservationStore | None = None,
+    ) -> None:
+        if type(state) is not dict:
+            raise ContractViolation("fixture state must be an exact JSON object")
+        if reservation_store is not None and shared_state is not None:
+            raise ContractViolation("fixture reservation authority is ambiguous")
         bounded_state = _safe_value(state, "fixture state")
         if not isinstance(bounded_state, dict):
             raise ContractViolation("fixture state must be a JSON object")
         self._state = bounded_state
         self._baseline = copy.deepcopy(self._state)
+        live = self._state.get("live")
+        initial_run = live.get("current_run_id") if isinstance(live, dict) else None
+        if reservation_store is not None:
+            authority = reservation_store
+        else:
+            authority = shared_state
+        if (
+            authority is not None
+            and type(authority) is not AtomicActionReservationStore
+        ):
+            raise ContractViolation("fixture reservation authority is malformed")
+        self._reservation_store = (
+            authority
+            if authority is not None
+            else AtomicActionReservationStore(current_run_id=initial_run)
+        )
         self._reads: list[str] = []
         self._proposal: dict[str, Any] | None = None
         self._external_readback: dict[str, Any] | None = None
@@ -1564,15 +2448,24 @@ class NoSideEffectFixtureAdapter:
     def bind_context(self, context: DecisionContext) -> None:
         """Bind the adapter boundary to one execution identity."""
 
+        if type(context) is not DecisionContext:
+            raise ContractViolation("context must be an exact DecisionContext")
+        context = context.trusted_copy()
         validate_context(context)
         self._context = context
+
+    def _bound_context(self) -> DecisionContext:
+        if self._context is None:
+            raise ContractViolation("fixture action requested before context binding")
+        self._context.assert_integrity()
+        return self._context
 
     @staticmethod
     def _can_propose(context: DecisionContext) -> bool:
         mode = context.execution.mode.casefold()
         profile = context.execution.profile_name.casefold()
         if mode not in {
-            item.casefold() for item in context.policy.allowed_execution_modes
+            item.casefold() for item in context.policy.execution_modes_snapshot()
         }:
             return False
         if mode in {"review", "read_only", "readonly", "worker"}:
@@ -1609,39 +2502,38 @@ class NoSideEffectFixtureAdapter:
         return self._proposal_attempts
 
     def _read(self, name: str, key: str, default: Any) -> Any:
+        self._bound_context()
         self._reads.append(name)
         value = self._state.get(key, default)
         return copy.deepcopy(_safe_value(value, f"fixture.{key}"))
 
     def read_live_state(self) -> dict[str, Any]:
         value = self._read("live", "live", {})
-        if not isinstance(value, Mapping):
+        if type(value) is not dict:
             raise ContractViolation("fixture live state is malformed")
         return dict(value)
 
     def read_parent_completion(self) -> dict[str, Any]:
         value = self._read("parent_completion", "parent", {})
-        if not isinstance(value, Mapping):
+        if type(value) is not dict:
             raise ContractViolation("fixture parent state is malformed")
         return dict(value)
 
     def read_source_state(self) -> dict[str, Any]:
         value = self._read("source", "source", {})
-        if not isinstance(value, Mapping):
+        if type(value) is not dict:
             raise ContractViolation("fixture source state is malformed")
         return dict(value)
 
     def read_ready_lanes(self) -> list[dict[str, Any]]:
         value = self._read("ready_lanes", "ready", [])
-        if not isinstance(value, list) or any(
-            not isinstance(row, Mapping) for row in value
-        ):
+        if type(value) is not list or any(type(row) is not dict for row in value):
             raise ContractViolation("fixture ready-lane state is malformed")
         return [dict(row) for row in value]
 
     def read_capabilities(self) -> dict[str, Any]:
         value = self._read("capabilities", "capabilities", {})
-        if not isinstance(value, Mapping):
+        if type(value) is not dict:
             raise ContractViolation("fixture capability state is malformed")
         return dict(value)
 
@@ -1650,10 +2542,9 @@ class NoSideEffectFixtureAdapter:
     ) -> dict[str, Any]:
         """Return the action/target-bound key without changing fixture state."""
 
-        if self._context is None:
-            raise ContractViolation("action key requested before context binding")
+        context = self._bound_context()
         action = _safe_identifier(action, "action_key.action")
-        if action not in self._context.policy.allowed_actions:
+        if action not in context.policy.actions_snapshot():
             raise ContractViolation("action key requested for a disallowed action")
         target = (
             None
@@ -1664,7 +2555,7 @@ class NoSideEffectFixtureAdapter:
         return {
             "action": action,
             "target_task_id": target,
-            "idempotency_key": action_idempotency_key(self._context, action, target),
+            "idempotency_key": action_idempotency_key(context, action, target),
         }
 
     def propose_action(
@@ -1675,6 +2566,7 @@ class NoSideEffectFixtureAdapter:
     ) -> dict[str, Any]:
         """Record one model proposal without changing fixture state."""
 
+        context = self._bound_context()
         self._proposal_attempts += 1
         if self._proposal is not None:
             raise ContractViolation("fixture accepts only one action proposal")
@@ -1693,31 +2585,32 @@ class NoSideEffectFixtureAdapter:
             raise ContractViolation(
                 "fixture proposal requires complete pre-proposal observations"
             )
-        if self._context is not None and not self._can_propose(self._context):
+        if not self._can_propose(context):
             raise ContractViolation(
                 "execution mode/profile is not permitted to propose an action"
             )
-        if self._context is not None and idempotency_key != action_idempotency_key(
-            self._context, action, target_task_id
-        ):
+        target = (
+            None
+            if target_task_id is None
+            else _safe_identifier(target_task_id, "proposal.target_task_id")
+        )
+        if idempotency_key != action_idempotency_key(context, action, target):
             raise ContractViolation(
                 "proposal idempotency key is not bound to the current context"
             )
-        if self._context is not None:
-            allowed_actions = self._context.policy.allowed_actions
-            if action not in allowed_actions:
-                raise ContractViolation(
-                    "proposal action is not allowed by the current policy"
-                )
+        allowed_actions = context.policy.actions_snapshot()
+        if action not in allowed_actions:
+            raise ContractViolation(
+                "proposal action is not allowed by the current policy"
+            )
         _reject_existing_admission(action, self._state.get("live"))
+        self._reservation_store.reserve(action, idempotency_key, target)
         self._proposal = {
             "action": action,
             "idempotency_key": idempotency_key,
         }
-        if target_task_id is not None:
-            self._proposal["target_task_id"] = _safe_identifier(
-                target_task_id, "proposal.target_task_id"
-            )
+        if target is not None:
+            self._proposal["target_task_id"] = target
         self._reads.append("propose_action")
         return {
             "status": "proposal_recorded",
@@ -1734,13 +2627,12 @@ class NoSideEffectFixtureAdapter:
     ) -> None:
         """Reconcile a proposal and receipt emitted by the native child."""
 
-        if not isinstance(proposal, Mapping) or not isinstance(readback, Mapping):
+        if type(proposal) is not dict or type(readback) is not dict:
             raise ContractViolation("native fixture proposal/receipt is malformed")
         proposal = _safe_mapping(proposal, "native.proposal")
         readback = _safe_mapping(readback, "native.readback")
-        if self._context is None:
-            raise ContractViolation("native fixture proposal is not context-bound")
-        if not self._can_propose(self._context):
+        context = self._bound_context()
+        if not self._can_propose(context):
             raise ContractViolation(
                 "execution mode/profile is not permitted to propose an action"
             )
@@ -1753,7 +2645,7 @@ class NoSideEffectFixtureAdapter:
         )
         trace_entries: list[dict[str, Any]] = []
         for index, entry in enumerate(raw_trace_entries):
-            if not isinstance(entry, Mapping):
+            if type(entry) is not dict:
                 raise ContractViolation(
                     "native fixture trace contains a malformed entry"
                 )
@@ -1764,7 +2656,7 @@ class NoSideEffectFixtureAdapter:
         trace_proposal = trace_entries[proposal_index]
         trace_readback = trace_entries[readback_index]
         action = _safe_identifier(proposal.get("action"), "proposal.action")
-        if action not in self._context.policy.allowed_actions:
+        if action not in context.policy.actions_snapshot():
             raise ContractViolation(
                 "native fixture proposal action is not allowed by the current policy"
             )
@@ -1774,7 +2666,7 @@ class NoSideEffectFixtureAdapter:
         key = _safe_identifier(
             proposal.get("idempotency_key"), "proposal.idempotency_key"
         )
-        if key != action_idempotency_key(self._context, action, target):
+        if key != action_idempotency_key(context, action, target):
             raise ContractViolation(
                 "native fixture proposal key is not bound to the current context"
             )
@@ -1792,8 +2684,11 @@ class NoSideEffectFixtureAdapter:
         if self._proposal is not None:
             raise ContractViolation("fixture accepts only one action proposal")
         sanitized = readback
+        _validate_receipt_scalar_types(sanitized, "native fixture receipt")
         trace_receipt = trace_readback.get("receipt")
-        if not isinstance(trace_receipt, Mapping) or trace_receipt != sanitized:
+        if type(trace_receipt) is not dict or not _exact_json_equal(
+            trace_receipt, sanitized
+        ):
             raise ContractViolation("native fixture receipt differs from its trace")
         if sanitized.get("idempotency_key") != key:
             raise ContractViolation("native fixture receipt identity is stale")
@@ -1801,6 +2696,15 @@ class NoSideEffectFixtureAdapter:
             raise ContractViolation("native fixture receipt is not post-proposal")
         if sanitized.get("receipt_digest") != _receipt_digest(sanitized):
             raise ContractViolation("native fixture receipt digest is invalid")
+        authoritative = self._reservation_store.reserve(action, key, target)
+        if not _exact_json_equal(self._reservation_store.read(key), authoritative):
+            raise ContractViolation(
+                "native fixture reservation readback is not authoritative"
+            )
+        if not _exact_json_equal(sanitized, authoritative):
+            raise ContractViolation(
+                "native fixture receipt is not the authoritative reservation readback"
+            )
         self._proposal_attempts += 1
         self._proposal = {"action": action, "idempotency_key": key}
         if target is not None:
@@ -1808,9 +2712,10 @@ class NoSideEffectFixtureAdapter:
                 target, "proposal.target_task_id"
             )
         self._reads.append("propose_action")
-        self._external_readback = sanitized
+        self._external_readback = copy.deepcopy(authoritative)
 
     def read_action_readback(self, idempotency_key: str) -> dict[str, Any]:
+        self._bound_context()
         self._reads.append("action_readback")
         idempotency_key = _safe_identifier(idempotency_key, "readback.idempotency_key")
         if self._proposal is None:
@@ -1826,14 +2731,13 @@ class NoSideEffectFixtureAdapter:
             self._postproposal_receipt_reads += 1
             live = self.read_live_state()
             _reject_existing_admission(self._proposal["action"], live)
-            if self._external_readback is not None:
-                result = copy.deepcopy(self._external_readback)
-            else:
-                result = simulated_action_readback(
-                    self._proposal["action"],
-                    idempotency_key,
-                    self._proposal.get("target_task_id"),
-                )
+            result = self._reservation_store.read(idempotency_key)
+            if result.get("status") == "not_started":
+                raise ContractViolation("reservation readback is missing")
+            if self._external_readback is not None and not _exact_json_equal(
+                result, self._external_readback
+            ):
+                raise ContractViolation("reservation readback changed after acceptance")
         self._last_readback = copy.deepcopy(result)
         return result
 
@@ -1854,7 +2758,7 @@ class NoSideEffectFixtureAdapter:
         self._forbid("set_status")
 
     def unchanged(self) -> bool:
-        return self._state == self._baseline
+        return _exact_json_equal(self._state, self._baseline)
 
 
 @dataclass(frozen=True)
@@ -1867,7 +2771,7 @@ class DecisionProposal:
 
     @classmethod
     def from_response(cls, response: Mapping[str, Any]) -> DecisionProposal:
-        if not isinstance(response, Mapping):
+        if type(response) is not dict:
             raise ContractViolation("model response must be an object")
         response = _safe_mapping(response, "model response")
         if set(response) != set(DECISION_LADDER):
@@ -1877,7 +2781,7 @@ class DecisionProposal:
         values = {}
         for step in DECISION_LADDER:
             value = response.get(step)
-            if not isinstance(value, Mapping):
+            if type(value) is not dict:
                 raise ContractViolation(
                     f"decision step {step} must be a non-empty object"
                 )
@@ -1898,14 +2802,12 @@ class DecisionProposal:
                             and (
                                 value[field] is None
                                 or (
-                                    isinstance(value[field], str)
+                                    type(value[field]) is str
                                     and bool(value[field].strip())
                                 )
                             )
                         )
-                        or (
-                            isinstance(value[field], str) and bool(value[field].strip())
-                        )
+                        or (type(value[field]) is str and bool(value[field].strip()))
                     )
                 ]
                 if not valid_fields:
@@ -1950,30 +2852,29 @@ def _state_identity_matches(
         ("input_identity", context.input_identity),
         ("semantic_lane", context.semantic_lane),
     ):
-        if field_name in state and state[field_name] != expected:
+        if field_name in state and not _exact_json_equal(state[field_name], expected):
             raise ContractViolation(f"{label} {field_name} does not match context")
     source_item = state.get("source_item")
     if source_item is not None:
-        if not isinstance(source_item, Mapping):
+        if type(source_item) is not dict:
             raise ContractViolation(f"{label} source identity is malformed")
-        if source_item.get("canonical_key") != source_key:
+        if not _exact_json_equal(source_item.get("canonical_key"), source_key):
             raise ContractViolation(f"{label} source identity does not match context")
 
 
 def _validate_parent_state(context: DecisionContext, parent: Mapping[str, Any]) -> None:
     """Reconcile the post-model parent read with the bound context."""
 
-    if not isinstance(parent, Mapping):
+    if type(parent) is not dict:
         raise ContractViolation("fixture parent state is malformed")
     expected = context.parent_completion.as_dict()
     for field_name in ("state", "verified", "parent_ids"):
-        if parent.get(field_name) != expected[field_name]:
+        if not _exact_json_equal(parent.get(field_name), expected[field_name]):
             raise ContractViolation(
                 f"parent completion {field_name} does not match context"
             )
-    if (
-        "evidence_reference" in expected
-        and parent.get("evidence_reference") != expected["evidence_reference"]
+    if "evidence_reference" in expected and not _exact_json_equal(
+        parent.get("evidence_reference"), expected["evidence_reference"]
     ):
         raise ContractViolation("parent completion evidence does not match context")
     _state_identity_matches(parent, context, label="parent completion")
@@ -2002,7 +2903,7 @@ def _validate_fixture_state(
         raise ContractViolation("fixture artifact state is unknown or malformed")
     artifact_task_id = source.get("artifact_task_id")
     if artifact_task_id is not None:
-        if not isinstance(artifact_task_id, str) or not artifact_task_id.strip():
+        if type(artifact_task_id) is not str or not artifact_task_id.strip():
             raise ContractViolation("fixture artifact task identity is malformed")
         _safe_identifier(artifact_task_id, "fixture source.artifact_task_id")
     if (
@@ -2017,9 +2918,7 @@ def _validate_fixture_state(
     for entry in source_evidence:
         attributes = entry.as_dict().get("attributes", {})
         observed_artifact = (
-            attributes.get("artifact_state")
-            if isinstance(attributes, Mapping)
-            else None
+            attributes.get("artifact_state") if type(attributes) is dict else None
         )
         if observed_artifact != artifact_state:
             raise ContractViolation(
@@ -2033,27 +2932,27 @@ def _validate_fixture_state(
     )
     for state, label in ((live, "lane"), (source, "source")):
         for field_name, expected in identity_fields:
-            if field_name not in state or state[field_name] != expected:
+            if field_name not in state or not _exact_json_equal(
+                state[field_name], expected
+            ):
                 raise ContractViolation(
                     f"{label} state {field_name} does not match context"
                 )
     if "current_run_id" not in live:
         raise ContractViolation("fixture lane state has no current-run field")
-    if live["current_run_id"] is not None and not isinstance(
-        live["current_run_id"], str
-    ):
+    if live["current_run_id"] is not None and type(live["current_run_id"]) is not str:
         raise ContractViolation("fixture lane current-run field is malformed")
     if live["current_run_id"] is not None:
         _safe_identifier(live["current_run_id"], "fixture lane current_run_id")
-    if live["current_run_id"] != context.execution.run_id:
+    if not _exact_json_equal(live["current_run_id"], context.execution.run_id):
         raise ContractViolation("fixture lane current-run does not match context")
     if "current_run_id" not in source:
         raise ContractViolation("fixture source state has no current-run field")
-    if source["current_run_id"] != context.execution.run_id:
+    if not _exact_json_equal(source["current_run_id"], context.execution.run_id):
         raise ContractViolation("fixture source current-run does not match context")
     _state_identity_matches(live, context, label="lane state")
     blocker = live.get("blocker")
-    if not isinstance(blocker, Mapping):
+    if type(blocker) is not dict:
         raise ContractViolation("fixture blocker state is malformed")
     if any(
         field_name not in blocker
@@ -2065,13 +2964,9 @@ def _validate_fixture_state(
         )
     ):
         raise ContractViolation("fixture blocker state is incomplete")
-    if (
-        not isinstance(blocker["occurrences"], int)
-        or isinstance(blocker["occurrences"], bool)
-        or blocker["occurrences"] < 0
-    ):
+    if type(blocker["occurrences"]) is not int or blocker["occurrences"] < 0:
         raise ContractViolation("fixture blocker occurrences are malformed")
-    if not isinstance(blocker["resolved"], bool):
+    if type(blocker["resolved"]) is not bool:
         raise ContractViolation("fixture blocker resolution is malformed")
     for field_name in ("fingerprint", "previous_fingerprint"):
         value = blocker[field_name]
@@ -2079,21 +2974,22 @@ def _validate_fixture_state(
             _safe_identifier(value, f"fixture blocker.{field_name}")
     expected_blocker = context.blocker.as_dict()
     for field_name, expected in expected_blocker.items():
-        if blocker.get(field_name) != expected:
+        if not _exact_json_equal(blocker.get(field_name), expected):
             raise ContractViolation(
                 f"fixture blocker {field_name} does not match context"
             )
     existing = live.get("existing_action")
     if existing is not None:
-        if not isinstance(existing, Mapping):
+        if type(existing) is not dict:
             raise ContractViolation("fixture existing action is malformed")
         _state_identity_matches(existing, context, label="existing action")
         if existing.get("status") not in {"blocked", "held", "running", "completed"}:
             raise ContractViolation("fixture existing action has an unknown status")
         if "current_run_id" not in existing:
             raise ContractViolation("fixture existing action has no current-run field")
-        if existing["current_run_id"] is not None and not isinstance(
-            existing["current_run_id"], str
+        if (
+            existing["current_run_id"] is not None
+            and type(existing["current_run_id"]) is not str
         ):
             raise ContractViolation("fixture existing action current-run is malformed")
         if existing["current_run_id"] is not None:
@@ -2113,14 +3009,14 @@ def _validate_fixture_state(
                 raise ContractViolation(
                     "fixture running action is bound to a foreign current run"
                 )
-        if "task_id" not in existing or not isinstance(existing["task_id"], str):
+        if "task_id" not in existing or type(existing["task_id"]) is not str:
             raise ContractViolation("fixture existing action has no task identity")
         _safe_identifier(existing["task_id"], "fixture existing action.task_id")
 
     seen_tasks: set[str] = set()
     for row in ready:
         task_id = row.get("task_id")
-        if not isinstance(task_id, str) or not task_id.strip():
+        if type(task_id) is not str or not task_id.strip():
             raise ContractViolation("fixture ready lane has no task identity")
         _safe_identifier(task_id, "fixture ready lane.task_id")
         if task_id in seen_tasks or task_id == context.execution.task_id:
@@ -2133,7 +3029,7 @@ def _validate_fixture_state(
             ("input_identity", context.input_identity),
             ("semantic_lane", context.semantic_lane),
         ):
-            if field_name in row and row[field_name] != expected:
+            if field_name in row and not _exact_json_equal(row[field_name], expected):
                 raise ContractViolation(
                     f"ready lane {field_name} does not match context"
                 )
@@ -2141,8 +3037,8 @@ def _validate_fixture_state(
     if "missing" not in capabilities:
         raise ContractViolation("fixture capability evidence is incomplete")
     missing = capabilities["missing"]
-    if not isinstance(missing, list) or any(
-        not isinstance(item, str) or not item.strip() for item in missing
+    if type(missing) is not list or any(
+        type(item) is not str or not item.strip() for item in missing
     ):
         raise ContractViolation("fixture capability evidence is malformed")
     for item in missing:
@@ -2152,10 +3048,10 @@ def _validate_fixture_state(
 def _reject_existing_admission(action: str, live: Mapping[str, Any] | None) -> None:
     """Reject duplicate admission before a fixture can allocate a run."""
 
-    if action != "admit" or not isinstance(live, Mapping):
+    if action != "admit" or type(live) is not dict:
         return
     existing = live.get("existing_action")
-    if not isinstance(existing, Mapping):
+    if type(existing) is not dict:
         return
     if existing.get("status") == "completed":
         raise ContractViolation(
@@ -2190,7 +3086,7 @@ def _expected_action(
         return "hold_missing_capability"
 
     existing = live.get("existing_action")
-    if isinstance(existing, Mapping) and existing.get("status") == "completed":
+    if type(existing) is dict and existing.get("status") == "completed":
         if existing.get("current_run_id") is not None:
             raise ContractViolation(
                 "completed existing action has a current run identity"
@@ -2209,7 +3105,7 @@ def _expected_action(
                 "completed existing action is not bound to this lane"
             )
         return "reuse_existing"
-    if isinstance(existing, Mapping) and existing.get("status") == "blocked":
+    if type(existing) is dict and existing.get("status") == "blocked":
         if not context.blocker.fingerprint:
             raise ContractViolation(
                 "existing blocked action has no blocker fingerprint"
@@ -2259,7 +3155,8 @@ def _validate_admission_guards(
         or not context.parent_completion.verified
     ):
         raise ContractViolation("admission requires verified parent completion")
-    if context.prior_decision:
+    prior_decision = context.prior_decision_snapshot()
+    if prior_decision is not None and len(prior_decision) > 0:
         raise ContractViolation("admission cannot reuse historical decision progress")
     for evidence in context.evidence.worker:
         if evidence.status != "not_started" or evidence.run_id is not None:
@@ -2293,12 +3190,14 @@ def _validate_admission_guards(
     )
     for state, label in ((live, "lane"), (source, "source")):
         for field_name, expected in identity_fields:
-            if field_name not in state or state[field_name] != expected:
+            if field_name not in state or not _exact_json_equal(
+                state[field_name], expected
+            ):
                 raise ContractViolation(
                     f"admission {label} {field_name} does not match context"
                 )
     existing = live.get("existing_action")
-    if isinstance(existing, Mapping) and (
+    if type(existing) is dict and (
         "current_run_id" not in existing or existing.get("current_run_id") is not None
     ):
         raise ContractViolation("admission cannot bypass an existing current run")
@@ -2312,7 +3211,7 @@ def _validate_admission_guards(
         ("retry_count", context.execution.retry_count),
     )
     for field_name, expected in guard_fields:
-        if field_name not in live or live[field_name] != expected:
+        if field_name not in live or not _exact_json_equal(live[field_name], expected):
             raise ContractViolation(f"admission {field_name} does not match context")
 
 
@@ -2322,6 +3221,13 @@ def _validate_action_semantics(
     readback: Mapping[str, Any],
     adapter: NoSideEffectFixtureAdapter,
 ) -> str:
+    if type(proposal) is not DecisionProposal:
+        raise ContractViolation("proposal must be an exact DecisionProposal")
+    if type(readback) is not dict or type(proposal.read_back) is not dict:
+        raise ContractViolation("readback payloads must be exact receipt objects")
+    _validate_receipt_scalar_types(proposal.read_back, "model read-back")
+    _validate_receipt_scalar_types(readback, "adapter read-back")
+    context = context.trusted_copy()
     choice_action = _required(proposal.choose.get("action"), "choose.action")
     act_action = _required(proposal.act.get("action"), "act.action")
     action = choice_action
@@ -2329,7 +3235,7 @@ def _validate_action_semantics(
         raise ContractViolation(
             "decision conflict: choose and act name different actions"
         )
-    if action not in context.policy.allowed_actions:
+    if action not in context.policy.actions_snapshot():
         raise ContractViolation(f"unsupported action: {action}")
 
     recorded_proposal = adapter.proposal
@@ -2372,7 +3278,7 @@ def _validate_action_semantics(
     ):
         raise ContractViolation(f"{action} target is not bound to the current task")
     if action == "select_independent_lane" and (
-        not isinstance(choose_target, str) or not choose_target.strip()
+        type(choose_target) is not str or not choose_target.strip()
     ):
         raise ContractViolation("independent-lane selection needs a target task")
     if action == "reuse_existing":
@@ -2381,7 +3287,7 @@ def _validate_action_semantics(
             raise ContractViolation("reuse target is not the bound existing task")
     if action == "repair_artifact":
         artifact_target = source.get("artifact_task_id")
-        if not isinstance(artifact_target, str) or not artifact_target.strip():
+        if type(artifact_target) is not str or not artifact_target.strip():
             raise ContractViolation("artifact repair lacks a failed artifact task")
         if choose_target != artifact_target:
             raise ContractViolation(
@@ -2412,7 +3318,7 @@ def _validate_action_semantics(
     if readback.get("receipt_digest") != _receipt_digest(readback):
         raise ContractViolation("readback receipt digest is invalid")
 
-    if dict(proposal.read_back) != dict(readback):
+    if not _exact_json_equal(proposal.read_back, readback):
         raise ContractViolation(
             "readback conflict: model did not copy the exact receipt payload"
         )
@@ -2424,7 +3330,7 @@ def _validate_action_semantics(
 
     claimed_run = proposal.read_back.get("current_run_id")
     actual_run = readback.get("current_run_id")
-    if claimed_run != actual_run:
+    if not _exact_json_equal(claimed_run, actual_run):
         raise ContractViolation("readback conflict: model run differs from adapter")
     for field_name in (
         "action",
@@ -2436,9 +3342,8 @@ def _validate_action_semantics(
         "receipt",
         "receipt_digest",
     ):
-        if (
-            field_name in readback
-            and proposal.read_back.get(field_name) != readback[field_name]
+        if field_name in readback and not _exact_json_equal(
+            proposal.read_back.get(field_name), readback[field_name]
         ):
             raise ContractViolation(
                 f"readback conflict: model did not copy exact {field_name} payload"
@@ -2472,13 +3377,15 @@ def _validate_action_semantics(
             )
         if not actual_run:
             raise ContractViolation("new admission must return a current run")
-        if readback.get("admission_count", 1) != 1:
+        if readback["admission_count"] != 1:
             raise ContractViolation(
                 "new admission must allocate exactly one current run"
             )
     else:
         if actual_run is not None:
             raise ContractViolation(f"{action} cannot claim a current run")
+        if readback["admission_count"] != 0:
+            raise ContractViolation(f"{action} cannot claim an admission")
 
     if action == "quarantine":
         blocker = live.get("blocker", {})
@@ -2523,7 +3430,7 @@ def _validate_action_semantics(
         raise ContractViolation("capability hold lacks a missing capability")
 
     next_phase = _required(proposal.advance.get("next_phase"), "advance.next_phase")
-    transition = dict(context.policy.transition_policy)
+    transition = context.policy.transitions_snapshot()
     configured_next_phase = transition.get(action)
     if configured_next_phase is None:
         raise ContractViolation(f"policy has no transition for action {action!r}")
@@ -2552,6 +3459,10 @@ def evaluate_decision(
 ) -> DecisionResult:
     """Run one bounded model/tool decision and verify its read-only readback."""
 
+    if type(context) is not DecisionContext:
+        raise ContractViolation("context must be an exact DecisionContext")
+    if type(adapter) is not NoSideEffectFixtureAdapter:
+        raise ContractViolation("adapter must be an exact NoSideEffectFixtureAdapter")
     validate_context(context)
     adapter.bind_context(context)
     tools: dict[str, Callable[..., Any]] = {
@@ -2579,17 +3490,9 @@ def evaluate_decision(
             raise ContractViolation(
                 "model did not commit exactly one fixture proposal; controller will not auto-propose"
             )
-        if (
-            not isinstance(native_receipt, tuple)
-            or len(native_receipt) != 2
-            or not isinstance(native_receipt[0], Mapping)
-            or not isinstance(native_receipt[1], Mapping)
-        ):
-            raise ContractViolation(
-                "native model proposal/receipt handoff is malformed"
-            )
+        native_receipt = _normalize_native_fixture_receipt(native_receipt)
         native_trace = getattr(model, "native_trace", None)
-        if not isinstance(native_trace, tuple):
+        if type(native_trace) is not tuple:
             raise ContractViolation("native model proposal has no ordered trace proof")
         adapter.accept_external_proposal(
             native_receipt[0], native_receipt[1], trace=native_trace
@@ -2632,6 +3535,7 @@ __all__ = [
     "CONTRACT_SCHEMA",
     "DECISION_LADDER",
     "DECISION_REQUIRED_FIELDS",
+    "AtomicActionReservationStore",
     "BlockerState",
     "ContractViolation",
     "DecisionContext",

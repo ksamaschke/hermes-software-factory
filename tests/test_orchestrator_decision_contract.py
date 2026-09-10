@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import multiprocessing
 import sys
+import threading
 from collections.abc import Iterator, Mapping
 from dataclasses import replace
 from pathlib import Path
@@ -432,12 +434,12 @@ def test_secret_private_path_and_resource_bounds_fail_closed():
                 f"tool-{index}" for index in range(contract._MAX_INPUT_ITEMS + 1)
             ],
         )
-    with pytest.raises(contract.ContractViolation, match="bounded mapping or sequence"):
+    with pytest.raises(contract.ContractViolation, match="exact dict, list, or tuple"):
         contract.prepare_prompt(
             _context("iterator-skills", {}),
             skills=((f"skill-{index}", "safe") for index in range(3)),
         )
-    with pytest.raises(contract.ContractViolation, match="bounded mapping or sequence"):
+    with pytest.raises(contract.ContractViolation, match="exact dict, list, or tuple"):
         contract.prepare_prompt(
             _context("iterator-tools", {}),
             tool_catalog=(f"tool-{index}" for index in range(3)),
@@ -479,11 +481,10 @@ def test_fixture_adapter_bounds_hostile_mapping_before_materialization():
             return self.item_count
 
     state = HostileMapping(contract._MAX_SAFE_VALUE_ITEMS * 4)
-    with pytest.raises(contract.ContractViolation, match="exceeds the contract bound"):
+    with pytest.raises(contract.ContractViolation, match="exact JSON object"):
         contract.NoSideEffectFixtureAdapter(state)
-    expected_consumption = contract._MAX_SAFE_VALUE_ITEMS + 1
-    assert state.yielded == expected_consumption
-    assert state.lookups == contract._MAX_SAFE_VALUE_ITEMS
+    assert state.yielded == 0
+    assert state.lookups == 0
     assert state.items_called == 0
 
 
@@ -566,9 +567,8 @@ def test_all_untrusted_mapping_ingresses_are_bounded_before_materialization(ingr
 
     with pytest.raises(contract.ContractViolation):
         operation()
-    expected_consumption = contract._MAX_SAFE_VALUE_ITEMS + 1
-    assert hostile.yielded == expected_consumption
-    assert hostile.lookups == contract._MAX_SAFE_VALUE_ITEMS
+    assert hostile.yielded == 0
+    assert hostile.lookups == 0
     assert hostile.items_called == 0
 
 
@@ -602,12 +602,12 @@ def test_nested_lying_sequences_use_builtins_and_reject_before_overbound_copy():
         LyingList(range(contract._MAX_SAFE_VALUE_ITEMS + 1)),
         LyingTuple(range(contract._MAX_SAFE_VALUE_ITEMS + 1)),
     ):
-        with pytest.raises(contract.ContractViolation, match="sequence exceeds"):
+        with pytest.raises(contract.ContractViolation, match="unsupported value"):
             contract._safe_value(sequence)
         assert sequence.iter_calls == 0
 
     nested = [LyingList([LyingTuple(range(contract._MAX_SAFE_VALUE_ITEMS + 1))])]
-    with pytest.raises(contract.ContractViolation, match="sequence exceeds"):
+    with pytest.raises(contract.ContractViolation, match="unsupported value"):
         contract._safe_value(nested)
     assert nested[0].iter_calls == 0
     assert nested[0][0].iter_calls == 0
@@ -1250,14 +1250,15 @@ def test_context_and_lying_sequences_are_bounded_without_len_trust():
     )
     with pytest.raises(contract.ContractViolation, match="context"):
         contract.validate_context(oversized)
+    policy_base = _context("lying-policy", {})
     policy = replace(
-        oversized.policy,
+        policy_base.policy,
         allowed_execution_modes=LyingSequence(
             ["scheduled"] + [f"mode-{index}" for index in range(100)]
         ),
     )
-    with pytest.raises(contract.ContractViolation, match="execution_modes"):
-        contract.validate_context(replace(oversized, policy=policy))
+    with pytest.raises(contract.ContractViolation, match="policy.execution_modes"):
+        replace(policy_base, policy=policy)
     with pytest.raises(
         contract.ContractViolation, match="parent_completion.parent_ids"
     ):
@@ -1313,3 +1314,522 @@ def test_foreign_running_action_is_rejected_before_decision():
             context,
             contract.NoSideEffectFixtureAdapter(state),
         )
+
+
+def test_evidence_is_frozen_before_later_validation_passes():
+    class RaisingIterationList(list):
+        def __iter__(self):
+            raise RuntimeError("caller-owned evidence was iterated after ingress")
+
+    base = _context("evidence-single-pass", {})
+    with pytest.raises(contract.ContractViolation, match="evidence.scheduler"):
+        contract.EvidenceBundle(
+            scheduler=RaisingIterationList(list(base.evidence.scheduler)),
+            worker=base.evidence.worker,
+            source=base.evidence.source,
+            review=base.evidence.review,
+        )
+
+
+def test_policy_membership_and_transition_use_the_normalized_snapshot():
+    class LyingActions(tuple):
+        def __contains__(self, value):
+            return value == "admit" or tuple.__contains__(self, value)
+
+    base = _context(
+        "policy-membership-snapshot",
+        {
+            "blocker": {
+                "fingerprint": "contract:v2",
+                "previous_fingerprint": "contract:v1",
+                "resolved": True,
+            }
+        },
+    )
+    policy = replace(
+        base.policy,
+        allowed_actions=LyingActions(("hold",)),
+    )
+    with pytest.raises(contract.ContractViolation, match="policy.allowed_actions"):
+        replace(base, policy=policy)
+
+
+def test_transition_policy_cannot_drift_between_prompt_and_admission():
+    class StatefulTransitions(list):
+        def __iter__(self):
+            return iter((("hold", "release"),))
+
+    base = _context("policy-transition-snapshot", {})
+    policy = replace(
+        base.policy,
+        allowed_actions=("hold",),
+        transition_policy=StatefulTransitions([("hold", "current_phase")]),
+    )
+    with pytest.raises(contract.ContractViolation, match="policy.transition_policy"):
+        replace(base, policy=policy)
+
+    object.__setattr__(base.policy, "transition_policy", (("hold", "release"),))
+    with pytest.raises(
+        contract.ContractViolation, match="policy changed after snapshot"
+    ):
+        contract.validate_context(base)
+
+
+def test_admission_uses_normalized_prior_decision_not_hostile_truthiness():
+    class LyingLengthMapping(Mapping):
+        def __iter__(self):
+            return iter(("historical",))
+
+        def __getitem__(self, key):
+            if key == "historical":
+                return "progress"
+            raise KeyError(key)
+
+        def __len__(self):
+            return 0
+
+    base = _context(
+        "prior-decision-snapshot",
+        {
+            "blocker": {
+                "fingerprint": "contract:v2",
+                "previous_fingerprint": "contract:v1",
+                "resolved": True,
+            }
+        },
+    )
+    with pytest.raises(contract.ContractViolation, match="prior_decision.*exact dict"):
+        replace(base, prior_decision=LyingLengthMapping())
+
+
+def test_skill_and_tool_ingress_rejects_hostile_values_before_conversion():
+    class HostileTuple(tuple):
+        def __len__(self):
+            raise RuntimeError("hostile tuple len")
+
+        def __getitem__(self, index):
+            raise RuntimeError("hostile tuple index")
+
+    class HostileText:
+        def __str__(self):
+            raise RuntimeError("hostile text conversion")
+
+    context = _context("hostile-ingress", {})
+    with pytest.raises(contract.ContractViolation, match="skill entry"):
+        contract.prepare_prompt(context, [HostileTuple(("name", "text"))])
+    with pytest.raises(contract.ContractViolation, match="skill entry"):
+        contract.prepare_prompt(context, [("name", "text", "hidden")])
+    with pytest.raises(contract.ContractViolation, match="skill"):
+        contract.prepare_prompt(context, [("name", HostileText())])
+    with pytest.raises(contract.ContractViolation, match="tool"):
+        contract.prepare_prompt(context, tool_catalog=[HostileText()])
+
+    class ExplodingToolDict(dict):
+        def __iter__(self):
+            raise RuntimeError("overridden tool-catalog iteration must not run")
+
+    with pytest.raises(contract.ContractViolation, match="tool input"):
+        contract.prepare_prompt(
+            context, tool_catalog=ExplodingToolDict({"read_state": object()})
+        )
+
+
+def test_native_receipt_is_normalized_before_tuple_operations():
+    class HostileTuple(tuple):
+        def __len__(self):
+            raise RuntimeError("hostile receipt len")
+
+        def __getitem__(self, index):
+            raise RuntimeError("hostile receipt index")
+
+    context = _context("hostile-native-receipt", {})
+    adapter = contract.NoSideEffectFixtureAdapter(_fixture_state(context))
+
+    class NativeReceiptModel:
+        native_fixture_receipt = HostileTuple(({}, {}))
+        native_trace = ()
+
+        def complete(self, prompt, tools):
+            del prompt, tools
+            return {
+                "diagnose": {"summary": "hold"},
+                "choose": {"action": "hold"},
+                "act": {"action": "hold", "idempotency_key": "key"},
+                "read_back": {
+                    "idempotency_key": "key",
+                    "status": "held",
+                    "current_run_id": None,
+                },
+                "advance": {"next_phase": "triage"},
+            }
+
+    with pytest.raises(contract.ContractViolation, match="native model"):
+        contract.evaluate_decision(NativeReceiptModel(), context, adapter)
+
+
+def test_dict_subclass_iteration_cannot_bypass_the_builtin_bound():
+    class ExplodingDict(dict):
+        def __iter__(self):
+            raise RuntimeError("overridden dict iteration must not run")
+
+    with pytest.raises(contract.ContractViolation, match="unsupported value"):
+        contract._safe_value(ExplodingDict({"safe": "value"}))
+
+
+def test_receipt_digest_does_not_call_untrusted_items():
+    receipt = contract.simulated_action_readback("hold", "receipt-key")
+
+    class RaisingItemsMapping(Mapping):
+        def __iter__(self):
+            return iter(receipt)
+
+        def __getitem__(self, key):
+            return receipt[key]
+
+        def __len__(self):
+            return len(receipt)
+
+        def items(self):
+            raise RuntimeError("unbounded hostile items")
+
+    with pytest.raises(
+        contract.ContractViolation, match="receipt must be an exact dict"
+    ):
+        contract._receipt_digest(RaisingItemsMapping())
+
+
+def test_safe_values_and_typed_numeric_fields_reject_scalar_subclasses():
+    class HostileInt(int):
+        pass
+
+    class HostileFloat(float):
+        pass
+
+    class HostileText(str):
+        pass
+
+    for value in (HostileInt(7), HostileFloat(1.25), HostileText("value")):
+        with pytest.raises(contract.ContractViolation, match="unsupported|built-in"):
+            contract._safe_value(value, "hostile scalar")
+
+    with pytest.raises(contract.ContractViolation, match="retry count"):
+        contract.ExecutionIdentity(
+            mode="scheduled",
+            profile_name="orchestrator",
+            task_id="task-1",
+            retry_count=HostileInt(0),
+        ).as_dict()
+    with pytest.raises(contract.ContractViolation, match="budgets"):
+        contract.DecisionPolicy(max_tools=HostileInt(16)).as_dict()
+    with pytest.raises(contract.ContractViolation, match="occurrences"):
+        contract.BlockerState(occurrences=HostileInt(0)).as_dict()
+
+    receipt = contract.simulated_action_readback("admit", "typed-receipt-key")
+    for malformed_count in (True, HostileInt(1), 1.0):
+        malformed = dict(receipt)
+        malformed["admission_count"] = malformed_count
+        with pytest.raises(contract.ContractViolation, match="exact integer"):
+            contract._validate_receipt_scalar_types(malformed, "test receipt")
+
+
+def test_decision_context_rejects_subclassed_typed_components_before_dispatch():
+    base = _context("exact-context-components", {})
+
+    class ExecutionSubclass(contract.ExecutionIdentity):
+        pass
+
+    class SourceSubclass(contract.SourceIdentity):
+        pass
+
+    class BlockerSubclass(contract.BlockerState):
+        pass
+
+    class ParentSubclass(contract.ParentCompletion):
+        pass
+
+    class EvidenceSubclass(contract.EvidenceBundle):
+        pass
+
+    class PolicySubclass(contract.DecisionPolicy):
+        pass
+
+    replacements = (
+        (
+            "execution",
+            ExecutionSubclass(
+                mode=base.execution.mode,
+                profile_name=base.execution.profile_name,
+                task_id=base.execution.task_id,
+            ),
+            "ExecutionIdentity",
+        ),
+        (
+            "source_item",
+            SourceSubclass(
+                tracker=base.source_item.tracker,
+                project=base.source_item.project,
+                item_key=base.source_item.item_key,
+            ),
+            "SourceIdentity",
+        ),
+        ("blocker", BlockerSubclass(), "BlockerState"),
+        (
+            "parent_completion",
+            ParentSubclass(state="none", verified=True),
+            "ParentCompletion",
+        ),
+        ("evidence", EvidenceSubclass(), "EvidenceBundle"),
+        ("policy", PolicySubclass(), "DecisionPolicy"),
+    )
+    for field_name, value, expected_name in replacements:
+        with pytest.raises(contract.ContractViolation, match=f"exact {expected_name}"):
+            replace(base, **{field_name: value})
+
+    class ContextSubclass(contract.DecisionContext):
+        pass
+
+    subclassed_context = ContextSubclass(
+        execution=base.execution,
+        source_item=base.source_item,
+        phase=base.phase,
+        input_identity=base.input_identity,
+        blocker=base.blocker,
+        parent_completion=base.parent_completion,
+        evidence=base.evidence,
+        policy=base.policy,
+    )
+    with pytest.raises(contract.ContractViolation, match="exact DecisionContext"):
+        contract.validate_context(subclassed_context)
+
+    class StatefulAuthority(contract.AtomicActionReservationStore):
+        def __bool__(self):
+            raise AssertionError("authority truthiness must not be observed")
+
+    with pytest.raises(
+        contract.ContractViolation, match="reservation authority is malformed"
+    ):
+        contract.NoSideEffectFixtureAdapter(
+            _fixture_state(base), reservation_store=StatefulAuthority()
+        )
+
+
+def test_context_snapshot_prevents_nested_identity_multipass(monkeypatch):
+    context = _context("context-single-pass", {})
+    original_execution = context.execution
+    calls = 0
+    original = contract.ExecutionIdentity.as_dict
+
+    def counted_as_dict(self):
+        nonlocal calls
+        if self is original_execution:
+            calls += 1
+        return original(self)
+
+    monkeypatch.setattr(contract.ExecutionIdentity, "as_dict", counted_as_dict)
+    frozen_document = context.as_dict()
+    frozen_identity = contract.decision_identity_key(context)
+    contract.validate_context(context)
+    contract.prepare_prompt(context, tool_catalog=())
+    assert contract.action_idempotency_key(context, "hold")
+    assert context.as_dict() == frozen_document
+    assert contract.decision_identity_key(context) == frozen_identity
+    assert calls == 0
+
+
+@pytest.mark.parametrize(
+    ("target", "field_name", "new_value"),
+    (
+        (lambda context: context.execution, "credentials_verified", False),
+        (lambda context: context.source_item, "item_key", "mutated-item"),
+        (lambda context: context.blocker, "occurrences", 9),
+        (lambda context: context.parent_completion, "verified", False),
+        (lambda context: context.policy, "max_prompt_chars", 4999),
+        (lambda context: context.evidence.worker[0], "subject", "mutated-task"),
+    ),
+)
+def test_context_rejects_nested_component_mutation_after_snapshot(
+    target, field_name, new_value
+):
+    context = _context("post-snapshot-mutation", {})
+    object.__setattr__(target(context), field_name, new_value)
+
+    with pytest.raises(contract.ContractViolation, match="changed after snapshot"):
+        context.trusted_copy()
+
+
+def test_frozen_component_hashes_do_not_change_during_snapshotting():
+    components = (
+        contract.SourceIdentity("tracker", "project", "issue", "item"),
+        contract.ExecutionIdentity("scheduled", "orchestrator", "task"),
+        contract.BlockerState("fingerprint", "fingerprint", 2, False),
+        contract.DecisionPolicy(),
+    )
+    for component in components:
+        before = hash(component)
+        component.as_dict()
+        assert hash(component) == before
+
+    with pytest.raises(contract.ContractViolation, match="must be canonical"):
+        contract.SourceIdentity(" tracker ", "project", "issue", "item").as_dict()
+
+
+def test_parent_ids_are_materialized_once_before_context_reuse():
+    class SinglePassParents:
+        def __init__(self):
+            self.iterations = 0
+
+        def __iter__(self):
+            self.iterations += 1
+            if self.iterations > 1:
+                raise RuntimeError("caller-owned parent IDs were consumed twice")
+            return iter(("parent-1", "parent-2"))
+
+    parent_ids = SinglePassParents()
+    with pytest.raises(contract.ContractViolation, match="exact tuple"):
+        contract.ParentCompletion(
+            state="complete",
+            verified=True,
+            parent_ids=parent_ids,
+            evidence_reference="parent-proof",
+        )
+    assert parent_ids.iterations == 0
+
+
+def test_atomic_shared_reservation_allows_at_most_one_admission():
+    context = _context(
+        "atomic-admission-race",
+        {
+            "blocker": {
+                "fingerprint": "contract:v2",
+                "previous_fingerprint": "contract:v1",
+                "resolved": True,
+            }
+        },
+    )
+    state = _fixture_state(context)
+    store = contract.AtomicActionReservationStore(
+        current_run_id=state["live"]["current_run_id"]
+    )
+    adapters = [
+        contract.NoSideEffectFixtureAdapter(state, reservation_store=store)
+        for _ in range(2)
+    ]
+    barrier = threading.Barrier(2)
+    outcomes = []
+
+    def attempt(adapter):
+        adapter.bind_context(context)
+        for name in (
+            "read_live_state",
+            "read_parent_completion",
+            "read_source_state",
+            "read_ready_lanes",
+            "read_capabilities",
+        ):
+            getattr(adapter, name)()
+        key = adapter.read_action_key("admit", context.execution.task_id)[
+            "idempotency_key"
+        ]
+        barrier.wait()
+        try:
+            adapter.propose_action("admit", key, context.execution.task_id)
+        except contract.ContractViolation as exc:
+            outcomes.append(str(exc))
+        else:
+            outcomes.append("reserved")
+
+    threads = [
+        threading.Thread(target=attempt, args=(adapter,)) for adapter in adapters
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert outcomes.count("reserved") == 2
+    receipt = store.read(
+        contract.action_idempotency_key(context, "admit", context.execution.task_id)
+    )
+    assert receipt["admission_count"] == 1
+    assert receipt["status"] == "admitted"
+
+
+def test_external_receipt_cannot_claim_success_without_authoritative_reservation():
+    context = _context("external-receipt-authority", {})
+    adapter = contract.NoSideEffectFixtureAdapter(_fixture_state(context))
+    adapter.bind_context(context)
+    key = contract.action_idempotency_key(context, "hold", None)
+    proposal = {"action": "hold", "idempotency_key": key}
+    forged = contract.simulated_action_readback("hold", key)
+    forged["status"] = "forged-success"
+    forged["receipt_digest"] = contract._receipt_digest(forged)
+    trace = [
+        {"tool": name}
+        for name in (
+            "read_live_state",
+            "read_parent_completion",
+            "read_source_state",
+            "read_ready_lanes",
+            "read_capabilities",
+        )
+    ]
+    trace.extend(
+        [
+            {
+                "tool": "read_action_key",
+                "action": "hold",
+                "target_task_id": None,
+                "idempotency_key": key,
+            },
+            {
+                "tool": "propose_action",
+                "action": "hold",
+                "idempotency_key": key,
+                "target_task_id": None,
+            },
+            {
+                "tool": "read_action_readback",
+                "idempotency_key": key,
+                "receipt": forged,
+            },
+        ]
+    )
+
+    with pytest.raises(contract.ContractViolation, match="authoritative"):
+        adapter.accept_external_proposal(proposal, forged, trace=trace)
+
+
+def _process_reservation_attempt(path: str, key: str, barrier, output) -> None:
+    store = contract.AtomicActionReservationStore(state_path=path)
+    barrier.wait()
+    try:
+        store.reserve("admit", key, "process-task")
+    except contract.ContractViolation as exc:
+        output.put(str(exc))
+    else:
+        output.put("reserved")
+
+
+def test_atomic_process_reservation_has_one_authoritative_admission(tmp_path: Path):
+    context = _context("atomic-process-race", {})
+    key = contract.action_idempotency_key(context, "admit", context.execution.task_id)
+    state_path = tmp_path / "reservation.json"
+    ctx = multiprocessing.get_context("fork")
+    barrier = ctx.Barrier(2)
+    output = ctx.Queue()
+    processes = [
+        ctx.Process(
+            target=_process_reservation_attempt,
+            args=(str(state_path), key, barrier, output),
+        )
+        for _ in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=10)
+    assert all(process.exitcode == 0 for process in processes)
+    assert [output.get(timeout=2) for _ in processes] == ["reserved", "reserved"]
+    receipt = contract.AtomicActionReservationStore(state_path=state_path).read(key)
+    assert receipt["admission_count"] == 1
+    assert receipt["status"] == "admitted"

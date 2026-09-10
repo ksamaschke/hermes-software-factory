@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -32,6 +33,7 @@ assert spec is not None and spec.loader is not None
 evaluation = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = evaluation
 spec.loader.exec_module(evaluation)
+REAL_RESOLVE_RUNTIME_CREDENTIALS = evaluation._resolve_runtime_credentials
 
 
 @pytest.fixture(autouse=True)
@@ -47,6 +49,28 @@ def _native_provider_registry(monkeypatch: pytest.MonkeyPatch):
     hermes_module.auth = auth_module
     monkeypatch.setitem(sys.modules, "hermes_cli", hermes_module)
     monkeypatch.setitem(sys.modules, "hermes_cli.auth", auth_module)
+    providers_module = ModuleType("hermes_cli.providers")
+    provider_definitions = {
+        "openai-codex": SimpleNamespace(id="openai-codex", auth_type="oauth_pkce"),
+        "api-provider": SimpleNamespace(id="api-provider", auth_type="api_key"),
+        "external-provider": SimpleNamespace(
+            id="external-provider", auth_type="external_process"
+        ),
+    }
+    provider_aliases = {"codex": "openai-codex", "openai_codex": "openai-codex"}
+
+    def normalize_provider(name: str) -> str:
+        return provider_aliases.get(name.casefold(), name.casefold())
+
+    def get_provider(name: str, *, allow_network: bool = True):
+        assert allow_network is False
+        return provider_definitions.get(name)
+
+    providers_module.normalize_provider = normalize_provider
+    providers_module.get_provider = get_provider
+    hermes_module.providers = providers_module
+    monkeypatch.setitem(sys.modules, "hermes_cli.providers", providers_module)
+    monkeypatch.setattr(evaluation, "_resolve_runtime_credentials", lambda *_args: True)
 
 
 def _contaminated_environment(live_board: Path) -> dict[str, str]:
@@ -286,9 +310,172 @@ def test_auth_validation_returns_verified_status_only_for_provider_shape(
     profile.mkdir()
     source.write_text(json.dumps(document), encoding="utf-8")
 
-    assert evaluation._copy_auth(source, profile, provider="openai-codex") is True
+    assert (
+        evaluation._copy_auth(
+            source,
+            profile,
+            provider="openai-codex",
+            preflight=lambda *_args: None,
+        )
+        is True
+    )
     assert json.loads((profile / "auth.json").read_text(encoding="utf-8")) == document
     assert (profile / "auth.json").stat().st_mode & 0o077 == 0
+
+
+def test_auth_copy_uses_the_exact_bytes_from_the_validated_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    original = {
+        "providers": {
+            "openai-codex": {
+                "tokens": {
+                    "access_token": "original-access",
+                    "refresh_token": "original-refresh",
+                }
+            }
+        }
+    }
+    replacement = {
+        "providers": {
+            "openai-codex": {
+                "tokens": {
+                    "access_token": "replacement-access",
+                    "refresh_token": "replacement-refresh",
+                }
+            }
+        }
+    }
+    source = tmp_path / "source-auth.json"
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    source.write_text(json.dumps(original), encoding="utf-8")
+    real_validate = evaluation._validate_auth_file
+
+    def validate_then_replace(*args: Any, **kwargs: Any):
+        validated = real_validate(*args, **kwargs)
+        source.write_text(json.dumps(replacement), encoding="utf-8")
+        return validated
+
+    monkeypatch.setattr(evaluation, "_validate_auth_file", validate_then_replace)
+    assert (
+        evaluation._copy_auth(
+            source,
+            profile,
+            provider="openai-codex",
+            preflight=lambda *_args: None,
+        )
+        is True
+    )
+    assert json.loads((profile / "auth.json").read_text(encoding="utf-8")) == original
+
+
+def test_auth_source_rejects_a_symlinked_parent_component(tmp_path: Path):
+    source_parent = tmp_path / "real-source"
+    source_parent.mkdir()
+    source = source_parent / "auth.json"
+    source.write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "openai-codex": {
+                        "tokens": {
+                            "access_token": "fixture-access",
+                            "refresh_token": "fixture-refresh",
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    linked_parent = tmp_path / "linked-source"
+    linked_parent.symlink_to(source_parent, target_is_directory=True)
+    profile = tmp_path / "profile"
+    profile.mkdir()
+
+    with pytest.raises(
+        evaluation.NativeEvaluationUnavailable, match="symlink|without symbolic links"
+    ):
+        evaluation._copy_auth(
+            linked_parent / "auth.json",
+            profile,
+            provider="openai-codex",
+            preflight=lambda *_args: None,
+        )
+    assert not (profile / "auth.json").exists()
+
+
+def test_auth_gate_resolves_provider_metadata_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source = tmp_path / "source-auth.json"
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    source.write_text(
+        json.dumps({"providers": {"api-provider": {"api_key": "fixture-key"}}}),
+        encoding="utf-8",
+    )
+    calls = 0
+    real_resolution = evaluation._provider_resolution
+
+    def counted_resolution(provider: str):
+        nonlocal calls
+        calls += 1
+        return real_resolution(provider)
+
+    monkeypatch.setattr(evaluation, "_provider_resolution", counted_resolution)
+    assert (
+        evaluation._copy_auth(
+            source,
+            profile,
+            provider="api-provider",
+            preflight=lambda *_args: None,
+        )
+        is True
+    )
+    assert calls == 1
+
+
+def test_provider_preflight_temporarily_removes_all_fixture_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = tmp_path / "evaluation"
+    root.mkdir()
+    state_path = root / "fixture-state.json"
+    trace_path = root / "fixture-trace.jsonl"
+    profile = evaluation._write_profile(
+        root,
+        model="unit-model",
+        provider="openai-codex",
+        state_path=state_path,
+        trace_path=trace_path,
+    )
+    original_text = (profile / "config.yaml").read_text(encoding="utf-8")
+    observed = {}
+
+    def fake_runner(command, *, cwd, env, timeout):
+        del command, cwd, env, timeout
+        observed.update(
+            json.loads((profile / "config.yaml").read_text(encoding="utf-8"))
+        )
+        return 0, "healthy", ""
+
+    monkeypatch.setattr(evaluation, "_run_bounded_process", fake_runner)
+    evaluation._native_provider_preflight(
+        "openai-codex",
+        profile,
+        hermes="hermes",
+        model="unit-model",
+        parent_env={},
+        run_budget=30,
+    )
+
+    assert observed["platform_toolsets"] == {"cli": []}
+    assert observed["include_default_mcp_servers"] is False
+    assert observed["mcp_servers"] == {}
+    assert observed["agent"]["max_turns"] == 1
+    assert (profile / "config.yaml").read_text(encoding="utf-8") == original_text
 
 
 def test_auth_provider_alias_preserves_oauth_refresh_requirement(tmp_path: Path):
@@ -307,7 +494,15 @@ def test_auth_provider_alias_preserves_oauth_refresh_requirement(tmp_path: Path)
     profile.mkdir()
     source.write_text(json.dumps(document), encoding="utf-8")
 
-    assert evaluation._copy_auth(source, profile, provider="codex") is True
+    assert (
+        evaluation._copy_auth(
+            source,
+            profile,
+            provider="codex",
+            preflight=lambda *_args: None,
+        )
+        is True
+    )
 
 
 def test_auth_provider_registry_accepts_authoritative_api_key_provider(
@@ -321,7 +516,15 @@ def test_auth_provider_registry_accepts_authoritative_api_key_provider(
     profile.mkdir()
     source.write_text(json.dumps(document), encoding="utf-8")
 
-    assert evaluation._copy_auth(source, profile, provider="api-provider") is True
+    assert (
+        evaluation._copy_auth(
+            source,
+            profile,
+            provider="api-provider",
+            preflight=lambda *_args: None,
+        )
+        is True
+    )
 
 
 def test_auth_provider_registry_rejects_unknown_provider_before_open(
@@ -371,8 +574,11 @@ def test_auth_provider_registry_unavailability_fails_closed_before_open(
         ),
         encoding="utf-8",
     )
-    monkeypatch.delitem(sys.modules, "hermes_cli.auth", raising=False)
-    monkeypatch.delitem(sys.modules, "hermes_cli", raising=False)
+
+    def unavailable():
+        raise ImportError("provider registry unavailable")
+
+    monkeypatch.setattr(evaluation, "_load_authoritative_provider_layer", unavailable)
     with pytest.raises(
         evaluation.NativeEvaluationUnavailable, match="provider registry"
     ):
@@ -485,6 +691,113 @@ def test_fixture_builders_do_not_forge_credentials_verified():
         "verified-builder", credentials_verified=True
     )
     assert verified[1].context.execution.credentials_verified is True
+
+
+def test_fixture_context_materializes_blocker_once_without_truthiness():
+    class SinglePassBlocker(Mapping):
+        def __init__(self):
+            self.iterations = 0
+            self._values = {
+                "fingerprint": "stable:blocker",
+                "previous_fingerprint": "stable:blocker",
+                "occurrences": 3,
+                "resolved": False,
+            }
+
+        def __bool__(self):
+            raise AssertionError("blocker truthiness must not be observed")
+
+        def __iter__(self):
+            self.iterations += 1
+            if self.iterations > 1:
+                raise AssertionError("blocker mapping was consumed twice")
+            return iter(self._values)
+
+        def __len__(self):
+            return len(self._values)
+
+        def __getitem__(self, key):
+            return self._values[key]
+
+    blocker = SinglePassBlocker()
+    with pytest.raises(contract.ContractViolation, match="unsupported value"):
+        evaluation._fixture_context("single-pass-blocker", blocker=blocker)
+    assert blocker.iterations == 0
+
+
+@pytest.mark.parametrize(
+    ("blocker", "message"),
+    [
+        ({"occurrences": True}, "occurrences"),
+        ({"occurrences": "3"}, "occurrences"),
+        ({"resolved": "false"}, "resolved"),
+        ({"resolved": 0}, "resolved"),
+    ],
+)
+def test_fixture_context_rejects_coerced_blocker_scalars(blocker, message):
+    with pytest.raises(contract.ContractViolation, match=message):
+        evaluation._fixture_context("typed-blocker", blocker=blocker)
+
+
+def test_case_state_snapshots_optional_containers_without_truthiness():
+    class SinglePassSource(Mapping):
+        def __init__(self):
+            self.iterations = 0
+            self._values = {"source_state": "open", "artifact_state": "ready"}
+
+        def __bool__(self):
+            raise AssertionError("source truthiness must not be observed")
+
+        def __iter__(self):
+            self.iterations += 1
+            if self.iterations > 1:
+                raise AssertionError("source mapping was consumed twice")
+            return iter(self._values)
+
+        def __len__(self):
+            return len(self._values)
+
+        def __getitem__(self, key):
+            return self._values[key]
+
+    class HostileList(list):
+        def __bool__(self):
+            raise AssertionError("optional list truthiness must not be observed")
+
+        def __iter__(self):
+            raise AssertionError("subclass iterator must not be used")
+
+    context = evaluation._fixture_context("single-pass-state")
+    source = SinglePassSource()
+    with pytest.raises(contract.ContractViolation, match="unsupported value"):
+        evaluation._case_state(
+            context,
+            "hold_missing_capability",
+            source=source,
+            ready=[{"task_id": "ready-task"}],
+            missing=["missing-capability"],
+        )
+    assert source.iterations == 0
+
+    with pytest.raises(contract.ContractViolation, match="exact dict, list, or tuple"):
+        evaluation._case_state(
+            context,
+            "hold_missing_capability",
+            source={"source_state": "open", "artifact_state": "ready"},
+            ready=HostileList([{"task_id": "ready-task"}]),
+            missing=["missing-capability"],
+        )
+
+    with pytest.raises(contract.ContractViolation, match="reserved or unexpected"):
+        evaluation._case_state(
+            context,
+            "hold",
+            source={
+                "source_state": "open",
+                "artifact_state": "ready",
+                "source_key": "foreign-source",
+            },
+        )
 
 
 def test_fixture_store_rejects_completed_admit_before_readback_allocation(
@@ -1018,3 +1331,235 @@ def test_native_subprocess_retries_only_retryable_failure(monkeypatch, tmp_path)
 
     assert model.complete("prompt", {}) == {"decision": "hold"}
     assert len(calls) == 2
+
+
+def test_native_subprocess_retry_discards_partial_trace_and_reservation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    trace_path = tmp_path / "trace.jsonl"
+    state_path = tmp_path / "state.json"
+    reservation_path = state_path.with_name(state_path.name + ".reservation.json")
+    calls = 0
+
+    def fake_run(*_args: Any, **_kwargs: Any):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            trace_path.write_text('{"tool":"propose_action"}\n', encoding="utf-8")
+            reservation_path.write_text('{"records":{"poison":{}}}', encoding="utf-8")
+            return 1, "", "provider temporarily unavailable"
+        assert not trace_path.exists()
+        assert not reservation_path.exists()
+        return 0, '{"decision":"hold"}', ""
+
+    monkeypatch.setattr(
+        evaluation,
+        "build_isolated_environment",
+        lambda parent_env, profile, board_path: {},
+    )
+    monkeypatch.setattr(evaluation, "_run_bounded_process", fake_run)
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    model = evaluation.HermesSubprocessModel(
+        profile,
+        state_path,
+        trace_path,
+        tmp_path / "board.db",
+        "/bin/hermes",
+        "model",
+        "provider",
+        1,
+        parent_env={},
+    )
+
+    assert model.complete("prompt", {}) == {"decision": "hold"}
+    assert calls == 2
+
+
+def test_runtime_credential_resolution_uses_isolated_child_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    auth_module = sys.modules["hermes_cli.auth"]
+    auth_module.resolve_api_key_provider_credentials = lambda _provider: {
+        "api_key": "not-observed"
+    }
+    observed: dict[str, Any] = {}
+
+    def fake_run(command, *, cwd, env, timeout):
+        observed.update(command=command, cwd=cwd, env=env, timeout=timeout)
+        return 0, "credential-ok", ""
+
+    monkeypatch.setattr(evaluation, "_run_bounded_process", fake_run)
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    before = dict(os.environ)
+
+    assert REAL_RESOLVE_RUNTIME_CREDENTIALS(
+        "api-provider",
+        profile,
+        ("api_key", ("api-provider",), SimpleNamespace(id="api-provider")),
+    )
+    assert dict(os.environ) == before
+    assert observed["env"]["HERMES_HOME"] == str(profile.resolve())
+    assert observed["env"]["HOME"] == str(profile.resolve())
+    assert "HERMES_KANBAN_TASK" not in observed["env"]
+    assert observed["command"][0] == sys.executable
+
+
+def test_configured_provider_uses_installed_full_resolver_without_network(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    providers_module = sys.modules["hermes_cli.providers"]
+    calls: list[tuple[Any, ...]] = []
+    metadata = SimpleNamespace(id="custom-provider", auth_type="api_key")
+
+    def resolve_user_provider(name, providers):
+        calls.append(("local", name, providers))
+        return metadata
+
+    def resolve_provider_full(name, providers, custom):
+        calls.append(("full", name, providers, custom))
+        return metadata
+
+    monkeypatch.setattr(
+        providers_module, "resolve_user_provider", resolve_user_provider, raising=False
+    )
+    monkeypatch.setattr(
+        providers_module, "resolve_provider_full", resolve_provider_full, raising=False
+    )
+    configured = {
+        "custom-provider": {
+            "base_url": "https://provider.invalid/v1",
+            "key_env": "CUSTOM_PROVIDER_KEY",
+        }
+    }
+
+    auth_type, keys, resolved = evaluation._provider_resolution(
+        "custom-provider", user_providers=configured
+    )
+    assert auth_type == "api_key"
+    assert keys == ("custom-provider",)
+    assert resolved is metadata
+    assert [call[0] for call in calls] == ["local", "full"]
+
+
+def test_authoritative_provider_aliases_resolve_without_network(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    providers_module = ModuleType("hermes_cli.providers")
+    canonical = {
+        "glm": "zai",
+        "claude": "anthropic",
+        "github": "github-copilot",
+        "grok-oauth": "xai-oauth",
+        "aws": "bedrock",
+    }
+
+    def normalize_provider(name):
+        return canonical.get(name.strip().lower(), name.strip().lower())
+
+    def get_provider(name, *, allow_network=True):
+        assert allow_network is False
+        return SimpleNamespace(
+            id=name,
+            name=name,
+            auth_type="aws_sdk" if name == "bedrock" else "api_key",
+            transport="openai_chat",
+            base_url="https://provider.invalid/v1",
+            api_key_env_vars=(),
+        )
+
+    providers_module.normalize_provider = normalize_provider
+    providers_module.get_provider = get_provider
+    providers_module.ALIASES = canonical
+    hermes_module = sys.modules["hermes_cli"]
+    hermes_module.providers = providers_module
+    monkeypatch.setitem(sys.modules, "hermes_cli.providers", providers_module)
+
+    for alias, provider_id in canonical.items():
+        if alias == "aws":
+            continue
+        auth_type, metadata = evaluation._provider_metadata(alias)
+        assert metadata.id == provider_id
+        assert auth_type == "api_key"
+    with pytest.raises(
+        evaluation.NativeEvaluationUnavailable, match="explicitly unsupported"
+    ):
+        evaluation._provider_metadata("aws")
+
+
+def test_credential_shaped_json_never_sets_verified_without_runtime_preflight(
+    tmp_path: Path,
+):
+    source = tmp_path / "source-auth.json"
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    source.write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "openai-codex": {
+                        "tokens": {
+                            "access_token": "fixture-access",
+                            "refresh_token": "fixture-refresh",
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(evaluation.NativeEvaluationUnavailable, match="preflight"):
+        evaluation._copy_auth(source, profile, provider="openai-codex")
+    assert not (profile / "auth.json").exists()
+
+
+def test_provider_registry_failure_is_injectable_and_fails_before_auth_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source = tmp_path / "source-auth.json"
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    source.write_text(
+        json.dumps({"providers": {"openai-codex": {"api_key": "fixture-key"}}}),
+        encoding="utf-8",
+    )
+
+    def unavailable():
+        raise ImportError("provider registry unavailable")
+
+    monkeypatch.setattr(
+        evaluation, "_load_authoritative_provider_layer", unavailable, raising=False
+    )
+    opens: list[tuple[Any, ...]] = []
+    real_open = evaluation.os.open
+
+    def observed_open(*args: Any, **kwargs: Any):
+        opens.append((args, kwargs))
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(evaluation.os, "open", observed_open)
+    with pytest.raises(
+        evaluation.NativeEvaluationUnavailable, match="provider registry"
+    ):
+        evaluation._copy_auth(source, profile, provider="openai-codex")
+    assert opens == []
+
+
+def test_board_verification_rejects_untrusted_items_mapping(tmp_path: Path):
+    class RaisingItemsMapping(Mapping):
+        def __iter__(self):
+            return iter((tmp_path / "board",))
+
+        def __getitem__(self, key):
+            return (False,)
+
+        def __len__(self):
+            return 1
+
+        def items(self):
+            raise RuntimeError("unbounded board snapshot items")
+
+    with pytest.raises(evaluation.NativeEvaluationUnavailable):
+        evaluation.verify_board_state_unchanged(RaisingItemsMapping())

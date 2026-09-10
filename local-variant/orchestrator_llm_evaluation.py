@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
+import importlib
 import json
 import os
 import selectors
@@ -36,6 +37,7 @@ try:  # Running as a package is useful to downstream installers.
         _MAX_NATIVE_RESPONSE_CHARS,
         _MAX_NATIVE_TRACE_BYTES,
         _MAX_NATIVE_TRACE_ENTRIES,
+        AtomicActionReservationStore,
         BlockerState,
         ContractViolation,
         DecisionContext,
@@ -68,6 +70,7 @@ except ImportError:  # Running this file directly is the supported CLI path.
         _MAX_NATIVE_RESPONSE_CHARS,
         _MAX_NATIVE_TRACE_BYTES,
         _MAX_NATIVE_TRACE_ENTRIES,
+        AtomicActionReservationStore,
         BlockerState,
         ContractViolation,
         DecisionContext,
@@ -92,7 +95,7 @@ except ImportError:  # Running this file directly is the supported CLI path.
         decision_identity_key,
         decision_response_requirements_text,
         evaluate_decision,
-        simulated_action_readback,
+        simulated_action_readback,  # noqa: F401
     )
 
 
@@ -628,7 +631,7 @@ def _fixture_context(
     artifact_state: str = "ready",
     review_state: str = "approved",
 ) -> DecisionContext:
-    if not isinstance(credentials_verified, bool):
+    if type(credentials_verified) is not bool:
         raise ContractViolation("credential verification guard is malformed")
     source = SourceIdentity(
         tracker="synthetic-tracker",
@@ -636,7 +639,21 @@ def _fixture_context(
         item_key=item_key,
         kind="issue",
     )
-    blocker = dict(blocker or {})
+    if blocker is None:
+        blocker_snapshot: dict[str, Any] = {}
+    else:
+        if not isinstance(blocker, Mapping):
+            raise ContractViolation("fixture blocker must be an object")
+        bounded_blocker = _safe_value(blocker, "fixture blocker")
+        if type(bounded_blocker) is not dict:
+            raise ContractViolation("fixture blocker must be an object")
+        blocker_snapshot = bounded_blocker
+    occurrences = blocker_snapshot.get("occurrences", 0)
+    if type(occurrences) is not int or occurrences < 0:
+        raise ContractViolation("fixture blocker occurrences are malformed")
+    resolved = blocker_snapshot.get("resolved", False)
+    if type(resolved) is not bool:
+        raise ContractViolation("fixture blocker resolved state is malformed")
     phase = "triage"
     execution = ExecutionIdentity(
         mode="scheduled",
@@ -690,10 +707,10 @@ def _fixture_context(
             {"fixture": "native-evaluation", "case": item_key},
         ),
         blocker=BlockerState(
-            fingerprint=blocker.get("fingerprint"),
-            previous_fingerprint=blocker.get("previous_fingerprint"),
-            occurrences=int(blocker.get("occurrences", 0)),
-            resolved=bool(blocker.get("resolved", False)),
+            fingerprint=blocker_snapshot.get("fingerprint"),
+            previous_fingerprint=blocker_snapshot.get("previous_fingerprint"),
+            occurrences=occurrences,
+            resolved=resolved,
         ),
         parent_completion=ParentCompletion(
             state="complete",
@@ -722,11 +739,69 @@ def _case_state(
     body: str = "The current typed state is supplied by the fixture.",
 ) -> dict[str, Any]:
     del _expected_action  # The oracle remains outside the model-visible state.
+    if type(context) is not DecisionContext:
+        raise ContractViolation("fixture context must be an exact DecisionContext")
+
+    if existing_action is None:
+        existing_snapshot = None
+    else:
+        if not isinstance(existing_action, Mapping):
+            raise ContractViolation("fixture existing action must be an object")
+        existing_snapshot = _safe_value(existing_action, "fixture existing action")
+        if type(existing_snapshot) is not dict:
+            raise ContractViolation("fixture existing action must be an object")
+
+    if source is None:
+        source_snapshot: dict[str, Any] = {
+            "source_state": "open",
+            "artifact_state": "ready",
+        }
+    else:
+        if not isinstance(source, Mapping):
+            raise ContractViolation("fixture source state must be an object")
+        bounded_source = _safe_value(source, "fixture source state")
+        if type(bounded_source) is not dict:
+            raise ContractViolation("fixture source state must be an object")
+        allowed_source_fields = {
+            "source_state",
+            "artifact_state",
+            "artifact_task_id",
+        }
+        unexpected_source_fields = sorted(set(bounded_source) - allowed_source_fields)
+        if unexpected_source_fields:
+            raise ContractViolation(
+                "fixture source state contains reserved or unexpected fields"
+            )
+        source_snapshot = bounded_source
+
+    ready_rows = []
+    if ready is not None:
+        for index, row in enumerate(
+            _bounded_iterable(ready, "fixture ready lanes", _MAX_NATIVE_CASES)
+        ):
+            if not isinstance(row, Mapping):
+                raise ContractViolation("fixture ready lane must be an object")
+            bounded_row = _safe_value(row, f"fixture ready lane {index}")
+            if type(bounded_row) is not dict:
+                raise ContractViolation("fixture ready lane must be an object")
+            ready_rows.append(bounded_row)
+
+    missing_capabilities = []
+    if missing is not None:
+        missing_capabilities = [
+            _safe_identifier(value, "fixture missing capability")
+            for value in _bounded_iterable(
+                missing, "fixture missing capabilities", _MAX_NATIVE_CASES
+            )
+        ]
+
+    title = _redact_text(title)
+    body = _redact_text(body)
     return {
         "decision_identity_key": decision_identity_key(context),
         "live": {
             "blocker": context.blocker.as_dict(),
-            "existing_action": copy.deepcopy(existing_action),
+            "existing_action": copy.deepcopy(existing_snapshot),
             "current_run_id": None,
             "source_key": context.source_item.canonical_key,
             "phase": context.phase,
@@ -749,10 +824,10 @@ def _case_state(
             "input_identity": context.input_identity,
             "semantic_lane": context.semantic_lane,
             "current_run_id": None,
-            **dict(source or {"source_state": "open", "artifact_state": "ready"}),
+            **source_snapshot,
         },
-        "ready": copy.deepcopy(ready or []),
-        "capabilities": {"missing": list(missing or [])},
+        "ready": copy.deepcopy(ready_rows),
+        "capabilities": {"missing": missing_capabilities},
         "readbacks": {},
     }
 
@@ -783,7 +858,12 @@ def build_synthetic_cases(
 ) -> tuple[EvaluationCase, ...]:
     """Build six unseen, opaque synthetic cases without an action oracle."""
 
-    suffix = (seed or uuid.uuid4().hex[:12]).strip()
+    if seed is None:
+        suffix = uuid.uuid4().hex[:12]
+    else:
+        if type(seed) is not str:
+            raise ValueError("seed must be a built-in string")
+        suffix = seed.strip()
     if not suffix:
         raise ValueError("seed must not be empty")
 
@@ -985,7 +1065,12 @@ def run_stateful_fixture_evaluation(
 ) -> StatefulEvaluation:
     """Exercise three unchanged ticks, resolution, reuse, and ready work."""
 
-    suffix = (seed or uuid.uuid4().hex[:12]).strip()
+    if seed is None:
+        suffix = uuid.uuid4().hex[:12]
+    else:
+        if type(seed) is not str:
+            raise ValueError("seed must be a built-in string")
+        suffix = seed.strip()
     if not suffix:
         raise ValueError("seed must not be empty")
     item_key = _opaque_item_key(suffix, 100)
@@ -1129,6 +1214,20 @@ class _FixtureStore:
         self.state_path = state_path
         self.trace_path = trace_path
         self._proposal: dict[str, Any] | None = None
+        try:
+            initial_state = json.loads(state_path.read_text(encoding="utf-8"))
+            initial_live = initial_state.get("live", {})
+            initial_run_id = (
+                initial_live.get("current_run_id")
+                if isinstance(initial_live, dict)
+                else None
+            )
+        except (OSError, TypeError, ValueError):
+            initial_run_id = None
+        self._reservation_store = AtomicActionReservationStore(
+            current_run_id=initial_run_id,
+            state_path=state_path.with_name(state_path.name + ".reservation.json"),
+        )
 
     def _state(self) -> dict[str, Any]:
         value = json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -1211,7 +1310,7 @@ class _FixtureStore:
                 "fixture proposal key is not bound to action and target"
             )
         _reject_existing_admission(action, state.get("live"))
-        simulated_action_readback(action, idempotency_key, target_task_id)
+        self._reservation_store.reserve(action, idempotency_key, target_task_id)
         self._proposal = {
             "action": action,
             "idempotency_key": idempotency_key,
@@ -1240,11 +1339,9 @@ class _FixtureStore:
         else:
             live = self._state().get("live")
             _reject_existing_admission(self._proposal["action"], live)
-            result = simulated_action_readback(
-                self._proposal["action"],
-                key,
-                self._proposal.get("target_task_id"),
-            )
+            result = self._reservation_store.read(key)
+            if result.get("status") == "not_started":
+                raise ContractViolation("fixture reservation readback is missing")
         self._record(
             "read_action_readback",
             idempotency_key=key,
@@ -1442,60 +1539,182 @@ def verify_fixture_only_profile(profile: Path) -> None:
 
 
 _MAX_AUTH_FILE_BYTES = 4 * 1024 * 1024
-_AUTH_PROVIDER_ALIASES = {
-    "codex": "openai-codex",
-    "openai_codex": "openai-codex",
-}
-_NON_OAUTH_AUTH_TYPES = frozenset({"api_key", "external_process", "aws_sdk", "vertex"})
+_NON_OAUTH_AUTH_TYPES = frozenset({"api_key", "external_process"})
 
 
-def _auth_provider_keys(provider: str) -> tuple[str, ...]:
-    if not isinstance(provider, str) or not provider.strip():
+def _load_authoritative_provider_layer() -> Any:
+    try:
+        return importlib.import_module("hermes_cli.providers")
+    except Exception as exc:
+        raise NativeEvaluationUnavailable(
+            "native Hermes provider registry/layer is unavailable"
+        ) from exc
+
+
+def _provider_resolution(
+    provider: str,
+    *,
+    user_providers: dict[str, Any] | None = None,
+    custom_providers: list[dict[str, Any]] | None = None,
+) -> tuple[str, tuple[str, ...], Any]:
+    if type(provider) is not str or not provider.strip():
         raise NativeEvaluationUnavailable("native provider identity is malformed")
-    normalized = provider.strip().casefold()
-    canonical = _AUTH_PROVIDER_ALIASES.get(normalized, normalized)
-    return tuple(dict.fromkeys((normalized, canonical)))
-
-
-def _provider_metadata(provider: str) -> tuple[str, Any]:
-    canonical = _auth_provider_keys(provider)[-1]
+    requested = provider.strip().casefold()
     try:
-        from hermes_cli.auth import PROVIDER_REGISTRY
-    except Exception:  # noqa: BLE001 - unavailable native metadata must fail closed
+        layer = _load_authoritative_provider_layer()
+    except NativeEvaluationUnavailable:
+        raise
+    except Exception as exc:
         raise NativeEvaluationUnavailable(
-            "native Hermes provider registry is unavailable"
-        ) from None
-    if not isinstance(PROVIDER_REGISTRY, Mapping):
+            "native Hermes provider registry/layer is unavailable"
+        ) from exc
+    normalize = getattr(layer, "normalize_provider", None)
+    get_provider = getattr(layer, "get_provider", None)
+    if not callable(normalize) or not callable(get_provider):
+        raise NativeEvaluationUnavailable("native Hermes provider layer is malformed")
+    try:
+        canonical = normalize(provider)
+    except Exception as exc:
         raise NativeEvaluationUnavailable(
-            "native Hermes provider registry is malformed"
+            "native Hermes provider identity cannot be normalized"
+        ) from exc
+    if type(canonical) is not str or not canonical.strip():
+        raise NativeEvaluationUnavailable(
+            "native Hermes provider identity is malformed"
         )
-    try:
-        config = PROVIDER_REGISTRY.get(canonical)
-    except Exception:  # noqa: BLE001 - hostile registry lookups must fail closed
-        raise NativeEvaluationUnavailable(
-            "native Hermes provider registry is malformed"
-        ) from None
+    canonical = canonical.strip().casefold()
+    config = None
+    raw = provider.strip().casefold()
+    if user_providers is not None:
+        if type(user_providers) is not dict:
+            raise NativeEvaluationUnavailable(
+                "configured native providers are malformed"
+            )
+        configured = dict.get(user_providers, raw)
+        if configured is not None:
+            if type(configured) is not dict:
+                raise NativeEvaluationUnavailable(
+                    "configured native provider metadata is malformed"
+                )
+            local_resolver = getattr(layer, "resolve_user_provider", None)
+            full_resolver = getattr(layer, "resolve_provider_full", None)
+            if not callable(local_resolver) or not callable(full_resolver):
+                raise NativeEvaluationUnavailable(
+                    "configured native provider resolver is unavailable"
+                )
+            try:
+                locally_resolved = local_resolver(raw, user_providers)
+                config = (
+                    full_resolver(provider, user_providers, None)
+                    if locally_resolved is not None
+                    else None
+                )
+            except Exception as exc:
+                raise NativeEvaluationUnavailable(
+                    "configured native provider metadata is unavailable"
+                ) from exc
+            if config is None:
+                raise NativeEvaluationUnavailable(
+                    "configured native provider metadata is incomplete"
+                )
+    if config is None:
+        try:
+            config = get_provider(canonical, allow_network=False)
+        except TypeError:
+            raise NativeEvaluationUnavailable(
+                "native Hermes provider resolver cannot disable network access"
+            ) from None
+        except Exception as exc:
+            raise NativeEvaluationUnavailable(
+                "native Hermes provider metadata is unavailable"
+            ) from exc
+    if config is None and custom_providers is not None:
+        if type(custom_providers) is not list or any(
+            type(entry) is not dict for entry in custom_providers
+        ):
+            raise NativeEvaluationUnavailable("custom native providers are malformed")
+        custom_resolver = getattr(layer, "resolve_custom_provider", None)
+        if not callable(custom_resolver):
+            raise NativeEvaluationUnavailable(
+                "custom native provider resolver is unavailable"
+            )
+        try:
+            config = custom_resolver(provider, custom_providers)
+        except Exception as exc:
+            raise NativeEvaluationUnavailable(
+                "custom native provider metadata is unavailable"
+            ) from exc
     if config is None:
         raise NativeEvaluationUnavailable("unsupported native provider identity")
     try:
+        config_id = getattr(config, "id", canonical)
         auth_type = getattr(config, "auth_type", None)
-    except Exception:  # noqa: BLE001 - hostile metadata access must fail closed
+    except Exception as exc:
         raise NativeEvaluationUnavailable(
             "native Hermes provider metadata is malformed"
-        ) from None
-    if not isinstance(auth_type, str):
+        ) from exc
+    if type(config_id) is not str or not config_id.strip():
+        config_id = canonical
+    resolved_id: str | None = None
+    try:
+        auth_module = importlib.import_module("hermes_cli.auth")
+        resolver = getattr(auth_module, "resolve_provider", None)
+        if callable(resolver):
+            candidate_id = resolver(provider)
+            if type(candidate_id) is str and candidate_id.strip():
+                resolved_id = candidate_id
+    except Exception:  # noqa: BLE001 - optional runtime identity lookup
+        resolved_id = None
+    candidates = tuple(
+        dict.fromkeys(
+            candidate.strip().casefold()
+            for candidate in (requested, config_id, resolved_id, canonical)
+            if type(candidate) is str and candidate.strip()
+        )
+    )
+    if type(auth_type) is not str or not auth_type.strip():
+        # The provider definition is authoritative for identity; the installed
+        # auth registry is only a credential resolver fallback for old provider
+        # definitions that do not carry auth_type themselves.
+        try:
+            auth_module = importlib.import_module("hermes_cli.auth")
+            registry = getattr(auth_module, "PROVIDER_REGISTRY", None)
+            auth_config = (
+                registry.get(next((key for key in candidates if key in registry), ""))
+                if isinstance(registry, Mapping)
+                else None
+            )
+            auth_type = getattr(auth_config, "auth_type", None)
+        except Exception as exc:
+            raise NativeEvaluationUnavailable(
+                "native Hermes provider auth metadata is unavailable"
+            ) from exc
+    if type(auth_type) is not str:
         raise NativeEvaluationUnavailable(
             "native Hermes provider metadata is malformed"
         )
     auth_type = auth_type.strip().casefold()
+    if auth_type in {"aws_sdk", "vertex"}:
+        raise NativeEvaluationUnavailable(
+            "native provider authentication type is explicitly unsupported"
+        )
     if (
         auth_type != "oauth"
         and not auth_type.startswith("oauth_")
-        and (auth_type not in _NON_OAUTH_AUTH_TYPES)
+        and auth_type not in _NON_OAUTH_AUTH_TYPES
     ):
         raise NativeEvaluationUnavailable(
             "native Hermes provider metadata is malformed"
         )
+    return auth_type, candidates, config
+
+
+def _auth_provider_keys(provider: str) -> tuple[str, ...]:
+    return _provider_resolution(provider)[1]
+
+
+def _provider_metadata(provider: str) -> tuple[str, Any]:
+    auth_type, _keys, config = _provider_resolution(provider)
     return auth_type, config
 
 
@@ -1557,50 +1776,131 @@ def _auth_pool_has_credential(entries: Any, *, requires_refresh: bool) -> bool:
     return False
 
 
-def _validate_auth_file(source: Path | None, provider: str) -> str:
-    """Read and validate auth JSON without returning or logging its contents."""
+def _open_directory_without_symlinks(path: Path, label: str) -> tuple[Path, int]:
+    """Open one directory through component-wise no-follow descriptors."""
+
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    if not no_follow or not directory_flag:
+        raise NativeEvaluationUnavailable(
+            f"{label} cannot be opened without symbolic links"
+        )
+    try:
+        absolute = Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
+    except (OSError, TypeError, ValueError):
+        raise NativeEvaluationUnavailable(f"{label} path is malformed") from None
+    flags = os.O_RDONLY | no_follow | directory_flag | getattr(os, "O_CLOEXEC", 0)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(absolute.anchor, flags)
+        for component in absolute.parts[1:]:
+            if component in {"", ".", ".."}:
+                raise NativeEvaluationUnavailable(f"{label} path is malformed")
+            next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+    except NativeEvaluationUnavailable:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
+    except (OSError, TypeError, ValueError):
+        if descriptor is not None:
+            os.close(descriptor)
+        raise NativeEvaluationUnavailable(
+            f"{label} cannot be opened without symbolic links"
+        ) from None
+    if descriptor is None:  # pragma: no cover - an absolute path always has an anchor
+        raise NativeEvaluationUnavailable(f"{label} path is malformed")
+    return absolute, descriptor
+
+
+def _validate_auth_file(
+    source: Path | None,
+    provider: str,
+    resolution: tuple[str, tuple[str, ...], Any] | None = None,
+) -> bytes:
+    """Return the exact bounded bytes validated from one no-follow file open."""
 
     if source is None:
         raise NativeEvaluationUnavailable(
             "set FACTORY_EVAL_AUTH_FILE to an authenticated native Hermes auth.json"
         )
+    if type(provider) is not str or not provider.strip():
+        raise NativeEvaluationUnavailable("native provider identity is malformed")
+    if resolution is None:
+        resolution = _provider_resolution(provider)
+    if type(resolution) is not tuple or tuple.__len__(resolution) != 3:
+        raise NativeEvaluationUnavailable("native provider resolution is malformed")
+    auth_type, provider_keys, _config = resolution
+    if (
+        type(auth_type) is not str
+        or type(provider_keys) is not tuple
+        or not provider_keys
+    ):
+        raise NativeEvaluationUnavailable("native provider resolution is malformed")
+    requires_refresh = auth_type == "oauth" or auth_type.startswith("oauth_")
     try:
-        source = Path(source)
+        source_path = Path(source)
     except (TypeError, ValueError):
         raise NativeEvaluationUnavailable(
             "native Hermes auth file path is malformed"
         ) from None
-    if not isinstance(provider, str) or not provider.strip():
-        raise NativeEvaluationUnavailable("native provider identity is malformed")
-    provider_keys = _auth_provider_keys(provider)
-    requires_refresh = _provider_requires_refresh(provider)
-    try:
-        source_name = os.fspath(source)
-    except (TypeError, ValueError, OSError):
-        raise NativeEvaluationUnavailable(
-            "native Hermes auth file path is malformed"
-        ) from None
-    no_follow = getattr(os, "O_NOFOLLOW", 0)
-    if not no_follow:
-        raise NativeEvaluationUnavailable(
-            "native Hermes auth file link protection is unavailable"
-        )
-    flags = os.O_RDONLY | no_follow
+    absolute_parent, parent_descriptor = _open_directory_without_symlinks(
+        source_path.parent, "native Hermes auth file parent"
+    )
+    absolute_source = absolute_parent / source_path.name
+    if not source_path.name or source_path.name in {".", ".."}:
+        os.close(parent_descriptor)
+        raise NativeEvaluationUnavailable("native Hermes auth file path is malformed")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     for flag_name in ("O_CLOEXEC", "O_NONBLOCK"):
         flags |= getattr(os, flag_name, 0)
     descriptor: int | None = None
     try:
-        descriptor = os.open(source_name, flags)
-        stat_result = os.fstat(descriptor)
-        if not S_ISREG(stat_result.st_mode):
+        descriptor = os.open(source_path.name, flags, dir_fd=parent_descriptor)
+        opened = os.fstat(descriptor)
+        if not S_ISREG(opened.st_mode):
             raise NativeEvaluationUnavailable(
                 "native Hermes auth file is not a regular readable file"
             )
-        if stat_result.st_size > _MAX_AUTH_FILE_BYTES:
+        if opened.st_size > _MAX_AUTH_FILE_BYTES:
             raise NativeEvaluationUnavailable(
                 "native Hermes auth file exceeds its bound"
             )
-        raw = os.read(descriptor, _MAX_AUTH_FILE_BYTES + 1)
+        chunks: list[bytes] = []
+        copied = 0
+        while True:
+            chunk = os.read(
+                descriptor, min(64 * 1024, _MAX_AUTH_FILE_BYTES + 1 - copied)
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            copied += len(chunk)
+            if copied > _MAX_AUTH_FILE_BYTES:
+                raise NativeEvaluationUnavailable(
+                    "native Hermes auth file exceeds its bound"
+                )
+        closed = os.fstat(descriptor)
+        identity_before = (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+        )
+        identity_after = (
+            closed.st_dev,
+            closed.st_ino,
+            closed.st_size,
+            closed.st_mtime_ns,
+            closed.st_ctime_ns,
+        )
+        raw = b"".join(chunks)
+        if identity_before != identity_after or len(raw) != opened.st_size:
+            raise NativeEvaluationUnavailable(
+                "native Hermes auth file changed during validation"
+            )
     except NativeEvaluationUnavailable:
         raise
     except (OSError, TypeError, ValueError):
@@ -1613,8 +1913,12 @@ def _validate_auth_file(source: Path | None, provider: str) -> str:
                 os.close(descriptor)
             except OSError:
                 pass
-    if len(raw) > _MAX_AUTH_FILE_BYTES:
-        raise NativeEvaluationUnavailable("native Hermes auth file exceeds its bound")
+        try:
+            os.close(parent_descriptor)
+        except OSError:
+            pass
+    if absolute_source.name != source_path.name:
+        raise NativeEvaluationUnavailable("native Hermes auth file path is malformed")
     try:
         text = raw.decode("utf-8-sig")
         payload = json.loads(text)
@@ -1622,7 +1926,7 @@ def _validate_auth_file(source: Path | None, provider: str) -> str:
         raise NativeEvaluationUnavailable(
             "native Hermes auth JSON is malformed"
         ) from None
-    if not isinstance(payload, Mapping):
+    if type(payload) is not dict:
         raise NativeEvaluationUnavailable("native Hermes auth JSON is not an object")
     try:
         bounded_payload = _safe_value(payload, "native auth payload")
@@ -1630,14 +1934,14 @@ def _validate_auth_file(source: Path | None, provider: str) -> str:
         raise NativeEvaluationUnavailable(
             "native Hermes auth JSON exceeds its structural bounds"
         ) from None
-    if not isinstance(bounded_payload, dict):
+    if type(bounded_payload) is not dict:
         raise NativeEvaluationUnavailable("native Hermes auth JSON is not an object")
 
-    providers = payload.get("providers")
-    pool = payload.get("credential_pool")
-    if providers is not None and not isinstance(providers, Mapping):
+    providers = bounded_payload.get("providers")
+    pool = bounded_payload.get("credential_pool")
+    if providers is not None and type(providers) is not dict:
         raise NativeEvaluationUnavailable("native Hermes auth providers are malformed")
-    if pool is not None and not isinstance(pool, Mapping):
+    if pool is not None and type(pool) is not dict:
         raise NativeEvaluationUnavailable(
             "native Hermes auth credential pool is malformed"
         )
@@ -1647,7 +1951,7 @@ def _validate_auth_file(source: Path | None, provider: str) -> str:
         )
 
     state_valid = bool(
-        isinstance(providers, Mapping)
+        type(providers) is dict
         and any(
             _auth_state_has_credential(
                 providers.get(provider_key), requires_refresh=requires_refresh
@@ -1656,7 +1960,7 @@ def _validate_auth_file(source: Path | None, provider: str) -> str:
         )
     )
     pool_valid = bool(
-        isinstance(pool, Mapping)
+        type(pool) is dict
         and any(
             _auth_pool_has_credential(
                 pool.get(provider_key), requires_refresh=requires_refresh
@@ -1668,28 +1972,260 @@ def _validate_auth_file(source: Path | None, provider: str) -> str:
         raise NativeEvaluationUnavailable(
             "native Hermes auth JSON has no provider-compatible credential"
         )
-    return text
+    return raw
+
+
+def _atomic_copy_auth(payload: bytes, destination: Path) -> None:
+    """Publish only the exact bytes validated from the original file descriptor."""
+
+    if type(payload) is not bytes or len(payload) > _MAX_AUTH_FILE_BYTES:
+        raise NativeEvaluationUnavailable("validated native auth payload is malformed")
+    try:
+        destination = Path(destination)
+    except (TypeError, ValueError):
+        raise NativeEvaluationUnavailable(
+            "native Hermes auth destination is malformed"
+        ) from None
+    _absolute_parent, parent_descriptor = _open_directory_without_symlinks(
+        destination.parent, "native Hermes auth destination parent"
+    )
+    if not destination.name or destination.name in {".", ".."}:
+        os.close(parent_descriptor)
+        raise NativeEvaluationUnavailable("native Hermes auth destination is malformed")
+    temporary_name = f".{destination.name}.{uuid.uuid4().hex}.tmp"
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptor: int | None = None
+    published = False
+    try:
+        descriptor = os.open(temporary_name, flags, 0o600, dir_fd=parent_descriptor)
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb", closefd=True) as output_stream:
+            descriptor = None
+            output_stream.write(payload)
+            output_stream.flush()
+            os.fsync(output_stream.fileno())
+        os.replace(
+            temporary_name,
+            destination.name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+        published = True
+        info = os.stat(
+            destination.name, dir_fd=parent_descriptor, follow_symlinks=False
+        )
+        if not S_ISREG(info.st_mode) or S_IMODE(info.st_mode) & 0o077:
+            raise NativeEvaluationUnavailable(
+                "native Hermes auth destination is not a private regular file"
+            )
+        os.fsync(parent_descriptor)
+    except NativeEvaluationUnavailable:
+        if published:
+            try:
+                os.unlink(destination.name, dir_fd=parent_descriptor)
+            except OSError:
+                pass
+        raise
+    except (OSError, TypeError, ValueError):
+        if published:
+            try:
+                os.unlink(destination.name, dir_fd=parent_descriptor)
+            except OSError:
+                pass
+        raise NativeEvaluationUnavailable(
+            "native Hermes auth file is not copyable"
+        ) from None
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        try:
+            os.unlink(temporary_name, dir_fd=parent_descriptor)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+        try:
+            os.close(parent_descriptor)
+        except OSError:
+            pass
+
+
+def _remove_auth_file(destination: Path) -> None:
+    """Remove the isolated copy through the same no-follow directory boundary."""
+
+    _parent, parent_descriptor = _open_directory_without_symlinks(
+        destination.parent, "native Hermes auth destination parent"
+    )
+    try:
+        os.unlink(destination.name, dir_fd=parent_descriptor)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise NativeEvaluationUnavailable(
+            "isolated native auth copy could not be removed"
+        ) from exc
+    finally:
+        os.close(parent_descriptor)
+
+
+def _resolve_runtime_credentials(
+    provider: str,
+    profile: Path,
+    resolution: tuple[str, tuple[str, ...], Any] | None = None,
+) -> bool:
+    """Resolve/refresh credentials through installed Hermes without returning them."""
+
+    try:
+        auth_module = importlib.import_module("hermes_cli.auth")
+        if resolution is None:
+            resolution = _provider_resolution(provider)
+        if type(resolution) is not tuple or tuple.__len__(resolution) != 3:
+            raise NativeEvaluationUnavailable("native provider resolution is malformed")
+        auth_type, provider_keys, _config = resolution
+        if (
+            type(auth_type) is not str
+            or type(provider_keys) is not tuple
+            or not provider_keys
+        ):
+            raise NativeEvaluationUnavailable("native provider resolution is malformed")
+        provider_id = provider_keys[-1]
+    except NativeEvaluationUnavailable:
+        raise
+    except Exception as exc:
+        raise NativeEvaluationUnavailable(
+            "native provider runtime credential layer is unavailable"
+        ) from exc
+    resolver_name = {
+        "oauth_pkce": "resolve_codex_runtime_credentials",
+        "oauth_device_code": "resolve_nous_runtime_credentials",
+        "oauth_qwen": "resolve_qwen_runtime_credentials",
+        "oauth_xai": "resolve_xai_oauth_runtime_credentials",
+        "oauth_minimax": "resolve_minimax_oauth_runtime_credentials",
+        "oauth_spotify": "resolve_spotify_runtime_credentials",
+        "api_key": "resolve_api_key_provider_credentials",
+        "external_process": "resolve_external_process_provider_credentials",
+    }.get(auth_type)
+    if auth_type == "oauth_external":
+        resolver_name = {
+            "openai-codex": "resolve_codex_runtime_credentials",
+            "xai-oauth": "resolve_xai_oauth_runtime_credentials",
+            "qwen-oauth": "resolve_qwen_runtime_credentials",
+            "minimax-oauth": "resolve_minimax_oauth_runtime_credentials",
+        }.get(provider_id)
+    if resolver_name is None:
+        raise NativeEvaluationUnavailable(
+            "native provider has no authenticated runtime credential resolver"
+        )
+    resolver = getattr(auth_module, resolver_name, None)
+    if not callable(resolver):
+        raise NativeEvaluationUnavailable(
+            "native provider runtime credential resolver is unavailable"
+        )
+    credential_root = profile.parent / "credential-runtime"
+    for directory in (
+        credential_root,
+        credential_root / "tmp",
+        credential_root / "workspaces",
+        credential_root / "attachments",
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+    board_path = credential_root / "kanban.db"
+    environment = build_isolated_environment(dict(os.environ), profile, board_path)
+    verifier = """
+import importlib
+import sys
+from collections.abc import Mapping
+
+resolver_name, auth_type, provider_id = sys.argv[1:4]
+try:
+    resolver = getattr(importlib.import_module("hermes_cli.auth"), resolver_name)
+    result = resolver() if auth_type.startswith("oauth_") else resolver(provider_id)
+except BaseException:
+    raise SystemExit(3)
+if not isinstance(result, Mapping) or not result:
+    raise SystemExit(4)
+sys.stdout.write("credential-ok")
+""".strip()
+    try:
+        return_code, stdout, _stderr = _run_bounded_process(
+            [
+                sys.executable,
+                "-c",
+                verifier,
+                resolver_name,
+                auth_type,
+                provider_id,
+            ],
+            cwd=profile,
+            env=environment,
+            timeout=90,
+        )
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError) as exc:
+        raise NativeEvaluationUnavailable(
+            "native provider runtime credential resolution did not complete"
+        ) from exc
+    if return_code != 0 or stdout != "credential-ok":
+        raise NativeEvaluationUnavailable(
+            "native provider runtime credential resolution returned no usable lease"
+        )
+    return True
+
+
+def _provider_preflight_unavailable(_provider: str, _profile: Path) -> None:
+    raise NativeEvaluationUnavailable(
+        "authenticated provider endpoint/native inference preflight is unavailable"
+    )
 
 
 def _copy_auth(
-    source: Path | None, profile: Path, *, provider: str = "openai-codex"
+    source: Path | None,
+    profile: Path,
+    *,
+    provider: str = "openai-codex",
+    preflight: Callable[[str, Path], None] | None = None,
 ) -> bool:
-    """Validate then copy auth into the ephemeral profile; return verified status."""
+    """Copy auth only after runtime resolution and authenticated preflight succeed."""
 
-    text = _validate_auth_file(source, provider)
+    resolution = _provider_resolution(provider)
+    payload = _validate_auth_file(source, provider, resolution)
     destination = profile / "auth.json"
-    _atomic_write_text(destination, text, label="native Hermes auth copy")
     try:
-        destination.chmod(0o600)
-    except OSError:
-        pass
+        _atomic_copy_auth(payload, destination)
+        _resolve_runtime_credentials(provider, profile, resolution)
+        (preflight or _provider_preflight_unavailable)(provider, profile)
+    except Exception:
+        try:
+            _remove_auth_file(destination)
+        except NativeEvaluationUnavailable as cleanup_exc:
+            raise NativeEvaluationUnavailable(
+                "native provider verification failed and the isolated auth copy "
+                "could not be removed"
+            ) from cleanup_exc
+        raise
     return True
 
 
 def _auth_source(explicit: str | None) -> Path | None:
     candidates = []
-    configured_explicit = explicit or os.environ.get("FACTORY_EVAL_AUTH_FILE", "")
-    if configured_explicit:
+    if explicit is not None and type(explicit) is not str:
+        raise NativeEvaluationUnavailable("explicit auth path is malformed")
+    configured_explicit = (
+        explicit
+        if explicit is not None and explicit.strip()
+        else os.environ.get("FACTORY_EVAL_AUTH_FILE", "")
+    )
+    if type(configured_explicit) is not str:
+        raise NativeEvaluationUnavailable("configured auth path is malformed")
+    if configured_explicit.strip():
         candidates.append(Path(configured_explicit).expanduser())
     configured_home = os.environ.get("HERMES_HOME", "").strip()
     if configured_home:
@@ -1895,8 +2431,16 @@ def snapshot_board_state(parent_env: Mapping[str, str]) -> dict[Path, tuple[Any,
 def verify_board_state_unchanged(snapshot: Mapping[Path, tuple[Any, ...]]) -> None:
     """Raise if the native child touched inherited board or tree contents."""
 
+    if type(snapshot) is not dict:
+        raise NativeEvaluationUnavailable(
+            "board snapshot is not a trusted built-in map"
+        )
     budget = _new_snapshot_budget()
-    for path, before in snapshot.items():
+    for path, before in dict.items(snapshot):
+        if not isinstance(path, Path) or type(before) is not tuple:
+            raise NativeEvaluationUnavailable(
+                "board snapshot is not a trusted built-in map"
+            )
         try:
             current = _path_signature(path, _budget=budget)
         except FileNotFoundError:
@@ -1912,12 +2456,138 @@ def verify_board_state_unchanged(snapshot: Mapping[Path, tuple[Any, ...]]) -> No
 
 
 def _hermes_binary(explicit: str | None) -> str:
-    if explicit:
+    if explicit is not None:
+        if type(explicit) is not str or not explicit.strip():
+            raise NativeEvaluationUnavailable("native Hermes executable is malformed")
         return explicit
     binary = shutil.which("hermes")
     if binary:
         return binary
     raise NativeEvaluationUnavailable("native Hermes executable is not on PATH")
+
+
+def _native_provider_preflight(
+    provider: str,
+    profile: Path,
+    *,
+    hermes: str,
+    model: str,
+    parent_env: Mapping[str, str],
+    run_budget: int,
+) -> None:
+    """Prove authenticated native inference with no configured tool surface."""
+
+    query_path = _ensure_path_not_inherited(
+        profile / "provider-preflight.txt", parent_env, "provider preflight query"
+    )
+    _atomic_write_text(
+        query_path,
+        "Return one short provider health response. Do not call tools or mutate files.",
+        label="provider preflight query",
+    )
+    board_path = _ensure_path_not_inherited(
+        profile / "provider-preflight-board.db", parent_env, "provider preflight board"
+    )
+    env = build_isolated_environment(parent_env, profile, board_path)
+    command = [
+        hermes,
+        "chat",
+        "--query-file",
+        str(query_path),
+        "--oneshot",
+        "--quiet",
+        "--model",
+        model,
+        "--provider",
+        provider,
+        "--run-budget",
+        str(min(run_budget, 60)),
+    ]
+
+    config_path = profile / "config.yaml"
+    try:
+        original_config_text = config_path.read_text(encoding="utf-8")
+        original_config = json.loads(original_config_text)
+    except (OSError, TypeError, json.JSONDecodeError) as exc:
+        raise NativeEvaluationUnavailable(
+            "provider preflight profile configuration is unavailable"
+        ) from exc
+    if type(original_config) is not dict:
+        raise NativeEvaluationUnavailable(
+            "provider preflight profile configuration is malformed"
+        )
+    preflight_config = copy.deepcopy(original_config)
+    preflight_config["platform_toolsets"] = {"cli": []}
+    preflight_config["include_default_mcp_servers"] = False
+    preflight_config["mcp_servers"] = {}
+    agent_config = preflight_config.get("agent")
+    if type(agent_config) is not dict:
+        agent_config = {}
+    else:
+        agent_config = dict(agent_config)
+    agent_config["max_turns"] = 1
+    preflight_config["agent"] = agent_config
+    preflight_config_text = (
+        json.dumps(preflight_config, indent=2, sort_keys=True) + "\n"
+    )
+
+    _atomic_write_text(
+        config_path,
+        preflight_config_text,
+        label="provider preflight profile configuration",
+    )
+    try:
+        try:
+            installed = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, json.JSONDecodeError) as exc:
+            raise NativeEvaluationUnavailable(
+                "provider preflight profile configuration cannot be verified"
+            ) from exc
+        if (
+            type(installed) is not dict
+            or installed.get("platform_toolsets") != {"cli": []}
+            or installed.get("include_default_mcp_servers") is not False
+            or installed.get("mcp_servers") != {}
+            or not isinstance(installed.get("agent"), Mapping)
+            or installed["agent"].get("max_turns") != 1
+        ):
+            raise NativeEvaluationUnavailable(
+                "provider preflight profile retained a tool surface"
+            )
+        try:
+            return_code, _stdout, stderr = _run_bounded_process(
+                command,
+                cwd=profile,
+                env=env,
+                timeout=min(run_budget, 60),
+            )
+        except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError) as exc:
+            raise NativeEvaluationUnavailable(
+                "authenticated provider preflight did not complete"
+            ) from exc
+    finally:
+        _atomic_write_text(
+            config_path,
+            original_config_text,
+            label="provider profile restoration",
+        )
+        try:
+            restored_text = config_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise NativeEvaluationUnavailable(
+                "provider profile restoration cannot be verified"
+            ) from exc
+        if restored_text != original_config_text:
+            raise NativeEvaluationUnavailable(
+                "provider profile restoration did not preserve the fixture profile"
+            )
+
+    if return_code != 0:
+        raise NativeEvaluationUnavailable(
+            "authenticated provider preflight failed",
+            diagnostic=_sanitize_native_diagnostic(stderr),
+            exit_code=return_code,
+        )
 
 
 def _parse_json_response(text: str) -> Mapping[str, Any]:
@@ -2050,8 +2720,7 @@ def _run_bounded_process(
                         stream.close()
                     except OSError:
                         pass
-            if process.poll() is None:
-                _kill_process_group(process)
+            _kill_process_group(process)
             try:
                 process.wait(timeout=1)
             except (subprocess.TimeoutExpired, ChildProcessError):
@@ -2140,6 +2809,27 @@ class HermesSubprocessModel(DecisionModel):
             "--run-budget",
             str(self.run_budget),
         ]
+
+        def reset_retry_artifacts() -> None:
+            reservation_path = self.state_path.with_name(
+                self.state_path.name + ".reservation.json"
+            )
+            for path in (
+                self.trace_path,
+                reservation_path,
+                Path(f"{reservation_path}.lock"),
+            ):
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    raise NativeEvaluationUnavailable(
+                        "native retry artifacts could not be reset"
+                    ) from exc
+            self.native_fixture_receipt = None
+            self.native_trace = ()
+
         attempts = 0
         while True:
             try:
@@ -2152,6 +2842,7 @@ class HermesSubprocessModel(DecisionModel):
             except subprocess.TimeoutExpired as exc:
                 if attempts == 0:
                     attempts += 1
+                    reset_retry_artifacts()
                     continue
                 raise NativeEvaluationUnavailable(
                     "native Hermes one-shot did not finish",
@@ -2175,6 +2866,7 @@ class HermesSubprocessModel(DecisionModel):
             )
             if retryable and attempts == 0:
                 attempts += 1
+                reset_retry_artifacts()
                 continue
             raise NativeEvaluationUnavailable(
                 f"native Hermes one-shot failed with exit code {return_code}",
@@ -2260,8 +2952,8 @@ def run_native_evaluation(
 ) -> NativeEvaluation:
     """Run all synthetic cases through native Hermes and return safe evidence."""
 
-    if run_budget < 30:
-        raise ValueError("run_budget must be at least 30 seconds")
+    if type(run_budget) is not int or run_budget < 30:
+        raise ValueError("run_budget must be an integer of at least 30 seconds")
     parent_env = dict(os.environ)
     source_auth = _auth_source(auth_file)
     if trace_output:
@@ -2280,16 +2972,26 @@ def run_native_evaluation(
             trace_path=trace_path,
         )
         verify_fixture_only_profile(profile)
+        binary = _hermes_binary(hermes)
         credentials_verified = _copy_auth(
             source_auth,
             profile,
             provider=provider,
+            preflight=lambda selected_provider, selected_profile: (
+                _native_provider_preflight(
+                    selected_provider,
+                    selected_profile,
+                    hermes=binary,
+                    model=model,
+                    parent_env=parent_env,
+                    run_budget=run_budget,
+                )
+            ),
         )
         if credentials_verified is not True:
             raise NativeEvaluationUnavailable(
                 "native Hermes credentials were not verified"
             )
-        binary = _hermes_binary(hermes)
         cases = build_synthetic_cases(
             seed,
             credentials_verified=credentials_verified,
@@ -2301,6 +3003,13 @@ def run_native_evaluation(
                 json.dumps(case.state, sort_keys=True, separators=(",", ":")),
                 encoding="utf-8",
             )
+            reservation_path = state_path.with_name(
+                state_path.name + ".reservation.json"
+            )
+            try:
+                reservation_path.unlink()
+            except FileNotFoundError:
+                pass
             trace_path.write_text("", encoding="utf-8")
             case_snapshot = snapshot_board_state(parent_env)
             board_snapshot = case_snapshot
