@@ -1,0 +1,71 @@
+{
+  "schema": "factory.review-runtime.v1",
+  "artifact_version": "1.0.0",
+  "description": "Runtime overlay for bounded review dispatch, durable deadlines, and single-path canonical recovery.",
+  "native_boundary_schema": "factory.native-boundary.v1",
+  "native_artifact_identity_sha256": "feaffd82904b7cce43285ec0a038a3e7c8f85f467cb8c99ae07075a6f59918ab",
+  "native_artifact_version": "1.0.0",
+  "patches": {
+    "patches/002-review-runtime.patch": "1809ee56dac3cc5ec1803abc21c37d0e2f700d62665d6586d56fce217c635596"
+  },
+  "patched_paths": [
+    "gateway/kanban_watchers.py",
+    "hermes_cli/kanban.py",
+    "hermes_cli/kanban_db.py",
+    "tools/code_execution_tool.py",
+    "tools/code_kernel_remote.py",
+    "tools/environments/base.py",
+    "tools/evidence_window.py",
+    "tools/file_operations.py",
+    "tools/image_source.py",
+    "tools/kanban_tools.py",
+    "tools/process_registry.py",
+    "tools/terminal_tool.py",
+    "tools/tool_result_storage.py",
+    "tui_gateway/server.py"
+  ],
+  "policy": {
+    "review_dispatch_hard_cap_seconds": 1200,
+    "review": {
+      "hard_worker_cap_seconds": 1200,
+      "evidence_budget_seconds": 600,
+      "per_command_timeout_seconds": 120
+    },
+    "evidence_recovery": {
+      "hard_worker_cap_seconds": 600,
+      "evidence_budget_seconds": 300,
+      "per_command_timeout_seconds": 60
+    },
+    "canonical_recovery": {
+      "terminal_failure_run_fence": true,
+      "one_leaf_per_lane": true,
+      "dependency_resolution": "canonical_leaf"
+    },
+    "retryable_statuses": [
+      "ready",
+      "review"
+    ],
+    "terminal_statuses": [
+      "blocked",
+      "triage",
+      "done",
+      "archived"
+    ]
+  },
+  "excluded_copy_entries": [
+    ".git",
+    ".hg",
+    ".svn",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".venv",
+    "node_modules",
+    "dist",
+    "build",
+    "*.pyc",
+    "*.pyo"
+  ]
+}
