@@ -269,6 +269,17 @@ def _bounded_mapping_items(
     return result
 
 
+def _safe_mapping(value: Any, field_name: str = "mapping") -> dict[str, Any]:
+    """Normalize one untrusted mapping before any materialization or lookup."""
+
+    if not isinstance(value, Mapping):
+        raise ContractViolation(f"{field_name} must be a mapping")
+    normalized = _safe_value(value, field_name)
+    if not isinstance(normalized, dict):
+        raise ContractViolation(f"{field_name} must be a JSON object")
+    return normalized
+
+
 def _safe_value(
     value: Any,
     field_name: str = "value",
@@ -607,12 +618,9 @@ class TypedEvidence:
             result["candidate"] = _safe_identifier(
                 self.candidate, f"evidence.{kind}.candidate"
             )
-        if not isinstance(self.attributes, Mapping):
-            raise ContractViolation(f"evidence.{kind}.attributes are malformed")
-        if self.attributes:
-            result["attributes"] = _safe_value(
-                dict(self.attributes), f"evidence.{kind}.attributes"
-            )
+        attributes = _safe_mapping(self.attributes, f"evidence.{kind}.attributes")
+        if attributes:
+            result["attributes"] = attributes
         for field_name in (
             "phase",
             "input_identity",
@@ -1350,8 +1358,12 @@ def _validate_observation_trace(
         "propose_action": {"tool", "action", "idempotency_key", "target_task_id"},
         "read_action_readback": {"tool", "idempotency_key", "receipt"},
     }
-    for entry in trace_entries:
-        if not isinstance(entry, Mapping) or not isinstance(entry.get("tool"), str):
+    normalized_entries: list[dict[str, Any]] = []
+    for index, entry in enumerate(trace_entries):
+        if not isinstance(entry, Mapping):
+            raise ContractViolation("native fixture trace contains a malformed entry")
+        entry = _safe_mapping(entry, f"native fixture trace entry {index}")
+        if not isinstance(entry.get("tool"), str):
             raise ContractViolation("native fixture trace contains a malformed entry")
         tool_name = entry["tool"]
         if tool_name in trace_fields and set(entry) != trace_fields[tool_name]:
@@ -1363,6 +1375,8 @@ def _validate_observation_trace(
         ):
             raise ContractViolation("native fixture trace contains an unexpected field")
         names.append(entry["tool"])
+        normalized_entries.append(entry)
+    trace_entries = normalized_entries
     unexpected = sorted(set(names) - allowed)
     if unexpected:
         raise ContractViolation(
@@ -1437,7 +1451,7 @@ def _validate_observation_trace(
     if not isinstance(receipt, Mapping):
         raise ContractViolation("native fixture trace omitted the receipt payload")
     try:
-        receipt_document = dict(_safe_value(dict(receipt), "trace.receipt"))
+        receipt_document = _safe_mapping(receipt, "trace.receipt")
     except (TypeError, ValueError, ContractViolation) as exc:
         raise ContractViolation("native fixture trace receipt is malformed") from exc
     if readback_key != key or receipt_document.get("idempotency_key") != key:
@@ -1666,6 +1680,7 @@ class NoSideEffectFixtureAdapter:
                 raise ContractViolation(
                     "proposal action is not allowed by the current policy"
                 )
+        _reject_existing_admission(action, self._state.get("live"))
         self._proposal = {
             "action": action,
             "idempotency_key": idempotency_key,
@@ -1692,6 +1707,8 @@ class NoSideEffectFixtureAdapter:
 
         if not isinstance(proposal, Mapping) or not isinstance(readback, Mapping):
             raise ContractViolation("native fixture proposal/receipt is malformed")
+        proposal = _safe_mapping(proposal, "native.proposal")
+        readback = _safe_mapping(readback, "native.readback")
         if self._context is None:
             raise ContractViolation("native fixture proposal is not context-bound")
         if not self._can_propose(self._context):
@@ -1702,9 +1719,18 @@ class NoSideEffectFixtureAdapter:
             raise ContractViolation(
                 "native fixture proposal has no ordered trace proof"
             )
-        trace_entries = _bounded_iterable(
+        raw_trace_entries = _bounded_iterable(
             trace, "native fixture trace", _MAX_NATIVE_TRACE_ENTRIES
         )
+        trace_entries: list[dict[str, Any]] = []
+        for index, entry in enumerate(raw_trace_entries):
+            if not isinstance(entry, Mapping):
+                raise ContractViolation(
+                    "native fixture trace contains a malformed entry"
+                )
+            trace_entries.append(
+                _safe_mapping(entry, f"native fixture trace entry {index}")
+            )
         proposal_index, readback_index = _validate_observation_trace(trace_entries)
         trace_proposal = trace_entries[proposal_index]
         trace_readback = trace_entries[readback_index]
@@ -1733,13 +1759,12 @@ class NoSideEffectFixtureAdapter:
             raise ContractViolation(
                 "native fixture proposal target differs from its trace"
             )
+        _reject_existing_admission(action, self._state.get("live"))
         if self._proposal is not None:
             raise ContractViolation("fixture accepts only one action proposal")
-        sanitized = _safe_value(dict(readback), "native.readback")
-        if not isinstance(sanitized, dict):
-            raise ContractViolation("native fixture receipt is malformed")
+        sanitized = readback
         trace_receipt = trace_readback.get("receipt")
-        if not isinstance(trace_receipt, Mapping) or dict(trace_receipt) != sanitized:
+        if not isinstance(trace_receipt, Mapping) or trace_receipt != sanitized:
             raise ContractViolation("native fixture receipt differs from its trace")
         if sanitized.get("idempotency_key") != key:
             raise ContractViolation("native fixture receipt identity is stale")
@@ -1813,6 +1838,7 @@ class DecisionProposal:
     def from_response(cls, response: Mapping[str, Any]) -> DecisionProposal:
         if not isinstance(response, Mapping):
             raise ContractViolation("model response must be an object")
+        response = _safe_mapping(response, "model response")
         if set(response) != set(DECISION_LADDER):
             raise ContractViolation(
                 "model response must contain exactly the bounded decision ladder"
@@ -1820,7 +1846,12 @@ class DecisionProposal:
         values = {}
         for step in DECISION_LADDER:
             value = response.get(step)
-            if not isinstance(value, Mapping) or not value:
+            if not isinstance(value, Mapping):
+                raise ContractViolation(
+                    f"decision step {step} must be a non-empty object"
+                )
+            value = _safe_mapping(value, f"decision step {step}")
+            if not value:
                 raise ContractViolation(
                     f"decision step {step} must be a non-empty object"
                 )
@@ -1851,7 +1882,7 @@ class DecisionProposal:
                     raise ContractViolation(
                         f"decision step {step} missing required field: {expected}"
                     )
-            values[step] = _safe_value(dict(value), step)
+            values[step] = value
         return cls(**values)
 
 
@@ -2087,6 +2118,24 @@ def _validate_fixture_state(
         _safe_identifier(item, "fixture missing capability")
 
 
+def _reject_existing_admission(action: str, live: Mapping[str, Any] | None) -> None:
+    """Reject duplicate admission before a fixture can allocate a run."""
+
+    if action != "admit" or not isinstance(live, Mapping):
+        return
+    existing = live.get("existing_action")
+    if not isinstance(existing, Mapping):
+        return
+    if existing.get("status") == "completed":
+        raise ContractViolation(
+            "admit proposal rejected: completed existing action is terminal"
+        )
+    if existing.get("current_run_id") is not None:
+        raise ContractViolation(
+            "admit proposal rejected: existing action already has a current run"
+        )
+
+
 def _expected_action(
     context: DecisionContext,
     live: Mapping[str, Any],
@@ -2110,6 +2159,25 @@ def _expected_action(
         return "hold_missing_capability"
 
     existing = live.get("existing_action")
+    if isinstance(existing, Mapping) and existing.get("status") == "completed":
+        if existing.get("current_run_id") is not None:
+            raise ContractViolation(
+                "completed existing action has a current run identity"
+            )
+        bound_fields = {
+            "source_key": context.source_item.canonical_key,
+            "phase": context.phase,
+            "input_identity": context.input_identity,
+            "semantic_lane": context.semantic_lane,
+        }
+        if not all(
+            field_name in existing and existing.get(field_name) == expected
+            for field_name, expected in bound_fields.items()
+        ):
+            raise ContractViolation(
+                "completed existing action is not bound to this lane"
+            )
+        return "reuse_existing"
     if isinstance(existing, Mapping) and existing.get("status") == "blocked":
         if not context.blocker.fingerprint:
             raise ContractViolation(
@@ -2152,6 +2220,7 @@ def _validate_admission_guards(
 ) -> None:
     """Fail closed before allocating a current run."""
 
+    _reject_existing_admission("admit", live)
     if context.execution.run_id is not None:
         raise ContractViolation("admission requires current_run_id=null before spawn")
     if (
@@ -2393,11 +2462,11 @@ def _validate_action_semantics(
     if action == "reuse_existing":
         existing = live.get("existing_action") or {}
         if not (
-            existing.get("status") == "blocked"
+            existing.get("status") in {"blocked", "completed"}
             and existing.get("current_run_id") is None
         ):
             raise ContractViolation(
-                "reuse requires a blocked existing action with null run"
+                "reuse requires a blocked or completed existing action with null run"
             )
 
     if action == "select_independent_lane":

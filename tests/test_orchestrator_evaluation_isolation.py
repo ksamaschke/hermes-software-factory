@@ -217,6 +217,149 @@ def test_profile_catalog_is_explicitly_fixture_only(tmp_path: Path):
         evaluation.verify_fixture_only_profile(profile)
 
 
+@pytest.mark.parametrize(
+    "document, leaked_marker",
+    [
+        ("{not-json", None),
+        ({"providers": {"openai-codex": {}}}, None),
+        (
+            {
+                "providers": {
+                    "openai-codex": {"tokens": {"access_token": "fixture-access"}}
+                }
+            },
+            "fixture-access",
+        ),
+    ],
+)
+def test_auth_validation_rejects_malformed_or_unsupported_input_before_copy(
+    tmp_path: Path, document: Any, leaked_marker: str | None
+):
+    source = tmp_path / "source-auth.json"
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    source.write_text(
+        document if isinstance(document, str) else json.dumps(document),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(evaluation.NativeEvaluationUnavailable) as failure:
+        evaluation._copy_auth(source, profile, provider="openai-codex")
+
+    assert not (profile / "auth.json").exists()
+    if leaked_marker is not None:
+        assert leaked_marker not in str(failure.value)
+
+
+def test_auth_validation_returns_verified_status_only_for_provider_shape(
+    tmp_path: Path,
+):
+    document = {
+        "version": 1,
+        "providers": {
+            "openai-codex": {
+                "tokens": {
+                    "access_token": "fixture-access",
+                    "refresh_token": "fixture-refresh",
+                }
+            }
+        },
+    }
+    source = tmp_path / "source-auth.json"
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    source.write_text(json.dumps(document), encoding="utf-8")
+
+    assert evaluation._copy_auth(source, profile, provider="openai-codex") is True
+    assert json.loads((profile / "auth.json").read_text(encoding="utf-8")) == document
+    assert (profile / "auth.json").stat().st_mode & 0o077 == 0
+
+
+def test_invalid_auth_aborts_before_case_construction_or_model_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source = tmp_path / "invalid-auth.json"
+    source.write_text("{not-json", encoding="utf-8")
+    calls: list[tuple[Any, ...]] = []
+
+    def forbidden_case_builder(*args: Any, **kwargs: Any):
+        calls.append((args, kwargs))
+        raise AssertionError("invalid auth reached case construction")
+
+    monkeypatch.setattr(evaluation, "build_synthetic_cases", forbidden_case_builder)
+    with pytest.raises(
+        evaluation.NativeEvaluationUnavailable, match="auth JSON is malformed"
+    ):
+        evaluation.run_native_evaluation(
+            hermes=sys.executable,
+            auth_file=str(source),
+            run_budget=30,
+        )
+    assert calls == []
+
+
+def test_fixture_builders_do_not_forge_credentials_verified():
+    unverified = evaluation.build_synthetic_cases(
+        "unverified-builder", credentials_verified=False
+    )
+    admission_case = unverified[1]
+    assert admission_case.context.execution.credentials_verified is False
+    with pytest.raises(
+        contract.ContractViolation, match="admission requires verified credentials"
+    ):
+        contract._validate_admission_guards(
+            admission_case.context,
+            admission_case.state["live"],
+            admission_case.state["source"],
+        )
+
+    verified = evaluation.build_synthetic_cases(
+        "verified-builder", credentials_verified=True
+    )
+    assert verified[1].context.execution.credentials_verified is True
+
+
+def test_fixture_store_rejects_completed_admit_before_readback_allocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    case = evaluation.build_synthetic_cases(
+        "completed-store", credentials_verified=True
+    )[1]
+    state = json.loads(json.dumps(case.state))
+    state["live"]["existing_action"] = {
+        "status": "completed",
+        "task_id": "completed-store-task",
+        "current_run_id": None,
+        "source_key": case.context.source_item.canonical_key,
+        "phase": case.context.phase,
+        "input_identity": case.context.input_identity,
+        "semantic_lane": case.context.semantic_lane,
+    }
+    state_path = tmp_path / "state.json"
+    trace_path = tmp_path / "trace.jsonl"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    store = evaluation._FixtureStore(state_path, trace_path)
+    key = store.read_action_key("admit", case.context.execution.task_id)[
+        "idempotency_key"
+    ]
+    readback_calls: list[tuple[Any, ...]] = []
+
+    def unexpected_readback(*args: Any, **kwargs: Any):
+        readback_calls.append((args, kwargs))
+        raise AssertionError("completed admit allocated a fixture readback")
+
+    monkeypatch.setattr(evaluation, "simulated_action_readback", unexpected_readback)
+    with pytest.raises(
+        contract.ContractViolation, match="completed existing action is terminal"
+    ):
+        store.propose_action("admit", key, case.context.execution.task_id)
+
+    assert readback_calls == []
+    trace = trace_path.read_text(encoding="utf-8")
+    assert "propose_action" not in trace
+    assert "read_action_readback" not in trace
+
+
 def test_native_summary_redacts_model_and_provider_values():
     summary = evaluation.NativeEvaluation(
         "https://user:pw@example.invalid", "token=SECRET", ()

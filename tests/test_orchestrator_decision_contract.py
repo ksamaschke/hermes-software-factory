@@ -64,7 +64,7 @@ class SyntheticDecisionModel:
             next_phase = context["phase"]
             target = None
         elif (
-            existing.get("status") == "blocked"
+            existing.get("status") in {"blocked", "completed"}
             and existing.get("current_run_id") is None
         ):
             action = "reuse_existing"
@@ -478,6 +478,81 @@ def test_fixture_adapter_bounds_hostile_mapping_before_materialization():
     assert state.lookups == expected_consumption
 
 
+@pytest.mark.parametrize(
+    "ingress", ["typed_evidence", "proposal", "trace_entry", "trace_receipt"]
+)
+def test_all_untrusted_mapping_ingresses_are_bounded_before_materialization(ingress):
+    class HostileMapping(Mapping[str, Any]):
+        def __init__(self) -> None:
+            self.yielded = 0
+            self.lookups = 0
+
+        def __getitem__(self, key: str) -> Any:
+            self.lookups += 1
+            return key
+
+        def __iter__(self) -> Iterator[str]:
+            for index in range(contract._MAX_SAFE_VALUE_ITEMS + 4):
+                self.yielded += 1
+                yield f"key-{index}"
+
+        def __len__(self) -> int:
+            return contract._MAX_SAFE_VALUE_ITEMS + 4
+
+    hostile = HostileMapping()
+    if ingress == "typed_evidence":
+        operation = lambda: contract.TypedEvidence(
+            kind="scheduler",
+            subject="subject",
+            status="observed",
+            reference="reference",
+            attributes=hostile,
+        ).as_dict()
+    elif ingress == "proposal":
+        operation = lambda: contract.DecisionProposal.from_response(hostile)
+    elif ingress == "trace_entry":
+        operation = lambda: contract._validate_observation_trace([hostile])
+    else:
+        key = "fixture-key"
+        trace = [
+            {"tool": name}
+            for name in (
+                "read_live_state",
+                "read_parent_completion",
+                "read_source_state",
+                "read_ready_lanes",
+                "read_capabilities",
+            )
+        ]
+        trace.extend(
+            [
+                {
+                    "tool": "read_action_key",
+                    "action": "hold",
+                    "target_task_id": None,
+                    "idempotency_key": key,
+                },
+                {
+                    "tool": "propose_action",
+                    "action": "hold",
+                    "idempotency_key": key,
+                    "target_task_id": None,
+                },
+                {
+                    "tool": "read_action_readback",
+                    "idempotency_key": key,
+                    "receipt": hostile,
+                },
+            ]
+        )
+        operation = lambda: contract._validate_observation_trace(trace)
+
+    with pytest.raises(contract.ContractViolation):
+        operation()
+    assert hostile.yielded <= contract._MAX_SAFE_VALUE_ITEMS + 1
+    assert hostile.lookups <= contract._MAX_SAFE_VALUE_ITEMS + 1
+
+
 def test_model_fixture_path_makes_safe_decisions_for_unseen_ids_without_writes():
     cases = [
         (
@@ -676,6 +751,106 @@ def test_reused_and_current_run_null_are_not_claimed_as_new_execution():
     assert result.readback["status"] == "reused"
     assert result.readback["current_run_id"] is None
     assert result.new_current_run is False
+
+
+def test_identity_bound_completed_action_is_reused_without_admission():
+    context = _context(
+        "completed-terminal",
+        {
+            "blocker": {
+                "fingerprint": "contract:v2",
+                "previous_fingerprint": "contract:v1",
+                "resolved": True,
+            },
+            "live": {
+                "blocker": {},
+                "existing_action": {
+                    "status": "completed",
+                    "task_id": "completed-card",
+                    "current_run_id": None,
+                },
+            },
+        },
+    )
+    adapter = contract.NoSideEffectFixtureAdapter(
+        _fixture_state(
+            context,
+            live={
+                "blocker": {},
+                "existing_action": {
+                    "status": "completed",
+                    "task_id": "completed-card",
+                    "current_run_id": None,
+                },
+            },
+        )
+    )
+
+    result = contract.evaluate_decision(SyntheticDecisionModel(), context, adapter)
+
+    assert result.action == "reuse_existing"
+    assert result.readback["current_run_id"] is None
+    assert result.readback["admission_count"] == 0
+    assert adapter.postproposal_receipt_reads == 1
+
+
+def test_completed_action_rejects_admit_before_fixture_readback_allocation():
+    context = _context(
+        "completed-admit-attack",
+        {
+            "blocker": {
+                "fingerprint": "contract:v2",
+                "previous_fingerprint": "contract:v1",
+                "resolved": True,
+            },
+            "live": {
+                "blocker": {},
+                "existing_action": {
+                    "status": "completed",
+                    "task_id": "completed-card",
+                    "current_run_id": None,
+                },
+            },
+        },
+    )
+    adapter = contract.NoSideEffectFixtureAdapter(
+        _fixture_state(
+            context,
+            live={
+                "blocker": {},
+                "existing_action": {
+                    "status": "completed",
+                    "task_id": "completed-card",
+                    "current_run_id": None,
+                },
+            },
+        )
+    )
+
+    class AdmitModel:
+        def complete(self, prompt: str, tools: dict[str, Any]) -> dict[str, Any]:
+            del prompt
+            for name in (
+                "read_live_state",
+                "read_parent_completion",
+                "read_source_state",
+                "read_ready_lanes",
+                "read_capabilities",
+            ):
+                tools[name]()
+            key = tools["read_action_key"]("admit", context.execution.task_id)[
+                "idempotency_key"
+            ]
+            tools["propose_action"]("admit", key, context.execution.task_id)
+            raise AssertionError("completed action reached an impossible readback")
+
+    with pytest.raises(
+        contract.ContractViolation, match="completed existing action is terminal"
+    ):
+        contract.evaluate_decision(AdmitModel(), context, adapter)
+    assert adapter.proposal is None
+    assert adapter.proposal_attempts == 1
+    assert adapter.postproposal_receipt_reads == 0
 
 
 def test_controller_does_not_auto_propose_a_response_without_a_model_commit():

@@ -27,7 +27,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from stat import S_IMODE, S_ISDIR, S_ISLNK, S_ISVTX
+from stat import S_IMODE, S_ISDIR, S_ISLNK, S_ISREG, S_ISVTX
 from typing import Any
 
 try:  # Running as a package is useful to downstream installers.
@@ -51,6 +51,7 @@ try:  # Running as a package is useful to downstream installers.
         _bounded_iterable,
         _receipt_digest,
         _redact_text,
+        _reject_existing_admission,
         _safe_identifier,
         _safe_value,
         _validate_observation_trace,
@@ -82,6 +83,7 @@ except ImportError:  # Running this file directly is the supported CLI path.
         _bounded_iterable,
         _receipt_digest,
         _redact_text,
+        _reject_existing_admission,
         _safe_identifier,
         _safe_value,
         _validate_observation_trace,
@@ -134,7 +136,8 @@ policy and current phase/action (it is not fixture-observed):
 The gate precedence is typed and must be applied before any proposal: a merged
 source with a failed artifact selects repair_artifact; otherwise an unrelated
 ready lane selects select_independent_lane; otherwise missing capabilities select
-hold_missing_capability; otherwise a bound blocked action selects reuse_existing;
+hold_missing_capability; otherwise a bound blocked or completed action selects reuse_existing; a
+completed existing action is terminal and a no-op, never admit;
 otherwise an unchanged blocker at or above repeated_blocker_threshold remains
 quarantined; otherwise a resolved or newly changed blocker may be admitted; and
 otherwise hold. These are contract rules, not case labels or an answer oracle.
@@ -619,11 +622,14 @@ class NativeEvaluation:
 def _fixture_context(
     item_key: str,
     *,
+    credentials_verified: bool = False,
     blocker: Mapping[str, Any] | None = None,
     source_state: str = "open",
     artifact_state: str = "ready",
     review_state: str = "approved",
 ) -> DecisionContext:
+    if not isinstance(credentials_verified, bool):
+        raise ContractViolation("credential verification guard is malformed")
     source = SourceIdentity(
         tracker="synthetic-tracker",
         project="synthetic-project",
@@ -637,7 +643,7 @@ def _fixture_context(
         profile_name="factory-orchestrator",
         task_id=f"task-{item_key}",
         run_id=None,
-        credentials_verified=True,
+        credentials_verified=credentials_verified,
     )
     evidence = EvidenceBundle(
         scheduler=(
@@ -772,7 +778,9 @@ def _counterfactual_text(index: int, variant: str) -> tuple[str, str]:
     )
 
 
-def build_synthetic_cases(seed: str | None = None) -> tuple[EvaluationCase, ...]:
+def build_synthetic_cases(
+    seed: str | None = None, *, credentials_verified: bool = False
+) -> tuple[EvaluationCase, ...]:
     """Build six unseen, opaque synthetic cases without an action oracle."""
 
     suffix = (seed or uuid.uuid4().hex[:12]).strip()
@@ -803,6 +811,7 @@ def build_synthetic_cases(seed: str | None = None) -> tuple[EvaluationCase, ...]
     item_key = _opaque_item_key(suffix, 0)
     context = _fixture_context(
         item_key,
+        credentials_verified=credentials_verified,
         blocker={
             "fingerprint": "provider:capacity",
             "previous_fingerprint": "provider:capacity",
@@ -814,6 +823,7 @@ def build_synthetic_cases(seed: str | None = None) -> tuple[EvaluationCase, ...]
     item_key = _opaque_item_key(suffix, 1)
     context = _fixture_context(
         item_key,
+        credentials_verified=credentials_verified,
         blocker={
             "fingerprint": "contract:v2",
             "previous_fingerprint": "contract:v1",
@@ -825,6 +835,7 @@ def build_synthetic_cases(seed: str | None = None) -> tuple[EvaluationCase, ...]
     item_key = _opaque_item_key(suffix, 2)
     context = _fixture_context(
         item_key,
+        credentials_verified=credentials_verified,
         blocker={
             "fingerprint": "existing:blocked",
             "previous_fingerprint": "existing:blocked",
@@ -849,7 +860,11 @@ def build_synthetic_cases(seed: str | None = None) -> tuple[EvaluationCase, ...]
     )
 
     item_key = _opaque_item_key(suffix, 3)
-    context = _fixture_context(item_key, blocker={"fingerprint": "signer:held"})
+    context = _fixture_context(
+        item_key,
+        credentials_verified=credentials_verified,
+        blocker={"fingerprint": "signer:held"},
+    )
     add_case(
         3,
         "select_independent_lane",
@@ -862,7 +877,12 @@ def build_synthetic_cases(seed: str | None = None) -> tuple[EvaluationCase, ...]
     )
 
     item_key = _opaque_item_key(suffix, 4)
-    context = _fixture_context(item_key, source_state="merged", artifact_state="failed")
+    context = _fixture_context(
+        item_key,
+        credentials_verified=credentials_verified,
+        source_state="merged",
+        artifact_state="failed",
+    )
     add_case(
         4,
         "repair_artifact",
@@ -879,7 +899,7 @@ def build_synthetic_cases(seed: str | None = None) -> tuple[EvaluationCase, ...]
     )
 
     item_key = _opaque_item_key(suffix, 5)
-    context = _fixture_context(item_key)
+    context = _fixture_context(item_key, credentials_verified=credentials_verified)
     add_case(
         5,
         "hold_missing_capability",
@@ -895,11 +915,15 @@ def build_synthetic_cases(seed: str | None = None) -> tuple[EvaluationCase, ...]
 
 def build_counterfactual_cases(
     seed: str | None = None,
+    *,
+    credentials_verified: bool = False,
 ) -> tuple[tuple[EvaluationCase, EvaluationCase], ...]:
     """Return baseline/paraphrase pairs sharing the exact canonical identity."""
 
     pairs: list[tuple[EvaluationCase, EvaluationCase]] = []
-    for index, baseline in enumerate(build_synthetic_cases(seed)):
+    for index, baseline in enumerate(
+        build_synthetic_cases(seed, credentials_verified=credentials_verified)
+    ):
         title, body = _counterfactual_text(index, "paraphrase")
         variant = EvaluationCase(
             baseline.item_key,
@@ -954,7 +978,10 @@ class StatefulEvaluation:
 
 
 def run_stateful_fixture_evaluation(
-    model: DecisionModel, *, seed: str | None = None
+    model: DecisionModel,
+    *,
+    seed: str | None = None,
+    credentials_verified: bool = False,
 ) -> StatefulEvaluation:
     """Exercise three unchanged ticks, resolution, reuse, and ready work."""
 
@@ -964,6 +991,7 @@ def run_stateful_fixture_evaluation(
     item_key = _opaque_item_key(suffix, 100)
     base = _fixture_context(
         item_key,
+        credentials_verified=credentials_verified,
         blocker={
             "fingerprint": "provider:capacity",
             "previous_fingerprint": "provider:capacity",
@@ -1172,8 +1200,9 @@ class _FixtureStore:
         idempotency_key = _safe_identifier(idempotency_key, "proposal.idempotency_key")
         if target_task_id is not None:
             target_task_id = _safe_identifier(target_task_id, "proposal.target_task_id")
+        state = self._state()
         decision_identity = _safe_identifier(
-            self._state().get("decision_identity_key"), "decision_identity_key"
+            state.get("decision_identity_key"), "decision_identity_key"
         )
         if idempotency_key != _action_key_from_decision_identity(
             decision_identity, action, target_task_id
@@ -1181,6 +1210,7 @@ class _FixtureStore:
             raise ContractViolation(
                 "fixture proposal key is not bound to action and target"
             )
+        _reject_existing_admission(action, state.get("live"))
         simulated_action_readback(action, idempotency_key, target_task_id)
         self._proposal = {
             "action": action,
@@ -1409,21 +1439,199 @@ def verify_fixture_only_profile(profile: Path) -> None:
         raise NativeEvaluationUnavailable("fixture-only profile permits shared memory")
 
 
-def _copy_auth(source: Path | None, profile: Path) -> None:
-    """Copy credentials only into the ephemeral profile, never into the source tree."""
+_MAX_AUTH_FILE_BYTES = 4 * 1024 * 1024
+_OAUTH_AUTH_PROVIDERS = frozenset(
+    {
+        "openai-codex",
+        "xai-oauth",
+        "qwen-oauth",
+        "minimax-oauth",
+        "nous",
+    }
+)
+_AUTH_PROVIDER_ALIASES = {
+    "codex": "openai-codex",
+    "openai_codex": "openai-codex",
+}
+
+
+def _auth_provider_keys(provider: str) -> tuple[str, ...]:
+    normalized = provider.strip().casefold()
+    canonical = _AUTH_PROVIDER_ALIASES.get(normalized, normalized)
+    return tuple(dict.fromkeys((normalized, canonical)))
+
+
+def _provider_requires_refresh(provider: str) -> bool:
+    canonical = _auth_provider_keys(provider)[-1]
+    if canonical in _OAUTH_AUTH_PROVIDERS:
+        return True
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY
+    except ImportError:
+        config = None
+    else:
+        try:
+            config = PROVIDER_REGISTRY.get(canonical)
+        except (AttributeError, TypeError):
+            config = None
+    auth_type = getattr(config, "auth_type", "")
+    return isinstance(auth_type, str) and auth_type.casefold().startswith("oauth")
+
+
+def _nonempty_auth_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _auth_state_has_credential(state: Any, *, requires_refresh: bool) -> bool:
+    if not isinstance(state, Mapping):
+        return False
+    tokens = state.get("tokens")
+    if (
+        isinstance(tokens, Mapping)
+        and _nonempty_auth_string(tokens.get("access_token"))
+        and (not requires_refresh or _nonempty_auth_string(tokens.get("refresh_token")))
+    ):
+        return True
+    access = next(
+        (
+            state.get(field_name)
+            for field_name in ("access_token", "api_key", "token", "agent_key")
+            if _nonempty_auth_string(state.get(field_name))
+        ),
+        None,
+    )
+    if not _nonempty_auth_string(access):
+        return False
+    return not requires_refresh or _nonempty_auth_string(state.get("refresh_token"))
+
+
+def _auth_pool_has_credential(entries: Any, *, requires_refresh: bool) -> bool:
+    if not isinstance(entries, list):
+        return False
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        auth_type = entry.get("auth_type")
+        entry_requires_refresh = requires_refresh or (
+            isinstance(auth_type, str) and auth_type.casefold() == "oauth"
+        )
+        access = next(
+            (
+                entry.get(field_name)
+                for field_name in ("access_token", "api_key", "token", "agent_key")
+                if _nonempty_auth_string(entry.get(field_name))
+            ),
+            None,
+        )
+        if _nonempty_auth_string(access) and (
+            not entry_requires_refresh
+            or _nonempty_auth_string(entry.get("refresh_token"))
+        ):
+            return True
+    return False
+
+
+def _validate_auth_file(source: Path | None, provider: str) -> str:
+    """Read and validate auth JSON without returning or logging its contents."""
 
     if source is None:
         raise NativeEvaluationUnavailable(
             "set FACTORY_EVAL_AUTH_FILE to an authenticated native Hermes auth.json"
         )
-    if not source.is_file():
-        raise NativeEvaluationUnavailable("native Hermes auth file is not present")
+    try:
+        source = Path(source)
+    except (TypeError, ValueError):
+        raise NativeEvaluationUnavailable(
+            "native Hermes auth file path is malformed"
+        ) from None
+    if not isinstance(provider, str) or not provider.strip():
+        raise NativeEvaluationUnavailable("native provider identity is malformed")
+    try:
+        with source.open("rb") as stream:
+            if not S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise NativeEvaluationUnavailable(
+                    "native Hermes auth file is not a regular readable file"
+                )
+            raw = stream.read(_MAX_AUTH_FILE_BYTES + 1)
+    except NativeEvaluationUnavailable:
+        raise
+    except (OSError, ValueError):
+        raise NativeEvaluationUnavailable(
+            "native Hermes auth file is not a regular readable file"
+        ) from None
+    if len(raw) > _MAX_AUTH_FILE_BYTES:
+        raise NativeEvaluationUnavailable("native Hermes auth file exceeds its bound")
+    try:
+        text = raw.decode("utf-8-sig")
+        payload = json.loads(text)
+    except (UnicodeDecodeError, TypeError, ValueError, RecursionError):
+        raise NativeEvaluationUnavailable(
+            "native Hermes auth JSON is malformed"
+        ) from None
+    if not isinstance(payload, Mapping):
+        raise NativeEvaluationUnavailable("native Hermes auth JSON is not an object")
+    try:
+        bounded_payload = _safe_value(payload, "native auth payload")
+    except ContractViolation:
+        raise NativeEvaluationUnavailable(
+            "native Hermes auth JSON exceeds its structural bounds"
+        ) from None
+    if not isinstance(bounded_payload, dict):
+        raise NativeEvaluationUnavailable("native Hermes auth JSON is not an object")
+
+    providers = payload.get("providers")
+    pool = payload.get("credential_pool")
+    if providers is not None and not isinstance(providers, Mapping):
+        raise NativeEvaluationUnavailable("native Hermes auth providers are malformed")
+    if pool is not None and not isinstance(pool, Mapping):
+        raise NativeEvaluationUnavailable(
+            "native Hermes auth credential pool is malformed"
+        )
+    if providers is None and pool is None:
+        raise NativeEvaluationUnavailable(
+            "native Hermes auth JSON has no provider credential structure"
+        )
+
+    provider_keys = _auth_provider_keys(provider)
+    requires_refresh = _provider_requires_refresh(provider)
+    state_valid = bool(
+        isinstance(providers, Mapping)
+        and any(
+            _auth_state_has_credential(
+                providers.get(provider_key), requires_refresh=requires_refresh
+            )
+            for provider_key in provider_keys
+        )
+    )
+    pool_valid = bool(
+        isinstance(pool, Mapping)
+        and any(
+            _auth_pool_has_credential(
+                pool.get(provider_key), requires_refresh=requires_refresh
+            )
+            for provider_key in provider_keys
+        )
+    )
+    if not (state_valid or pool_valid):
+        raise NativeEvaluationUnavailable(
+            "native Hermes auth JSON has no provider-compatible credential"
+        )
+    return text
+
+
+def _copy_auth(
+    source: Path | None, profile: Path, *, provider: str = "openai-codex"
+) -> bool:
+    """Validate then copy auth into the ephemeral profile; return verified status."""
+
+    text = _validate_auth_file(source, provider)
     destination = profile / "auth.json"
-    shutil.copy2(source, destination)
+    _atomic_write_text(destination, text, label="native Hermes auth copy")
     try:
         destination.chmod(0o600)
     except OSError:
         pass
+    return True
 
 
 def _auth_source(explicit: str | None) -> Path | None:
@@ -1997,9 +2205,7 @@ def run_native_evaluation(
     if run_budget < 30:
         raise ValueError("run_budget must be at least 30 seconds")
     parent_env = dict(os.environ)
-    binary = _hermes_binary(hermes)
     source_auth = _auth_source(auth_file)
-    cases = build_synthetic_cases(seed)
     if trace_output:
         _ensure_path_not_inherited(
             Path(trace_output), parent_env, "native trace output"
@@ -2016,7 +2222,20 @@ def run_native_evaluation(
             trace_path=trace_path,
         )
         verify_fixture_only_profile(profile)
-        _copy_auth(source_auth, profile)
+        credentials_verified = _copy_auth(
+            source_auth,
+            profile,
+            provider=provider,
+        )
+        if credentials_verified is not True:
+            raise NativeEvaluationUnavailable(
+                "native Hermes credentials were not verified"
+            )
+        binary = _hermes_binary(hermes)
+        cases = build_synthetic_cases(
+            seed,
+            credentials_verified=credentials_verified,
+        )
         result_rows: list[dict[str, Any]] = []
         board_snapshot: dict[Path, tuple[Any, ...]] | None = None
         for case in cases:
