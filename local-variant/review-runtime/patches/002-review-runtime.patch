@@ -1,8 +1,7 @@
 diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
-index 4b547a1..d61c098 100644
 --- a/hermes_cli/kanban_db.py
 +++ b/hermes_cli/kanban_db.py
-@@ -83,6 +83,7 @@ import subprocess
+@@ -83,6 +83,7 @@
  import sys
  import threading
  import logging
@@ -10,10 +9,11 @@ index 4b547a1..d61c098 100644
  import time
  from contextvars import ContextVar, Token
  from dataclasses import dataclass, field
-@@ -102,6 +103,31 @@ _log = logging.getLogger(__name__)
+@@ -101,6 +102,31 @@
+
  VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
  VALID_INITIAL_STATUSES = {"running", "blocked"}
-
++
 +# Runtime classes are selected from durable task state or an explicit
 +# dispatcher entrypoint. They are never inferred from comments or prose.
 +RUNTIME_CLASS_IMPLEMENTATION = "implementation"
@@ -38,14 +38,14 @@ index 4b547a1..d61c098 100644
 +    "spawn_failed",
 +    "gave_up",
 +})
-+
+
  # Typed block reasons. Distinguishes the two fundamentally different things a
  # worker (or human) means by "blocked", so each can be routed differently
- # instead of all landing in one undifferentiated ``blocked`` bucket that a cron
-@@ -1049,6 +1075,28 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
+@@ -1048,6 +1074,28 @@
+ # ---------------------------------------------------------------------------
  # Data classes
  # ---------------------------------------------------------------------------
-
++
 +
 +def _optional_finite_float(value: Any) -> Optional[float]:
 +    """Return a finite float or ``None`` for malformed persisted state."""
@@ -67,11 +67,10 @@ index 4b547a1..d61c098 100644
 +    except (TypeError, ValueError, OverflowError):
 +        return None
 +
-+
+
  @dataclass
  class Task:
-     """In-memory view of a row from the ``tasks`` table."""
-@@ -1141,6 +1189,19 @@ class Task:
+@@ -1141,6 +1189,19 @@
      # Unblock-loop counter. See the column comment in SCHEMA_SQL and
      # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
      block_recurrences: int = 0
@@ -91,7 +90,7 @@ index 4b547a1..d61c098 100644
 
      @classmethod
      def from_row(cls, row: sqlite3.Row) -> "Task":
-@@ -1235,6 +1296,21 @@ class Task:
+@@ -1235,6 +1296,21 @@
                  if "block_recurrences" in keys and row["block_recurrences"] is not None
                  else 0
              ),
@@ -113,7 +112,7 @@ index 4b547a1..d61c098 100644
          )
 
 
-@@ -1258,6 +1334,7 @@ class Run:
+@@ -1258,6 +1334,7 @@
      claim_expires: Optional[int]
      worker_pid: Optional[int]
      max_runtime_seconds: Optional[int]
@@ -121,7 +120,7 @@ index 4b547a1..d61c098 100644
      last_heartbeat_at: Optional[int]
      started_at: int
      ended_at: Optional[int]
-@@ -1268,6 +1345,7 @@ class Run:
+@@ -1268,6 +1345,7 @@
 
      @classmethod
      def from_row(cls, row: sqlite3.Row) -> "Run":
@@ -129,7 +128,7 @@ index 4b547a1..d61c098 100644
          try:
              meta = json.loads(row["metadata"]) if row["metadata"] else None
          except Exception:
-@@ -1282,6 +1360,9 @@ class Run:
+@@ -1282,6 +1360,9 @@
              claim_expires=row["claim_expires"],
              worker_pid=row["worker_pid"],
              max_runtime_seconds=row["max_runtime_seconds"],
@@ -139,7 +138,7 @@ index 4b547a1..d61c098 100644
              last_heartbeat_at=row["last_heartbeat_at"],
              started_at=int(row["started_at"]),
              ended_at=(int(row["ended_at"]) if row["ended_at"] is not None else None),
-@@ -1362,6 +1443,7 @@ CREATE TABLE IF NOT EXISTS tasks (
+@@ -1362,6 +1443,7 @@
      -- Short excerpt of the most recent failure's error text.
      last_failure_error   TEXT,
      max_runtime_seconds  INTEGER,
@@ -147,7 +146,7 @@ index 4b547a1..d61c098 100644
      last_heartbeat_at    INTEGER,
      -- Pointer into task_runs for the currently-active run (NULL if no
      -- run is in-flight). Denormalised for cheap reads.
-@@ -1431,6 +1513,30 @@ CREATE TABLE IF NOT EXISTS task_links (
+@@ -1431,6 +1513,30 @@
      PRIMARY KEY (parent_id, child_id)
  );
 
@@ -178,7 +177,7 @@ index 4b547a1..d61c098 100644
  CREATE TABLE IF NOT EXISTS task_comments (
      id         INTEGER PRIMARY KEY AUTOINCREMENT,
      task_id    TEXT NOT NULL,
-@@ -1464,9 +1570,10 @@ CREATE TABLE IF NOT EXISTS task_runs (
+@@ -1464,9 +1570,10 @@
      -- status: running | done | blocked | crashed | timed_out | failed | released
      claim_lock          TEXT,
      claim_expires       INTEGER,
@@ -191,7 +190,7 @@ index 4b547a1..d61c098 100644
      started_at          INTEGER NOT NULL,
      ended_at            INTEGER,
      outcome             TEXT,
-@@ -1518,6 +1625,8 @@ CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
+@@ -1518,6 +1625,8 @@
  CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
  CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
  CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
@@ -200,7 +199,7 @@ index 4b547a1..d61c098 100644
  CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
  CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
  CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
-@@ -2605,6 +2714,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
+@@ -2605,6 +2714,11 @@
          _add_column_if_missing(
              conn, "tasks", "max_runtime_seconds", "max_runtime_seconds INTEGER"
          )
@@ -212,10 +211,11 @@ index 4b547a1..d61c098 100644
      if "last_heartbeat_at" not in cols:
          _add_column_if_missing(
              conn, "tasks", "last_heartbeat_at", "last_heartbeat_at INTEGER"
-@@ -2634,6 +2748,19 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
+@@ -2633,6 +2747,19 @@
+         # which is the correct default (they keep the global behaviour
          # they were getting before the column existed).
          _add_column_if_missing(conn, "tasks", "max_retries", "max_retries INTEGER")
-
++
 +    runs_exist = conn.execute(
 +        "SELECT 1 FROM sqlite_master "
 +        "WHERE type='table' AND name='task_runs' LIMIT 1"
@@ -228,11 +228,10 @@ index 4b547a1..d61c098 100644
 +            _add_column_if_missing(
 +                conn, "task_runs", "evidence_deadline", "evidence_deadline REAL"
 +            )
-+
+
      if "model_override" not in cols:
          conn.execute("ALTER TABLE tasks ADD COLUMN model_override TEXT")
-
-@@ -3182,6 +3309,7 @@ def create_task(
+@@ -3182,6 +3309,7 @@
      triage: bool = False,
      idempotency_key: Optional[str] = None,
      max_runtime_seconds: Optional[int] = None,
@@ -240,19 +239,19 @@ index 4b547a1..d61c098 100644
      skills: Optional[Iterable[str]] = None,
      max_retries: Optional[int] = None,
      model_override: Optional[str] = None,
-@@ -3246,6 +3374,11 @@ def create_task(
+@@ -3245,6 +3373,11 @@
+     if initial_status not in VALID_INITIAL_STATUSES:
          raise ValueError(
              f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
-         )
++        )
 +    runtime_class = str(runtime_class or RUNTIME_CLASS_IMPLEMENTATION).strip().lower()
 +    if runtime_class not in VALID_RUNTIME_CLASSES:
 +        raise ValueError(
 +            f"runtime_class must be one of {sorted(VALID_RUNTIME_CLASSES)}"
-+        )
+         )
      if workspace_kind not in VALID_WORKSPACE_KINDS:
          raise ValueError(
-             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
-@@ -3505,11 +3638,11 @@ def create_task(
+@@ -3505,11 +3638,11 @@
                          id, title, body, assignee, status, priority,
                          created_by, created_at, workspace_kind, workspace_path,
                          branch_name, project_id, tenant, idempotency_key,
@@ -266,7 +265,7 @@ index 4b547a1..d61c098 100644
                      """,
                      (
                          task_id,
-@@ -3527,6 +3660,7 @@ def create_task(
+@@ -3527,6 +3660,7 @@
                          tenant,
                          idempotency_key,
                          int(max_runtime_seconds) if max_runtime_seconds is not None else None,
@@ -274,7 +273,7 @@ index 4b547a1..d61c098 100644
                          json.dumps(skills_list) if skills_list is not None else None,
                          int(max_retries) if max_retries is not None else None,
                          model_override,
-@@ -3559,6 +3693,7 @@ def create_task(
+@@ -3559,6 +3693,7 @@
                          "workspace_path": workspace_path,
                          "branch_name": branch_name,
                          "project_id": project_id,
@@ -282,7 +281,7 @@ index 4b547a1..d61c098 100644
                          "skills": list(skills_list) if skills_list else None,
                          "goal_mode": bool(goal_mode) or None,
                          "model_override": model_override,
-@@ -3640,7 +3775,17 @@ def _inherit_notify_subs(
+@@ -3640,7 +3775,17 @@
 
 
  def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
@@ -301,14 +300,14 @@ index 4b547a1..d61c098 100644
      return Task.from_row(row) if row else None
 
 
-@@ -3834,9 +3979,43 @@ def set_reasoning_effort(
+@@ -3834,8 +3979,42 @@
 
 
  # ---------------------------------------------------------------------------
 -# Links
 +# Links and canonical recovery
  # ---------------------------------------------------------------------------
-
++
 +def canonical_task_chain(
 +    conn: sqlite3.Connection, task_id: str
 +) -> tuple[str, ...]:
@@ -342,11 +341,10 @@ index 4b547a1..d61c098 100644
 +    """Resolve ``task_id`` to the sole current recovery leaf."""
 +    return canonical_task_chain(conn, task_id)[-1]
 +
-+
+
  def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
      if parent_id == child_id:
-         raise ValueError("a task cannot depend on itself")
-@@ -3852,11 +4031,10 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
+@@ -3852,11 +4031,10 @@
              "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
              (parent_id, child_id),
          )
@@ -362,10 +360,12 @@ index 4b547a1..d61c098 100644
              conn.execute(
                  "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
                  (child_id,),
-@@ -3891,6 +4069,301 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
+@@ -3889,6 +4067,301 @@
+         ).fetchall()
+         stack.extend(r["child_id"] for r in rows)
      return False
-
-
++
++
 +_CANONICAL_RECOVERY_FAILURE_OUTCOMES = frozenset(
 +    {
 +        "blocked",
@@ -659,12 +659,10 @@ index 4b547a1..d61c098 100644
 +    notify_task_updated(conn, successor_id, ("status",))
 +    recompute_ready(conn)
 +    return relation
-+
-+
+
+
  def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
-     with write_txn(conn):
-         cur = conn.execute(
-@@ -3971,19 +4444,30 @@ def task_graph_context(conn: sqlite3.Connection, task_id: str) -> dict:
+@@ -3971,19 +4444,30 @@
      return task_graph_contexts(conn, [task_id])[task_id]
 
 
@@ -708,16 +706,17 @@ index 4b547a1..d61c098 100644
 
 
  # ---------------------------------------------------------------------------
-@@ -4521,11 +5005,15 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
+@@ -4521,11 +5005,15 @@
  def recompute_ready(
      conn: sqlite3.Connection, failure_limit: int = None,
  ) -> int:
 -    """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
-+    """Promote waiting tasks when every canonical dependency leaf is terminal.
-
+-
 -    Returns the number of tasks promoted.  Opens its own IMMEDIATE txn, so it
 -    MUST be called OUTSIDE any open write transaction (plain ``write_txn``
 -    raises on nesting); call it after the enclosing txn commits.
++    """Promote waiting tasks when every canonical dependency leaf is terminal.
++
 +    Direct dependency edges remain immutable audit history. If a failed
 +    parent was explicitly superseded, readiness follows its one fenced
 +    successor chain instead of treating the archived predecessor as success.
@@ -728,7 +727,7 @@ index 4b547a1..d61c098 100644
 
      ``blocked`` tasks are also considered for promotion (so a task
      blocked purely by a parent dependency unblocks itself when the
-@@ -4567,13 +5055,7 @@ def recompute_ready(
+@@ -4567,13 +5055,7 @@
                  # legitimate exit (it emits ``"unblocked"`` which flips
                  # this predicate back).
                  continue
@@ -743,7 +742,7 @@ index 4b547a1..d61c098 100644
                  resume_status = _resume_status_from_events(conn, task_id)
                  if cur_status == "blocked":
                      # Don't auto-recover tasks that have hit the
-@@ -4615,14 +5097,24 @@ def recompute_ready(
+@@ -4615,14 +5097,24 @@
  # ---------------------------------------------------------------------------
 
  def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -775,7 +774,7 @@ index 4b547a1..d61c098 100644
 
 
  def claim_task(
-@@ -4631,6 +5123,7 @@ def claim_task(
+@@ -4631,6 +5123,7 @@
      *,
      ttl_seconds: Optional[int] = None,
      claimer: Optional[str] = None,
@@ -783,7 +782,7 @@ index 4b547a1..d61c098 100644
  ) -> Optional[Task]:
      """Atomically transition ``ready -> running``.
 
-@@ -4649,21 +5142,17 @@ def claim_task(
+@@ -4649,21 +5142,17 @@
          # 'todo' here — recompute_ready will re-promote when the parents
          # actually finish. See RCA at
          # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
@@ -810,15 +809,17 @@ index 4b547a1..d61c098 100644
              )
              return None
          # Defensive: if a prior run somehow leaked (invariant violation from
-@@ -4704,17 +5193,34 @@ def claim_task(
-         # Look up the current task row so we can populate the run with
-         # its assignee / step / runtime cap.
-         trow = conn.execute(
--            "SELECT assignee, max_runtime_seconds, current_step_key "
+@@ -4686,10 +5175,35 @@
+                 """,
+                 (now, int(stale["current_run_id"])),
+             )
++        # Resolve the canonical policy before the claim CAS so the durable task
++        # row, active run, and reconstructed worker all agree on the class.
++        trow = conn.execute(
 +            "SELECT assignee, max_runtime_seconds, current_step_key, runtime_class "
-             "FROM tasks WHERE id = ?",
-             (task_id,),
-         ).fetchone()
++            "FROM tasks WHERE id = ?",
++            (task_id,),
++        ).fetchone()
 +        policy_runtime_class = _dispatch_runtime_class(
 +            runtime_class,
 +            assignee=trow["assignee"] if trow else None,
@@ -836,6 +837,30 @@ index 4b547a1..d61c098 100644
 +            if policy.evidence_budget_seconds is not None
 +            else None
 +        )
+         cur = conn.execute(
+             """
+             UPDATE tasks
+                SET status        = 'running',
++                   runtime_class = ?,
+                    claim_lock    = ?,
+                    claim_expires = ?,
+                    started_at    = COALESCE(started_at, ?)
+@@ -4697,24 +5211,17 @@
+                AND status = 'ready'
+                AND claim_lock IS NULL
+             """,
+-            (lock, expires, now, task_id),
++            (policy.runtime_class, lock, expires, now, task_id),
+         )
+         if cur.rowcount != 1:
+             return None
+-        # Look up the current task row so we can populate the run with
+-        # its assignee / step / runtime cap.
+-        trow = conn.execute(
+-            "SELECT assignee, max_runtime_seconds, current_step_key "
+-            "FROM tasks WHERE id = ?",
+-            (task_id,),
+-        ).fetchone()
          run_cur = conn.execute(
              """
              INSERT INTO task_runs (
@@ -848,7 +873,7 @@ index 4b547a1..d61c098 100644
              """,
              (
                  task_id,
-@@ -4722,7 +5228,8 @@ def claim_task(
+@@ -4722,7 +5229,8 @@
                  trow["current_step_key"] if trow else None,
                  lock,
                  expires,
@@ -858,7 +883,7 @@ index 4b547a1..d61c098 100644
                  now,
              ),
          )
-@@ -4733,10 +5240,23 @@ def claim_task(
+@@ -4733,10 +5241,23 @@
          )
          _append_event(
              conn, task_id, "claimed",
@@ -883,10 +908,12 @@ index 4b547a1..d61c098 100644
      _fire_kanban_lifecycle_hook(
          "kanban_task_claimed",
          task_id,
-@@ -4747,6 +5267,124 @@ def claim_task(
+@@ -4745,6 +5266,124 @@
+         run_id=run_id,
+     )
      return claimed
-
-
++
++
 +REVIEW_DISPATCH_HARD_CAP_SECONDS = 1200
 +
 +
@@ -1003,12 +1030,10 @@ index 4b547a1..d61c098 100644
 +    result = _effective_runtime_seconds(max_runtime_seconds, REVIEW_RUNTIME_POLICY)
 +    assert result is not None
 +    return result
-+
-+
+
+
  def claim_review_task(
-     conn: sqlite3.Connection,
-     task_id: str,
-@@ -4790,6 +5428,7 @@ def claim_review_task(
+@@ -4790,6 +5429,7 @@
              """
              UPDATE tasks
                 SET status        = 'running',
@@ -1016,7 +1041,7 @@ index 4b547a1..d61c098 100644
                     claim_lock    = ?,
                     claim_expires = ?,
                     started_at    = COALESCE(started_at, ?)
-@@ -4797,22 +5436,31 @@ def claim_review_task(
+@@ -4797,22 +5437,31 @@
                 AND status = 'review'
                 AND claim_lock IS NULL
              """,
@@ -1052,7 +1077,7 @@ index 4b547a1..d61c098 100644
              """,
              (
                  task_id,
-@@ -4820,7 +5468,8 @@ def claim_review_task(
+@@ -4820,7 +5469,8 @@
                  trow["current_step_key"] if trow else None,
                  lock,
                  expires,
@@ -1062,7 +1087,7 @@ index 4b547a1..d61c098 100644
                  now,
              ),
          )
-@@ -4831,11 +5480,44 @@ def claim_review_task(
+@@ -4831,11 +5481,45 @@
          )
          _append_event(
              conn, task_id, "claimed",
@@ -1100,8 +1125,9 @@ index 4b547a1..d61c098 100644
 +    """Explicit evidence-only successor entrypoint.
 +
 +    The runtime class is selected by this API, never inferred from a title or
-+    comment. The task row's requested implementation budget remains intact;
-+    the active task_runs row receives the recovery cap.
++    comment. The task row is durably marked with the recovery class in the same
++    claim CAS; its requested implementation budget remains intact while the
++    active task_runs row receives the recovery cap.
 +    """
 +    return claim_task(
 +        conn, task_id, ttl_seconds=ttl_seconds, claimer=claimer,
@@ -1110,7 +1136,7 @@ index 4b547a1..d61c098 100644
 
 
  def _retry_status_for_run(
-@@ -5360,6 +6042,251 @@ class ArtifactPreservationError(RuntimeError):
+@@ -5360,6 +6044,289 @@
      """Raised when a declared scratch deliverable cannot be preserved."""
 
 
@@ -1193,6 +1219,7 @@ index 4b547a1..d61c098 100644
 +    task_id: str,
 +    *,
 +    expected_run_id: Optional[int],
++    expected_run_bound: bool = False,
 +    summary: Optional[str],
 +    result: Optional[str],
 +    metadata: Optional[dict],
@@ -1205,7 +1232,20 @@ index 4b547a1..d61c098 100644
 +    if task_row is None:
 +        return None
 +    current_run_id = task_row["current_run_id"]
-+    if expected_run_id is not None:
++    if expected_run_bound:
++        if expected_run_id is None:
++            if current_run_id is not None:
++                # The caller observed no active run, so never inspect or block
++                # a successor that claimed the task during preflight.
++                return None
++            run_id = None
++        else:
++            if current_run_id is None or int(current_run_id) != int(expected_run_id):
++                # The CAS in complete_task owns this race. Never block a successor
++                # run when an older worker has lost ownership.
++                return None
++            run_id = int(expected_run_id)
++    elif expected_run_id is not None:
 +        if current_run_id is None or int(current_run_id) != int(expected_run_id):
 +            # The CAS in complete_task owns this race. Never block a successor
 +            # run when an older worker has lost ownership.
@@ -1284,6 +1324,7 @@ index 4b547a1..d61c098 100644
 +    reason: str,
 +    *,
 +    expected_run_id: Optional[int],
++    expected_run_bound: bool = False,
 +) -> bool:
 +    """Durably route an unsafe review completion to a typed blocked state."""
 +    error = f"{REVIEW_INCOMPLETE_CODE}: {reason}"
@@ -1300,26 +1341,43 @@ index 4b547a1..d61c098 100644
 +        if row is None or row["status"] not in {"running", "review"}:
 +            return False
 +        current_run_id = row["current_run_id"]
-+        if expected_run_id is not None:
++        if expected_run_bound:
++            if expected_run_id is None:
++                if current_run_id is not None:
++                    return False
++            elif current_run_id is None or int(current_run_id) != int(expected_run_id):
++                return False
++        elif expected_run_id is not None:
 +            if current_run_id is None or int(current_run_id) != int(expected_run_id):
 +                return False
-+        run_id = _end_run(
-+            conn,
-+            task_id,
-+            outcome="blocked",
-+            status="blocked",
-+            error=error,
-+            metadata=payload,
-+        )
++        run_id = int(current_run_id) if current_run_id is not None else None
++        run_guard = ""
++        run_params: tuple[int, ...] = ()
++        if expected_run_bound and expected_run_id is None:
++            run_guard = " AND current_run_id IS NULL"
++        elif expected_run_bound:
++            run_guard = " AND current_run_id = ?"
++            run_params = (int(expected_run_id),)
 +        cur = conn.execute(
 +            "UPDATE tasks SET status = 'blocked', block_kind = ?, "
-+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
-+            "current_run_id = NULL WHERE id = ? "
-+            "AND status IN ('running', 'review')",
-+            (REVIEW_INCOMPLETE_BLOCK_KIND, task_id),
++            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
++            "WHERE id = ? "
++            "AND status IN ('running', 'review')" + run_guard,
++            (REVIEW_INCOMPLETE_BLOCK_KIND, task_id) + run_params,
 +        )
 +        if cur.rowcount != 1:
 +            return False
++        if run_id is not None:
++            closed_run_id = _end_run(
++                conn,
++                task_id,
++                outcome="blocked",
++                status="blocked",
++                error=error,
++                metadata=payload,
++            )
++            if closed_run_id is not None:
++                run_id = closed_run_id
 +        if run_id is None:
 +            run_id = _synthesize_ended_run(
 +                conn,
@@ -1338,6 +1396,7 @@ index 4b547a1..d61c098 100644
 +    task_id: str,
 +    *,
 +    expected_run_id: Optional[int],
++    expected_run_bound: bool = False,
 +    summary: Optional[str],
 +    result: Optional[str],
 +    metadata: Optional[dict],
@@ -1346,6 +1405,7 @@ index 4b547a1..d61c098 100644
 +        conn,
 +        task_id,
 +        expected_run_id=expected_run_id,
++        expected_run_bound=expected_run_bound,
 +        summary=summary,
 +        result=result,
 +        metadata=metadata,
@@ -1353,7 +1413,11 @@ index 4b547a1..d61c098 100644
 +    if reason is None:
 +        return None
 +    if not _block_review_incomplete(
-+        conn, task_id, reason, expected_run_id=expected_run_id
++        conn,
++        task_id,
++        reason,
++        expected_run_id=expected_run_id,
++        expected_run_bound=expected_run_bound,
 +    ):
 +        return None
 +    return ReviewIncompleteError(task_id, reason)
@@ -1362,14 +1426,27 @@ index 4b547a1..d61c098 100644
  def complete_task(
      conn: sqlite3.Connection,
      task_id: str,
-@@ -5404,6 +6331,16 @@ def complete_task(
+@@ -5403,7 +6370,29 @@
+     ``suspected_hallucinated_references`` event. This pass is advisory
      and never blocks.
      """
++    preflight = conn.execute(
++        "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)
++    ).fetchone()
++    if preflight is None:
++        return False
++    observed_run_id = preflight["current_run_id"]
++    fenced_run_id = (
++        int(expected_run_id)
++        if expected_run_id is not None
++        else (int(observed_run_id) if observed_run_id is not None else None)
++    )
      now = int(time.time())
 +    incomplete = _reject_incomplete_review_completion(
 +        conn,
 +        task_id,
-+        expected_run_id=expected_run_id,
++        expected_run_id=fenced_run_id,
++        expected_run_bound=True,
 +        summary=summary,
 +        result=result,
 +        metadata=metadata,
@@ -1379,7 +1456,33 @@ index 4b547a1..d61c098 100644
      # Fail before validating cards or staging artifacts; re-check inside the
      # final write transaction below to close the parent-reopen race.
      if not _parents_satisfied(conn, task_id):
-@@ -6600,19 +7537,24 @@ def request_review(
+@@ -5450,7 +6439,7 @@
+             (task_id,),
+         ).fetchone()
+         prior_status = prior["status"] if prior else None
+-        if expected_run_id is None:
++        if fenced_run_id is None:
+             cur = conn.execute(
+                 """
+                 UPDATE tasks
+@@ -5464,6 +6453,7 @@
+                        block_recurrences = 0
+                  WHERE id = ?
+                    AND status IN ('running', 'ready', 'blocked', 'review')
++                   AND current_run_id IS NULL
+                 """,
+                 (result, now, task_id),
+             )
+@@ -5483,7 +6473,7 @@
+                    AND status IN ('running', 'ready', 'blocked', 'review')
+                    AND current_run_id = ?
+                 """,
+-                (result, now, task_id, int(expected_run_id)),
++                (result, now, task_id, int(fenced_run_id)),
+             )
+         if cur.rowcount != 1:
+             return False
+@@ -6600,19 +7590,24 @@
          assignee_sql = ", assignee = ?" if reviewer is not None else ""
          params: tuple[Any, ...]
          if expected_run_id is None:
@@ -1407,7 +1510,7 @@ index 4b547a1..d61c098 100644
                     claim_lock    = NULL,
                     claim_expires = NULL,
                     worker_pid    = NULL
-@@ -6747,13 +7689,14 @@ def request_changes(
+@@ -6747,13 +7742,14 @@
              """
              UPDATE tasks
                 SET status = ?,
@@ -1423,7 +1526,7 @@ index 4b547a1..d61c098 100644
          )
          if cur.rowcount != 1:
              return False, "task changed during review handoff"
-@@ -6888,14 +7831,7 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
+@@ -6888,14 +7884,7 @@
      kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md. Kept in one place
      so the two transitions can't drift.
      """
@@ -1439,7 +1542,7 @@ index 4b547a1..d61c098 100644
 
 
  def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
-@@ -6999,12 +7935,12 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
+@@ -6999,12 +7988,12 @@
              implementer = None
          assignee_sql = ", assignee = ?" if implementer else ""
          params: tuple[Any, ...] = (
@@ -1455,7 +1558,7 @@ index 4b547a1..d61c098 100644
              "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
              # consecutive_failures deliberately PRESERVED: review reopen is
              # not a success signal; only complete_task resets the breaker
-@@ -8442,10 +9378,135 @@ def heartbeat_worker(
+@@ -8442,10 +9431,135 @@
      return True
 
 
@@ -1591,7 +1694,7 @@ index 4b547a1..d61c098 100644
  ) -> list[str]:
      """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
 
-@@ -8467,10 +9528,12 @@ def enforce_max_runtime(
+@@ -8467,10 +9581,12 @@
      rows = conn.execute(
          "SELECT t.id, t.worker_pid, "
          "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
@@ -1606,7 +1709,7 @@ index 4b547a1..d61c098 100644
          "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
          "  AND t.worker_pid IS NOT NULL"
      ).fetchall()
-@@ -8482,7 +9545,7 @@ def enforce_max_runtime(
+@@ -8482,7 +9598,7 @@
          # intentionally records the first time a task ever started, so retries
          # must be measured from the active task_runs row when present.
          elapsed = now - int(row["active_started_at"])
@@ -1615,7 +1718,7 @@ index 4b547a1..d61c098 100644
              continue
 
          pid = int(row["worker_pid"])
-@@ -8513,52 +9576,22 @@ def enforce_max_runtime(
+@@ -8513,52 +9629,22 @@
                  except (ProcessLookupError, OSError):
                      pass
 
@@ -1684,7 +1787,7 @@ index 4b547a1..d61c098 100644
      return timed_out
 
 
-@@ -9288,7 +10321,9 @@ def _record_task_failure(
+@@ -9288,7 +10374,9 @@
                          "trigger_outcome": outcome,
                          "effective_limit": effective_limit,
                          "limit_source": limit_source,
@@ -1695,7 +1798,7 @@ index 4b547a1..d61c098 100644
                      },
                  )
              payload = {
-@@ -9297,7 +10332,9 @@ def _record_task_failure(
+@@ -9297,7 +10385,9 @@
                  "limit_source": limit_source,
                  "error": error[:500],
                  "trigger_outcome": outcome,
@@ -1706,7 +1809,7 @@ index 4b547a1..d61c098 100644
              }
              if event_payload_extra:
                  payload.update(event_payload_extra)
-@@ -9860,6 +10897,7 @@ def dispatch_once(
+@@ -9860,6 +10950,7 @@
      default_assignee: Optional[str] = None,
      max_in_progress_per_profile: Optional[int] = None,
      reconcile_orphans: bool = True,
@@ -1714,7 +1817,7 @@ index 4b547a1..d61c098 100644
  ) -> DispatchResult:
      """Run one dispatcher tick under the board's single-writer lock.
 
-@@ -9876,6 +10914,8 @@ def dispatch_once(
+@@ -9876,6 +10967,8 @@
      boards tick in parallel. See :func:`_dispatch_tick_lock` for the
      cross-process / cross-platform mechanics.
      """
@@ -1723,7 +1826,7 @@ index 4b547a1..d61c098 100644
      try:
          db_path = kanban_db_path(board=board)
      except Exception:
-@@ -9895,6 +10935,7 @@ def dispatch_once(
+@@ -9895,6 +10988,7 @@
              default_assignee=default_assignee,
              max_in_progress_per_profile=max_in_progress_per_profile,
              reconcile_orphans=reconcile_orphans,
@@ -1731,7 +1834,7 @@ index 4b547a1..d61c098 100644
          )
          _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
          return result
-@@ -9915,6 +10956,7 @@ def dispatch_once(
+@@ -9915,6 +11009,7 @@
                  default_assignee=default_assignee,
                  max_in_progress_per_profile=max_in_progress_per_profile,
                  reconcile_orphans=reconcile_orphans,
@@ -1739,10 +1842,12 @@ index 4b547a1..d61c098 100644
              )
              # Still under the dispatch lock: run the periodic PASSIVE WAL
              # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
-@@ -9928,6 +10970,15 @@ def dispatch_once(
+@@ -9926,6 +11021,15 @@
+     # the lock hold and stall a sibling dispatcher's tick.
+     _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
      return result
-
-
++
++
 +def dispatch_evidence_recovery_once(
 +    conn: sqlite3.Connection,
 +    **kwargs: Any,
@@ -1750,12 +1855,10 @@ index 4b547a1..d61c098 100644
 +    """Run an explicitly evidence-only recovery dispatch tick."""
 +    kwargs["runtime_class"] = RUNTIME_CLASS_EVIDENCE_RECOVERY
 +    return dispatch_once(conn, **kwargs)
-+
-+
+
+
  def _dispatch_once_locked(
-     conn: sqlite3.Connection,
-     *,
-@@ -9942,6 +10993,7 @@ def _dispatch_once_locked(
+@@ -9942,6 +11046,7 @@
      default_assignee: Optional[str] = None,
      max_in_progress_per_profile: Optional[int] = None,
      reconcile_orphans: bool = True,
@@ -1763,7 +1866,7 @@ index 4b547a1..d61c098 100644
  ) -> DispatchResult:
      """Run one dispatcher tick.
 
-@@ -10009,7 +11061,7 @@ def _dispatch_once_locked(
+@@ -10009,7 +11114,7 @@
      )
      if _crash_rate_limited:
          result.rate_limited.extend(_crash_rate_limited)
@@ -1772,7 +1875,7 @@ index 4b547a1..d61c098 100644
      result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
      # Count tasks already running so max_spawn enforces concurrency rather
-@@ -10074,15 +11126,39 @@ def _dispatch_once_locked(
+@@ -10074,15 +11179,39 @@
              )
              spawn_budget = 1
 
@@ -1819,7 +1922,7 @@ index 4b547a1..d61c098 100644
          review_rows = conn.execute(
              "SELECT id, assignee FROM tasks "
              "WHERE status = 'review' AND claim_lock IS NULL "
-@@ -10268,7 +11344,14 @@ def _dispatch_once_locked(
+@@ -10268,7 +11397,14 @@
                      _per_profile_running.get(row_assignee, 0) + 1
                  )
              continue
@@ -1835,7 +1938,7 @@ index 4b547a1..d61c098 100644
          if claimed is None:
              continue
          try:
-@@ -10541,6 +11624,83 @@ def _rotate_worker_log(
+@@ -10541,6 +11677,83 @@
          pass
 
 
@@ -1919,7 +2022,7 @@ index 4b547a1..d61c098 100644
  def _module_hermes_argv() -> list[str]:
      """Return the interpreter-bound Hermes CLI invocation."""
      # ``hermes_cli.main`` is the console-script target declared in
-@@ -10594,8 +11754,13 @@ def _safe_which_no_cwd(command: str) -> Optional[str]:
+@@ -10594,8 +11807,13 @@
          if not raw_dir or raw_dir == ".":
              continue
          directory = os.path.expanduser(raw_dir)
@@ -1934,7 +2037,7 @@ index 4b547a1..d61c098 100644
              if not os.path.isfile(candidate):
                  continue
              if _IS_WINDOWS or os.access(candidate, os.X_OK):
-@@ -10617,43 +11782,13 @@ def _hermes_path_argv(path: str) -> list[str]:
+@@ -10617,43 +11835,13 @@
 
 
  def _resolve_hermes_argv() -> list[str]:
@@ -1971,11 +2074,12 @@ index 4b547a1..d61c098 100644
 -        if resolved_env_bin:
 -            return _hermes_path_argv(resolved_env_bin)
 -        return _module_hermes_argv()
-+    """Return the interpreter-bound invocation for a detached worker.
-
+-
 -    hermes_bin = _safe_which_no_cwd("hermes") if _IS_WINDOWS else shutil.which("hermes")
 -    if hermes_bin:
 -        return _hermes_path_argv(hermes_bin)
++    """Return the interpreter-bound invocation for a detached worker.
++
 +    Neither ambient ``PATH`` nor inherited ``HERMES_BIN`` is an executable
 +    trust boundary. The running interpreter has already imported this reviewed
 +    runtime and is therefore the only accepted child entrypoint.
@@ -1984,10 +2088,12 @@ index 4b547a1..d61c098 100644
      return _module_hermes_argv()
 
 
-@@ -10773,6 +11908,35 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
+@@ -10771,6 +11959,35 @@
+         command,
+         unit_suffix=f"kanban-{task.id}-run-{task.current_run_id}",
      )
-
-
++
++
 +def _validated_worker_evidence_deadline(
 +    task: Task, runtime_policy: RuntimePolicy
 +) -> float:
@@ -2015,12 +2121,10 @@ index 4b547a1..d61c098 100644
 +            task.id, "review/evidence worker deadline expired before spawn"
 +        )
 +    return deadline
-+
-+
+
+
  def _default_spawn(
-     task: Task,
-     workspace: str,
-@@ -10832,6 +11996,20 @@ def _default_spawn(
+@@ -10832,6 +12049,20 @@
          # This only happens in test fixtures where the isolated
          # HERMES_HOME never had profiles created.
          pass
@@ -2041,23 +2145,23 @@ index 4b547a1..d61c098 100644
      if task.tenant:
          env["HERMES_TENANT"] = task.tenant
      env["HERMES_KANBAN_TASK"] = task.id
-@@ -10871,18 +12049,44 @@ def _default_spawn(
+@@ -10871,18 +12102,44 @@
          env["HERMES_KANBAN_GOAL_MODE"] = "1"
          if task.goal_max_turns is not None:
              env["HERMES_KANBAN_GOAL_MAX_TURNS"] = str(int(task.goal_max_turns))
 -    terminal_timeout = _worker_terminal_timeout_env(
 -        task.max_runtime_seconds,
 -        env.get("TERMINAL_TIMEOUT"),
--    )
++    runtime_policy = resolve_runtime_policy(
++        getattr(task, "runtime_class", None),
++        source_status=("review" if getattr(task, "status", None) == "review" else None),
+     )
 -    if terminal_timeout is not None:
 -        env["TERMINAL_TIMEOUT"] = terminal_timeout
 -    foreground_timeout = _worker_terminal_timeout_env(
 -        task.max_runtime_seconds,
 -        env.get("TERMINAL_MAX_FOREGROUND_TIMEOUT"),
-+    runtime_policy = resolve_runtime_policy(
-+        getattr(task, "runtime_class", None),
-+        source_status=("review" if getattr(task, "status", None) == "review" else None),
-     )
+-    )
 -    if foreground_timeout is not None:
 -        env["TERMINAL_MAX_FOREGROUND_TIMEOUT"] = foreground_timeout
 +    env["HERMES_KANBAN_RUNTIME_CLASS"] = runtime_policy.runtime_class
@@ -2097,7 +2201,7 @@ index 4b547a1..d61c098 100644
      # Pin the shared board + workspaces root the dispatcher resolved, so
      # that even when the worker activates a profile (`hermes -p <name>`
      # rewrites HERMES_HOME), its kanban paths still match the
-@@ -10912,7 +12116,7 @@ def _default_spawn(
+@@ -10912,7 +12169,7 @@
      env.pop("HERMES_TUI", None)
 
      cmd = [
@@ -2106,7 +2210,7 @@ index 4b547a1..d61c098 100644
          "-p", profile_arg,
          "--cli",
          # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
-@@ -11129,13 +12333,30 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
+@@ -11129,13 +12386,30 @@
      if task.tenant:
          lines.append(f"Tenant:   {task.tenant}")
      lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
@@ -2144,17 +2248,18 @@ index 4b547a1..d61c098 100644
          if effective_terminal_timeout:
              lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
      if task.branch_name:
-@@ -11215,11 +12436,14 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
+@@ -11215,11 +12489,14 @@
          "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
          (task_id,),
      ).fetchall()
 -    parent_ids = [r["parent_id"] for r in parent_rows]
+-
+-    if parent_ids:
 +    parent_refs = [
 +        (str(row["parent_id"]), canonical_task_id(conn, str(row["parent_id"])))
 +        for row in parent_rows
 +    ]
-
--    if parent_ids:
++
 +    if parent_refs:
          wrote_header = False
 -        for pid in parent_ids:
@@ -2162,7 +2267,7 @@ index 4b547a1..d61c098 100644
              pt = get_task(conn, pid)
              if not pt or pt.status != "done":
                  continue
-@@ -11246,7 +12470,13 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
+@@ -11246,7 +12523,13 @@
              elif pt.completed_at:
                  done_ts = pt.completed_at
              age = _relative_age(done_ts, _now)
@@ -2178,13 +2283,14 @@ index 4b547a1..d61c098 100644
              body_lines: list[str] = []
              if run is not None and run.summary and run.summary.strip():
 diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
-index 6ff4edc..1e0f409 100644
 --- a/gateway/kanban_watchers.py
 +++ b/gateway/kanban_watchers.py
-@@ -49,6 +49,90 @@ def _safe_review_reason(value: Any, limit: int = 160) -> str:
+@@ -47,6 +47,90 @@
+     if len(reason) > limit:
+         reason = reason[: limit - 1].rstrip() + "…"
      return reason
-
-
++
++
 +def _explicit_timeout_run_id(event: Any) -> Optional[int]:
 +    """Return the run id carried by an event or its legacy payload."""
 +    value = getattr(event, "run_id", None)
@@ -2267,12 +2373,10 @@ index 6ff4edc..1e0f409 100644
 +        if getattr(event, "kind", "") not in timeout_kinds
 +        or id(event) in selected_ids
 +    ]
-+
-+
+
+
  def _resolve_auto_decompose_settings(
-     load_config: Callable[[], Any],
- ) -> "tuple[bool, int]":
-@@ -571,7 +655,13 @@ class GatewayKanbanWatchersMixin:
+@@ -571,7 +655,13 @@
                      # exists on the board.
                      wake_handoff = ""
                      wake_review_detail = ""
@@ -2287,7 +2391,7 @@ index 6ff4edc..1e0f409 100644
                          kind = ev.kind
                          # Identity prefix: attribute terminal pings to the
                          # worker that did the work. Makes fleets (where one
-@@ -624,10 +714,22 @@ class GatewayKanbanWatchersMixin:
+@@ -624,10 +714,22 @@
                              limit = 0
                              if ev.payload and ev.payload.get("limit_seconds"):
                                  limit = int(ev.payload["limit_seconds"])
@@ -2314,7 +2418,7 @@ index 6ff4edc..1e0f409 100644
                          elif kind == "status":
                              new_status = ""
                              if ev.payload and ev.payload.get("status"):
-@@ -844,8 +946,12 @@ class GatewayKanbanWatchersMixin:
+@@ -844,8 +946,12 @@
                              "blocked", "review_requested", "changes_requested",
                              "block_loop_detected",
                          )
@@ -2328,7 +2432,7 @@ index 6ff4edc..1e0f409 100644
                              if wake_agent
                              else set()
                          )
-@@ -878,8 +984,26 @@ class GatewayKanbanWatchersMixin:
+@@ -878,8 +984,26 @@
                              if "completed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.completed"))
                              if "gave_up" in _wake_kinds: _parts.append(t("gateway.kanban.wake.gave_up"))
                              if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
@@ -2358,10 +2462,9 @@ index 6ff4edc..1e0f409 100644
                              if "changes_requested" in _wake_kinds: _parts.append(t("gateway.kanban.wake.changes_requested"))
                              if "block_loop_detected" in _wake_kinds: _parts.append(t("gateway.kanban.wake.block_loop_detected"))
 diff --git a/tui_gateway/server.py b/tui_gateway/server.py
-index 4455b91..a064d1f 100644
 --- a/tui_gateway/server.py
 +++ b/tui_gateway/server.py
-@@ -12451,6 +12451,80 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
+@@ -12451,6 +12451,80 @@
              pass
 
 
@@ -2442,7 +2545,7 @@ index 4455b91..a064d1f 100644
  def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[str]:
      """Single-line notification text for one kanban event.
 
-@@ -12491,7 +12565,19 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
+@@ -12491,7 +12565,19 @@
              limit = int(payload.get("limit_seconds") or 0)
          except (TypeError, ValueError):
              pass
@@ -2463,7 +2566,7 @@ index 4455b91..a064d1f 100644
      if kind == "status":
          return f"🔄 {board_tag}{tag}Kanban {task_id} → {payload.get('status') or ''}"
      return None
-@@ -12582,6 +12668,7 @@ def _collect_kanban_notifications(session: dict) -> list:
+@@ -12582,6 +12668,7 @@
                  if not events:
                      continue
                  task = _kb.get_task(conn, sub["task_id"])
@@ -2472,10 +2575,9 @@ index 4455b91..a064d1f 100644
                      text = _format_kanban_event_text(sub, task, ev, slug)
                      if text:
 diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
-index b55d17b..9b40fa3 100644
 --- a/tools/terminal_tool.py
 +++ b/tools/terminal_tool.py
-@@ -1632,6 +1632,61 @@ def _parse_env_var(name: str, default: str, converter: Any = int, type_label: st
+@@ -1632,6 +1632,99 @@
          )
 
 
@@ -2534,10 +2636,48 @@ index b55d17b..9b40fa3 100644
 +    )
 +
 +
++class _ReviewEvidenceDeadlineExpired(RuntimeError):
++    """Signal a fail-closed evidence boundary before an environment command."""
++
++
++def _evidence_execute_timeout(
++    requested_timeout: float | int | None = None,
++    *,
++    require_evidence_window: bool = False,
++) -> float | None:
++    """Return a deadline-bounded timeout or raise before executing."""
++    remaining = _kanban_evidence_remaining()
++    runtime_class = os.environ.get("HERMES_KANBAN_RUNTIME_CLASS", "").strip().lower()
++    evidence_window_expected = (
++        require_evidence_window
++        or runtime_class in {"review", "evidence_recovery"}
++        or any(
++            os.environ.get(name, "").strip()
++            for name in (
++                "HERMES_KANBAN_EVIDENCE_STARTED_AT",
++                "HERMES_KANBAN_EVIDENCE_BUDGET_SECONDS",
++            )
++        )
++    )
++    if remaining is None:
++        if evidence_window_expected:
++            raise _ReviewEvidenceDeadlineExpired(
++                "evidence window is missing; no further probes or approval are allowed"
++            )
++        return None
++    if remaining <= 0:
++        raise _ReviewEvidenceDeadlineExpired(
++            "evidence budget expired; no further probes or approval are allowed"
++        )
++    if requested_timeout is None:
++        return remaining
++    return min(float(requested_timeout), remaining)
++
++
  def _safe_getcwd() -> str:
      """Return the current working directory, tolerating a deleted or
      permission-restricted CWD.
-@@ -2921,6 +2976,20 @@ def terminal_tool(
+@@ -2921,6 +3014,20 @@
                  "status": "error",
              }, ensure_ascii=False)
 
@@ -2558,10 +2698,11 @@ index b55d17b..9b40fa3 100644
          # Get configuration
          config = _get_env_config()
          env_type = "local" if _host_local else config["env_type"]
-@@ -3005,6 +3074,31 @@ def terminal_tool(
+@@ -3004,6 +3111,31 @@
+                 f"timeout must be a positive number of seconds (got {timeout})."
              )
          effective_timeout = timeout or default_timeout
-
++
 +        # A foreground command cannot outlive the evidence deadline.  Re-read
 +        # the clock after configuration work because environment setup itself
 +        # consumes part of the bounded review window.
@@ -2586,13 +2727,67 @@ index b55d17b..9b40fa3 100644
 +                    f"Kanban worker timeout {effective_timeout}s exceeds the "
 +                    f"per-command maximum of {tool_timeout_cap}s."
 +                )
-+
+
          # Reject foreground commands where the model explicitly requests
          # a timeout above FOREGROUND_MAX_TIMEOUT — nudge it toward background.
-         if not background and timeout and timeout > FOREGROUND_MAX_TIMEOUT:
-@@ -3654,6 +3748,12 @@ def terminal_tool(
+@@ -3216,10 +3348,19 @@
+                 # redirect keeps leading-dash paths out of argv (same form as
+                 # tools/image_source.py).
+                 try:
++                    execute_timeout = _evidence_execute_timeout(
++                        require_evidence_window=evidence_remaining is not None
++                    )
++                    execute_kwargs = {}
++                    if execute_timeout is not None:
++                        execute_kwargs["timeout"] = execute_timeout
+                     result = env.execute(
+                         f"head -c {_MAX_REFERENCED_SCRIPT_BYTES + 1} "
+-                        f"< {shlex.quote(script_path)}"
++                        f"< {shlex.quote(script_path)}",
++                        **execute_kwargs,
+                     )
++                    if execute_timeout is not None:
++                        _evidence_execute_timeout(require_evidence_window=True)
+                     if result.get("returncode", -1) == 0:
+                         output = result.get("output", "")
+                         if output and "\x00" in output:
+@@ -3227,15 +3368,21 @@
+                             # same reason as the local branch above (#77703).
+                             return None
+                         return output
++                except _ReviewEvidenceDeadlineExpired:
++                    raise
+                 except Exception:
+                     pass
+                 return None
+
+-            if contains_gateway_lifecycle_command_or_referenced_script(
+-                command,
+-                cwd=guard_cwd,
+-                read_remote_script=_read_script_in_env,
+-            ):
++            try:
++                lifecycle_blocked = contains_gateway_lifecycle_command_or_referenced_script(
++                    command,
++                    cwd=guard_cwd,
++                    read_remote_script=_read_script_in_env,
++                )
++            except _ReviewEvidenceDeadlineExpired as exc:
++                return _review_incomplete_response(str(exc))
++            if lifecycle_blocked:
+                 return json.dumps({
+                     "output": "",
+                     "exit_code": 1,
+@@ -3653,7 +3800,21 @@
+                         # reads, RPC reads) intentionally stay unbounded.
                          "bounded_capture": True,
                      }
++                    evidence_timeout = _evidence_execute_timeout(
++                        effective_timeout,
++                        require_evidence_window=evidence_remaining is not None,
++                    )
++                    if evidence_timeout is not None:
++                        execute_kwargs["timeout"] = evidence_timeout
                      result = env.execute(command, **execute_kwargs)
 +                    if evidence_remaining is not None:
 +                        evidence_remaining = _kanban_evidence_remaining()
@@ -2600,14 +2795,15 @@ index b55d17b..9b40fa3 100644
 +                            return _review_incomplete_response(
 +                                "evidence budget expired while the probe was running"
 +                            )
++                except _ReviewEvidenceDeadlineExpired as exc:
++                    return _review_incomplete_response(str(exc))
                  except Exception as e:
                      error_str = str(e).lower()
                      if "timeout" in error_str:
 diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
-index 8cef514..17b7dff 100644
 --- a/hermes_cli/kanban.py
 +++ b/hermes_cli/kanban.py
-@@ -81,6 +81,8 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
+@@ -81,6 +81,8 @@
          "session_id": t.session_id,
          "workflow_template_id": t.workflow_template_id,
          "current_step_key": t.current_step_key,
@@ -2616,7 +2812,7 @@ index 8cef514..17b7dff 100644
      }
 
 
-@@ -392,6 +394,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
+@@ -392,6 +394,11 @@
                                 "durations (90s, 30m, 2h, 1d). When exceeded, "
                                 "the dispatcher SIGTERMs (then SIGKILLs) the worker "
                                 "and re-queues the task.")
@@ -2628,7 +2824,7 @@ index 8cef514..17b7dff 100644
      p_create.add_argument("--created-by", default="user",
                            help="Author name recorded on the task (default: user)")
      p_create.add_argument("--skill", action="append", default=[], dest="skills",
-@@ -584,13 +591,28 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
+@@ -584,13 +591,28 @@
          help="Emit JSON (structured) instead of the default human table",
      )
 
@@ -2658,7 +2854,7 @@ index 8cef514..17b7dff 100644
 
      # --- claim ---
      p_claim = sub.add_parser(
-@@ -799,6 +821,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
+@@ -799,6 +821,12 @@
                          default=kb.DEFAULT_SPAWN_FAILURE_LIMIT,
                          help=f"Auto-block a task after this many consecutive non-success attempts "
                               f"(spawn_failed, timed_out, or crashed; default: {kb.DEFAULT_SPAWN_FAILURE_LIMIT})")
@@ -2671,7 +2867,7 @@ index 8cef514..17b7dff 100644
      p_disp.add_argument("--json", action="store_true")
 
      # --- daemon (deprecated) ---
-@@ -1158,6 +1186,7 @@ def kanban_command(args: argparse.Namespace) -> int:
+@@ -1158,6 +1186,7 @@
              "diag":     _cmd_diagnostics,
              "link":     _cmd_link,
              "unlink":   _cmd_unlink,
@@ -2679,7 +2875,7 @@ index 8cef514..17b7dff 100644
              "claim":    _cmd_claim,
              "comment":  _cmd_comment,
              "attach":   _cmd_attach,
-@@ -1227,6 +1256,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
+@@ -1227,6 +1256,7 @@
      "reassign",
      "link",
      "unlink",
@@ -2687,7 +2883,7 @@ index 8cef514..17b7dff 100644
      "claim",
      "comment",
      "attach",
-@@ -1679,6 +1709,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
+@@ -1679,6 +1709,9 @@
              triage=bool(getattr(args, "triage", False)),
              idempotency_key=getattr(args, "idempotency_key", None),
              max_runtime_seconds=max_runtime,
@@ -2697,7 +2893,7 @@ index 8cef514..17b7dff 100644
              skills=getattr(args, "skills", None) or None,
              max_retries=max_retries,
              model_override=getattr(args, "model_override", None),
-@@ -2166,6 +2199,28 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
+@@ -2166,6 +2199,28 @@
      return 0
 
 
@@ -2726,7 +2922,7 @@ index 8cef514..17b7dff 100644
  def _cmd_link(args: argparse.Namespace) -> int:
      with kb.connect_closing() as conn:
          kb.link_tasks(conn, args.parent_id, args.child_id)
-@@ -2407,13 +2462,19 @@ def _cmd_complete(args: argparse.Namespace) -> int:
+@@ -2407,13 +2462,19 @@
                  failed.append(tid)
                  continue
 
@@ -2753,7 +2949,7 @@ index 8cef514..17b7dff 100644
                  failed.append(tid)
                  print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
              else:
-@@ -2790,6 +2851,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
+@@ -2790,6 +2851,7 @@
              failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
              default_assignee=default_assignee,
              max_in_progress_per_profile=max_in_progress_per_profile,
@@ -2762,10 +2958,9 @@ index 8cef514..17b7dff 100644
      if getattr(args, "json", False):
          print(json.dumps({
 diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
-index dd1db3e..5547efd 100644
 --- a/tools/kanban_tools.py
 +++ b/tools/kanban_tools.py
-@@ -1661,6 +1661,55 @@ def _handle_unblock(args: dict, **kw) -> str:
+@@ -1661,6 +1661,55 @@
          return tool_error(f"kanban_unblock: {e}")
 
 
@@ -2821,7 +3016,7 @@ index dd1db3e..5547efd 100644
  def _handle_link(args: dict, **kw) -> str:
      """Add a parent→child dependency edge after the fact."""
      delegated_err = _reject_delegated_child_mutation("kanban_link")
-@@ -2350,6 +2399,70 @@ KANBAN_UNBLOCK_SCHEMA = {
+@@ -2350,6 +2399,70 @@
      },
  }
 
@@ -2892,11 +3087,10 @@ index dd1db3e..5547efd 100644
  KANBAN_LINK_SCHEMA = {
      "name": "kanban_link",
      "description": (
-@@ -2490,6 +2603,15 @@ registry.register(
-     emoji="▶",
+@@ -2491,6 +2604,15 @@
  )
 
-+registry.register(
+ registry.register(
 +    name="kanban_supersede",
 +    toolset="kanban",
 +    schema=KANBAN_SUPERSEDE_SCHEMA,
@@ -2905,6 +3099,7 @@ index dd1db3e..5547efd 100644
 +    emoji="⏭",
 +)
 +
- registry.register(
++registry.register(
      name="kanban_link",
      toolset="kanban",
+     schema=KANBAN_LINK_SCHEMA,

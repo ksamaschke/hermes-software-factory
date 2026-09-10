@@ -1099,3 +1099,240 @@ def test_terminal_boundary_accepts_exact_valid_evidence_window(monkeypatch):
         sys.modules.pop(module_name, None)
         sys.path.remove(source_value)
         sys.path.remove(runtime_value)
+
+
+def test_evidence_recovery_claim_persists_class_and_expiry_blocks_completion(
+    tmp_path, monkeypatch
+):
+    runtime_value = os.environ.get("FACTORY_REVIEW_RUNTIME")
+    source_value = os.environ.get("FACTORY_SOURCE_RUNTIME")
+    if not runtime_value or not source_value:
+        pytest.skip("set FACTORY_REVIEW_RUNTIME and FACTORY_SOURCE_RUNTIME")
+
+    sys.path.insert(0, runtime_value)
+    sys.path.insert(1, source_value)
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "hermes_cli.kanban_db", Path(runtime_value) / "hermes_cli/kanban_db.py"
+        )
+        assert spec is not None and spec.loader is not None
+        import hermes_cli  # noqa: F401
+
+        sys.modules.pop("hermes_cli.kanban_db", None)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["hermes_cli.kanban_db"] = module
+        spec.loader.exec_module(module)
+
+        db_path = tmp_path / "evidence-recovery-class.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+        module.init_db()
+        conn = module.connect()
+        task_id = module.create_task(
+            conn,
+            title="explicit evidence recovery",
+            assignee="reviewer",
+            runtime_class=module.RUNTIME_CLASS_IMPLEMENTATION,
+        )
+        claimed = module.claim_evidence_recovery_task(
+            conn, task_id, claimer="recovery-reviewer"
+        )
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+        row = conn.execute(
+            "SELECT runtime_class FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        assert row["runtime_class"] == module.RUNTIME_CLASS_EVIDENCE_RECOVERY
+
+        with module.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET evidence_deadline=0 WHERE id=?", (run_id,)
+            )
+
+        with pytest.raises(module.ReviewIncompleteError, match="REVIEW-INCOMPLETE"):
+            module.complete_task(
+                conn,
+                task_id,
+                summary="APPROVE stale evidence",
+                expected_run_id=run_id,
+                fire_lifecycle_hook=False,
+            )
+        final = conn.execute(
+            "SELECT status, block_kind, current_run_id FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        assert tuple(final) == ("blocked", "needs_input", None)
+    finally:
+        sys.modules.pop("hermes_cli.kanban_db", None)
+        sys.path.remove(source_value)
+        sys.path.remove(runtime_value)
+
+
+def test_completion_without_explicit_run_id_is_fenced_to_preflight_run(
+    tmp_path, monkeypatch
+):
+    runtime_value = os.environ.get("FACTORY_REVIEW_RUNTIME")
+    source_value = os.environ.get("FACTORY_SOURCE_RUNTIME")
+    if not runtime_value or not source_value:
+        pytest.skip("set FACTORY_REVIEW_RUNTIME and FACTORY_SOURCE_RUNTIME")
+
+    sys.path.insert(0, runtime_value)
+    sys.path.insert(1, source_value)
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "hermes_cli.kanban_db", Path(runtime_value) / "hermes_cli/kanban_db.py"
+        )
+        assert spec is not None and spec.loader is not None
+        import hermes_cli  # noqa: F401
+
+        sys.modules.pop("hermes_cli.kanban_db", None)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["hermes_cli.kanban_db"] = module
+        spec.loader.exec_module(module)
+
+        db_path = tmp_path / "completion-run-fence.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+        module.init_db()
+        conn = module.connect()
+        task_id = module.create_task(conn, title="review race", assignee="reviewer")
+        with module.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='review' WHERE id=?", (task_id,))
+        claimed = module.claim_review_task(conn, task_id, claimer="old-reviewer")
+        assert claimed is not None and claimed.current_run_id is not None
+        old_run_id = claimed.current_run_id
+        worker_pid = 987654
+        with module.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET worker_pid=? WHERE id=?", (worker_pid, task_id)
+            )
+        owner = conn.execute(
+            "SELECT claim_lock FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()["claim_lock"]
+
+        fresh_run_ids: list[int] = []
+        real_merge = module._merge_completion_prose_artifacts
+
+        def interleave_timeout_and_reclaim(*args, **kwargs):
+            other = module.connect()
+            try:
+                assert module._settle_timed_out_run(
+                    other,
+                    task_id=task_id,
+                    pid=worker_pid,
+                    claim_lock=owner,
+                    expected_run_id=old_run_id,
+                    elapsed=1301,
+                    limit_seconds=1200,
+                    killed=True,
+                    failure_limit=3,
+                )
+                fresh = module.claim_review_task(
+                    other, task_id, claimer="fresh-reviewer"
+                )
+                assert fresh is not None and fresh.current_run_id is not None
+                fresh_run_ids.append(fresh.current_run_id)
+            finally:
+                other.close()
+            return real_merge(*args, **kwargs)
+
+        monkeypatch.setattr(
+            module, "_merge_completion_prose_artifacts", interleave_timeout_and_reclaim
+        )
+        assert (
+            module.complete_task(
+                conn,
+                task_id,
+                summary="APPROVE from stale run",
+                fire_lifecycle_hook=False,
+            )
+            is False
+        )
+
+        assert len(fresh_run_ids) == 1
+        current = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        assert tuple(current) == ("running", fresh_run_ids[0])
+        fresh_run = conn.execute(
+            "SELECT status, outcome, ended_at FROM task_runs WHERE id=?",
+            (fresh_run_ids[0],),
+        ).fetchone()
+        assert tuple(fresh_run) == ("running", None, None)
+    finally:
+        sys.modules.pop("hermes_cli.kanban_db", None)
+        sys.path.remove(source_value)
+        sys.path.remove(runtime_value)
+
+
+def test_terminal_rechecks_deadline_after_environment_creation_before_execute(
+    tmp_path, monkeypatch
+):
+    runtime_value = os.environ.get("FACTORY_REVIEW_RUNTIME")
+    source_value = os.environ.get("FACTORY_SOURCE_RUNTIME")
+    if not runtime_value or not source_value:
+        pytest.skip("set FACTORY_REVIEW_RUNTIME and FACTORY_SOURCE_RUNTIME")
+
+    sys.path.insert(0, runtime_value)
+    sys.path.insert(1, source_value)
+    module_name = "factory_review_terminal_creation_deadline_test"
+    try:
+        spec = importlib.util.spec_from_file_location(
+            module_name, Path(runtime_value) / "tools/terminal_tool.py"
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+
+        remaining = iter((5.0, 5.0, 0.0))
+        executed: list[tuple[str, dict[str, Any]]] = []
+
+        class FakeEnvironment:
+            cwd = str(tmp_path)
+
+            def execute(self, command, **kwargs):
+                executed.append((command, kwargs))
+                return {"output": "ran", "returncode": 0, "cwd_observed": False}
+
+        monkeypatch.setattr(
+            module, "_kanban_evidence_remaining", lambda: next(remaining)
+        )
+        monkeypatch.setattr(module, "_start_cleanup_thread", lambda: None)
+        monkeypatch.setattr(module, "resolve_task_overrides", lambda _task_id: {})
+        monkeypatch.setattr(
+            module,
+            "_get_env_config",
+            lambda: {
+                "env_type": "local",
+                "cwd": str(tmp_path),
+                "timeout": 30,
+                "local_persistent": False,
+            },
+        )
+        created: list[bool] = []
+
+        def create_environment(**_kwargs):
+            created.append(True)
+            return FakeEnvironment()
+
+        monkeypatch.setattr(module, "_create_environment", create_environment)
+        module._active_environments.clear()
+        module._creation_locks.clear()
+
+        result = json.loads(
+            module.terminal_tool(
+                "true",
+                timeout=5,
+                task_id="deadline-after-create-fixture",
+                force=True,
+                _host_local=True,
+            )
+        )
+        assert created == [True]
+        assert result["code"] == "REVIEW-INCOMPLETE"
+        assert executed == []
+    finally:
+        sys.modules.pop(module_name, None)
+        sys.path.remove(source_value)
+        sys.path.remove(runtime_value)

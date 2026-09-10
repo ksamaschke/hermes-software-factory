@@ -10,7 +10,8 @@ The overlay has three responsibilities:
 
 - Resolve every ordinary reviewer claim to the 1,200-second hard worker cap,
   600-second evidence budget, and 120-second per-command timeout at claim time.
-  The persisted task row is not rewritten; the active `task_runs` row and the
+  The persisted task row records the canonical dispatch class; its requested
+  runtime budget remains intact while the active `task_runs` row and the
   worker-facing task object carry the effective cap.
 - Keep evidence-only recovery distinct at the actual dispatch boundary: its
   hard worker cap is 600 seconds, its evidence budget is 300 seconds, and its

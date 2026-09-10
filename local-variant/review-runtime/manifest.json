@@ -6,7 +6,7 @@
   "native_artifact_identity_sha256": "feaffd82904b7cce43285ec0a038a3e7c8f85f467cb8c99ae07075a6f59918ab",
   "native_artifact_version": "1.0.0",
   "patches": {
-    "patches/002-review-runtime.patch": "696e4449be9176fec3f2014f145d5fca83689b667f29dd7787660a1f5f2d2547"
+    "patches/002-review-runtime.patch": "4885c5a33f9f569836879480996413d938ec8c348ad1100fac2ec3a09139894c"
   },
   "patched_paths": [
     "hermes_cli/kanban_db.py",
