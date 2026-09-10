@@ -8,6 +8,20 @@ Hermes profile.
 
 These skills form the software-factory operating set:
 
+### `operator-observer`
+
+**Primary concern:** read-only human-facing evidence and transport.
+
+Use for:
+
+- exact tracker, Kanban, repository, scheduler, deployment, and sanitized runtime readback;
+- concise owner/boundary/evidence/next-gate reporting;
+- one sanitized response handoff for a policy-declared non-delegable decision;
+- keeping all routine product and factory mutations with the orchestrator.
+
+The observer is not a second orchestrator and is never a substitute for a
+native implementer, reviewer, integration, or release profile.
+
 ### `kanban-implementation-workflow`
 
 **Primary concern:** end-to-end implementation workflow.
@@ -121,6 +135,7 @@ its own overlay or add-on rather than modifying the shared skill.
 Only these installed skill directories are symlinked to this repository:
 
 - `scoped-subagent-audits`;
+- `operator-observer`;
 - `kanban-implementation-workflow`;
 - `kanban-factory-operations`;
 - `kanban-progress-evidence`;
@@ -137,6 +152,7 @@ use `<HERMES_HOME>` or profile-scoped `HERMES_HOME` roots. A generic local
 installation can map:
 
 - `<HERMES_HOME>/skills/.../scoped-subagent-audits` → `skills/scoped-subagent-audits`;
+- `<HERMES_HOME>/skills/.../operator-observer` → `skills/operator-observer`;
 - `<HERMES_HOME>/skills/.../kanban-implementation-workflow` → `skills/kanban-implementation-workflow`;
 - `<HERMES_HOME>/skills/.../kanban-factory-operations` → `skills/kanban-factory-operations`;
 - `<HERMES_HOME>/skills/.../kanban-progress-evidence` → `skills/kanban-progress-evidence`;
@@ -157,6 +173,9 @@ related to the factory does not implicitly grant synchronization ownership.
 From this checkout:
 
 ```bash
+hermes skills install \
+  https://raw.githubusercontent.com/ksamaschke/hermes-software-factory/main/skills/operator-observer/SKILL.md
+
 hermes skills install \
   https://raw.githubusercontent.com/ksamaschke/hermes-software-factory/main/skills/kanban-implementation-workflow/SKILL.md
 

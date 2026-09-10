@@ -15,6 +15,7 @@ tracker:
 
 profiles:
   orchestrator: default
+  operator_observer: null # read-only human-facing evidence/transport profile
   implementer: implementer
   code_reviewer: reviewer # concrete profile name may remain reviewer
   completion_verifier: null # optional concrete profile name
@@ -60,11 +61,56 @@ decision_authority:
     - rollback_or_fallback
     - next_gate
 
+# The controller passes this compact, provider-neutral envelope to the reasoning
+# model. Projects may lower these budgets, but may not omit required identity or
+# evidence fields. Runtime adapters enforce the ladder and exact readback.
+decision_contract:
+  schema: factory.decision.v1
+  ladder: [diagnose, choose, act, read_back, advance]
+  required_context:
+    - execution_mode
+    - profile_name
+    - source_item
+    - phase
+    - input_identity
+    - current_task
+    - current_run
+    - blocker
+    - parent_completion
+    - evidence.scheduler
+    - evidence.worker
+    - evidence.source
+    - evidence.review
+  evidence_kinds: [scheduler, worker, source, review]
+  budgets:
+    max_prompt_chars: 12000
+    max_skill_chars: 6000
+    max_skills: 4
+  repeated_blocker_threshold: 3
+  conflict_mode: fail_closed
+  current_run_null:
+    before_spawn: true
+    reused_or_held: true
+    new_admission_requires_run: true
+  transition_policy:
+    quarantine: current_phase
+    admit: implementation
+    reuse_existing: current_phase
+    select_independent_lane: implementation
+    repair_artifact: artifact
+    hold_missing_capability: current_phase
+    hold: current_phase
+  denied_capability: hold_or_external_gate
+
 operator_bridge:
   mode: central_transport_only
   enabled: true
   request_marker: OPERATOR_INPUT_REQUIRED
   response_marker: DECISION
+  observer_profile: operator_observer
+  orchestrator_profile: orchestrator
+  mutation_owner: orchestrator
+  observer_actions: [read_evidence, transport_decision_response]
   dedupe_on: [source_item, change_request, kanban_task, evidence_fingerprint]
 
 kanban:

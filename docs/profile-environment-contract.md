@@ -44,8 +44,9 @@ binary exists in every profile.
 
 Before dispatching a worker or reviewer:
 
-1. Resolve the exact profile and verify its skills and actual toolsets. A skill
-   name does not provision a tool or package.
+1. Resolve the exact profile and verify its effective role prompt (`SOUL.md` or
+   equivalent), config, skills, actual toolsets, and memory mode. A profile name
+   does not provision a prompt, tool, or package.
 2. Launch the bounded environment probe through the same profile/runtime that
    will run the task, not only from the controller shell.
 3. Verify the worktree, branch, candidate commit, effective `cwd`, project
@@ -53,8 +54,11 @@ Before dispatching a worker or reviewer:
 4. Run the smallest project-declared discovery check, such as test collection,
    a build-tool version check, or a project runner dry probe. Do not run the full
    gate during preflight.
-5. Record the result in the task/run evidence without secrets.
-6. Dispatch the task only when the required capability is present.
+5. Measure the effective prompt and loaded skill inventory against the project
+   decision-contract budgets. Optional skills may be omitted or trimmed, but the
+   typed identity/evidence context may not be truncated.
+6. Record the result in the task/run evidence without secrets.
+7. Dispatch the task only when the required capability is present.
 
 After changing profile configuration, skills, tools, credentials, or project
 dependencies, repeat the preflight. Do not retry an unchanged worker prompt.

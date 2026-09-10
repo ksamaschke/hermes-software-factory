@@ -39,6 +39,13 @@ identity, idempotent intake tasks, actionability/dependency mapping, conservativ
 source-state reconciliation, and supervised-dispatch separation. Concrete
 projects provide overlays or external add-ons.
 
+### `operator-observer`
+
+A read-only human-facing evidence and transport role. It reports exact durable
+state and routes genuine non-delegable decisions to the orchestrator; it cannot
+implement, create work, dispatch workers, merge, publish, promote, roll out, or
+close delivery state.
+
 ### `kanban-implementation-workflow`
 
 A tracker-agnostic Hermes Kanban workflow for:
@@ -103,6 +110,9 @@ Install the Skill directly from GitHub:
 
 ```bash
 hermes skills install \
+  https://raw.githubusercontent.com/ksamaschke/hermes-software-factory/main/skills/operator-observer/SKILL.md
+
+hermes skills install \
   https://raw.githubusercontent.com/ksamaschke/hermes-software-factory/main/skills/kanban-implementation-workflow/SKILL.md
 
 hermes skills install \
@@ -124,7 +134,7 @@ hermes skills install \
 Once installed, load the set explicitly for a session:
 
 ```bash
-hermes --skills kanban-implementation-workflow,kanban-factory-operations,kanban-progress-evidence,kanban-reviewer-contract,tracker-kanban-reconciliation,software-factory-recovery
+hermes --skills kanban-implementation-workflow,kanban-factory-operations,kanban-progress-evidence,operator-observer,kanban-reviewer-contract,tracker-kanban-reconciliation,software-factory-recovery
 ```
 
 The deterministic recovery add-ons are installed separately from the skill
@@ -237,6 +247,8 @@ Recommended reusable profile roles:
 - `orchestrator` — operating and architecture authority for decomposition,
   architecture, ownership, sequencing, remediation, recovery, routing, WIP,
   adjudication, and tracker writes; no source-code writes;
+- `operator-observer` — read-only human-facing evidence and transport; never a
+  delivery mutation owner;
 - `implementer` — TDD-first code changes in isolated worktrees;
 - `code-reviewer` — independent read-only review from a fresh typed packet;
 - `completion-verifier` — checks review coverage, acceptance evidence, and board transitions;

@@ -1,16 +1,14 @@
-from pathlib import Path
 import re
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import pytest
 import yaml
 
-
 ROOT = Path(__file__).resolve().parents[1]
 POLICY = ROOT / "examples" / "project-policy.yaml"
 PROFILE_ROLES = ROOT / "docs" / "profile-roles.md"
 SOUL_TEMPLATE = ROOT / "docs" / "orchestrator-soul-template.md"
-
 
 
 def _text(*relative_paths: str) -> str:
@@ -20,10 +18,8 @@ def _text(*relative_paths: str) -> str:
     )
 
 
-
 def _compact(text: str) -> str:
     return " ".join(text.lower().split())
-
 
 
 def test_policy_declares_bounded_orchestrator_authority():
@@ -55,26 +51,28 @@ def test_policy_declares_bounded_orchestrator_authority():
     assert set(bridge["dedupe_on"]) >= {"source_item", "kanban_task"}
 
 
-
 def test_policy_defines_safety_hold_and_approval_required_mode():
     policy = yaml.safe_load(POLICY.read_text(encoding="utf-8"))
     non_delegable = set(policy["decision_authority"]["non_delegable"])
     assert "undefined_safety_critical_value" in non_delegable
 
-    text = _compact((ROOT / "docs" / "policy-resolution.md").read_text(encoding="utf-8"))
+    text = _compact(
+        (ROOT / "docs" / "policy-resolution.md").read_text(encoding="utf-8")
+    )
     assert "safety-critical value is unspecified" in text
     assert "hold only the affected action" in text
     assert "approval_required" in text
     assert "planning-only" in text
 
 
-
 def test_orchestrator_contract_is_operating_and_architecture_authority():
-    text = _compact(_text(
-        "docs/profile-roles.md",
-        "docs/kanban-factory-runtime.md",
-        "README.md",
-    ))
+    text = _compact(
+        _text(
+            "docs/profile-roles.md",
+            "docs/kanban-factory-runtime.md",
+            "README.md",
+        )
+    )
 
     for phrase in (
         "operating and architecture authority",
@@ -89,10 +87,11 @@ def test_orchestrator_contract_is_operating_and_architecture_authority():
     ):
         assert phrase in text
 
-    runtime = _compact((ROOT / "docs" / "kanban-factory-runtime.md").read_text(encoding="utf-8"))
+    runtime = _compact(
+        (ROOT / "docs" / "kanban-factory-runtime.md").read_text(encoding="utf-8")
+    )
     assert "mechanical" in runtime
     assert "gateway" in runtime
-
 
 
 def test_shared_skills_require_the_common_decision_ladder():
@@ -118,12 +117,14 @@ def test_shared_skills_require_the_common_decision_ladder():
         assert "selected issue or locked lane" in text
 
 
-
-@pytest.mark.parametrize("skill", [
-    "kanban-factory-operations",
-    "kanban-implementation-workflow",
-    "kanban-progress-evidence",
-])
+@pytest.mark.parametrize(
+    "skill",
+    [
+        "kanban-factory-operations",
+        "kanban-implementation-workflow",
+        "kanban-progress-evidence",
+    ],
+)
 def test_installed_skill_links_to_canonical_decision_ladder(tmp_path, skill):
     # Raw SKILL.md installs must work without the collection checkout or siblings.
     installed = tmp_path / skill / "SKILL.md"
@@ -152,7 +153,9 @@ def test_installed_skill_links_to_canonical_decision_ladder(tmp_path, skill):
 
 
 def test_central_bridge_requires_recommendation_and_keeps_workers_off_human_channels():
-    text = _compact((ROOT / "docs" / "central-kanban-reporting.md").read_text(encoding="utf-8"))
+    text = _compact(
+        (ROOT / "docs" / "central-kanban-reporting.md").read_text(encoding="utf-8")
+    )
     for phrase in (
         "workers and task cards do not contact the user directly",
         "one deduplicated clarification packet",
@@ -164,7 +167,6 @@ def test_central_bridge_requires_recommendation_and_keeps_workers_off_human_chan
         "unanswered requests are not repeated unless evidence materially changes",
     ):
         assert phrase in text
-
 
 
 def test_orchestrator_soul_template_is_generic_and_complete():
@@ -192,13 +194,14 @@ def test_orchestrator_soul_template_is_generic_and_complete():
         assert project_specific not in lowered
 
 
-
 def test_authority_contract_keeps_runtime_safety_boundaries():
-    text = _compact(_text(
-        "docs/profile-roles.md",
-        "docs/central-kanban-reporting.md",
-        "skills/kanban-factory-operations/SKILL.md",
-    ))
+    text = _compact(
+        _text(
+            "docs/profile-roles.md",
+            "docs/central-kanban-reporting.md",
+            "skills/kanban-factory-operations/SKILL.md",
+        )
+    )
     for phrase in (
         "second dispatcher",
         "do not bypass independent review",
@@ -209,20 +212,21 @@ def test_authority_contract_keeps_runtime_safety_boundaries():
         assert phrase in text
 
 
-
 def test_public_authority_contract_stays_product_agnostic():
-    text = _compact(_text(
-        "README.md",
-        "docs/profile-roles.md",
-        "docs/kanban-factory-runtime.md",
-        "docs/policy-resolution.md",
-        "docs/central-kanban-reporting.md",
-        "docs/orchestrator-soul-template.md",
-        "examples/project-policy.yaml",
-        "skills/kanban-factory-operations/SKILL.md",
-        "skills/kanban-implementation-workflow/SKILL.md",
-        "skills/kanban-progress-evidence/SKILL.md",
-    ))
+    text = _compact(
+        _text(
+            "README.md",
+            "docs/profile-roles.md",
+            "docs/kanban-factory-runtime.md",
+            "docs/policy-resolution.md",
+            "docs/central-kanban-reporting.md",
+            "docs/orchestrator-soul-template.md",
+            "examples/project-policy.yaml",
+            "skills/kanban-factory-operations/SKILL.md",
+            "skills/kanban-implementation-workflow/SKILL.md",
+            "skills/kanban-progress-evidence/SKILL.md",
+        )
+    )
     for forbidden_pattern in (
         r"\bsustainical\b",
         r"\besg[-_]\w*",
