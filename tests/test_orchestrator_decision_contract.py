@@ -457,6 +457,14 @@ def test_fixture_adapter_bounds_hostile_mapping_before_materialization():
             self.item_count = item_count
             self.yielded = 0
             self.lookups = 0
+            self.items_called = 0
+
+        def items(self):
+            self.items_called += 1
+            return [
+                (f"eager-key-{index}", f"eager-value-{index}")
+                for index in range(self.item_count)
+            ]
 
         def __getitem__(self, key: str) -> Any:
             self.lookups += 1
@@ -475,7 +483,8 @@ def test_fixture_adapter_bounds_hostile_mapping_before_materialization():
         contract.NoSideEffectFixtureAdapter(state)
     expected_consumption = contract._MAX_SAFE_VALUE_ITEMS + 1
     assert state.yielded == expected_consumption
-    assert state.lookups == expected_consumption
+    assert state.lookups == contract._MAX_SAFE_VALUE_ITEMS
+    assert state.items_called == 0
 
 
 @pytest.mark.parametrize(
@@ -486,6 +495,14 @@ def test_all_untrusted_mapping_ingresses_are_bounded_before_materialization(ingr
         def __init__(self) -> None:
             self.yielded = 0
             self.lookups = 0
+            self.items_called = 0
+
+        def items(self):
+            self.items_called += 1
+            return [
+                (f"eager-key-{index}", f"eager-value-{index}")
+                for index in range(contract._MAX_SAFE_VALUE_ITEMS * 4)
+            ]
 
         def __getitem__(self, key: str) -> Any:
             self.lookups += 1
@@ -549,8 +566,91 @@ def test_all_untrusted_mapping_ingresses_are_bounded_before_materialization(ingr
 
     with pytest.raises(contract.ContractViolation):
         operation()
-    assert hostile.yielded <= contract._MAX_SAFE_VALUE_ITEMS + 1
-    assert hostile.lookups <= contract._MAX_SAFE_VALUE_ITEMS + 1
+    expected_consumption = contract._MAX_SAFE_VALUE_ITEMS + 1
+    assert hostile.yielded == expected_consumption
+    assert hostile.lookups == contract._MAX_SAFE_VALUE_ITEMS
+    assert hostile.items_called == 0
+
+
+def test_nested_lying_sequences_use_builtins_and_reject_before_overbound_copy():
+    class LyingList(list):
+        def __init__(self, values):
+            super().__init__(values)
+            self.iter_calls = 0
+
+        def __len__(self):
+            return 1
+
+        def __iter__(self):
+            self.iter_calls += 1
+            raise RuntimeError("overridden list iteration must not be trusted")
+
+    class LyingTuple(tuple):
+        def __new__(cls, values):
+            value = super().__new__(cls, values)
+            value.iter_calls = 0
+            return value
+
+        def __len__(self):
+            return 1
+
+        def __iter__(self):
+            self.iter_calls += 1
+            raise RuntimeError("overridden tuple iteration must not be trusted")
+
+    for sequence in (
+        LyingList(range(contract._MAX_SAFE_VALUE_ITEMS + 1)),
+        LyingTuple(range(contract._MAX_SAFE_VALUE_ITEMS + 1)),
+    ):
+        with pytest.raises(contract.ContractViolation, match="sequence exceeds"):
+            contract._safe_value(sequence)
+        assert sequence.iter_calls == 0
+
+    nested = [LyingList([LyingTuple(range(contract._MAX_SAFE_VALUE_ITEMS + 1))])]
+    with pytest.raises(contract.ContractViolation, match="sequence exceeds"):
+        contract._safe_value(nested)
+    assert nested[0].iter_calls == 0
+    assert nested[0][0].iter_calls == 0
+
+
+def test_non_string_mapping_keys_fail_before_string_conversion():
+    class HostileKey:
+        def __init__(self) -> None:
+            self.str_calls = 0
+
+        def __str__(self) -> str:
+            self.str_calls += 1
+            raise RuntimeError("hostile key conversion")
+
+    key = HostileKey()
+    with pytest.raises(contract.ContractViolation, match="mapping keys"):
+        contract._safe_value({key: "value"})
+    assert key.str_calls == 0
+
+
+def test_ordinary_mapping_ingress_remains_supported():
+    attributes = {"ordinary": {"nested": [1, 2, 3]}}
+    evidence = contract.TypedEvidence(
+        kind="scheduler",
+        subject="subject",
+        status="observed",
+        reference="reference",
+        attributes=attributes,
+    )
+    assert evidence.as_dict()["attributes"] == attributes
+    response = {
+        "diagnose": {"summary": "observed"},
+        "choose": {"action": "hold"},
+        "act": {"action": "hold", "idempotency_key": "key"},
+        "read_back": {
+            "idempotency_key": "key",
+            "status": "held",
+            "current_run_id": None,
+        },
+        "advance": {"next_phase": "triage"},
+    }
+    proposal = contract.DecisionProposal.from_response(response)
+    assert proposal.choose["action"] == "hold"
 
 
 def test_model_fixture_path_makes_safe_decisions_for_unseen_ids_without_writes():

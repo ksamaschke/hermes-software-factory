@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -31,6 +32,21 @@ assert spec is not None and spec.loader is not None
 evaluation = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = evaluation
 spec.loader.exec_module(evaluation)
+
+
+@pytest.fixture(autouse=True)
+def _native_provider_registry(monkeypatch: pytest.MonkeyPatch):
+    auth_module = ModuleType("hermes_cli.auth")
+    auth_module.PROVIDER_REGISTRY = {
+        "openai-codex": SimpleNamespace(auth_type="oauth_pkce"),
+        "api-provider": SimpleNamespace(auth_type="api_key"),
+        "external-provider": SimpleNamespace(auth_type="external_process"),
+    }
+    hermes_module = ModuleType("hermes_cli")
+    hermes_module.__path__ = []
+    hermes_module.auth = auth_module
+    monkeypatch.setitem(sys.modules, "hermes_cli", hermes_module)
+    monkeypatch.setitem(sys.modules, "hermes_cli.auth", auth_module)
 
 
 def _contaminated_environment(live_board: Path) -> dict[str, str]:
@@ -275,6 +291,158 @@ def test_auth_validation_returns_verified_status_only_for_provider_shape(
     assert (profile / "auth.json").stat().st_mode & 0o077 == 0
 
 
+def test_auth_provider_alias_preserves_oauth_refresh_requirement(tmp_path: Path):
+    document = {
+        "providers": {
+            "openai-codex": {
+                "tokens": {
+                    "access_token": "fixture-access",
+                    "refresh_token": "fixture-refresh",
+                }
+            }
+        }
+    }
+    source = tmp_path / "source-auth.json"
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    source.write_text(json.dumps(document), encoding="utf-8")
+
+    assert evaluation._copy_auth(source, profile, provider="codex") is True
+
+
+def test_auth_provider_registry_accepts_authoritative_api_key_provider(
+    tmp_path: Path,
+):
+    document = {
+        "providers": {"api-provider": {"api_key": "fixture-key"}},
+    }
+    source = tmp_path / "source-auth.json"
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    source.write_text(json.dumps(document), encoding="utf-8")
+
+    assert evaluation._copy_auth(source, profile, provider="api-provider") is True
+
+
+def test_auth_provider_registry_rejects_unknown_provider_before_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source = tmp_path / "source-auth.json"
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    source.write_text(
+        json.dumps({"providers": {"not-a-provider": {"api_key": "fixture-key"}}}),
+        encoding="utf-8",
+    )
+    opens: list[tuple[Any, ...]] = []
+    real_open = evaluation.os.open
+
+    def observed_open(*args: Any, **kwargs: Any):
+        opens.append((args, kwargs))
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(evaluation.os, "open", observed_open)
+    with pytest.raises(
+        evaluation.NativeEvaluationUnavailable, match="unsupported native provider"
+    ):
+        evaluation._copy_auth(source, profile, provider="not-a-provider")
+    assert opens == []
+    assert not (profile / "auth.json").exists()
+
+
+def test_auth_provider_registry_unavailability_fails_closed_before_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source = tmp_path / "source-auth.json"
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    source.write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "openai-codex": {
+                        "tokens": {
+                            "access_token": "fixture-access",
+                            "refresh_token": "fixture-refresh",
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.delitem(sys.modules, "hermes_cli.auth", raising=False)
+    monkeypatch.delitem(sys.modules, "hermes_cli", raising=False)
+    with pytest.raises(
+        evaluation.NativeEvaluationUnavailable, match="provider registry"
+    ):
+        evaluation._copy_auth(source, profile, provider="openai-codex")
+    assert not (profile / "auth.json").exists()
+
+
+@pytest.mark.parametrize("kind", ["symlink", "fifo"])
+def test_auth_source_rejects_links_and_special_files_before_copy_or_cases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+):
+    target = tmp_path / "target-auth.json"
+    target.write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "openai-codex": {
+                        "tokens": {
+                            "access_token": "fixture-access",
+                            "refresh_token": "fixture-refresh",
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    source = tmp_path / "source-auth.json"
+    if kind == "symlink":
+        source.symlink_to(target)
+    else:
+        os.mkfifo(source)
+
+    copy_calls: list[tuple[Any, ...]] = []
+    case_calls: list[tuple[Any, ...]] = []
+
+    def forbidden_copy(*args: Any, **kwargs: Any) -> None:
+        copy_calls.append((args, kwargs))
+
+    def forbidden_cases(*args: Any, **kwargs: Any):
+        case_calls.append((args, kwargs))
+        raise AssertionError("invalid auth reached case construction")
+
+    monkeypatch.setattr(evaluation, "_atomic_write_text", forbidden_copy)
+    monkeypatch.setattr(evaluation, "build_synthetic_cases", forbidden_cases)
+    with pytest.raises(
+        evaluation.NativeEvaluationUnavailable, match="regular readable file"
+    ):
+        evaluation.run_native_evaluation(
+            hermes=sys.executable,
+            auth_file=str(source),
+            run_budget=30,
+        )
+    assert copy_calls == []
+    assert case_calls == []
+
+
+def test_auth_regular_file_bound_rejects_before_copy(tmp_path: Path):
+    source = tmp_path / "oversized-auth.json"
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    source.write_bytes(b"x" * (evaluation._MAX_AUTH_FILE_BYTES + 1))
+
+    with pytest.raises(
+        evaluation.NativeEvaluationUnavailable, match="auth file exceeds its bound"
+    ):
+        evaluation._copy_auth(source, profile, provider="api-provider")
+    assert not (profile / "auth.json").exists()
+
+
 def test_invalid_auth_aborts_before_case_construction_or_model_execution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -358,6 +526,92 @@ def test_fixture_store_rejects_completed_admit_before_readback_allocation(
     trace = trace_path.read_text(encoding="utf-8")
     assert "propose_action" not in trace
     assert "read_action_readback" not in trace
+
+
+def test_fixture_store_rechecks_live_state_after_proposal_before_admission_readback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    case = evaluation.build_synthetic_cases(
+        "completed-store-race", credentials_verified=True
+    )[1]
+    state = json.loads(json.dumps(case.state))
+    state_path = tmp_path / "state.json"
+    trace_path = tmp_path / "trace.jsonl"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    store = evaluation._FixtureStore(state_path, trace_path)
+    key = store.read_action_key("admit", case.context.execution.task_id)[
+        "idempotency_key"
+    ]
+    store.propose_action("admit", key, case.context.execution.task_id)
+    state["live"]["existing_action"] = {
+        "status": "completed",
+        "task_id": "completed-store-race-task",
+        "current_run_id": None,
+        "source_key": case.context.source_item.canonical_key,
+        "phase": case.context.phase,
+        "input_identity": case.context.input_identity,
+        "semantic_lane": case.context.semantic_lane,
+    }
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    readback_calls: list[tuple[Any, ...]] = []
+
+    def unexpected_readback(*args: Any, **kwargs: Any):
+        readback_calls.append((args, kwargs))
+        raise AssertionError("completed transition allocated a fixture readback")
+
+    monkeypatch.setattr(evaluation, "simulated_action_readback", unexpected_readback)
+    with pytest.raises(
+        contract.ContractViolation, match="completed existing action is terminal"
+    ):
+        store.read_action(key)
+    assert readback_calls == []
+    trace = trace_path.read_text(encoding="utf-8")
+    assert "read_action_readback" not in trace
+
+
+def test_no_side_effect_adapter_rechecks_live_state_after_proposal_before_readback(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    case = evaluation.build_synthetic_cases(
+        "completed-adapter-race", credentials_verified=True
+    )[1]
+    adapter = contract.NoSideEffectFixtureAdapter(json.loads(json.dumps(case.state)))
+    adapter.bind_context(case.context)
+    for name in (
+        "read_live_state",
+        "read_parent_completion",
+        "read_source_state",
+        "read_ready_lanes",
+        "read_capabilities",
+    ):
+        getattr(adapter, name)()
+    key = adapter.read_action_key("admit", case.context.execution.task_id)[
+        "idempotency_key"
+    ]
+    adapter.propose_action("admit", key, case.context.execution.task_id)
+    adapter._state["live"]["existing_action"] = {
+        "status": "completed",
+        "task_id": "completed-adapter-race-task",
+        "current_run_id": None,
+        "source_key": case.context.source_item.canonical_key,
+        "phase": case.context.phase,
+        "input_identity": case.context.input_identity,
+        "semantic_lane": case.context.semantic_lane,
+    }
+    readback_calls: list[tuple[Any, ...]] = []
+
+    def unexpected_readback(*args: Any, **kwargs: Any):
+        readback_calls.append((args, kwargs))
+        raise AssertionError("completed transition allocated an adapter readback")
+
+    monkeypatch.setattr(evaluation, "simulated_action_readback", unexpected_readback)
+    with pytest.raises(
+        contract.ContractViolation, match="completed existing action is terminal"
+    ):
+        adapter.read_action_readback(key)
+    assert readback_calls == []
+    assert adapter.last_readback is None
+    assert adapter.postproposal_receipt_reads == 1
 
 
 def test_native_summary_redacts_model_and_provider_values():

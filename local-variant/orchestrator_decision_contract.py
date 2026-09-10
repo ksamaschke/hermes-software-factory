@@ -240,33 +240,56 @@ def _bounded_iterable(value: Any, field_name: str, limit: int) -> list[Any]:
 
     if isinstance(value, (str, bytes, bytearray)):
         raise ContractViolation(f"{field_name} input must be an iterable of items")
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
+        raise ContractViolation(f"{field_name} input bound is malformed")
     try:
-        iterator = iter(value)
-    except TypeError as exc:
-        raise ContractViolation(f"{field_name} input is not iterable") from exc
+        if isinstance(value, list):
+            iterator = list.__iter__(value)
+        elif isinstance(value, tuple):
+            iterator = tuple.__iter__(value)
+        else:
+            iterator = iter(value)
+    except Exception:  # noqa: BLE001 - hostile iterables must become contract errors
+        raise ContractViolation(f"{field_name} input is not iterable") from None
     result: list[Any] = []
-    for index, item in enumerate(iterator):
+    for index in range(limit + 1):
+        try:
+            item = next(iterator)
+        except StopIteration:
+            return result
+        except Exception:  # noqa: BLE001 - hostile iterators must become contract errors
+            raise ContractViolation(f"{field_name} input iteration failed") from None
         if index >= limit:
             raise ContractViolation(f"{field_name} input exceeds the contract bound")
         result.append(item)
-    return result
+    raise ContractViolation(f"{field_name} input exceeds the contract bound")
 
 
 def _bounded_mapping_items(
     value: Mapping[Any, Any], field_name: str, limit: int
 ) -> list[tuple[Any, Any]]:
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
+        raise ContractViolation(f"{field_name} mapping bound is malformed")
     try:
-        iterator = iter(value.items())
-    except (AttributeError, TypeError) as exc:
-        raise ContractViolation(f"{field_name} input is not a mapping") from exc
+        iterator = iter(value)
+    except Exception:  # noqa: BLE001 - hostile mappings must become contract errors
+        raise ContractViolation(f"{field_name} input is not a mapping") from None
     result: list[tuple[Any, Any]] = []
-    for index, item in enumerate(iterator):
+    for index in range(limit + 1):
+        try:
+            key = next(iterator)
+        except StopIteration:
+            return result
+        except Exception:  # noqa: BLE001 - hostile iterators must become contract errors
+            raise ContractViolation(f"{field_name} mapping iteration failed") from None
         if index >= limit:
             raise ContractViolation(f"{field_name} input exceeds the contract bound")
-        if not isinstance(item, tuple) or len(item) != 2:
-            raise ContractViolation(f"{field_name} mapping entry is malformed")
-        result.append(item)
-    return result
+        try:
+            item = value[key]
+        except Exception:  # noqa: BLE001 - hostile lookups must become contract errors
+            raise ContractViolation(f"{field_name} mapping lookup failed") from None
+        result.append((key, item))
+    raise ContractViolation(f"{field_name} input exceeds the contract bound")
 
 
 def _safe_mapping(value: Any, field_name: str = "mapping") -> dict[str, Any]:
@@ -310,7 +333,9 @@ def _safe_value(
         for key, item in _bounded_mapping_items(
             value, field_name, _MAX_SAFE_VALUE_ITEMS
         ):
-            key_text = str(key)
+            if type(key) is not str:
+                raise ContractViolation(f"{field_name} mapping keys must be strings")
+            key_text = key
             if len(key_text) > _MAX_SAFE_TEXT_CHARS:
                 raise ContractViolation(
                     f"field name exceeds the contract bound: {field_name}"
@@ -337,10 +362,14 @@ def _safe_value(
         if object_id in _seen:
             raise ContractViolation(f"cyclic or shared value: {field_name}")
         _seen.add(object_id)
-        if len(value) > _MAX_SAFE_VALUE_ITEMS:
-            raise ContractViolation(
-                f"sequence exceeds the contract bound: {field_name}"
-            )
+        try:
+            items = _bounded_iterable(value, field_name, _MAX_SAFE_VALUE_ITEMS)
+        except ContractViolation as exc:
+            if "input exceeds the contract bound" in str(exc):
+                raise ContractViolation(
+                    f"sequence exceeds the contract bound: {field_name}"
+                ) from exc
+            raise
         return [
             _safe_value(
                 item,
@@ -349,7 +378,7 @@ def _safe_value(
                 _nodes=_nodes,
                 _seen=_seen,
             )
-            for item in value
+            for item in items
         ]
     if value is None or isinstance(value, (bool, int, float)):
         if isinstance(value, float) and not math.isfinite(value):
@@ -1795,6 +1824,8 @@ class NoSideEffectFixtureAdapter:
             if self._proposal["idempotency_key"] != idempotency_key:
                 raise ContractViolation("readback requested for a foreign proposal")
             self._postproposal_receipt_reads += 1
+            live = self.read_live_state()
+            _reject_existing_admission(self._proposal["action"], live)
             if self._external_readback is not None:
                 result = copy.deepcopy(self._external_readback)
             else:

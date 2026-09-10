@@ -1238,6 +1238,8 @@ class _FixtureStore:
                 "current_run_id": None,
             }
         else:
+            live = self._state().get("live")
+            _reject_existing_admission(self._proposal["action"], live)
             result = simulated_action_readback(
                 self._proposal["action"],
                 key,
@@ -1440,42 +1442,66 @@ def verify_fixture_only_profile(profile: Path) -> None:
 
 
 _MAX_AUTH_FILE_BYTES = 4 * 1024 * 1024
-_OAUTH_AUTH_PROVIDERS = frozenset(
-    {
-        "openai-codex",
-        "xai-oauth",
-        "qwen-oauth",
-        "minimax-oauth",
-        "nous",
-    }
-)
 _AUTH_PROVIDER_ALIASES = {
     "codex": "openai-codex",
     "openai_codex": "openai-codex",
 }
+_NON_OAUTH_AUTH_TYPES = frozenset({"api_key", "external_process", "aws_sdk", "vertex"})
 
 
 def _auth_provider_keys(provider: str) -> tuple[str, ...]:
+    if not isinstance(provider, str) or not provider.strip():
+        raise NativeEvaluationUnavailable("native provider identity is malformed")
     normalized = provider.strip().casefold()
     canonical = _AUTH_PROVIDER_ALIASES.get(normalized, normalized)
     return tuple(dict.fromkeys((normalized, canonical)))
 
 
-def _provider_requires_refresh(provider: str) -> bool:
+def _provider_metadata(provider: str) -> tuple[str, Any]:
     canonical = _auth_provider_keys(provider)[-1]
-    if canonical in _OAUTH_AUTH_PROVIDERS:
-        return True
     try:
         from hermes_cli.auth import PROVIDER_REGISTRY
-    except ImportError:
-        config = None
-    else:
-        try:
-            config = PROVIDER_REGISTRY.get(canonical)
-        except (AttributeError, TypeError):
-            config = None
-    auth_type = getattr(config, "auth_type", "")
-    return isinstance(auth_type, str) and auth_type.casefold().startswith("oauth")
+    except Exception:  # noqa: BLE001 - unavailable native metadata must fail closed
+        raise NativeEvaluationUnavailable(
+            "native Hermes provider registry is unavailable"
+        ) from None
+    if not isinstance(PROVIDER_REGISTRY, Mapping):
+        raise NativeEvaluationUnavailable(
+            "native Hermes provider registry is malformed"
+        )
+    try:
+        config = PROVIDER_REGISTRY.get(canonical)
+    except Exception:  # noqa: BLE001 - hostile registry lookups must fail closed
+        raise NativeEvaluationUnavailable(
+            "native Hermes provider registry is malformed"
+        ) from None
+    if config is None:
+        raise NativeEvaluationUnavailable("unsupported native provider identity")
+    try:
+        auth_type = getattr(config, "auth_type", None)
+    except Exception:  # noqa: BLE001 - hostile metadata access must fail closed
+        raise NativeEvaluationUnavailable(
+            "native Hermes provider metadata is malformed"
+        ) from None
+    if not isinstance(auth_type, str):
+        raise NativeEvaluationUnavailable(
+            "native Hermes provider metadata is malformed"
+        )
+    auth_type = auth_type.strip().casefold()
+    if (
+        auth_type != "oauth"
+        and not auth_type.startswith("oauth_")
+        and (auth_type not in _NON_OAUTH_AUTH_TYPES)
+    ):
+        raise NativeEvaluationUnavailable(
+            "native Hermes provider metadata is malformed"
+        )
+    return auth_type, config
+
+
+def _provider_requires_refresh(provider: str) -> bool:
+    auth_type, _config = _provider_metadata(provider)
+    return auth_type == "oauth" or auth_type.startswith("oauth_")
 
 
 def _nonempty_auth_string(value: Any) -> bool:
@@ -1546,19 +1572,47 @@ def _validate_auth_file(source: Path | None, provider: str) -> str:
         ) from None
     if not isinstance(provider, str) or not provider.strip():
         raise NativeEvaluationUnavailable("native provider identity is malformed")
+    provider_keys = _auth_provider_keys(provider)
+    requires_refresh = _provider_requires_refresh(provider)
     try:
-        with source.open("rb") as stream:
-            if not S_ISREG(os.fstat(stream.fileno()).st_mode):
-                raise NativeEvaluationUnavailable(
-                    "native Hermes auth file is not a regular readable file"
-                )
-            raw = stream.read(_MAX_AUTH_FILE_BYTES + 1)
+        source_name = os.fspath(source)
+    except (TypeError, ValueError, OSError):
+        raise NativeEvaluationUnavailable(
+            "native Hermes auth file path is malformed"
+        ) from None
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    if not no_follow:
+        raise NativeEvaluationUnavailable(
+            "native Hermes auth file link protection is unavailable"
+        )
+    flags = os.O_RDONLY | no_follow
+    for flag_name in ("O_CLOEXEC", "O_NONBLOCK"):
+        flags |= getattr(os, flag_name, 0)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(source_name, flags)
+        stat_result = os.fstat(descriptor)
+        if not S_ISREG(stat_result.st_mode):
+            raise NativeEvaluationUnavailable(
+                "native Hermes auth file is not a regular readable file"
+            )
+        if stat_result.st_size > _MAX_AUTH_FILE_BYTES:
+            raise NativeEvaluationUnavailable(
+                "native Hermes auth file exceeds its bound"
+            )
+        raw = os.read(descriptor, _MAX_AUTH_FILE_BYTES + 1)
     except NativeEvaluationUnavailable:
         raise
-    except (OSError, ValueError):
+    except (OSError, TypeError, ValueError):
         raise NativeEvaluationUnavailable(
             "native Hermes auth file is not a regular readable file"
         ) from None
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
     if len(raw) > _MAX_AUTH_FILE_BYTES:
         raise NativeEvaluationUnavailable("native Hermes auth file exceeds its bound")
     try:
@@ -1592,8 +1646,6 @@ def _validate_auth_file(source: Path | None, provider: str) -> str:
             "native Hermes auth JSON has no provider credential structure"
         )
 
-    provider_keys = _auth_provider_keys(provider)
-    requires_refresh = _provider_requires_refresh(provider)
     state_valid = bool(
         isinstance(providers, Mapping)
         and any(
@@ -1643,7 +1695,13 @@ def _auth_source(explicit: str | None) -> Path | None:
     if configured_home:
         candidates.append(Path(configured_home) / "auth.json")
     for candidate in candidates:
-        if candidate.is_file():
+        try:
+            os.lstat(os.fspath(candidate))
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return candidate
+        else:
             return candidate
     return None
 
