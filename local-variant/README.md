@@ -19,6 +19,12 @@ is a durable backup, not the live copy.
 `vanillacore-reviewer` profiles. Both carry the change-scoped review contract:
 two review kinds, the diff as the scope boundary, and the two-tier budget.
 
+`coordinator_admission_contract.py` — a project-agnostic pure helper for
+scheduled coordinator overlays. It preserves a queue-derived product action
+when a liveness/no-progress handoff wakes the coordinator, emits a bounded
+progress contract, and leaves issue selection and mutation to the LLM-owned
+coordinator path.
+
 ## Relationship to the live installation
 
 The live copies live under `~/.hermes/skills/software-development/<skill>/` and

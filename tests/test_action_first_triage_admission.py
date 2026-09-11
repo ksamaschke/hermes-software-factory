@@ -5,7 +5,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 REFERENCE = (
     ROOT
@@ -35,6 +34,10 @@ def test_zero_ready_contract_requires_triage_and_one_audited_action_before_idle(
         "safe independent triage action",
         "idempotency key",
         "read back",
+        "wake-up input",
+        "must never rewrite",
+        "unverified no-op is retried on the next tick",
+        "coordinator_admission_contract.py",
     ):
         assert phrase in text
 
@@ -121,6 +124,10 @@ def test_operations_surface_references_the_action_first_contract():
         "one bounded audited admission/remediation action",
         "hold only that lane",
         "continue independent work",
+        "wake-up input only",
+        "must not replace an already derived product admission action",
+        "retry an unverified no-op on the next tick",
+        "coordinator_admission_contract.py",
     ):
         assert phrase in operations
 

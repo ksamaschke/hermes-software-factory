@@ -87,6 +87,13 @@ no-progress report when a safe independent triage action exists. Read back the
 exact action, idempotency key, parent evidence, status, owner, retry state, WIP
 accounting, and audit event before claiming progress.
 
+Treat a liveness/no-progress heartbeat as a wake-up input only. It must not
+replace an already derived product admission action with generic watchdog
+reconciliation. Preserve the selected source action; require one verified
+transition or complete all-gated proof, and retry an unverified no-op on the
+next tick. Project overlays may consume the pure, non-selecting helper in
+`local-variant/coordinator_admission_contract.py` to enforce this precedence.
+
 Parked work, unfinished or ambiguous parents, malformed/stale contracts,
 duplicate identities, and WIP-full lanes remain unchanged. Genuine external or
 human gates, including protected signer/credential boundaries, hold only that

@@ -71,6 +71,21 @@ The snapshot must distinguish:
 A digest may identify what to inspect, but it cannot substitute for this live
 read.
 
+A liveness or no-progress heartbeat is a **wake-up input**, not a replacement
+action. It must never rewrite an already derived `fill`/admission decision into
+generic watchdog reconciliation. Only an independently observed watchdog
+failure may select watchdog repair. When a fresh no-progress handoff arrives,
+the coordinator must preserve the source decision, attempt one bounded product
+transition, or prove from the complete frontier that every candidate is gated.
+An unverified no-op is retried on the next tick; it is not converted to
+`[SILENT]` or a status-only comment.
+
+Project overlays can reuse
+`local-variant/coordinator_admission_contract.py` to keep this precedence and
+emit a bounded non-selecting progress contract. The helper never chooses an
+issue, changes the board, or spawns a worker; those remain LLM-owned decisions
+through the supported coordinator path.
+
 ### 2. Reconcile parent completion
 
 For each existing canonical candidate, read every declared parent and its
