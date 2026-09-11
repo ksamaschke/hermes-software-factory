@@ -71,6 +71,32 @@ The snapshot must distinguish:
 A digest may identify what to inspect, but it cannot substitute for this live
 read.
 
+A liveness or no-progress heartbeat is a **wake-up input**, not a replacement
+action. It must never rewrite an already derived `fill`/admission decision into
+generic watchdog reconciliation. Only an independently observed watchdog
+failure may select watchdog repair. When a fresh no-progress handoff arrives,
+the coordinator must preserve the source decision, attempt one bounded product
+transition, or prove from the complete frontier that every candidate is gated.
+An unverified no-op is retried on the next tick; it is not converted to
+`[SILENT]` or a status-only comment.
+
+Project overlays can reuse
+`local-variant/coordinator_admission_contract.py` to keep this precedence and
+emit a bounded non-selecting progress contract. The helper never chooses an
+issue, changes the board, or spawns a worker; those remain LLM-owned decisions
+through the supported coordinator path.
+
+An overlay must supply an explicit action allow-list and candidate-key schema,
+exact booleans, bounded structured probe errors, and a bounded heartbeat event
+identity, age, and signal list. Malformed inputs fail closed without echoing raw
+values. Candidate counts are accepted only as a bounded built-in mapping whose
+keys exactly match the caller's bounded schema; arbitrary mapping adapters and
+oversized key sets fail closed before iteration. Probe errors and a suppressed
+coordinator gate are reserved hard dispositions derived only from their causal
+inputs, never caller-selectable product actions. Their progress contract
+requires surfacing and holding that boundary and must not simultaneously
+require product admission or no-op retry.
+
 ### 2. Reconcile parent completion
 
 For each existing canonical candidate, read every declared parent and its
