@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import sys
+from collections.abc import Mapping
 from copy import deepcopy
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCAL_VARIANT = ROOT / "local-variant"
@@ -152,6 +154,54 @@ def test_action_mode_is_typed_bounded_and_control_free():
     assert result["action_mode"] == "probe_error"
 
 
+def test_reserved_hard_modes_cannot_spoof_a_product_action():
+    for action in ("probe_error", "coordinator_gate_suppressed"):
+        result = _directive(summary_action=action)
+
+        assert result["action_mode"] == "probe_error"
+        assert result["progress_contract"]["hard_disposition"] == (
+            "input_contract_error"
+        )
+        assert result["progress_contract"]["can_start_next"] is False
+        assert result["progress_contract"]["no_progress_decision_required"] is False
+        assert result["progress_contract"]["retry_unverified_noop_on_next_tick"] is (
+            False
+        )
+
+
+class _ExplodingMapping(Mapping[object, object]):
+    def __getitem__(self, key: object) -> object:
+        raise AssertionError("candidate mapping item access must not occur")
+
+    def __iter__(self):
+        raise AssertionError("candidate mapping iteration must not occur")
+
+    def __len__(self) -> int:
+        raise AssertionError("candidate mapping length access must not occur")
+
+
+class _UnhashableKeyMapping(Mapping[object, object]):
+    def __getitem__(self, key: object) -> object:
+        return 0
+
+    def __iter__(self):
+        return iter((["ready"],))
+
+    def __len__(self) -> int:
+        return 1
+
+
+class _ExplodingDict(dict[Any, Any]):
+    def __iter__(self):
+        raise AssertionError("dict subclass iteration must not occur")
+
+    def __len__(self) -> int:
+        raise AssertionError("dict subclass length access must not occur")
+
+    def get(self, key: object, default: object = None) -> object:
+        raise AssertionError("dict subclass item access must not occur")
+
+
 def test_candidate_schema_is_explicit_and_malformed_counts_fail_closed():
     invalid_counts = (
         {"ready": 0, "backlog": "1", "triage": 0, "unmapped_active": 0},
@@ -182,6 +232,27 @@ def test_candidate_schema_is_explicit_and_malformed_counts_fail_closed():
         "todo": 2,
         "review": 1,
     }
+
+
+def test_candidate_mapping_ingress_is_bounded_and_fail_closed():
+    oversized = {f"candidate_{index}": 0 for index in range(17)}
+    hostile_inputs = (
+        _ExplodingMapping(),
+        _UnhashableKeyMapping(),
+        _ExplodingDict(),
+        oversized,
+    )
+
+    for counts in hostile_inputs:
+        result = _directive(candidate_counts=counts)
+
+        assert result["action_mode"] == "probe_error"
+        assert result["progress_contract"]["hard_disposition"] == (
+            "input_contract_error"
+        )
+        assert result["progress_contract"]["candidate_projection_valid"] is False
+        assert result["progress_contract"]["candidate_counts"] == {}
+        assert len(json.dumps(result)) < 2000
 
 
 def test_handoff_requires_fresh_bounded_identity_and_signal_schema():

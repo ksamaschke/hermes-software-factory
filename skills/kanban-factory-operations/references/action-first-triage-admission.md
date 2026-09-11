@@ -89,9 +89,13 @@ through the supported coordinator path.
 An overlay must supply an explicit action allow-list and candidate-key schema,
 exact booleans, bounded structured probe errors, and a bounded heartbeat event
 identity, age, and signal list. Malformed inputs fail closed without echoing raw
-values. Probe errors and a suppressed coordinator gate are hard dispositions:
-their progress contract requires surfacing and holding that boundary and must
-not simultaneously require product admission or no-op retry.
+values. Candidate counts are accepted only as a bounded built-in mapping whose
+keys exactly match the caller's bounded schema; arbitrary mapping adapters and
+oversized key sets fail closed before iteration. Probe errors and a suppressed
+coordinator gate are reserved hard dispositions derived only from their causal
+inputs, never caller-selectable product actions. Their progress contract
+requires surfacing and holding that boundary and must not simultaneously
+require product admission or no-op retry.
 
 ### 2. Reconcile parent completion
 

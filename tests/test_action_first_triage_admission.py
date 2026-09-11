@@ -38,6 +38,9 @@ def test_zero_ready_contract_requires_triage_and_one_audited_action_before_idle(
         "must never rewrite",
         "unverified no-op is retried on the next tick",
         "coordinator_admission_contract.py",
+        "fail closed before iteration",
+        "reserved hard dispositions",
+        "never caller-selectable product actions",
     ):
         assert phrase in text
 
@@ -128,6 +131,8 @@ def test_operations_surface_references_the_action_first_contract():
         "must not replace an already derived product admission action",
         "retry an unverified no-op on the next tick",
         "coordinator_admission_contract.py",
+        "bounded built-in mapping",
+        "reserved outputs derived from causal fields",
     ):
         assert phrase in operations
 

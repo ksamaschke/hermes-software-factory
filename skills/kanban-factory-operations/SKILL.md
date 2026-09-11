@@ -96,7 +96,9 @@ next tick. Project overlays may consume the pure, non-selecting helper in
 They must pass a typed action allow-list, exact booleans, an explicit candidate
 schema, and bounded fresh heartbeat evidence. Malformed inputs, probe errors,
 and a suppressed coordinator gate fail closed and never demand admission and a
-hold at the same time.
+hold at the same time. Candidate counts must be a bounded built-in mapping with
+exactly the declared keys. `probe_error` and `coordinator_gate_suppressed` are
+reserved outputs derived from causal fields, not source product actions.
 
 Parked work, unfinished or ambiguous parents, malformed/stale contracts,
 duplicate identities, and WIP-full lanes remain unchanged. Genuine external or
