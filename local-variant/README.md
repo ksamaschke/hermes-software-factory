@@ -23,7 +23,9 @@ two review kinds, the diff as the scope boundary, and the two-tier budget.
 scheduled coordinator overlays. It preserves a queue-derived product action
 when a liveness/no-progress handoff wakes the coordinator, emits a bounded
 progress contract, and leaves issue selection and mutation to the LLM-owned
-coordinator path.
+coordinator path. Callers provide their typed action allow-list and candidate
+schema; malformed booleans, unbounded identifiers, stale/malformed handoffs,
+probe errors, and suppressed gates fail closed.
 
 ## Relationship to the live installation
 

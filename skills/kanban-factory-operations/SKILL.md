@@ -93,6 +93,10 @@ reconciliation. Preserve the selected source action; require one verified
 transition or complete all-gated proof, and retry an unverified no-op on the
 next tick. Project overlays may consume the pure, non-selecting helper in
 `local-variant/coordinator_admission_contract.py` to enforce this precedence.
+They must pass a typed action allow-list, exact booleans, an explicit candidate
+schema, and bounded fresh heartbeat evidence. Malformed inputs, probe errors,
+and a suppressed coordinator gate fail closed and never demand admission and a
+hold at the same time.
 
 Parked work, unfinished or ambiguous parents, malformed/stale contracts,
 duplicate identities, and WIP-full lanes remain unchanged. Genuine external or
