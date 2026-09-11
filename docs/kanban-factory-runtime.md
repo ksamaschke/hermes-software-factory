@@ -34,6 +34,34 @@ One supervised gateway owns dispatcher promotion, claims, worktrees,
 heartbeats, retries, and recovery. A source reconciler or progress digest does
 not start another dispatcher.
 
+### Worker/process reconciliation
+
+Dispatcher workers are started in an isolated POSIX session and carry the
+following non-secret identity values in their environment:
+
+- `HERMES_KANBAN_TASK`;
+- `HERMES_KANBAN_RUN_ID`;
+- `HERMES_KANBAN_BOARD` and/or `HERMES_KANBAN_DB`.
+
+The factory recovery add-on may reconcile a worker only after an exact task
+readback shows a terminal handoff (`blocked`, `review`, `done`, `failed`,
+`cancelled`, or `archived`) and `current_run_id=null`. It resolves the canonical
+terminal run from the handoff/run history and requires every process member to
+carry the exact task, `HERMES_KANBAN_RUN_ID`, board, and database identity.
+Missing or mismatched identity is an `unsafe` result; it is never inferred from
+process names. Destructive cleanup also requires a resolved database path whose
+verified reservation path matches exactly before the first process scan. A
+board-only binding is permitted only for dry-run inspection. The reaper must
+revalidate the task, run, and process start-time before each `SIGTERM`/`SIGKILL`,
+require an isolated process group, use bounded signals, and read process state
+back. Active tasks, board mismatches, PID reuse, unreadable group members, and
+non-isolated sessions are preserved as explicit `unsafe` evidence. Reaper
+reports retain exact counts but expose only a small PID/group sample and
+sanitized, truncated reasons. `workers_only` recovery shares the normal
+monotonic global recovery deadline and emits at most one bounded skipped-task
+marker when the budget expires. Process names, shell command text, and broad
+`pkill`/`killall` matching are never valid identity or cleanup mechanisms.
+
 `failure_limit` is a recovery breaker, not a review verdict. Review leaves set
 `max_retries: 1` individually and use the declared two-tier review budget. A
 timeout, crash, or
