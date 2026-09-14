@@ -1,7 +1,7 @@
 {
   "schema": "factory.native-boundary.v1",
-  "artifact_version": "1.0.0",
-  "description": "Fail-closed native Kanban boundary patch for a disposable Hermes runtime copy.",
+  "artifact_version": "1.2.0",
+  "description": "Fail-closed native Kanban boundary patch with dependency-wait retry-loop prevention.",
   "source_files": [
     {
       "path": "hermes_cli/kanban_db.py",
@@ -15,7 +15,7 @@
   "patches": [
     {
       "path": "patches/001-native-boundary.patch",
-      "sha256": "932d47a6d8d5933af5182ea54f3e048a345a470e4ac3002c085be5efc9514b81"
+      "sha256": "f7e8e270ef37b1199c9b8b767278a3973d9ce5abdabbfeff538d98a3f013b1b1"
     }
   ],
   "patched_paths": [
