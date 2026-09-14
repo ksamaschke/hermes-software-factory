@@ -1,10 +1,236 @@
 --- a/hermes_cli/kanban_db.py
 +++ b/hermes_cli/kanban_db.py
-@@ -7230 +7230,2 @@
+@@ -4518,6 +4518,50 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
+     return "ready"
+
+
++def _quarantine_invalid_dependency_wait(
++    conn: sqlite3.Connection,
++    task_id: str,
++    *,
++    source_status: str,
++    reason: str,
++) -> bool:
++    """Atomically fence an unauthenticated dependency wait.
++
++    The explicit ``blocked`` event makes the quarantine sticky under
++    ``recompute_ready`` while preserving the original typed block kind for
++    diagnosis. Callers already own the surrounding native write transaction.
++    """
++    cur = conn.execute(
++        """
++        UPDATE tasks
++           SET status = 'blocked',
++               block_kind = 'dependency',
++               claim_lock = NULL,
++               claim_expires = NULL,
++               worker_pid = NULL,
++               current_run_id = NULL
++         WHERE id = ?
++           AND status = ?
++        """,
++        (task_id, source_status),
++    )
++    if cur.rowcount != 1:
++        return False
++    _append_event(
++        conn,
++        task_id,
++        "blocked",
++        {
++            "schema": "factory.dependency-wait-quarantine.v1",
++            "reason": f"dependency_wait_quarantined: {reason}",
++            "kind": "dependency",
++            "source_status": source_status,
++            "quarantine": True,
++        },
++    )
++    return True
++
++
+ def recompute_ready(
+     conn: sqlite3.Connection, failure_limit: int = None,
+ ) -> int:
+@@ -4555,8 +4599,8 @@ def recompute_ready(
+     promoted = 0
+     with write_txn(conn):
+         todo_rows = conn.execute(
+-            "SELECT id, status, consecutive_failures, max_retries "
+-            "FROM tasks WHERE status IN ('todo', 'blocked')"
++            "SELECT id, status, block_kind, consecutive_failures, max_retries "
++            "FROM tasks WHERE status IN ('todo', 'blocked', 'ready')"
+         ).fetchall()
+         for row in todo_rows:
+             task_id = row["id"]
+@@ -4567,6 +4611,14 @@ def recompute_ready(
+                 # legitimate exit (it emits ``"unblocked"`` which flips
+                 # this predicate back).
+                 continue
++            from hermes_cli.native_boundary import dependency_wait_requires_validation
++
++            validates_dependency_wait = dependency_wait_requires_validation(
++                conn, task_id, row["block_kind"]
++            )
++            if cur_status == "ready" and not validates_dependency_wait:
++                # Ready tasks are otherwise outside recompute_ready's scope.
++                continue
+             parents = conn.execute(
+                 "SELECT t.status FROM tasks t "
+                 "JOIN task_links l ON l.parent_id = t.id "
+@@ -4574,6 +4626,24 @@ def recompute_ready(
+                 (task_id,),
+             ).fetchall()
+             if all(p["status"] in ("done", "archived") for p in parents):
++                if validates_dependency_wait:
++                    from hermes_cli.native_boundary import (
++                        dependency_wait_promotion_rejection,
++                    )
++
++                    rejection = dependency_wait_promotion_rejection(conn, task_id)
++                    if rejection is not None:
++                        _quarantine_invalid_dependency_wait(
++                            conn,
++                            task_id,
++                            source_status=cur_status,
++                            reason=rejection,
++                        )
++                        continue
++                if cur_status == "ready":
++                    # Ready dependency continuations are scanned only so a
++                    # legacy/ambiguous row can be quarantined before dispatch.
++                    continue
+                 resume_status = _resume_status_from_events(conn, task_id)
+                 if cur_status == "blocked":
+                     # Don't auto-recover tasks that have hit the
+@@ -4666,6 +4736,31 @@ def claim_task(
+                 {"reason": "parents_not_done"},
+             )
+             return None
++        candidate = conn.execute(
++            "SELECT status, block_kind FROM tasks WHERE id = ?",
++            (task_id,),
++        ).fetchone()
++        from hermes_cli.native_boundary import (
++            dependency_wait_requires_validation,
++            dependency_wait_promotion_rejection,
++        )
++
++        if (
++            candidate is not None
++            and candidate["status"] == "ready"
++            and dependency_wait_requires_validation(
++                conn, task_id, candidate["block_kind"]
++            )
++        ):
++            rejection = dependency_wait_promotion_rejection(conn, task_id)
++            if rejection is not None:
++                _quarantine_invalid_dependency_wait(
++                    conn,
++                    task_id,
++                    source_status="ready",
++                    reason=rejection,
++                )
++                return None
+         # Defensive: if a prior run somehow leaked (invariant violation from
+         # an unknown code path), close it as 'reclaimed' so we don't strand
+         # it when the CAS resets the pointer below. No-op when the invariant
+@@ -4770,8 +4865,14 @@ def claim_review_task(
+     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+     with write_txn(conn):
+         if not _parents_satisfied(conn, task_id):
++            from hermes_cli.native_boundary import (
++                DEPENDENCY_WAIT_SCHEMA,
++                dependency_wait_parent_ids,
++            )
++
++            waiting_parent_ids = dependency_wait_parent_ids(conn, task_id)
+             demoted = conn.execute(
+-                "UPDATE tasks SET status = 'todo' "
++                "UPDATE tasks SET status = 'todo', block_kind = 'dependency' "
+                 "WHERE id = ? AND status = 'review' AND claim_lock IS NULL",
+                 (task_id,),
+             )
+@@ -4781,11 +4882,38 @@ def claim_review_task(
+                     task_id,
+                     "dependency_wait",
+                     {
++                        "schema": DEPENDENCY_WAIT_SCHEMA,
+                         "reason": "parent_reopened",
+                         "source_status": "review",
++                        "waiting_parent_ids": list(waiting_parent_ids),
+                     },
+                 )
+             return None
++        review_candidate = conn.execute(
++            "SELECT status, block_kind FROM tasks WHERE id = ?",
++            (task_id,),
++        ).fetchone()
++        from hermes_cli.native_boundary import (
++            dependency_wait_requires_validation,
++            dependency_wait_promotion_rejection,
++        )
++
++        if (
++            review_candidate is not None
++            and review_candidate["status"] == "review"
++            and dependency_wait_requires_validation(
++                conn, task_id, review_candidate["block_kind"]
++            )
++        ):
++            rejection = dependency_wait_promotion_rejection(conn, task_id)
++            if rejection is not None:
++                _quarantine_invalid_dependency_wait(
++                    conn,
++                    task_id,
++                    source_status="review",
++                    reason=rejection,
++                )
++                return None
+         cur = conn.execute(
+             """
+             UPDATE tasks
+@@ -6317,8 +6445,17 @@ def block_task(
+         # Dependency blocks never enter the human ``blocked`` bucket — they
+         # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
+         # here (rather than ``blocked``) is what keeps a cron from ever seeing
+-        # a dependency-wait as something to "unblock".
++        # a dependency-wait as something to "unblock". The wait must name an
++        # unfinished direct parent in the durable graph; otherwise ``all([])``
++        # or already-terminal parents would make the next recompute immediately
++        # re-admit the same run in an unbounded retry loop.
+         if kind == "dependency":
++            from hermes_cli.native_boundary import (
++                DEPENDENCY_WAIT_SCHEMA,
++                dependency_wait_parent_ids,
++            )
++
++            waiting_parent_ids = dependency_wait_parent_ids(conn, task_id)
+             cur = conn.execute(
+                 """
+                 UPDATE tasks
+@@ -6347,9 +6484,11 @@ def block_task(
+             _append_event(
+                 conn, task_id, "dependency_wait",
+                 {
++                    "schema": DEPENDENCY_WAIT_SCHEMA,
+                     "reason": reason,
+                     "kind": kind,
+                     "source_status": source_status,
++                    "waiting_parent_ids": list(waiting_parent_ids),
+                 },
+                 run_id=run_id,
+             )
+@@ -7227,11 +7366,22 @@ def specify_triage_task(
+     assignee = _canonical_assignee(assignee)
+     with write_txn(conn):
+         existing = conn.execute(
 -            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
 +            "SELECT title, body, assignee, block_recurrences "
 +            "FROM tasks WHERE id = ? AND status = 'triage'",
-@@ -7234,0 +7236,10 @@
+             (task_id,),
+         ).fetchone()
+         if existing is None:
+             return False
 +        from hermes_cli.native_boundary import triage_admission_rejection
 +
 +        quarantine_reason = triage_admission_rejection(
@@ -15,8 +241,13 @@
 +        )
 +        if quarantine_reason is not None:
 +            return False
-@@ -9506,0 +9518,9 @@
-+
+         sets: list[str] = ["status = 'todo'"]
+         params: list[Any] = []
+         changed_fields: list[str] = []
+@@ -9505,6 +9655,15 @@ def check_respawn_guard(
+     if err and _RESPAWN_BLOCKER_RE.search(err):
+         return "blocker_auth"
+
 +    # A native explicit same-owner unblock/requeue is durable lifecycle
 +    # authority.  The helper ignores comments and is evaluated only after
 +    # quota/auth guards, so it cannot launder a retry or provider blocker.
@@ -25,9 +256,13 @@
 +
 +        if same_owner_requeue_is_authorized(conn, task_id):
 +            return None
++
+     # Review-lane spawns stop here: a recent completed run and a fresh PR
+     # URL comment are the canonical *inputs* to a review handoff (worker
+     # opened a PR, then requested review), not signals of duplicate work.
 --- /dev/null
 +++ b/hermes_cli/native_boundary.py
-@@ -0,0 +1,151 @@
+@@ -0,0 +1,272 @@
 +"""Fail-closed native boundary decisions for the versioned Factory artifact.
 +
 +This module is added to a disposable copied Hermes runtime by the artifact
@@ -91,6 +326,127 @@
 +    except (TypeError, ValueError, json.JSONDecodeError):
 +        return {}
 +    return value if isinstance(value, dict) else {}
++
++
++DEPENDENCY_WAIT_SCHEMA = "factory.dependency-wait.v1"
++MAX_DEPENDENCY_WAIT_PARENTS = 256
++_DEPENDENCY_WAIT_PARENT_ERROR = (
++    "dependency block requires at least one unfinished direct parent"
++)
++
++
++def _valid_parent_id(value: Any) -> bool:
++    return (
++        type(value) is str
++        and 0 < len(value) <= 128
++        and not any(ord(char) < 32 or ord(char) == 127 for char in value)
++    )
++
++
++def dependency_wait_parent_ids(
++    conn: sqlite3.Connection,
++    task_id: str,
++) -> tuple[str, ...]:
++    """Return a bounded snapshot of unfinished direct parents or fail closed."""
++    rows = conn.execute(
++        "SELECT p.id AS parent_id FROM task_links l "
++        "JOIN tasks p ON p.id = l.parent_id "
++        "WHERE l.child_id = ? "
++        "AND p.status NOT IN ('done', 'archived') "
++        "ORDER BY p.id LIMIT ?",
++        (task_id, MAX_DEPENDENCY_WAIT_PARENTS + 1),
++    ).fetchall()
++    if not rows:
++        raise ValueError(_DEPENDENCY_WAIT_PARENT_ERROR)
++    if len(rows) > MAX_DEPENDENCY_WAIT_PARENTS:
++        raise ValueError("dependency block has too many unfinished direct parents")
++    parent_ids = tuple(_row_value(row, "parent_id") for row in rows)
++    if any(not _valid_parent_id(parent_id) for parent_id in parent_ids):
++        raise ValueError("dependency block has an invalid direct parent identity")
++    if len(set(parent_ids)) != len(parent_ids):
++        raise ValueError("dependency block has duplicate direct parent identities")
++    return parent_ids
++
++
++def dependency_wait_promotion_rejection(
++    conn: sqlite3.Connection,
++    task_id: str,
++) -> str | None:
++    """Validate durable parent evidence before re-admission.
++
++    Legacy dependency waits did not record which parents were unfinished when
++    the task parked.  Their state is ambiguous and must be quarantined instead
++    of being promoted or claimed after activation.
++    """
++    event = conn.execute(
++        "SELECT payload FROM task_events "
++        "WHERE task_id = ? AND kind = 'dependency_wait' "
++        "ORDER BY id DESC LIMIT 1",
++        (task_id,),
++    ).fetchone()
++    payload = _json_object(_row_value(event, "payload")) if event else {}
++    if payload.get("schema") != DEPENDENCY_WAIT_SCHEMA:
++        return "dependency wait lacks an authenticated parent snapshot"
++    parent_ids = payload.get("waiting_parent_ids")
++    if type(parent_ids) is not list or not parent_ids:
++        return "dependency wait has an invalid parent snapshot"
++    if len(parent_ids) > MAX_DEPENDENCY_WAIT_PARENTS:
++        return "dependency wait parent snapshot exceeds the configured bound"
++    if any(not _valid_parent_id(parent_id) for parent_id in parent_ids):
++        return "dependency wait has an invalid parent identity"
++    if len(set(parent_ids)) != len(parent_ids):
++        return "dependency wait has duplicate parent identities"
++
++    for parent_id in parent_ids:
++        parent = conn.execute(
++            "SELECT p.status FROM task_links l "
++            "JOIN tasks p ON p.id = l.parent_id "
++            "WHERE l.child_id = ? AND p.id = ?",
++            (task_id, parent_id),
++        ).fetchone()
++        if parent is None:
++            return "dependency wait parent is missing from the current graph"
++        if _row_value(parent, "status") not in {"done", "archived"}:
++            return "dependency wait parent is not terminal"
++    return None
++
++
++_DEPENDENCY_WAIT_PHASE_EVENTS = (
++    "dependency_wait",
++    "review_requested",
++    "changes_requested",
++    "review_reopened",
++    "completed",
++    "archived",
++    "blocked",
++    "unblocked",
++    "status",
++    "deleted",
++)
++
++
++def dependency_wait_requires_validation(
++    conn: sqlite3.Connection,
++    task_id: str,
++    block_kind: Any,
++) -> bool:
++    """Return whether admission must authenticate a dependency wait.
++
++    Promotion and claim/retry events deliberately do not supersede a wait: a
++    resumed task must retain the parent proof until a new review, rework,
++    terminal, explicit-unblock, or manual-status phase begins.  If no relevant
++    event exists, a durable dependency marker is treated as malformed and
++    therefore still requires validation.
++    """
++    placeholders = ", ".join("?" for _ in _DEPENDENCY_WAIT_PHASE_EVENTS)
++    event = conn.execute(
++        "SELECT kind FROM task_events WHERE task_id = ? "
++        f"AND kind IN ({placeholders}) ORDER BY id DESC LIMIT 1",
++        (task_id, *_DEPENDENCY_WAIT_PHASE_EVENTS),
++    ).fetchone()
++    if event is None:
++        return block_kind == "dependency"
++    return _row_value(event, "kind") == "dependency_wait"
 +
 +
 +def same_owner_requeue_is_authorized(
