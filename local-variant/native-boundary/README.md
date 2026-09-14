@@ -13,7 +13,11 @@ of the pinned Hermes runtime:
   unfinished direct parent and records that bounded parent snapshot. Parentless
   or already-satisfied waits fail before mutation, while legacy or malformed
   waits are atomically quarantined before implementation/review promotion or
-  claim instead of cycling `running -> todo -> ready -> running`.
+  claim instead of cycling `running -> todo -> ready -> running`. Durable event
+  payloads are size- and depth-bounded before JSON decoding. Quarantine closes
+  any referenced active run in the same transaction, records the fenced run,
+  and remains sticky across manual promotion or direct claim until the audited
+  `unblock` transition explicitly resolves it.
 
 The artifact is fail-closed. It pins both input source files and the patch,
 rejects symlinks, hardlinks, special files, path escapes, patch mode/rename

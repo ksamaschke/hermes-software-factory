@@ -1,6 +1,6 @@
 --- a/hermes_cli/kanban_db.py
 +++ b/hermes_cli/kanban_db.py
-@@ -4518,6 +4518,50 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
+@@ -4518,6 +4518,117 @@
      return "ready"
 
 
@@ -11,12 +11,47 @@
 +    source_status: str,
 +    reason: str,
 +) -> bool:
-+    """Atomically fence an unauthenticated dependency wait.
++    """Atomically fence ownership and quarantine an unauthenticated wait.
 +
-+    The explicit ``blocked`` event makes the quarantine sticky under
-+    ``recompute_ready`` while preserving the original typed block kind for
-+    diagnosis. Callers already own the surrounding native write transaction.
++    The referenced run is closed in the same write transaction before commit,
++    so an old worker cannot heartbeat or complete with its stale run id.  The
++    explicit ``blocked`` event keeps the quarantine sticky until ``unblock``.
 +    """
++    state = conn.execute(
++        "SELECT current_run_id, worker_pid FROM tasks "
++        "WHERE id = ? AND status = ?",
++        (task_id, source_status),
++    ).fetchone()
++    if state is None:
++        return False
++
++    try:
++        stale_run_id = (
++            int(state["current_run_id"])
++            if state["current_run_id"] is not None
++            else None
++        )
++    except (TypeError, ValueError, OverflowError):
++        stale_run_id = None
++    run_row = (
++        conn.execute(
++            "SELECT id, ended_at, worker_pid FROM task_runs "
++            "WHERE id = ? AND task_id = ?",
++            (stale_run_id, task_id),
++        ).fetchone()
++        if stale_run_id is not None
++        else None
++    )
++    prior_worker_pid = state["worker_pid"]
++    if prior_worker_pid is None and run_row is not None:
++        prior_worker_pid = run_row["worker_pid"]
++    try:
++        prior_worker_pid = (
++            int(prior_worker_pid) if prior_worker_pid is not None else None
++        )
++    except (TypeError, ValueError, OverflowError):
++        prior_worker_pid = None
++
 +    cur = conn.execute(
 +        """
 +        UPDATE tasks
@@ -33,17 +68,49 @@
 +    )
 +    if cur.rowcount != 1:
 +        return False
++
++    run_fenced = False
++    event_run_id = int(run_row["id"]) if run_row is not None else None
++    if run_row is not None:
++        if run_row["ended_at"] is None:
++            fenced = conn.execute(
++                """
++                UPDATE task_runs
++                   SET status = 'reclaimed',
++                       outcome = 'reclaimed',
++                       summary = COALESCE(
++                           summary, 'dependency wait quarantine ownership fence'
++                       ),
++                       ended_at = ?,
++                       claim_lock = NULL,
++                       claim_expires = NULL,
++                       worker_pid = NULL
++                 WHERE id = ? AND task_id = ? AND ended_at IS NULL
++                """,
++                (int(time.time()), event_run_id, task_id),
++            )
++            run_fenced = fenced.rowcount == 1
++        else:
++            run_fenced = True
++
++    from hermes_cli.native_boundary import DEPENDENCY_WAIT_QUARANTINE_SCHEMA
++
 +    _append_event(
 +        conn,
 +        task_id,
 +        "blocked",
 +        {
-+            "schema": "factory.dependency-wait-quarantine.v1",
++            "schema": DEPENDENCY_WAIT_QUARANTINE_SCHEMA,
 +            "reason": f"dependency_wait_quarantined: {reason}",
 +            "kind": "dependency",
 +            "source_status": source_status,
 +            "quarantine": True,
++            "reclaimed_run_id": event_run_id,
++            "prior_worker_pid": prior_worker_pid,
++            "run_fenced": run_fenced,
++            "worker_fenced": True,
 +        },
++        run_id=event_run_id,
 +    )
 +    return True
 +
@@ -51,7 +118,7 @@
  def recompute_ready(
      conn: sqlite3.Connection, failure_limit: int = None,
  ) -> int:
-@@ -4555,8 +4599,8 @@ def recompute_ready(
+@@ -4555,8 +4666,8 @@
      promoted = 0
      with write_txn(conn):
          todo_rows = conn.execute(
@@ -62,11 +129,23 @@
          ).fetchall()
          for row in todo_rows:
              task_id = row["id"]
-@@ -4567,6 +4611,14 @@ def recompute_ready(
+@@ -4567,6 +4678,26 @@
                  # legitimate exit (it emits ``"unblocked"`` which flips
                  # this predicate back).
                  continue
-+            from hermes_cli.native_boundary import dependency_wait_requires_validation
++            from hermes_cli.native_boundary import (
++                dependency_wait_quarantine_is_sticky,
++                dependency_wait_requires_validation,
++            )
++
++            if dependency_wait_quarantine_is_sticky(conn, task_id):
++                _quarantine_invalid_dependency_wait(
++                    conn,
++                    task_id,
++                    source_status=cur_status,
++                    reason="unresolved dependency wait quarantine",
++                )
++                continue
 +
 +            validates_dependency_wait = dependency_wait_requires_validation(
 +                conn, task_id, row["block_kind"]
@@ -77,7 +156,7 @@
              parents = conn.execute(
                  "SELECT t.status FROM tasks t "
                  "JOIN task_links l ON l.parent_id = t.id "
-@@ -4574,6 +4626,24 @@ def recompute_ready(
+@@ -4574,6 +4705,24 @@
                  (task_id,),
              ).fetchall()
              if all(p["status"] in ("done", "archived") for p in parents):
@@ -102,7 +181,31 @@
                  resume_status = _resume_status_from_events(conn, task_id)
                  if cur_status == "blocked":
                      # Don't auto-recover tasks that have hit the
-@@ -4666,6 +4736,31 @@ def claim_task(
+@@ -4641,6 +4790,23 @@
+     lock = claimer or _claimer_id()
+     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+     with write_txn(conn):
++        sticky_candidate = conn.execute(
++            "SELECT status FROM tasks WHERE id = ?",
++            (task_id,),
++        ).fetchone()
++        if sticky_candidate is not None and sticky_candidate["status"] == "ready":
++            from hermes_cli.native_boundary import (
++                dependency_wait_quarantine_is_sticky,
++            )
++
++            if dependency_wait_quarantine_is_sticky(conn, task_id):
++                _quarantine_invalid_dependency_wait(
++                    conn,
++                    task_id,
++                    source_status="ready",
++                    reason="unresolved dependency wait quarantine",
++                )
++                return None
+         # Structural invariant: never transition ready -> running while any
+         # parent is not yet 'done'. This is the single enforcement point
+         # regardless of which writer (create_task, link_tasks, unblock_task,
+@@ -4666,6 +4832,31 @@
                  {"reason": "parents_not_done"},
              )
              return None
@@ -134,9 +237,27 @@
          # Defensive: if a prior run somehow leaked (invariant violation from
          # an unknown code path), close it as 'reclaimed' so we don't strand
          # it when the CAS resets the pointer below. No-op when the invariant
-@@ -4770,8 +4865,14 @@ def claim_review_task(
+@@ -4769,9 +4960,32 @@
+     lock = claimer or _claimer_id()
      expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
      with write_txn(conn):
++        sticky_candidate = conn.execute(
++            "SELECT status FROM tasks WHERE id = ?",
++            (task_id,),
++        ).fetchone()
++        if sticky_candidate is not None and sticky_candidate["status"] == "review":
++            from hermes_cli.native_boundary import (
++                dependency_wait_quarantine_is_sticky,
++            )
++
++            if dependency_wait_quarantine_is_sticky(conn, task_id):
++                _quarantine_invalid_dependency_wait(
++                    conn,
++                    task_id,
++                    source_status="review",
++                    reason="unresolved dependency wait quarantine",
++                )
++                return None
          if not _parents_satisfied(conn, task_id):
 +            from hermes_cli.native_boundary import (
 +                DEPENDENCY_WAIT_SCHEMA,
@@ -150,7 +271,7 @@
                  "WHERE id = ? AND status = 'review' AND claim_lock IS NULL",
                  (task_id,),
              )
-@@ -4781,11 +4882,38 @@ def claim_review_task(
+@@ -4781,11 +4995,38 @@
                      task_id,
                      "dependency_wait",
                      {
@@ -189,7 +310,7 @@
          cur = conn.execute(
              """
              UPDATE tasks
-@@ -6317,8 +6445,17 @@ def block_task(
+@@ -6317,8 +6558,17 @@
          # Dependency blocks never enter the human ``blocked`` bucket — they
          # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
          # here (rather than ``blocked``) is what keeps a cron from ever seeing
@@ -208,7 +329,7 @@
              cur = conn.execute(
                  """
                  UPDATE tasks
-@@ -6347,9 +6484,11 @@ def block_task(
+@@ -6347,9 +6597,11 @@
              _append_event(
                  conn, task_id, "dependency_wait",
                  {
@@ -220,7 +341,102 @@
                  },
                  run_id=run_id,
              )
-@@ -7227,11 +7366,22 @@ def specify_triage_task(
+@@ -6794,44 +7046,57 @@
+     drives it from a deliberate operator action with an audit-trail
+     entry. Refuses to promote if any parent dep is not in a terminal
+     state (`done`/`archived`) unless ``force=True``. Does NOT change
+-    assignee or claim state. Returns ``(True, None)`` on success and
+-    ``(False, reason)`` if refused. ``dry_run=True`` validates the
+-    promotion would succeed without mutating state.
+-    """
+-    row = conn.execute(
+-        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+-    ).fetchone()
+-    if row is None:
+-        return False, f"task {task_id} not found"
+-
+-    cur_status = row["status"]
+-    if cur_status not in ("todo", "blocked"):
+-        return False, (
+-            f"task {task_id} is {cur_status!r}; promote only applies to "
+-            f"'todo' or 'blocked'"
+-        )
+-
+-    if not force:
+-        parents = conn.execute(
+-            "SELECT t.id, t.status FROM tasks t "
+-            "JOIN task_links l ON l.parent_id = t.id "
+-            "WHERE l.child_id = ?",
+-            (task_id,),
+-        ).fetchall()
+-        unsatisfied = [
+-            p["id"] for p in parents
+-            if p["status"] not in ("done", "archived")
+-        ]
+-        if unsatisfied:
++    assignee or claim state. A sticky dependency-wait quarantine cannot be
++    bypassed with ``force``; it requires the dedicated audited ``unblock``
++    transition first. Returns ``(True, None)`` on success and ``(False, reason)``
++    if refused. ``dry_run=True`` validates the promotion would succeed without
++    mutating state.
++    """
++    with write_txn(conn):
++        row = conn.execute(
++            "SELECT status FROM tasks WHERE id = ?", (task_id,)
++        ).fetchone()
++        if row is None:
++            return False, f"task {task_id} not found"
++
++        cur_status = row["status"]
++        if cur_status not in ("todo", "blocked"):
+             return False, (
+-                f"unsatisfied parent dependencies: "
+-                f"{', '.join(unsatisfied)} (use --force to override)"
+-            )
+-
+-    if dry_run:
+-        return True, None
+-
+-    with write_txn(conn):
++                f"task {task_id} is {cur_status!r}; promote only applies to "
++                f"'todo' or 'blocked'"
++            )
++
++        if cur_status == "blocked":
++            from hermes_cli.native_boundary import (
++                dependency_wait_quarantine_is_sticky,
++            )
++
++            if dependency_wait_quarantine_is_sticky(conn, task_id):
++                return False, (
++                    "dependency wait quarantine requires an explicit unblock "
++                    "before promotion"
++                )
++
++        if not force:
++            parents = conn.execute(
++                "SELECT t.id, t.status FROM tasks t "
++                "JOIN task_links l ON l.parent_id = t.id "
++                "WHERE l.child_id = ?",
++                (task_id,),
++            ).fetchall()
++            unsatisfied = [
++                p["id"] for p in parents
++                if p["status"] not in ("done", "archived")
++            ]
++            if unsatisfied:
++                return False, (
++                    f"unsatisfied parent dependencies: "
++                    f"{', '.join(unsatisfied)} (use --force to override)"
++                )
++
++        if dry_run:
++            return True, None
++
+         upd = conn.execute(
+             "UPDATE tasks SET status = 'ready' "
+             "WHERE id = ? AND status IN ('todo', 'blocked')",
+@@ -7227,10 +7492,21 @@
      assignee = _canonical_assignee(assignee)
      with write_txn(conn):
          existing = conn.execute(
@@ -230,7 +446,7 @@
              (task_id,),
          ).fetchone()
          if existing is None:
-             return False
++            return False
 +        from hermes_cli.native_boundary import triage_admission_rejection
 +
 +        quarantine_reason = triage_admission_rejection(
@@ -240,14 +456,14 @@
 +            recurrence_limit=BLOCK_RECURRENCE_LIMIT,
 +        )
 +        if quarantine_reason is not None:
-+            return False
+             return False
          sets: list[str] = ["status = 'todo'"]
          params: list[Any] = []
-         changed_fields: list[str] = []
-@@ -9505,6 +9655,15 @@ def check_respawn_guard(
+@@ -9504,6 +9780,15 @@
+     err = row["last_failure_error"]
      if err and _RESPAWN_BLOCKER_RE.search(err):
          return "blocker_auth"
-
++
 +    # A native explicit same-owner unblock/requeue is durable lifecycle
 +    # authority.  The helper ignores comments and is evaluated only after
 +    # quota/auth guards, so it cannot launder a retry or provider blocker.
@@ -256,13 +472,12 @@
 +
 +        if same_owner_requeue_is_authorized(conn, task_id):
 +            return None
-+
+
      # Review-lane spawns stop here: a recent completed run and a fresh PR
      # URL comment are the canonical *inputs* to a review handoff (worker
-     # opened a PR, then requested review), not signals of duplicate work.
 --- /dev/null
 +++ b/hermes_cli/native_boundary.py
-@@ -0,0 +1,272 @@
+@@ -0,0 +1,333 @@
 +"""Fail-closed native boundary decisions for the versioned Factory artifact.
 +
 +This module is added to a disposable copied Hermes runtime by the artifact
@@ -320,15 +535,60 @@
 +    return "repeated blocker remains quarantined pending explicit resolution"
 +
 +
-+def _json_object(payload: str | None) -> dict[str, Any]:
++MAX_DURABLE_EVENT_PAYLOAD_CHARS = 16_384
++MAX_DURABLE_EVENT_NESTING_DEPTH = 64
++
++
++def _json_nesting_within_bound(payload: str) -> bool:
++    """Preflight JSON structure without recursively materializing it."""
++    depth = 0
++    in_string = False
++    escaped = False
++    for char in payload:
++        if in_string:
++            if escaped:
++                escaped = False
++            elif char == "\\":
++                escaped = True
++            elif char == '"':
++                in_string = False
++            continue
++        if char == '"':
++            in_string = True
++        elif char in "[{":
++            depth += 1
++            if depth > MAX_DURABLE_EVENT_NESTING_DEPTH:
++                return False
++        elif char in "]}":
++            depth -= 1
++            if depth < 0:
++                return False
++    return depth == 0
++
++
++def _json_object(payload: Any) -> dict[str, Any]:
++    if type(payload) is not str:
++        return {}
++    if len(payload) > MAX_DURABLE_EVENT_PAYLOAD_CHARS:
++        return {}
++    if not _json_nesting_within_bound(payload):
++        return {}
 +    try:
 +        value = json.loads(payload) if payload else {}
-+    except (TypeError, ValueError, json.JSONDecodeError):
++    except (
++        TypeError,
++        ValueError,
++        json.JSONDecodeError,
++        RecursionError,
++        MemoryError,
++        OverflowError,
++    ):
 +        return {}
 +    return value if isinstance(value, dict) else {}
 +
 +
 +DEPENDENCY_WAIT_SCHEMA = "factory.dependency-wait.v1"
++DEPENDENCY_WAIT_QUARANTINE_SCHEMA = "factory.dependency-wait-quarantine.v1"
 +MAX_DEPENDENCY_WAIT_PARENTS = 256
 +_DEPENDENCY_WAIT_PARENT_ERROR = (
 +    "dependency block requires at least one unfinished direct parent"
@@ -447,6 +707,22 @@
 +    if event is None:
 +        return block_kind == "dependency"
 +    return _row_value(event, "kind") == "dependency_wait"
++
++
++def dependency_wait_quarantine_is_sticky(
++    conn: sqlite3.Connection,
++    task_id: str,
++) -> bool:
++    """Return whether a dependency quarantine lacks an explicit unblock."""
++    event = conn.execute(
++        "SELECT kind, payload FROM task_events WHERE task_id = ? "
++        "AND kind IN ('blocked', 'unblocked') ORDER BY id DESC LIMIT 1",
++        (task_id,),
++    ).fetchone()
++    if event is None or _row_value(event, "kind") != "blocked":
++        return False
++    payload = _json_object(_row_value(event, "payload"))
++    return payload.get("schema") == DEPENDENCY_WAIT_QUARANTINE_SCHEMA
 +
 +
 +def same_owner_requeue_is_authorized(

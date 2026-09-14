@@ -195,6 +195,33 @@ def test_dependency_wait_promotion_rejects_parent_that_is_still_open():
         conn.close()
 
 
+@pytest.mark.parametrize("payload_kind", ["deep", "oversized"])
+def test_dependency_wait_payload_parser_fails_closed_within_bounds(payload_kind):
+    conn = _decision_connection(["done"])
+    try:
+        if payload_kind == "deep":
+            payload = '{"schema":' + ("[" * 2_000) + "0" + ("]" * 2_000) + "}"
+        else:
+            payload = json.dumps(
+                {
+                    "schema": native_boundary.DEPENDENCY_WAIT_SCHEMA,
+                    "padding": "x"
+                    * (native_boundary.MAX_DURABLE_EVENT_PAYLOAD_CHARS + 1),
+                }
+            )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload) "
+            "VALUES ('child', 'dependency_wait', ?)",
+            (payload,),
+        )
+        conn.commit()
+        assert native_boundary.dependency_wait_promotion_rejection(
+            conn, "child"
+        ) == "dependency wait lacks an authenticated parent snapshot"
+    finally:
+        conn.close()
+
+
 def test_dependency_wait_validation_tracks_the_current_lifecycle_phase():
     conn = _decision_connection(["done"])
     try:
@@ -412,10 +439,11 @@ def _create_legacy_wait(
 
 def _assert_quarantine_event(payload: object, source_status: str) -> None:
     assert isinstance(payload, dict)
-    assert payload["schema"] == "factory.dependency-wait-quarantine.v1"
+    assert payload["schema"] == native_boundary.DEPENDENCY_WAIT_QUARANTINE_SCHEMA
     assert payload["kind"] == "dependency"
     assert payload["source_status"] == source_status
     assert payload["quarantine"] is True
+    assert payload["worker_fenced"] is True
     assert "lacks an authenticated parent snapshot" in payload["reason"]
 
 
@@ -835,6 +863,27 @@ def test_candidate_quarantines_review_wait_after_parent_graph_change(
                 kb.link_tasks(conn, replacement, child)
             review = kb.claim_review_task(conn, child, claimer="must-not-claim")
             task = kb.get_task(conn, child)
+            dry_promote = kb.promote_task(
+                conn,
+                child,
+                actor="must-not-bypass",
+                force=True,
+                dry_run=True,
+            )
+            promote = kb.promote_task(
+                conn,
+                child,
+                actor="must-not-bypass",
+                force=True,
+            )
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status = 'review' WHERE id = ?", (child,)
+                )
+            bypass_claim = kb.claim_review_task(
+                conn, child, claimer="must-not-bypass"
+            )
+            task = kb.get_task(conn, child)
             blocked = [
                 event for event in kb.list_events(conn, child)
                 if event.kind == "blocked"
@@ -844,7 +893,11 @@ def test_candidate_quarantines_review_wait_after_parent_graph_change(
                 "status": task.status,
                 "block_kind": task.block_kind,
                 "claimed": review is not None,
+                "dry_promote": dry_promote,
+                "promote": promote,
+                "bypass_claimed": bypass_claim is not None,
                 "blocked_events": len(blocked),
+                "first_payload": blocked[0].payload,
                 "payload": blocked[-1].payload,
             }))
         """,
@@ -854,7 +907,266 @@ def test_candidate_quarantines_review_wait_after_parent_graph_change(
     assert probe["status"] == "blocked"
     assert probe["block_kind"] == "dependency"
     assert probe["claimed"] is False
-    assert probe["blocked_events"] == 1
+    dry_promote = probe["dry_promote"]
+    promote = probe["promote"]
+    assert isinstance(dry_promote, list)
+    assert isinstance(promote, list)
+    assert dry_promote[0] is False
+    assert promote[0] is False
+    assert "explicit unblock" in promote[1]
+    assert probe["bypass_claimed"] is False
+    assert probe["blocked_events"] == 2
+    first_payload = probe["first_payload"]
+    assert isinstance(first_payload, dict)
+    assert "missing from the current graph" in first_payload["reason"]
     payload = probe["payload"]
     assert isinstance(payload, dict)
-    assert "missing from the current graph" in payload["reason"]
+    assert "unresolved dependency wait quarantine" in payload["reason"]
+
+
+@pytest.mark.parametrize(
+    ("target", "expected_source_status"),
+    [
+        ("recompute", "ready"),
+        ("implementation_claim", "ready"),
+        ("review_claim", "review"),
+    ],
+)
+@pytest.mark.parametrize("payload_kind", ["deep", "oversized"])
+def test_malformed_wait_payload_is_quarantined_on_every_admission_path(
+    tmp_path, target, expected_source_status, payload_kind
+):
+    runtime, _legacy = _staged_and_legacy_runtimes()
+    probe = _run_script(
+        runtime,
+        tmp_path / f"malformed-{target}-{payload_kind}-home",
+        tmp_path / f"malformed-{target}-{payload_kind}.db",
+        """
+        import json
+        import os
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+
+        target = os.environ["TARGET"]
+        payload_kind = os.environ["PAYLOAD_KIND"]
+        if payload_kind == "deep":
+            malformed = '{"schema":' + ("[" * 2_000) + "0" + ("]" * 2_000) + "}"
+        else:
+            malformed = json.dumps({
+                "schema": "factory.dependency-wait.v1",
+                "padding": "x" * 20_000,
+            })
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            parent = kb.create_task(conn, title="malformed parent", assignee="fixture")
+            assert kb.complete_task(conn, parent, result="initially complete")
+            child = kb.create_task(
+                conn, title="malformed wait", assignee="fixture", parents=[parent]
+            )
+            implementation = kb.claim_task(conn, child, claimer="implementer")
+            assert implementation is not None
+            if target == "review_claim":
+                assert kb.request_review(
+                    conn,
+                    child,
+                    summary="review handoff",
+                    reviewer="reviewer",
+                    expected_run_id=implementation.current_run_id,
+                )
+                with kb.write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET status = 'ready' WHERE id = ?", (parent,)
+                    )
+                assert kb.claim_review_task(conn, child, claimer="must-wait") is None
+                assert kb.complete_task(conn, parent, result="parent complete")
+                with kb.write_txn(conn):
+                    conn.execute(
+                        "UPDATE task_events SET payload = ? WHERE id = ("
+                        "SELECT MAX(id) FROM task_events "
+                        "WHERE task_id = ? AND kind = 'dependency_wait')",
+                        (malformed, child),
+                    )
+                    conn.execute(
+                        "UPDATE tasks SET status = 'review' WHERE id = ?", (child,)
+                    )
+                claimed = kb.claim_review_task(conn, child, claimer="must-not-claim")
+                promoted = 0
+            else:
+                with kb.write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET status = 'ready' WHERE id = ?", (parent,)
+                    )
+                assert kb.block_task(
+                    conn,
+                    child,
+                    reason="wait for parent",
+                    kind="dependency",
+                    expected_run_id=implementation.current_run_id,
+                )
+                assert kb.complete_task(conn, parent, result="parent complete")
+                with kb.write_txn(conn):
+                    conn.execute(
+                        "UPDATE task_events SET payload = ? WHERE id = ("
+                        "SELECT MAX(id) FROM task_events "
+                        "WHERE task_id = ? AND kind = 'dependency_wait')",
+                        (malformed, child),
+                    )
+                    if target == "implementation_claim":
+                        conn.execute(
+                            "UPDATE tasks SET status = 'ready' WHERE id = ?", (child,)
+                        )
+                if target == "recompute":
+                    promoted = kb.recompute_ready(conn)
+                    claimed = None
+                else:
+                    promoted = 0
+                    claimed = kb.claim_task(conn, child, claimer="must-not-claim")
+
+            task = kb.get_task(conn, child)
+            blocked = [
+                event for event in kb.list_events(conn, child)
+                if event.kind == "blocked"
+            ]
+            print(json.dumps({
+                "runtime": str(Path(kb.__file__).resolve()),
+                "status": task.status,
+                "promoted": promoted,
+                "claimed": claimed is not None,
+                "blocked_events": len(blocked),
+                "payload": blocked[-1].payload,
+            }))
+        """,
+        TARGET=target,
+        PAYLOAD_KIND=payload_kind,
+    )
+    assert Path(str(probe["runtime"])).is_relative_to(runtime)
+    assert probe["status"] == "blocked"
+    assert probe["promoted"] == 0
+    assert probe["claimed"] is False
+    assert probe["blocked_events"] == 1
+    _assert_quarantine_event(probe["payload"], expected_source_status)
+
+
+def test_quarantine_atomically_fences_stale_run_before_readmission(tmp_path):
+    runtime, _legacy = _staged_and_legacy_runtimes()
+    probe = _run_script(
+        runtime,
+        tmp_path / "stale-run-home",
+        tmp_path / "stale-run.db",
+        """
+        import json
+        import os
+        import time
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            parent = kb.create_task(conn, title="stale run parent", assignee="fixture")
+            assert kb.complete_task(conn, parent, result="initially complete")
+            child = kb.create_task(
+                conn, title="stale run wait", assignee="fixture", parents=[parent]
+            )
+            implementation = kb.claim_task(conn, child, claimer="implementer")
+            assert implementation is not None
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (parent,))
+            assert kb.block_task(
+                conn,
+                child,
+                reason="wait for parent",
+                kind="dependency",
+                expected_run_id=implementation.current_run_id,
+            )
+            assert kb.complete_task(conn, parent, result="parent complete")
+            now = int(time.time())
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE task_events SET payload = '{}' WHERE id = ("
+                    "SELECT MAX(id) FROM task_events "
+                    "WHERE task_id = ? AND kind = 'dependency_wait')",
+                    (child,),
+                )
+                run_cur = conn.execute(
+                    "INSERT INTO task_runs ("
+                    "task_id, profile, status, claim_lock, claim_expires, "
+                    "worker_pid, started_at"
+                    ") VALUES (?, 'fixture', 'running', 'stale-owner', ?, 999999, ?)",
+                    (child, now + 600, now),
+                )
+                stale_run_id = int(run_cur.lastrowid)
+                conn.execute(
+                    "UPDATE tasks SET status = 'ready', current_run_id = ?, "
+                    "claim_lock = 'stale-owner', claim_expires = ?, worker_pid = 999999 "
+                    "WHERE id = ?",
+                    (stale_run_id, now + 600, child),
+                )
+
+            first_claim = kb.claim_task(conn, child, claimer="must-not-claim")
+            task_after_quarantine = kb.get_task(conn, child)
+            stale_run = conn.execute(
+                "SELECT status, outcome, ended_at, claim_lock, worker_pid "
+                "FROM task_runs WHERE id = ?",
+                (stale_run_id,),
+            ).fetchone()
+            blocked = [
+                event for event in kb.list_events(conn, child)
+                if event.kind == "blocked"
+            ]
+            old_heartbeat = kb.heartbeat_claim(conn, child, claimer="stale-owner")
+
+            # Even a direct status write cannot bypass the sticky quarantine.
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (child,))
+            bypass_claim = kb.claim_task(conn, child, claimer="must-not-bypass")
+            status_after_bypass = kb.get_task(conn, child).status
+
+            assert kb.unblock_task(conn, child)
+            new_claim = kb.claim_task(conn, child, claimer="new-owner")
+            open_runs = conn.execute(
+                "SELECT COUNT(*) AS n FROM task_runs "
+                "WHERE task_id = ? AND ended_at IS NULL",
+                (child,),
+            ).fetchone()["n"]
+            print(json.dumps({
+                "runtime": str(Path(kb.__file__).resolve()),
+                "first_claimed": first_claim is not None,
+                "quarantine_status": task_after_quarantine.status,
+                "stale_run_id": stale_run_id,
+                "stale_run_status": stale_run["status"],
+                "stale_run_outcome": stale_run["outcome"],
+                "stale_run_ended": stale_run["ended_at"] is not None,
+                "stale_run_claim": stale_run["claim_lock"],
+                "stale_run_pid": stale_run["worker_pid"],
+                "event_run_id": blocked[0].run_id,
+                "event_payload": blocked[0].payload,
+                "old_heartbeat": old_heartbeat,
+                "bypass_claimed": bypass_claim is not None,
+                "status_after_bypass": status_after_bypass,
+                "new_claimed": new_claim is not None,
+                "open_runs": open_runs,
+            }))
+        """,
+    )
+    assert Path(str(probe["runtime"])).is_relative_to(runtime)
+    assert probe["first_claimed"] is False
+    assert probe["quarantine_status"] == "blocked"
+    assert probe["stale_run_status"] == "reclaimed"
+    assert probe["stale_run_outcome"] == "reclaimed"
+    assert probe["stale_run_ended"] is True
+    assert probe["stale_run_claim"] is None
+    assert probe["stale_run_pid"] is None
+    assert probe["event_run_id"] == probe["stale_run_id"]
+    event_payload = probe["event_payload"]
+    assert isinstance(event_payload, dict)
+    assert event_payload["reclaimed_run_id"] == probe["stale_run_id"]
+    assert event_payload["run_fenced"] is True
+    assert event_payload["worker_fenced"] is True
+    assert probe["old_heartbeat"] is False
+    assert probe["bypass_claimed"] is False
+    assert probe["status_after_bypass"] == "blocked"
+    assert probe["new_claimed"] is True
+    assert probe["open_runs"] == 1

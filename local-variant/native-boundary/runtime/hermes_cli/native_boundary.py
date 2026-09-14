@@ -55,15 +55,60 @@ def triage_admission_rejection(
     return "repeated blocker remains quarantined pending explicit resolution"
 
 
-def _json_object(payload: str | None) -> dict[str, Any]:
+MAX_DURABLE_EVENT_PAYLOAD_CHARS = 16_384
+MAX_DURABLE_EVENT_NESTING_DEPTH = 64
+
+
+def _json_nesting_within_bound(payload: str) -> bool:
+    """Preflight JSON structure without recursively materializing it."""
+    depth = 0
+    in_string = False
+    escaped = False
+    for char in payload:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "[{":
+            depth += 1
+            if depth > MAX_DURABLE_EVENT_NESTING_DEPTH:
+                return False
+        elif char in "]}":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0
+
+
+def _json_object(payload: Any) -> dict[str, Any]:
+    if type(payload) is not str:
+        return {}
+    if len(payload) > MAX_DURABLE_EVENT_PAYLOAD_CHARS:
+        return {}
+    if not _json_nesting_within_bound(payload):
+        return {}
     try:
         value = json.loads(payload) if payload else {}
-    except (TypeError, ValueError, json.JSONDecodeError):
+    except (
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+        RecursionError,
+        MemoryError,
+        OverflowError,
+    ):
         return {}
     return value if isinstance(value, dict) else {}
 
 
 DEPENDENCY_WAIT_SCHEMA = "factory.dependency-wait.v1"
+DEPENDENCY_WAIT_QUARANTINE_SCHEMA = "factory.dependency-wait-quarantine.v1"
 MAX_DEPENDENCY_WAIT_PARENTS = 256
 _DEPENDENCY_WAIT_PARENT_ERROR = (
     "dependency block requires at least one unfinished direct parent"
@@ -182,6 +227,22 @@ def dependency_wait_requires_validation(
     if event is None:
         return block_kind == "dependency"
     return _row_value(event, "kind") == "dependency_wait"
+
+
+def dependency_wait_quarantine_is_sticky(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> bool:
+    """Return whether a dependency quarantine lacks an explicit unblock."""
+    event = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? "
+        "AND kind IN ('blocked', 'unblocked') ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if event is None or _row_value(event, "kind") != "blocked":
+        return False
+    payload = _json_object(_row_value(event, "payload"))
+    return payload.get("schema") == DEPENDENCY_WAIT_QUARANTINE_SCHEMA
 
 
 def same_owner_requeue_is_authorized(

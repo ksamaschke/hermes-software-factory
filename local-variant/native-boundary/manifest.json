@@ -1,6 +1,6 @@
 {
   "schema": "factory.native-boundary.v1",
-  "artifact_version": "1.1.0",
+  "artifact_version": "1.2.0",
   "description": "Fail-closed native Kanban boundary patch with dependency-wait retry-loop prevention.",
   "source_files": [
     {
@@ -15,7 +15,7 @@
   "patches": [
     {
       "path": "patches/001-native-boundary.patch",
-      "sha256": "eff97a067000925be34e40f3211698707177430ae1baf195ad77058a1ac1ac4c"
+      "sha256": "f7e8e270ef37b1199c9b8b767278a3973d9ce5abdabbfeff538d98a3f013b1b1"
     }
   ],
   "patched_paths": [
