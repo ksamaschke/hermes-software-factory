@@ -12,7 +12,10 @@ of the pinned Hermes runtime:
   one such transition; title-only or malformed specifications are not.
   Missing, malformed, implausibly old, or future lifecycle timestamps and
   malformed/non-object transition payloads fail closed in both the helper and
-  the production respawn guard. Retry counters, failure text, run state, and
+  the production respawn guard. Duplicate JSON members, unknown transition
+  fields, empty reclaim locks, and impossible run status/outcome pairs are not
+  authority. A canonical non-terminal run blocks duplicate dispatch even when
+  task claim pointers were lost. Retry counters, failure text, run state, and
   comment evidence are type-checked before they affect admission. Comments and
   PR URLs are evidence only.
 

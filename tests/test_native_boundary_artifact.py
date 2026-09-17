@@ -46,7 +46,7 @@ native_boundary = _load_module("native_boundary_for_tests", NATIVE_PATH)
 def test_static_manifest_and_patch_are_pinned():
     manifest = builder._static_manifest()
     assert manifest["schema"] == "factory.native-boundary.v1"
-    assert manifest["artifact_version"] == "1.0.7"
+    assert manifest["artifact_version"] == "1.0.8"
     assert manifest["copy_policy"] == {
         "fresh_copy_required": True,
         "reject_symlinks": True,
@@ -396,6 +396,7 @@ def _requeue_connection() -> sqlite3.Connection:
             id INTEGER PRIMARY KEY,
             task_id TEXT,
             profile TEXT,
+            status TEXT,
             outcome TEXT,
             ended_at INTEGER
         );
@@ -413,7 +414,7 @@ def _requeue_connection() -> sqlite3.Connection:
         ("task-1", "fixture-worker"),
     )
     conn.execute(
-        "INSERT INTO task_runs VALUES (1, ?, ?, 'blocked', ?)",
+        "INSERT INTO task_runs VALUES (1, ?, ?, 'blocked', 'blocked', ?)",
         ("task-1", "fixture-worker", _TEST_LIFECYCLE_BASE),
     )
     conn.execute(
@@ -466,6 +467,7 @@ def test_material_specification_is_same_owner_readmission_authority():
         "changed_fields": ["title", "body"],
         "previous_status": "blocked",
         "status": "ready",
+        "block_recurrences_reset": True,
     }
     conn.execute(
         "INSERT INTO task_events VALUES (2, ?, 'specified', ?, ?)",
@@ -476,9 +478,12 @@ def test_material_specification_is_same_owner_readmission_authority():
 
     for invalid in (
         {**payload, "changed_fields": ["title"]},
+        {**payload, "changed_fields": ["body", "unexpected"]},
         {**payload, "previous_status": "ready"},
         {**payload, "status": "running"},
         {**payload, "changed_fields": "body"},
+        {**payload, "block_recurrences_reset": False},
+        {key: value for key, value in payload.items() if key != "block_recurrences_reset"},
     ):
         conn.execute(
             "UPDATE task_events SET payload = ? WHERE id = 2",
@@ -516,8 +521,9 @@ def test_same_owner_requeue_rejects_newer_null_ended_run(outcome):
     conn = _requeue_connection()
     conn.execute(
         "INSERT INTO task_runs "
-        "(id, task_id, profile, outcome, ended_at) VALUES (2, ?, ?, ?, NULL)",
-        ("task-1", "fixture-worker", outcome),
+        "(id, task_id, profile, status, outcome, ended_at) "
+        "VALUES (2, ?, ?, ?, ?, NULL)",
+        ("task-1", "fixture-worker", outcome, outcome),
     )
     conn.commit()
 
@@ -565,8 +571,19 @@ def test_same_owner_requeue_rejects_noncanonical_failure_counter(counter):
     conn.close()
 
 
-@pytest.mark.parametrize("owner", [b"fixture-worker"])
-def test_same_owner_requeue_rejects_nontext_owner_and_profile(owner):
+@pytest.mark.parametrize(
+    "owner",
+    [
+        b"fixture-worker",
+        " fixture-worker",
+        "fixture-worker ",
+        "Fixture-Worker",
+        "fixture.worker",
+        "fixture-worker\x00",
+        "a" * 65,
+    ],
+)
+def test_same_owner_requeue_rejects_noncanonical_owner_and_profile(owner):
     conn = _requeue_connection()
     conn.execute("UPDATE tasks SET assignee = ? WHERE id = 'task-1'", (owner,))
     conn.execute("UPDATE task_runs SET profile = ? WHERE id = 1", (owner,))
@@ -574,6 +591,77 @@ def test_same_owner_requeue_rejects_nontext_owner_and_profile(owner):
 
     assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is False
     conn.close()
+
+
+@pytest.mark.parametrize(
+    ("status", "outcome"),
+    [
+        ("running", "blocked"),
+        ("garbage", "blocked"),
+        ("blocked", "garbage"),
+        (b"blocked", "blocked"),
+        ("blocked", b"blocked"),
+    ],
+)
+def test_same_owner_requeue_requires_canonical_blocked_run_state(status, outcome):
+    conn = _requeue_connection()
+    conn.execute(
+        "UPDATE task_runs SET status = ?, outcome = ? WHERE id = 1",
+        (status, outcome),
+    )
+    conn.commit()
+
+    assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is False
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    ("kind", "payload"),
+    [
+        ("status", '{"status":"running","status":"ready"}'),
+        ("status", '{"status":"ready","unexpected":true}'),
+        ("status", '{"status":' + "[" * 2_000 + '"ready"' + "]" * 2_000 + "}"),
+        (
+            "status",
+            json.dumps({"status": "ready", "padding": "x" * 70_000}),
+        ),
+        (
+            "reclaimed",
+            json.dumps(
+                {
+                    "manual": True,
+                    "reason": None,
+                    "prev_lock": "",
+                    "retry_status": "ready",
+                    "prev_pid": None,
+                    "host_local": False,
+                    "termination_attempted": False,
+                    "terminated": False,
+                    "sigkill": False,
+                }
+            ),
+        ),
+        (
+            "reclaimed",
+            json.dumps(
+                {
+                    "manual": True,
+                    "reason": None,
+                    "prev_lock": "fixture",
+                    "retry_status": "ready",
+                    "prev_pid": None,
+                    "host_local": False,
+                    "termination_attempted": False,
+                    "terminated": False,
+                    "sigkill": False,
+                    "unexpected": True,
+                }
+            ),
+        ),
+    ],
+)
+def test_requeue_transition_rejects_ambiguous_or_noncanonical_objects(kind, payload):
+    assert native_boundary.requeue_transition_is_authorized(kind, payload) is False
 
 
 @pytest.mark.parametrize(
@@ -1025,7 +1113,7 @@ def test_staged_dispatch_negative_controls(tmp_path):
             now = int(time.time())
             conn.execute(
                 "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome) "
-                "VALUES (?, ?, 'done', ?, ?, 'rate_limited')",
+                "VALUES (?, ?, 'rate_limited', ?, ?, 'rate_limited')",
                 (retry, "default", now, now),
             )
             conn.commit()
@@ -1062,7 +1150,7 @@ def test_staged_dispatch_negative_controls(tmp_path):
     assert probe["guards"]["comment_only"] == "active_pr"
     assert probe["guards"]["wrong_owner"] == "active_pr"
     assert probe["guards"]["unknown_owner"] == "active_pr"
-    assert probe["guards"]["live_run"] == "active_pr"
+    assert probe["guards"]["live_run"] == "active_run"
     assert probe["guards"]["quota_auth"] == "blocker_auth"
     assert probe["guards"]["retry_quarantine"] == "rate_limit_cooldown"
     assert probe["spawned"] == []
@@ -1275,6 +1363,9 @@ def test_staged_dispatch_fails_closed_on_malformed_pr_comment(
     [
         (b"done", "failed"),
         ("done", b"failed"),
+        ("running", "blocked"),
+        ("nonsense", "failed"),
+        ("done", "nonsense"),
     ],
 )
 def test_staged_dispatch_fails_closed_on_malformed_run_state(
@@ -1341,22 +1432,153 @@ def test_staged_dispatch_fails_closed_on_malformed_run_state(
     assert probe["spawned"] == []
 
 
+def test_staged_dispatch_guards_orphaned_active_run(tmp_path):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import time
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="Orphaned active run",
+                body="A durable active run must prevent duplicate dispatch.",
+                assignee="default",
+                created_by="fixture",
+            )
+            now = int(time.time())
+            conn.execute(
+                "INSERT INTO task_runs "
+                "(task_id, profile, status, started_at, ended_at, outcome) "
+                "VALUES (?, ?, 'running', ?, NULL, NULL)",
+                (task_id, "default", now),
+            )
+            conn.commit()
+            guard = kb.check_respawn_guard(conn, task_id, lane="ready")
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "task_id": task_id,
+                "guard": guard,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "orphaned-active-run.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["guard"] == "active_run"
+    assert probe["guarded"] == [[probe["task_id"], "active_run"]]
+    assert probe["spawned"] == []
+
+
+def test_staged_dispatch_rejects_malformed_older_completion(tmp_path):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import time
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="Malformed historical completion",
+                body="An impossible completion must not become requeue authority.",
+                assignee="default",
+                created_by="fixture",
+            )
+            now = int(time.time())
+            conn.execute(
+                "INSERT INTO task_runs "
+                "(task_id, profile, status, started_at, ended_at, outcome) "
+                "VALUES (?, ?, 'nonsense', ?, ?, 'completed')",
+                (task_id, "default", now - 2, now - 1),
+            )
+            conn.execute(
+                "INSERT INTO task_runs "
+                "(task_id, profile, status, started_at, ended_at, outcome) "
+                "VALUES (?, ?, 'crashed', ?, ?, 'crashed')",
+                (task_id, "default", now - 1, now),
+            )
+            kb._append_event(conn, task_id, "status", {"status": "ready"})
+            conn.commit()
+            guard = kb.check_respawn_guard(conn, task_id, lane="ready")
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "task_id": task_id,
+                "guard": guard,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "malformed-older-completion.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["guard"] == "recent_success"
+    assert probe["guarded"] == [[probe["task_id"], "recent_success"]]
+    assert probe["spawned"] == []
+
+
 @pytest.mark.parametrize(
-    ("outcome", "ended_at", "expected_guard"),
+    ("status", "outcome", "ended_at", "expected_guard"),
     [
-        ("rate_limited", "not-a-timestamp", "rate_limit_cooldown"),
-        ("rate_limited", None, "rate_limit_cooldown"),
-        ("completed", "not-a-timestamp", "recent_success"),
-        ("completed", None, "recent_success"),
-        ("completed", True, "recent_success"),
-        ("blocked", "not-a-timestamp", "recent_success"),
-        ("blocked", None, "recent_success"),
-        ("failed", "not-a-timestamp", "recent_success"),
-        ("failed", None, "recent_success"),
+        ("rate_limited", "rate_limited", "not-a-timestamp", "rate_limit_cooldown"),
+        ("rate_limited", "rate_limited", None, "rate_limit_cooldown"),
+        ("done", "completed", "not-a-timestamp", "recent_success"),
+        ("done", "completed", None, "recent_success"),
+        ("done", "completed", True, "recent_success"),
+        ("blocked", "blocked", "not-a-timestamp", "recent_success"),
+        ("blocked", "blocked", None, "recent_success"),
+        ("failed", "failed", "not-a-timestamp", "recent_success"),
+        ("failed", "failed", None, "recent_success"),
     ],
 )
 def test_staged_dispatch_fails_closed_on_malformed_run_timestamp(
-    tmp_path, outcome, ended_at, expected_guard
+    tmp_path, status, outcome, ended_at, expected_guard
 ):
     runtime = _staged_runtime()
     script = textwrap.dedent(
@@ -1381,7 +1603,7 @@ def test_staged_dispatch_fails_closed_on_malformed_run_timestamp(
             conn.execute(
                 "INSERT INTO task_runs "
                 "(task_id, profile, status, started_at, ended_at, outcome) "
-                "VALUES (?, ?, 'done', ?, ?, ?)",
+                "VALUES (?, ?, __STATUS__, ?, ?, ?)",
                 (task_id, "default", now, __ENDED_AT__, __OUTCOME__),
             )
             conn.commit()
@@ -1399,7 +1621,9 @@ def test_staged_dispatch_fails_closed_on_malformed_run_timestamp(
                 "spawned": [item[0] for item in result.spawned],
             }))
         """
-    ).replace("__OUTCOME__", repr(outcome)).replace("__ENDED_AT__", repr(ended_at))
+    ).replace("__STATUS__", repr(status)).replace(
+        "__OUTCOME__", repr(outcome)
+    ).replace("__ENDED_AT__", repr(ended_at))
     result = subprocess.run(
         [sys.executable, "-B", "-c", script],
         cwd=runtime,
@@ -1431,8 +1655,31 @@ def test_staged_dispatch_fails_closed_on_malformed_run_timestamp(
             json.dumps(
                 {
                     "manual": True,
+                    "reason": None,
                     "prev_lock": "fixture-lock",
                     "retry_status": "ready",
+                    "prev_pid": None,
+                    "host_local": False,
+                    "termination_attempted": False,
+                    "terminated": False,
+                    "sigkill": False,
+                }
+            ),
+            None,
+        ),
+        (
+            "reclaimed",
+            json.dumps(
+                {
+                    "manual": True,
+                    "reason": None,
+                    "prev_lock": None,
+                    "retry_status": "ready",
+                    "prev_pid": None,
+                    "host_local": False,
+                    "termination_attempted": False,
+                    "terminated": False,
+                    "sigkill": False,
                 }
             ),
             None,
@@ -1442,9 +1689,17 @@ def test_staged_dispatch_fails_closed_on_malformed_run_timestamp(
             json.dumps(
                 {
                     "stale_lock": "fixture-lock",
+                    "worker_pid": None,
                     "claim_expires": _TEST_LIFECYCLE_BASE,
+                    "last_heartbeat_at": None,
                     "now": _TEST_LIFECYCLE_BASE + 1,
+                    "host_local": False,
+                    "heartbeat_stale": True,
                     "retry_status": "ready",
+                    "prev_pid": None,
+                    "termination_attempted": False,
+                    "terminated": False,
+                    "sigkill": False,
                 }
             ),
             None,
@@ -1460,6 +1715,12 @@ def test_staged_dispatch_fails_closed_on_malformed_run_timestamp(
         ("promoted", json.dumps({"status": {}}), "recent_success"),
         ("status", json.dumps({"status": []}), "recent_success"),
         ("status", json.dumps({"status": {}}), "recent_success"),
+        ("status", '{"status":"running","status":"ready"}', "recent_success"),
+        (
+            "status",
+            json.dumps({"status": "ready", "unexpected": True}),
+            "recent_success",
+        ),
         ("unblocked", "{", "recent_success"),
         ("unblocked", "null", "recent_success"),
         ("unblocked", "[]", "recent_success"),
@@ -1474,6 +1735,23 @@ def test_staged_dispatch_fails_closed_on_malformed_run_timestamp(
         (
             "reclaimed",
             json.dumps({"retry_status": "ready"}),
+            "recent_success",
+        ),
+        (
+            "reclaimed",
+            json.dumps(
+                {
+                    "manual": True,
+                    "reason": None,
+                    "prev_lock": "",
+                    "retry_status": "ready",
+                    "prev_pid": None,
+                    "host_local": False,
+                    "termination_attempted": False,
+                    "terminated": False,
+                    "sigkill": False,
+                }
+            ),
             "recent_success",
         ),
     ],

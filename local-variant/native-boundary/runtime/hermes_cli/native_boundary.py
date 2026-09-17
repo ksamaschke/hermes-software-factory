@@ -8,6 +8,7 @@ reads; callers own the surrounding native write transaction and guard order.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from typing import Any
@@ -22,6 +23,34 @@ _OBSERVATION_EVENT_KINDS = ("commented", "respawn_guarded")
 # lifecycle row predates 2000-01-01, so a plausibility floor keeps that lossy
 # coercion from becoming durable timestamp authority.
 _MIN_LIFECYCLE_TIMESTAMP = 946_684_800
+_MAX_TRANSITION_PAYLOAD_CHARS = 65_536
+_PROFILE_ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
+
+# Canonical terminal task-run state pairs emitted by the native kernel.  A
+# synthetic terminal row uses the outcome as its status; claimed runs use the
+# task landing phase for completion/review handoffs.  This explicit matrix
+# prevents a non-empty but impossible status/outcome combination from becoming
+# durable re-admission authority.
+_TERMINAL_RUN_STATE_PAIRS = frozenset(
+    {
+        ("blocked", "blocked"),
+        ("completed", "completed"),
+        ("done", "completed"),
+        ("review_requested", "review_requested"),
+        ("review", "review_requested"),
+        ("ready", "changes_requested"),
+        ("todo", "changes_requested"),
+        ("reclaimed", "reclaimed"),
+        ("todo", "reclaimed"),
+        ("scheduled", "scheduled"),
+        ("timed_out", "timed_out"),
+        ("stale", "stale"),
+        ("crashed", "crashed"),
+        ("rate_limited", "rate_limited"),
+        ("gave_up", "gave_up"),
+        ("spawn_failed", "spawn_failed"),
+    }
+)
 
 
 def _row_value(row: Any, key: str, default: Any = None) -> Any:
@@ -71,11 +100,72 @@ def _json_object(payload: str | None) -> dict[str, Any] | None:
         return None
     if type(payload) is not str:
         return None
+    if len(payload) > _MAX_TRANSITION_PAYLOAD_CHARS:
+        return None
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate JSON object member")
+            value[key] = item
+        return value
+
     try:
-        value = json.loads(payload)
-    except (TypeError, ValueError, json.JSONDecodeError):
+        value = json.loads(payload, object_pairs_hook=unique_object)
+    except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def terminal_run_state_is_authorized(status: Any, outcome: Any) -> bool:
+    """Return whether durable run status/outcome form a native terminal pair."""
+    return (
+        type(status) is str
+        and type(outcome) is str
+        and (status, outcome) in _TERMINAL_RUN_STATE_PAIRS
+    )
+
+
+def _canonical_profile_id(value: Any) -> str | None:
+    if type(value) is not str or _PROFILE_ID_RE.fullmatch(value) is None:
+        return None
+    return value
+
+
+def _optional_reclaim_metadata_is_canonical(value: dict[str, Any]) -> bool:
+    """Validate optional fields emitted by native reclaim implementations."""
+    if (
+        "reason" in value
+        and value["reason"] is not None
+        and type(value["reason"]) is not str
+    ):
+        return False
+    for key in ("worker_pid", "prev_pid"):
+        item = value.get(key)
+        if (
+            key in value
+            and item is not None
+            and (type(item) is not int or item <= 0)
+        ):
+            return False
+    if "last_heartbeat_at" in value:
+        heartbeat = value["last_heartbeat_at"]
+        if (
+            heartbeat is not None
+            and validated_lifecycle_timestamp(heartbeat) is None
+        ):
+            return False
+    for key in (
+        "host_local",
+        "heartbeat_stale",
+        "termination_attempted",
+        "terminated",
+        "sigkill",
+    ):
+        if key in value and type(value[key]) is not bool:
+            return False
+    return True
 
 
 def validated_lifecycle_timestamp(
@@ -106,13 +196,23 @@ def requeue_transition_is_authorized(kind: Any, payload: Any) -> bool:
     if kind == "status":
         value = _json_object(payload)
         status = value.get("status") if value is not None else None
-        return type(status) is str and status in {"ready", "todo"}
+        return (
+            value is not None
+            and frozenset(value) == {"status"}
+            and type(status) is str
+            and status in {"ready", "todo"}
+        )
     if kind == "promoted":
         if payload is None:
             return True
         value = _json_object(payload)
         status = value.get("status") if value is not None else None
-        return type(status) is str and status in {"ready", "todo"}
+        return (
+            value is not None
+            and frozenset(value) == {"status"}
+            and type(status) is str
+            and status in {"ready", "todo"}
+        )
     if kind == "unblocked":
         # The native direct blocked -> ready event deliberately stores SQL
         # NULL.  Object/scalar payloads describe another landing phase or are
@@ -126,10 +226,49 @@ def requeue_transition_is_authorized(kind: Any, payload: Any) -> bool:
         if type(retry_status) is not str or retry_status not in {"ready", "todo"}:
             return False
         if value.get("manual") is True:
+            if frozenset(value) != frozenset(
+                {
+                    "manual",
+                    "reason",
+                    "prev_lock",
+                    "retry_status",
+                    "prev_pid",
+                    "host_local",
+                    "termination_attempted",
+                    "terminated",
+                    "sigkill",
+                }
+            ):
+                return False
             previous_lock = value.get("prev_lock")
-            return "prev_lock" in value and (
-                previous_lock is None or type(previous_lock) is str
-            )
+            return (
+                previous_lock is None
+                or (
+                    type(previous_lock) is str
+                    and bool(previous_lock.strip())
+                )
+            ) and _optional_reclaim_metadata_is_canonical(value)
+        if frozenset(value) != frozenset(
+            {
+                "stale_lock",
+                "worker_pid",
+                "claim_expires",
+                "last_heartbeat_at",
+                "now",
+                "host_local",
+                "heartbeat_stale",
+                "retry_status",
+                "prev_pid",
+                "termination_attempted",
+                "terminated",
+                "sigkill",
+            }
+        ):
+            return False
+        if not _optional_reclaim_metadata_is_canonical(value):
+            return False
+        if value["worker_pid"] != value["prev_pid"]:
+            return False
         stale_lock = value.get("stale_lock")
         observed_now = validated_lifecycle_timestamp(
             value.get("now"), maximum=int(time.time())
@@ -137,6 +276,15 @@ def requeue_transition_is_authorized(kind: Any, payload: Any) -> bool:
         claim_expires = validated_lifecycle_timestamp(
             value.get("claim_expires"), maximum=observed_now
         )
+        heartbeat = value["last_heartbeat_at"]
+        if (
+            heartbeat is not None
+            and validated_lifecycle_timestamp(
+                heartbeat, maximum=observed_now
+            )
+            is None
+        ):
+            return False
         return (
             type(stale_lock) is str
             and bool(stale_lock.strip())
@@ -148,6 +296,15 @@ def requeue_transition_is_authorized(kind: Any, payload: Any) -> bool:
         value = _json_object(payload)
         if value is None:
             return False
+        if frozenset(value) != frozenset(
+            {
+                "changed_fields",
+                "previous_status",
+                "status",
+                "block_recurrences_reset",
+            }
+        ):
+            return False
         changed_fields = value.get("changed_fields")
         previous_status = value.get("previous_status")
         status = value.get("status")
@@ -157,7 +314,15 @@ def requeue_transition_is_authorized(kind: Any, payload: Any) -> bool:
             and type(status) is str
             and status in {"ready", "todo"}
             and type(changed_fields) is list
+            and bool(changed_fields)
+            and all(
+                type(field) is str and bool(field.strip())
+                for field in changed_fields
+            )
+            and len(set(changed_fields)) == len(changed_fields)
+            and set(changed_fields).issubset({"title", "body", "assignee"})
             and "body" in changed_fields
+            and value["block_recurrences_reset"] is True
         )
     return False
 
@@ -194,27 +359,24 @@ def same_owner_requeue_is_authorized(
     if type(consecutive_failures) is not int or consecutive_failures != 0:
         return False
 
-    raw_owner = row["assignee"]
-    if type(raw_owner) is not str:
-        return False
-    owner = raw_owner.strip().casefold()
-    if not owner:
+    owner = _canonical_profile_id(row["assignee"])
+    if owner is None:
         return False
 
     prior_run = conn.execute(
-        "SELECT id, profile, outcome, ended_at FROM task_runs "
+        "SELECT id, profile, status, outcome, ended_at FROM task_runs "
         "WHERE task_id = ? "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
     if prior_run is None:
         return False
-    raw_profile = prior_run["profile"]
-    if type(raw_profile) is not str:
+    profile = _canonical_profile_id(prior_run["profile"])
+    if profile is None or profile != owner:
         return False
-    if raw_profile.strip().casefold() != owner:
-        return False
-    if prior_run["outcome"] != "blocked":
+    if not terminal_run_state_is_authorized(
+        prior_run["status"], prior_run["outcome"]
+    ) or prior_run["outcome"] != "blocked":
         return False
     transition = conn.execute(
         "SELECT id, kind, payload, created_at FROM task_events "

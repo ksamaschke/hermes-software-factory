@@ -15,59 +15,59 @@
 +            recurrence_limit=BLOCK_RECURRENCE_LIMIT,
 +        )
 +        if quarantine_reason is not None:
-@@ -9811,0 +9823,4 @@
+@@ -9795,0 +9807,5 @@
++    ``"active_run"``
++        The newest durable run is the canonical non-terminal running state.
++        Even if task claim pointers were lost, dispatch must not start a
++        duplicate beside a possibly live worker.
++
+@@ -9811,0 +9828,4 @@
 +    if type(row["status"]) is not str:
 +        return "recent_success"
 +    if row["block_kind"] is not None and type(row["block_kind"]) is not str:
 +        return "recent_success"
-@@ -9813,0 +9829,4 @@
+@@ -9813,0 +9834,5 @@
 +    from hermes_cli.native_boundary import (
 +        requeue_transition_is_authorized,
++        terminal_run_state_is_authorized,
 +        validated_lifecycle_timestamp,
 +    )
-@@ -9822 +9841 @@
+@@ -9822 +9847 @@
 -    #    We look at the LATEST run only (ORDER BY ended_at DESC LIMIT 1): if a
 +    #    We look at the LATEST run only (ORDER BY id DESC LIMIT 1): if a
-@@ -9827,3 +9846,3 @@
+@@ -9827,3 +9852,3 @@
 -        "SELECT outcome, ended_at FROM task_runs "
 -        "WHERE task_id = ? AND ended_at IS NOT NULL "
 -        "ORDER BY ended_at DESC LIMIT 1",
 +        "SELECT status, outcome, ended_at FROM task_runs "
 +        "WHERE task_id = ? "
 +        "ORDER BY id DESC LIMIT 1",
-@@ -9831,0 +9851,24 @@
+@@ -9831,0 +9857,17 @@
 +    if latest_run is not None:
 +        run_status = latest_run["status"]
 +        run_outcome = latest_run["outcome"]
-+        if (
-+            type(run_status) is not str
-+            or not run_status.strip()
-+            or (
-+                run_outcome is not None
-+                and (type(run_outcome) is not str or not run_outcome.strip())
-+            )
-+        ):
++        raw_ended_at = latest_run["ended_at"]
++        if run_status == "running" and run_outcome is None and raw_ended_at is None:
++            return "active_run"
++        if not terminal_run_state_is_authorized(run_status, run_outcome):
 +            return "recent_success"
-+    latest_ended_at = (
-+        validated_lifecycle_timestamp(latest_run["ended_at"], maximum=now)
-+        if latest_run is not None
-+        else None
-+    )
-+    latest_run_is_terminal = latest_run is not None and (
-+        latest_run["outcome"] is not None or latest_run["status"] != "running"
-+    )
-+    if latest_run_is_terminal and latest_ended_at is None:
++        latest_ended_at = validated_lifecycle_timestamp(
++            raw_ended_at, maximum=now
++        )
++    else:
++        latest_ended_at = None
++    if latest_run is not None and latest_ended_at is None:
 +        if latest_run["outcome"] == "rate_limited":
 +            return "rate_limit_cooldown"
 +        return "recent_success"
-@@ -9841,2 +9884 @@
+@@ -9841,2 +9883 @@
 -        ended_at = latest_run["ended_at"]
 -        if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
 +        if (now - latest_ended_at) < rl_cooldown:
-@@ -9852,0 +9895,2 @@
+@@ -9852,0 +9894,2 @@
 +    if err is not None and type(err) is not str:
 +        return "blocker_auth"
-@@ -9854,0 +9899,9 @@
+@@ -9854,0 +9898,9 @@
 +
 +    # A native explicit same-owner unblock/requeue is durable lifecycle
 +    # authority.  The helper ignores comments and is evaluated only after
@@ -77,14 +77,16 @@
 +
 +        if same_owner_requeue_is_authorized(conn, task_id):
 +            return None
-@@ -9871,3 +9924,3 @@
+@@ -9870,4 +9922,4 @@
+-        "SELECT ended_at FROM task_runs "
 -        "WHERE task_id = ? AND outcome = 'completed' AND ended_at >= ? "
 -        "ORDER BY ended_at DESC LIMIT 1",
 -        (task_id, cutoff),
++        "SELECT status, outcome, ended_at FROM task_runs "
 +        "WHERE task_id = ? AND outcome = 'completed' "
 +        "ORDER BY id DESC LIMIT 1",
 +        (task_id,),
-@@ -9876,9 +9929,4 @@
+@@ -9876,9 +9928,3 @@
 -        completed_at = int(recent_completed["ended_at"] or 0)
 -        requeued_after = conn.execute(
 -            "SELECT 1 FROM task_events "
@@ -94,11 +96,15 @@
 -            (task_id, completed_at),
 -        ).fetchone()
 -        if not requeued_after:
++        if not terminal_run_state_is_authorized(
++            recent_completed["status"], recent_completed["outcome"]
++        ):
+@@ -9885,0 +9932,26 @@
 +        completed_at = validated_lifecycle_timestamp(
 +            recent_completed["ended_at"], maximum=now
 +        )
 +        if completed_at is None:
-@@ -9885,0 +9934,21 @@
++            return "recent_success"
 +        if completed_at >= cutoff:
 +            latest_requeue = conn.execute(
 +                "SELECT kind, payload, created_at FROM task_events "
@@ -120,13 +126,13 @@
 +                )
 +            ):
 +                return "recent_success"
-@@ -9900,2 +9969,3 @@
+@@ -9900,2 +9972,3 @@
 -        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
 -        (task_id, pr_cutoff),
 +        "SELECT body, created_at FROM task_comments "
 +        "WHERE task_id = ? ORDER BY id DESC",
 +        (task_id,),
-@@ -9903 +9973,9 @@
+@@ -9903 +9976,9 @@
 -        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
 +        comment_created_at = validated_lifecycle_timestamp(
 +            c["created_at"], maximum=now
@@ -139,7 +145,7 @@
 +        if body and _RESPAWN_GUARD_PR_URL_RE.search(body):
 --- /dev/null
 +++ b/hermes_cli/native_boundary.py
-@@ -0,0 +1,254 @@
+@@ -0,0 +1,416 @@
 +"""Fail-closed native boundary decisions for the versioned Factory artifact.
 +
 +This module is added to a disposable copied Hermes runtime by the artifact
@@ -150,6 +156,7 @@
 +from __future__ import annotations
 +
 +import json
++import re
 +import sqlite3
 +import time
 +from typing import Any
@@ -164,6 +171,34 @@
 +# lifecycle row predates 2000-01-01, so a plausibility floor keeps that lossy
 +# coercion from becoming durable timestamp authority.
 +_MIN_LIFECYCLE_TIMESTAMP = 946_684_800
++_MAX_TRANSITION_PAYLOAD_CHARS = 65_536
++_PROFILE_ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
++
++# Canonical terminal task-run state pairs emitted by the native kernel.  A
++# synthetic terminal row uses the outcome as its status; claimed runs use the
++# task landing phase for completion/review handoffs.  This explicit matrix
++# prevents a non-empty but impossible status/outcome combination from becoming
++# durable re-admission authority.
++_TERMINAL_RUN_STATE_PAIRS = frozenset(
++    {
++        ("blocked", "blocked"),
++        ("completed", "completed"),
++        ("done", "completed"),
++        ("review_requested", "review_requested"),
++        ("review", "review_requested"),
++        ("ready", "changes_requested"),
++        ("todo", "changes_requested"),
++        ("reclaimed", "reclaimed"),
++        ("todo", "reclaimed"),
++        ("scheduled", "scheduled"),
++        ("timed_out", "timed_out"),
++        ("stale", "stale"),
++        ("crashed", "crashed"),
++        ("rate_limited", "rate_limited"),
++        ("gave_up", "gave_up"),
++        ("spawn_failed", "spawn_failed"),
++    }
++)
 +
 +
 +def _row_value(row: Any, key: str, default: Any = None) -> Any:
@@ -213,11 +248,72 @@
 +        return None
 +    if type(payload) is not str:
 +        return None
++    if len(payload) > _MAX_TRANSITION_PAYLOAD_CHARS:
++        return None
++
++    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
++        value: dict[str, Any] = {}
++        for key, item in pairs:
++            if key in value:
++                raise ValueError("duplicate JSON object member")
++            value[key] = item
++        return value
++
 +    try:
-+        value = json.loads(payload)
-+    except (TypeError, ValueError, json.JSONDecodeError):
++        value = json.loads(payload, object_pairs_hook=unique_object)
++    except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
 +        return None
 +    return value if isinstance(value, dict) else None
++
++
++def terminal_run_state_is_authorized(status: Any, outcome: Any) -> bool:
++    """Return whether durable run status/outcome form a native terminal pair."""
++    return (
++        type(status) is str
++        and type(outcome) is str
++        and (status, outcome) in _TERMINAL_RUN_STATE_PAIRS
++    )
++
++
++def _canonical_profile_id(value: Any) -> str | None:
++    if type(value) is not str or _PROFILE_ID_RE.fullmatch(value) is None:
++        return None
++    return value
++
++
++def _optional_reclaim_metadata_is_canonical(value: dict[str, Any]) -> bool:
++    """Validate optional fields emitted by native reclaim implementations."""
++    if (
++        "reason" in value
++        and value["reason"] is not None
++        and type(value["reason"]) is not str
++    ):
++        return False
++    for key in ("worker_pid", "prev_pid"):
++        item = value.get(key)
++        if (
++            key in value
++            and item is not None
++            and (type(item) is not int or item <= 0)
++        ):
++            return False
++    if "last_heartbeat_at" in value:
++        heartbeat = value["last_heartbeat_at"]
++        if (
++            heartbeat is not None
++            and validated_lifecycle_timestamp(heartbeat) is None
++        ):
++            return False
++    for key in (
++        "host_local",
++        "heartbeat_stale",
++        "termination_attempted",
++        "terminated",
++        "sigkill",
++    ):
++        if key in value and type(value[key]) is not bool:
++            return False
++    return True
 +
 +
 +def validated_lifecycle_timestamp(
@@ -248,13 +344,23 @@
 +    if kind == "status":
 +        value = _json_object(payload)
 +        status = value.get("status") if value is not None else None
-+        return type(status) is str and status in {"ready", "todo"}
++        return (
++            value is not None
++            and frozenset(value) == {"status"}
++            and type(status) is str
++            and status in {"ready", "todo"}
++        )
 +    if kind == "promoted":
 +        if payload is None:
 +            return True
 +        value = _json_object(payload)
 +        status = value.get("status") if value is not None else None
-+        return type(status) is str and status in {"ready", "todo"}
++        return (
++            value is not None
++            and frozenset(value) == {"status"}
++            and type(status) is str
++            and status in {"ready", "todo"}
++        )
 +    if kind == "unblocked":
 +        # The native direct blocked -> ready event deliberately stores SQL
 +        # NULL.  Object/scalar payloads describe another landing phase or are
@@ -268,10 +374,49 @@
 +        if type(retry_status) is not str or retry_status not in {"ready", "todo"}:
 +            return False
 +        if value.get("manual") is True:
++            if frozenset(value) != frozenset(
++                {
++                    "manual",
++                    "reason",
++                    "prev_lock",
++                    "retry_status",
++                    "prev_pid",
++                    "host_local",
++                    "termination_attempted",
++                    "terminated",
++                    "sigkill",
++                }
++            ):
++                return False
 +            previous_lock = value.get("prev_lock")
-+            return "prev_lock" in value and (
-+                previous_lock is None or type(previous_lock) is str
-+            )
++            return (
++                previous_lock is None
++                or (
++                    type(previous_lock) is str
++                    and bool(previous_lock.strip())
++                )
++            ) and _optional_reclaim_metadata_is_canonical(value)
++        if frozenset(value) != frozenset(
++            {
++                "stale_lock",
++                "worker_pid",
++                "claim_expires",
++                "last_heartbeat_at",
++                "now",
++                "host_local",
++                "heartbeat_stale",
++                "retry_status",
++                "prev_pid",
++                "termination_attempted",
++                "terminated",
++                "sigkill",
++            }
++        ):
++            return False
++        if not _optional_reclaim_metadata_is_canonical(value):
++            return False
++        if value["worker_pid"] != value["prev_pid"]:
++            return False
 +        stale_lock = value.get("stale_lock")
 +        observed_now = validated_lifecycle_timestamp(
 +            value.get("now"), maximum=int(time.time())
@@ -279,6 +424,15 @@
 +        claim_expires = validated_lifecycle_timestamp(
 +            value.get("claim_expires"), maximum=observed_now
 +        )
++        heartbeat = value["last_heartbeat_at"]
++        if (
++            heartbeat is not None
++            and validated_lifecycle_timestamp(
++                heartbeat, maximum=observed_now
++            )
++            is None
++        ):
++            return False
 +        return (
 +            type(stale_lock) is str
 +            and bool(stale_lock.strip())
@@ -290,6 +444,15 @@
 +        value = _json_object(payload)
 +        if value is None:
 +            return False
++        if frozenset(value) != frozenset(
++            {
++                "changed_fields",
++                "previous_status",
++                "status",
++                "block_recurrences_reset",
++            }
++        ):
++            return False
 +        changed_fields = value.get("changed_fields")
 +        previous_status = value.get("previous_status")
 +        status = value.get("status")
@@ -299,7 +462,15 @@
 +            and type(status) is str
 +            and status in {"ready", "todo"}
 +            and type(changed_fields) is list
++            and bool(changed_fields)
++            and all(
++                type(field) is str and bool(field.strip())
++                for field in changed_fields
++            )
++            and len(set(changed_fields)) == len(changed_fields)
++            and set(changed_fields).issubset({"title", "body", "assignee"})
 +            and "body" in changed_fields
++            and value["block_recurrences_reset"] is True
 +        )
 +    return False
 +
@@ -336,27 +507,24 @@
 +    if type(consecutive_failures) is not int or consecutive_failures != 0:
 +        return False
 +
-+    raw_owner = row["assignee"]
-+    if type(raw_owner) is not str:
-+        return False
-+    owner = raw_owner.strip().casefold()
-+    if not owner:
++    owner = _canonical_profile_id(row["assignee"])
++    if owner is None:
 +        return False
 +
 +    prior_run = conn.execute(
-+        "SELECT id, profile, outcome, ended_at FROM task_runs "
++        "SELECT id, profile, status, outcome, ended_at FROM task_runs "
 +        "WHERE task_id = ? "
 +        "ORDER BY id DESC LIMIT 1",
 +        (task_id,),
 +    ).fetchone()
 +    if prior_run is None:
 +        return False
-+    raw_profile = prior_run["profile"]
-+    if type(raw_profile) is not str:
++    profile = _canonical_profile_id(prior_run["profile"])
++    if profile is None or profile != owner:
 +        return False
-+    if raw_profile.strip().casefold() != owner:
-+        return False
-+    if prior_run["outcome"] != "blocked":
++    if not terminal_run_state_is_authorized(
++        prior_run["status"], prior_run["outcome"]
++    ) or prior_run["outcome"] != "blocked":
 +        return False
 +    transition = conn.execute(
 +        "SELECT id, kind, payload, created_at FROM task_events "
