@@ -44,7 +44,7 @@ native_boundary = _load_module("native_boundary_for_tests", NATIVE_PATH)
 def test_static_manifest_and_patch_are_pinned():
     manifest = builder._static_manifest()
     assert manifest["schema"] == "factory.native-boundary.v1"
-    assert manifest["artifact_version"] == "1.0.3"
+    assert manifest["artifact_version"] == "1.0.4"
     assert manifest["copy_policy"] == {
         "fresh_copy_required": True,
         "reject_symlinks": True,
@@ -464,6 +464,20 @@ def test_same_owner_requeue_rejects_malformed_lifecycle_timestamps(
     conn.execute(
         f"UPDATE {table} SET {column} = 'not-a-timestamp' WHERE id = ?",
         (row_id,),
+    )
+    conn.commit()
+
+    assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is False
+    conn.close()
+
+
+@pytest.mark.parametrize("outcome", ["blocked", "completed"])
+def test_same_owner_requeue_rejects_newer_null_ended_run(outcome):
+    conn = _requeue_connection()
+    conn.execute(
+        "INSERT INTO task_runs "
+        "(id, task_id, profile, outcome, ended_at) VALUES (2, ?, ?, ?, NULL)",
+        ("task-1", "fixture-worker", outcome),
     )
     conn.commit()
 
@@ -962,14 +976,20 @@ def test_staged_dispatch_negative_controls(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("outcome", "expected_guard"),
+    ("outcome", "ended_at", "expected_guard"),
     [
-        ("rate_limited", "rate_limit_cooldown"),
-        ("completed", "recent_success"),
+        ("rate_limited", "not-a-timestamp", "rate_limit_cooldown"),
+        ("rate_limited", None, "rate_limit_cooldown"),
+        ("completed", "not-a-timestamp", "recent_success"),
+        ("completed", None, "recent_success"),
+        ("blocked", "not-a-timestamp", "recent_success"),
+        ("blocked", None, "recent_success"),
+        ("failed", "not-a-timestamp", "recent_success"),
+        ("failed", None, "recent_success"),
     ],
 )
 def test_staged_dispatch_fails_closed_on_malformed_run_timestamp(
-    tmp_path, outcome, expected_guard
+    tmp_path, outcome, ended_at, expected_guard
 ):
     runtime = _staged_runtime()
     script = textwrap.dedent(
@@ -995,7 +1015,7 @@ def test_staged_dispatch_fails_closed_on_malformed_run_timestamp(
                 "INSERT INTO task_runs "
                 "(task_id, profile, status, started_at, ended_at, outcome) "
                 "VALUES (?, ?, 'done', ?, ?, ?)",
-                (task_id, "default", now, "not-a-timestamp", __OUTCOME__),
+                (task_id, "default", now, __ENDED_AT__, __OUTCOME__),
             )
             conn.commit()
             guard = kb.check_respawn_guard(conn, task_id, lane="ready")
@@ -1012,7 +1032,7 @@ def test_staged_dispatch_fails_closed_on_malformed_run_timestamp(
                 "spawned": [item[0] for item in result.spawned],
             }))
         """
-    ).replace("__OUTCOME__", repr(outcome))
+    ).replace("__OUTCOME__", repr(outcome)).replace("__ENDED_AT__", repr(ended_at))
     result = subprocess.run(
         [sys.executable, "-B", "-c", script],
         cwd=runtime,
@@ -1030,6 +1050,93 @@ def test_staged_dispatch_fails_closed_on_malformed_run_timestamp(
     assert probe["guard"] == expected_guard
     assert probe["guarded"] == [[probe["task_id"], expected_guard]]
     assert probe["spawned"] == []
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_guard"),
+    [
+        (None, None),
+        (json.dumps({"status": "ready"}), None),
+        ("", "recent_success"),
+        ("{", "recent_success"),
+        ("null", "recent_success"),
+        ("[]", "recent_success"),
+        ('"ready"', "recent_success"),
+        ("{}", "recent_success"),
+        (json.dumps({"status": "running"}), "recent_success"),
+    ],
+)
+def test_staged_dispatch_validates_promoted_requeue_payload(
+    tmp_path, payload, expected_guard
+):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import time
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="Promoted payload validation",
+                body="Only native ready-promotion evidence may bypass recent success.",
+                assignee="default",
+                created_by="fixture",
+            )
+            now = int(time.time())
+            conn.execute(
+                "INSERT INTO task_runs "
+                "(task_id, profile, status, started_at, ended_at, outcome) "
+                "VALUES (?, ?, 'done', ?, ?, 'completed')",
+                (task_id, "default", now, now),
+            )
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES (?, 'promoted', ?, ?)",
+                (task_id, __PAYLOAD__, now),
+            )
+            conn.commit()
+            guard = kb.check_respawn_guard(conn, task_id, lane="ready")
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "task_id": task_id,
+                "guard": guard,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    ).replace("__PAYLOAD__", repr(payload))
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "promoted-payload.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["guard"] == expected_guard
+    if expected_guard is None:
+        assert probe["guarded"] == []
+        assert probe["spawned"] == [probe["task_id"]]
+    else:
+        assert probe["guarded"] == [[probe["task_id"], expected_guard]]
+        assert probe["spawned"] == []
 
 
 def test_staged_dispatch_fails_closed_on_malformed_requeue_timestamp(tmp_path):

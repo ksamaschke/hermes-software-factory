@@ -74,6 +74,32 @@ def validated_lifecycle_timestamp(value: Any) -> int | None:
     return value
 
 
+def requeue_transition_is_authorized(kind: Any, payload: Any) -> bool:
+    """Validate durable transition evidence without trusting SQLite types."""
+    if kind not in _REQUEUE_EVENT_KINDS:
+        return False
+    if kind == "status":
+        value = _json_object(payload)
+        return value is not None and value.get("status") in {"ready", "todo"}
+    if kind == "promoted":
+        if payload is None:
+            return True
+        value = _json_object(payload)
+        return value is not None and value.get("status") in {"ready", "todo"}
+    if kind == "specified":
+        value = _json_object(payload)
+        if value is None:
+            return False
+        changed_fields = value.get("changed_fields")
+        return (
+            value.get("previous_status") in {"blocked", "triage"}
+            and value.get("status") in {"ready", "todo"}
+            and isinstance(changed_fields, list)
+            and "body" in changed_fields
+        )
+    return True
+
+
 def same_owner_requeue_is_authorized(
     conn: sqlite3.Connection,
     task_id: str,
@@ -114,7 +140,7 @@ def same_owner_requeue_is_authorized(
 
     prior_run = conn.execute(
         "SELECT id, profile, outcome, ended_at FROM task_runs "
-        "WHERE task_id = ? AND ended_at IS NOT NULL "
+        "WHERE task_id = ? "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
@@ -124,9 +150,6 @@ def same_owner_requeue_is_authorized(
         return False
     if prior_run["outcome"] != "blocked":
         return False
-    if prior_run["ended_at"] is None:
-        return False
-
     transition = conn.execute(
         "SELECT id, kind, payload, created_at FROM task_events "
         "WHERE task_id = ? AND kind IN "
@@ -136,7 +159,9 @@ def same_owner_requeue_is_authorized(
     ).fetchone()
     if transition is None:
         return False
-    if transition["kind"] not in _REQUEUE_EVENT_KINDS:
+    if not requeue_transition_is_authorized(
+        transition["kind"], transition["payload"]
+    ):
         return False
     transition_created_at = validated_lifecycle_timestamp(transition["created_at"])
     prior_run_ended_at = validated_lifecycle_timestamp(prior_run["ended_at"])
@@ -144,28 +169,6 @@ def same_owner_requeue_is_authorized(
         return False
     if transition_created_at < prior_run_ended_at:
         return False
-
-    if transition["kind"] == "status":
-        payload = _json_object(transition["payload"])
-        if payload is None or payload.get("status") not in {"ready", "todo"}:
-            return False
-    elif transition["kind"] == "promoted":
-        raw_payload = transition["payload"]
-        if raw_payload is not None:
-            payload = _json_object(raw_payload)
-            if payload is None or payload.get("status") not in {"ready", "todo"}:
-                return False
-    elif transition["kind"] == "specified":
-        payload = _json_object(transition["payload"])
-        if payload is None:
-            return False
-        changed_fields = payload.get("changed_fields")
-        if payload.get("previous_status") not in {"blocked", "triage"}:
-            return False
-        if payload.get("status") not in {"ready", "todo"}:
-            return False
-        if not isinstance(changed_fields, list) or "body" not in changed_fields:
-            return False
 
     # Comments and guard telemetry are deliberately ignored here. They are
     # observations, not lifecycle changes: the native dispatcher emits a
