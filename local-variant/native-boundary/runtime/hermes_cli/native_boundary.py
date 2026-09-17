@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from typing import Any
 
 # These are lifecycle transitions that can establish an explicit re-admission.
@@ -67,10 +68,22 @@ def _json_object(payload: str | None) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def validated_lifecycle_timestamp(value: Any) -> int | None:
-    """Return a positive SQLite integer timestamp, else fail closed."""
+def validated_lifecycle_timestamp(
+    value: Any,
+    *,
+    maximum: int | None = None,
+) -> int | None:
+    """Return a bounded positive SQLite integer timestamp, else fail closed."""
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         return None
+    if maximum is not None:
+        if (
+            isinstance(maximum, bool)
+            or not isinstance(maximum, int)
+            or maximum <= 0
+            or value > maximum
+        ):
+            return None
     return value
 
 
@@ -163,8 +176,13 @@ def same_owner_requeue_is_authorized(
         transition["kind"], transition["payload"]
     ):
         return False
-    transition_created_at = validated_lifecycle_timestamp(transition["created_at"])
-    prior_run_ended_at = validated_lifecycle_timestamp(prior_run["ended_at"])
+    now = int(time.time())
+    transition_created_at = validated_lifecycle_timestamp(
+        transition["created_at"], maximum=now
+    )
+    prior_run_ended_at = validated_lifecycle_timestamp(
+        prior_run["ended_at"], maximum=now
+    )
     if transition_created_at is None or prior_run_ended_at is None:
         return False
     if transition_created_at < prior_run_ended_at:

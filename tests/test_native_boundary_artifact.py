@@ -16,6 +16,7 @@ import sqlite3
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -44,7 +45,7 @@ native_boundary = _load_module("native_boundary_for_tests", NATIVE_PATH)
 def test_static_manifest_and_patch_are_pinned():
     manifest = builder._static_manifest()
     assert manifest["schema"] == "factory.native-boundary.v1"
-    assert manifest["artifact_version"] == "1.0.4"
+    assert manifest["artifact_version"] == "1.0.5"
     assert manifest["copy_policy"] == {
         "fresh_copy_required": True,
         "reject_symlinks": True,
@@ -479,6 +480,17 @@ def test_same_owner_requeue_rejects_newer_null_ended_run(outcome):
         "(id, task_id, profile, outcome, ended_at) VALUES (2, ?, ?, ?, NULL)",
         ("task-1", "fixture-worker", outcome),
     )
+    conn.commit()
+
+    assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is False
+    conn.close()
+
+
+def test_same_owner_requeue_rejects_future_lifecycle_timestamps():
+    conn = _requeue_connection()
+    future = int(time.time()) + 1_000_000
+    conn.execute("UPDATE task_runs SET ended_at = ? WHERE id = 1", (future,))
+    conn.execute("UPDATE task_events SET created_at = ? WHERE id = 2", (future + 1,))
     conn.commit()
 
     assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is False
@@ -1225,6 +1237,108 @@ def test_staged_dispatch_fails_closed_on_malformed_requeue_timestamp(tmp_path):
     assert probe["guards"] == {
         "malformed": "recent_success",
         "observation": "recent_success",
+    }
+    assert sorted(reason for _task_id, reason in probe["guarded"]) == [
+        "recent_success",
+        "recent_success",
+    ]
+    assert probe["spawned"] == []
+
+
+def test_staged_dispatch_fails_closed_on_future_lifecycle_timestamps(tmp_path):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import time
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            now = int(time.time())
+            future = now + 1_000_000
+
+            future_terminal = kb.create_task(
+                conn,
+                title="Future terminal timestamp",
+                body="Future terminal evidence must fail closed.",
+                assignee="default",
+                created_by="fixture",
+            )
+            conn.execute(
+                "INSERT INTO task_runs "
+                "(task_id, profile, status, started_at, ended_at, outcome) "
+                "VALUES (?, ?, 'done', ?, ?, 'completed')",
+                (future_terminal, "default", now, future),
+            )
+
+            future_transition = kb.create_task(
+                conn,
+                title="Future transition timestamp",
+                body="Future requeue evidence must not bypass recent success.",
+                assignee="default",
+                created_by="fixture",
+            )
+            conn.execute(
+                "INSERT INTO task_runs "
+                "(task_id, profile, status, started_at, ended_at, outcome) "
+                "VALUES (?, ?, 'done', ?, ?, 'completed')",
+                (future_transition, "default", now, now),
+            )
+            kb._append_event(
+                conn,
+                future_transition,
+                "status",
+                {"status": "ready"},
+            )
+            conn.execute(
+                "UPDATE task_events SET created_at = ? "
+                "WHERE task_id = ? AND kind = 'status'",
+                (future, future_transition),
+            )
+            conn.commit()
+
+            guards = {
+                "future_terminal": kb.check_respawn_guard(
+                    conn, future_terminal, lane="ready"
+                ),
+                "future_transition": kb.check_respawn_guard(
+                    conn, future_transition, lane="ready"
+                ),
+            }
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=2,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "guards": guards,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "future-lifecycle.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["guards"] == {
+        "future_terminal": "recent_success",
+        "future_transition": "recent_success",
     }
     assert sorted(reason for _task_id, reason in probe["guarded"]) == [
         "recent_success",

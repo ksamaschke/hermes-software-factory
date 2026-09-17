@@ -10,7 +10,7 @@ of the pinned Hermes runtime:
   post-run lifecycle requeue evidence and the current assignee still matches
   the prior native run profile. A material blocked/triage `specified` event is
   one such transition; title-only or malformed specifications are not.
-  Missing or malformed lifecycle timestamps and malformed/non-object
+  Missing, malformed, or future lifecycle timestamps and malformed/non-object
   `promoted` payloads fail closed in both the helper and the production
   respawn guard. Comments and PR URLs are evidence only.
 

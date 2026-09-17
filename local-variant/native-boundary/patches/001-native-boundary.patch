@@ -4,7 +4,8 @@
 -            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
 +            "SELECT title, body, assignee, block_recurrences "
 +            "FROM tasks WHERE id = ? AND status = 'triage'",
-@@ -7582,0 +7584,10 @@
+@@ -7581,0 +7583,10 @@
++            return False
 +        from hermes_cli.native_boundary import triage_admission_rejection
 +
 +        quarantine_reason = triage_admission_rejection(
@@ -14,7 +15,6 @@
 +            recurrence_limit=BLOCK_RECURRENCE_LIMIT,
 +        )
 +        if quarantine_reason is not None:
-+            return False
 @@ -9813,0 +9825,4 @@
 +    from hermes_cli.native_boundary import (
 +        requeue_transition_is_authorized,
@@ -32,7 +32,7 @@
 +        "ORDER BY id DESC LIMIT 1",
 @@ -9831,0 +9847,12 @@
 +    latest_ended_at = (
-+        validated_lifecycle_timestamp(latest_run["ended_at"])
++        validated_lifecycle_timestamp(latest_run["ended_at"], maximum=now)
 +        if latest_run is not None
 +        else None
 +    )
@@ -64,7 +64,7 @@
 +        "WHERE task_id = ? AND outcome = 'completed' "
 +        "ORDER BY id DESC LIMIT 1",
 +        (task_id,),
-@@ -9876,9 +9911,2 @@
+@@ -9876,9 +9911,4 @@
 -        completed_at = int(recent_completed["ended_at"] or 0)
 -        requeued_after = conn.execute(
 -            "SELECT 1 FROM task_events "
@@ -74,9 +74,11 @@
 -            (task_id, completed_at),
 -        ).fetchone()
 -        if not requeued_after:
-+        completed_at = validated_lifecycle_timestamp(recent_completed["ended_at"])
++        completed_at = validated_lifecycle_timestamp(
++            recent_completed["ended_at"], maximum=now
++        )
 +        if completed_at is None:
-@@ -9885,0 +9914,19 @@
+@@ -9885,0 +9916,21 @@
 +        if completed_at >= cutoff:
 +            latest_requeue = conn.execute(
 +                "SELECT kind, payload, created_at FROM task_events "
@@ -87,7 +89,9 @@
 +            ).fetchone()
 +            if latest_requeue is None:
 +                return "recent_success"
-+            requeued_at = validated_lifecycle_timestamp(latest_requeue["created_at"])
++            requeued_at = validated_lifecycle_timestamp(
++                latest_requeue["created_at"], maximum=now
++            )
 +            if (
 +                requeued_at is None
 +                or requeued_at < completed_at
@@ -98,7 +102,7 @@
 +                return "recent_success"
 --- /dev/null
 +++ b/hermes_cli/native_boundary.py
-@@ -0,0 +1,183 @@
+@@ -0,0 +1,201 @@
 +"""Fail-closed native boundary decisions for the versioned Factory artifact.
 +
 +This module is added to a disposable copied Hermes runtime by the artifact
@@ -110,6 +114,7 @@
 +
 +import json
 +import sqlite3
++import time
 +from typing import Any
 +
 +# These are lifecycle transitions that can establish an explicit re-admission.
@@ -168,10 +173,22 @@
 +    return value if isinstance(value, dict) else None
 +
 +
-+def validated_lifecycle_timestamp(value: Any) -> int | None:
-+    """Return a positive SQLite integer timestamp, else fail closed."""
++def validated_lifecycle_timestamp(
++    value: Any,
++    *,
++    maximum: int | None = None,
++) -> int | None:
++    """Return a bounded positive SQLite integer timestamp, else fail closed."""
 +    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
 +        return None
++    if maximum is not None:
++        if (
++            isinstance(maximum, bool)
++            or not isinstance(maximum, int)
++            or maximum <= 0
++            or value > maximum
++        ):
++            return None
 +    return value
 +
 +
@@ -264,8 +281,13 @@
 +        transition["kind"], transition["payload"]
 +    ):
 +        return False
-+    transition_created_at = validated_lifecycle_timestamp(transition["created_at"])
-+    prior_run_ended_at = validated_lifecycle_timestamp(prior_run["ended_at"])
++    now = int(time.time())
++    transition_created_at = validated_lifecycle_timestamp(
++        transition["created_at"], maximum=now
++    )
++    prior_run_ended_at = validated_lifecycle_timestamp(
++        prior_run["ended_at"], maximum=now
++    )
 +    if transition_created_at is None or prior_run_ended_at is None:
 +        return False
 +    if transition_created_at < prior_run_ended_at:
