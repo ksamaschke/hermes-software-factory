@@ -115,6 +115,14 @@ never convert a pushed artifact or terminal worker summary into completion
 around RED evidence. Route an in-scope CI/evaluator/bootstrap/policy or graph
 prerequisite through the canonical lane and keep downstream children gated.
 
+Link downstream work to the terminal prerequisite phase. If a consumer
+validation requires a prerequisite PR on the trusted/default base, review
+approval is not enough: encode `source/review -> guarded merge/migration ->
+consumer validation/review`. Repair a premature direct edge after the consumer
+returns idle; do not re-admit it until the live base and fresh checks prove the
+merge/migration. Routine in-scope trusted-base merge and synchronized digest
+migration remain coordinator-owned rather than operator gates.
+
 Parked work, unfinished or ambiguous parents, malformed/stale contracts,
 duplicate identities, and WIP-full lanes remain unchanged. Genuine external or
 human gates, including protected signer/credential boundaries, hold only that

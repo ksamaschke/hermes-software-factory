@@ -141,6 +141,24 @@ def test_parent_completion_preserves_parent_gates_and_child_release_conditions()
     assert completion < repair < release
 
 
+def test_terminal_prerequisite_phase_is_encoded_in_the_graph():
+    text = _compact(REFERENCE)
+    skill = _compact(OPERATIONS)
+
+    for phrase in (
+        "link the terminal prerequisite phase",
+        "approval of that pr is not base availability",
+        "prerequisite source/review -> guarded merge/migration -> downstream validation/review",
+        "do not release a consumer merely because",
+        "live base state and fresh exact-artifact checks",
+    ):
+        assert phrase in text
+
+    assert "link downstream work to the terminal prerequisite phase" in skill
+    assert "review approval is not enough" in skill
+    assert "coordinator-owned rather than operator gates" in skill
+
+
 def test_idle_by_gating_requires_complete_scans_and_no_safe_action():
     text = _compact(REFERENCE)
     idle_section = text[text.index("idle-by-gating") :]
