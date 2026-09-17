@@ -57,12 +57,14 @@ def triage_admission_rejection(
     return "repeated blocker remains quarantined pending explicit resolution"
 
 
-def _json_object(payload: str | None) -> dict[str, Any]:
+def _json_object(payload: str | None) -> dict[str, Any] | None:
+    if payload is None:
+        return None
     try:
-        value = json.loads(payload) if payload else {}
+        value = json.loads(payload)
     except (TypeError, ValueError, json.JSONDecodeError):
-        return {}
-    return value if isinstance(value, dict) else {}
+        return None
+    return value if isinstance(value, dict) else None
 
 
 def same_owner_requeue_is_authorized(
@@ -129,19 +131,29 @@ def same_owner_requeue_is_authorized(
         return False
     if transition["kind"] not in _REQUEUE_EVENT_KINDS:
         return False
-    if int(transition["created_at"] or 0) < int(prior_run["ended_at"] or 0):
+    transition_created_at = transition["created_at"]
+    prior_run_ended_at = prior_run["ended_at"]
+    if type(transition_created_at) is not int or type(prior_run_ended_at) is not int:
+        return False
+    if transition_created_at <= 0 or prior_run_ended_at <= 0:
+        return False
+    if transition_created_at < prior_run_ended_at:
         return False
 
     if transition["kind"] == "status":
         payload = _json_object(transition["payload"])
-        if payload.get("status") not in {"ready", "todo"}:
+        if payload is None or payload.get("status") not in {"ready", "todo"}:
             return False
     elif transition["kind"] == "promoted":
-        payload = _json_object(transition["payload"])
-        if payload and payload.get("status") not in {"ready", "todo"}:
-            return False
+        raw_payload = transition["payload"]
+        if raw_payload is not None:
+            payload = _json_object(raw_payload)
+            if payload is None or payload.get("status") not in {"ready", "todo"}:
+                return False
     elif transition["kind"] == "specified":
         payload = _json_object(transition["payload"])
+        if payload is None:
+            return False
         changed_fields = payload.get("changed_fields")
         if payload.get("previous_status") not in {"blocked", "triage"}:
             return False

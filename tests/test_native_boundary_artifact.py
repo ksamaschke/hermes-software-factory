@@ -44,7 +44,7 @@ native_boundary = _load_module("native_boundary_for_tests", NATIVE_PATH)
 def test_static_manifest_and_patch_are_pinned():
     manifest = builder._static_manifest()
     assert manifest["schema"] == "factory.native-boundary.v1"
-    assert manifest["artifact_version"] == "1.0.1"
+    assert manifest["artifact_version"] == "1.0.2"
     assert manifest["copy_policy"] == {
         "fresh_copy_required": True,
         "reject_symlinks": True,
@@ -447,6 +447,63 @@ def test_material_specification_is_same_owner_readmission_authority():
         conn.commit()
         assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is False
 
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    ("table", "column", "row_id"),
+    [
+        ("task_events", "created_at", 2),
+        ("task_runs", "ended_at", 1),
+    ],
+)
+def test_same_owner_requeue_rejects_malformed_lifecycle_timestamps(
+    table, column, row_id
+):
+    conn = _requeue_connection()
+    conn.execute(
+        f"UPDATE {table} SET {column} = 'not-a-timestamp' WHERE id = ?",
+        (row_id,),
+    )
+    conn.commit()
+
+    assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is False
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    "malformed_payload",
+    [
+        "",
+        "{",
+        "null",
+        "[]",
+        '"ready"',
+        "{}",
+    ],
+)
+def test_same_owner_requeue_rejects_malformed_promoted_payload(malformed_payload):
+    conn = _requeue_connection()
+    conn.execute(
+        "UPDATE task_events SET kind = 'promoted', payload = ? WHERE id = 2",
+        (malformed_payload,),
+    )
+    conn.commit()
+
+    assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is False
+    conn.close()
+
+
+@pytest.mark.parametrize("payload", [None, json.dumps({"status": "ready"})])
+def test_same_owner_requeue_accepts_well_formed_ready_promotion(payload):
+    conn = _requeue_connection()
+    conn.execute(
+        "UPDATE task_events SET kind = 'promoted', payload = ? WHERE id = 2",
+        (payload,),
+    )
+    conn.commit()
+
+    assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is True
     conn.close()
 
 
