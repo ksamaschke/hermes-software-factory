@@ -1,10 +1,10 @@
 --- a/hermes_cli/kanban_db.py
 +++ b/hermes_cli/kanban_db.py
-@@ -7230 +7230,2 @@
+@@ -7578 +7578,2 @@
 -            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
 +            "SELECT title, body, assignee, block_recurrences "
 +            "FROM tasks WHERE id = ? AND status = 'triage'",
-@@ -7234,0 +7236,10 @@
+@@ -7582,0 +7584,10 @@
 +        from hermes_cli.native_boundary import triage_admission_rejection
 +
 +        quarantine_reason = triage_admission_rejection(
@@ -15,7 +15,7 @@
 +        )
 +        if quarantine_reason is not None:
 +            return False
-@@ -9506,0 +9518,9 @@
+@@ -9854,0 +9866,9 @@
 +
 +    # A native explicit same-owner unblock/requeue is durable lifecycle
 +    # authority.  The helper ignores comments and is evaluated only after
@@ -27,7 +27,7 @@
 +            return None
 --- /dev/null
 +++ b/hermes_cli/native_boundary.py
-@@ -0,0 +1,151 @@
+@@ -0,0 +1,163 @@
 +"""Fail-closed native boundary decisions for the versioned Factory artifact.
 +
 +This module is added to a disposable copied Hermes runtime by the artifact
@@ -43,7 +43,9 @@
 +
 +# These are lifecycle transitions that can establish an explicit re-admission.
 +# Comments are intentionally absent: text is evidence, never authority.
-+_REQUEUE_EVENT_KINDS = frozenset({"unblocked", "promoted", "reclaimed", "status"})
++_REQUEUE_EVENT_KINDS = frozenset(
++    {"unblocked", "promoted", "reclaimed", "specified", "status"}
++)
 +_OBSERVATION_EVENT_KINDS = ("commented", "respawn_guarded")
 +
 +
@@ -148,7 +150,8 @@
 +
 +    transition = conn.execute(
 +        "SELECT id, kind, payload, created_at FROM task_events "
-+        "WHERE task_id = ? AND kind IN ('unblocked', 'promoted', 'reclaimed', 'status') "
++        "WHERE task_id = ? AND kind IN "
++        "('unblocked', 'promoted', 'reclaimed', 'specified', 'status') "
 +        "ORDER BY id DESC LIMIT 1",
 +        (task_id,),
 +    ).fetchone()
@@ -166,6 +169,15 @@
 +    elif transition["kind"] == "promoted":
 +        payload = _json_object(transition["payload"])
 +        if payload and payload.get("status") not in {"ready", "todo"}:
++            return False
++    elif transition["kind"] == "specified":
++        payload = _json_object(transition["payload"])
++        changed_fields = payload.get("changed_fields")
++        if payload.get("previous_status") not in {"blocked", "triage"}:
++            return False
++        if payload.get("status") not in {"ready", "todo"}:
++            return False
++        if not isinstance(changed_fields, list) or "body" not in changed_fields:
 +            return False
 +
 +    # Comments and guard telemetry are deliberately ignored here. They are

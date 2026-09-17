@@ -13,7 +13,9 @@ from typing import Any
 
 # These are lifecycle transitions that can establish an explicit re-admission.
 # Comments are intentionally absent: text is evidence, never authority.
-_REQUEUE_EVENT_KINDS = frozenset({"unblocked", "promoted", "reclaimed", "status"})
+_REQUEUE_EVENT_KINDS = frozenset(
+    {"unblocked", "promoted", "reclaimed", "specified", "status"}
+)
 _OBSERVATION_EVENT_KINDS = ("commented", "respawn_guarded")
 
 
@@ -118,7 +120,8 @@ def same_owner_requeue_is_authorized(
 
     transition = conn.execute(
         "SELECT id, kind, payload, created_at FROM task_events "
-        "WHERE task_id = ? AND kind IN ('unblocked', 'promoted', 'reclaimed', 'status') "
+        "WHERE task_id = ? AND kind IN "
+        "('unblocked', 'promoted', 'reclaimed', 'specified', 'status') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
@@ -136,6 +139,15 @@ def same_owner_requeue_is_authorized(
     elif transition["kind"] == "promoted":
         payload = _json_object(transition["payload"])
         if payload and payload.get("status") not in {"ready", "todo"}:
+            return False
+    elif transition["kind"] == "specified":
+        payload = _json_object(transition["payload"])
+        changed_fields = payload.get("changed_fields")
+        if payload.get("previous_status") not in {"blocked", "triage"}:
+            return False
+        if payload.get("status") not in {"ready", "todo"}:
+            return False
+        if not isinstance(changed_fields, list) or "body" not in changed_fields:
             return False
 
     # Comments and guard telemetry are deliberately ignored here. They are

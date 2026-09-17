@@ -44,7 +44,7 @@ native_boundary = _load_module("native_boundary_for_tests", NATIVE_PATH)
 def test_static_manifest_and_patch_are_pinned():
     manifest = builder._static_manifest()
     assert manifest["schema"] == "factory.native-boundary.v1"
-    assert manifest["artifact_version"] == "1.0.0"
+    assert manifest["artifact_version"] == "1.0.1"
     assert manifest["copy_policy"] == {
         "fresh_copy_required": True,
         "reject_symlinks": True,
@@ -52,7 +52,7 @@ def test_static_manifest_and_patch_are_pinned():
         "no_live_install_or_restart": True,
     }
     assert {entry["path"]: entry["sha256"] for entry in manifest["source_files"]} == {
-        "hermes_cli/kanban_db.py": "3d225442d9aae60ae05f659b1e3a10bc5833b1b8332bce81fc83a77bc791473f",
+        "hermes_cli/kanban_db.py": "9262365420d875736fbc90927b353cd854241ae85fb80ffda2e622789fc6ed9e",
         "hermes_cli/kanban_specify.py": "67bdf407fc4ce626677c8aae7ee3a2a0da893c9015ad56410e0de3704ed19f13",
     }
     for entry in manifest["patches"]:
@@ -419,6 +419,37 @@ def test_same_owner_requeue_ignores_later_comment_but_not_new_lifecycle_state():
     conn.close()
 
 
+def test_material_specification_is_same_owner_readmission_authority():
+    conn = _requeue_connection()
+    conn.execute("DELETE FROM task_events WHERE id = 2")
+    payload = {
+        "changed_fields": ["title", "body"],
+        "previous_status": "blocked",
+        "status": "ready",
+    }
+    conn.execute(
+        "INSERT INTO task_events VALUES (2, ?, 'specified', ?, 101)",
+        ("task-1", json.dumps(payload)),
+    )
+    conn.commit()
+    assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is True
+
+    for invalid in (
+        {**payload, "changed_fields": ["title"]},
+        {**payload, "previous_status": "ready"},
+        {**payload, "status": "running"},
+        {**payload, "changed_fields": "body"},
+    ):
+        conn.execute(
+            "UPDATE task_events SET payload = ? WHERE id = 2",
+            (json.dumps(invalid),),
+        )
+        conn.commit()
+        assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is False
+
+    conn.close()
+
+
 @pytest.mark.parametrize(
     "change",
     [
@@ -667,6 +698,74 @@ def test_staged_dispatch_tick_uses_guard_before_dry_run_admission(tmp_path):
     assert staged_probe["spawned"] == [old_probe["task_id"]]
     assert staged_probe["resumed"] is True
     assert staged_probe["second_claim"] is False
+
+
+def test_staged_material_respecification_bypasses_active_pr_guard(tmp_path):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="Canonical review continuation",
+                body="Review the exact existing pull request.",
+                assignee="default",
+                created_by="fixture",
+            )
+            running = kb.claim_task(conn, task_id, claimer="fixture-owner:1")
+            assert running is not None
+            assert kb.block_task(
+                conn,
+                task_id,
+                reason="worker classified an internal gate as capability",
+                kind="capability",
+                expected_run_id=running.current_run_id,
+            )
+            landing = kb.respecify_idle_task(
+                conn,
+                task_id,
+                body="Materially corrected exact-head review contract.",
+                author="fixture-controller",
+            )
+            kb.add_comment(conn, task_id, "fixture-controller", __FIXTURE_PR_URL__)
+            guard = kb.check_respawn_guard(conn, task_id, lane="ready")
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "landing": landing,
+                "guard": guard,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    ).replace("__FIXTURE_PR_URL__", repr(FIXTURE_PR_URL))
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "specified-requeue.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["landing"] == "ready"
+    assert probe["guard"] is None
+    assert len(probe["spawned"]) == 1
 
 
 def test_staged_dispatch_negative_controls(tmp_path):

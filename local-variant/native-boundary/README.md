@@ -8,7 +8,9 @@ of the pinned Hermes runtime:
   write transaction before any task fields are changed;
 - a same-owner continuation is admitted only when the task has durable,
   post-run lifecycle requeue evidence and the current assignee still matches
-  the prior native run profile. Comments and PR URLs are evidence only.
+  the prior native run profile. A material blocked/triage `specified` event is
+  one such transition; title-only or malformed specifications are not.
+  Comments and PR URLs are evidence only.
 
 The artifact is fail-closed. It pins both input source files and the patch,
 rejects symlinks, hardlinks, special files, path escapes, patch mode/rename
