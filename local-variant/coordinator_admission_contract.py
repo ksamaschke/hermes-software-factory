@@ -24,6 +24,7 @@ _TOKEN = re.compile(r"^[a-z][a-z0-9_]*$")
 _HANDOFF_TOKEN = re.compile(r"^[A-Za-z0-9_.:+-]+$")
 _UNAVAILABLE_HANDOFF_STATES = {"invalid", "missing", "stale", "unavailable"}
 _RESERVED_HARD_ACTION_MODES = {"probe_error", "coordinator_gate_suppressed"}
+_BLOCKED_WORKER_STATES = {"blocked", "triage"}
 
 
 def _is_token(value: Any, *, limit: int, pattern: re.Pattern[str]) -> bool:
@@ -128,6 +129,51 @@ def _normalize_candidate_counts(
             return {}, False
         normalized[key] = value
     return normalized, True
+
+
+def build_worker_blocker_claim_directive(
+    *,
+    status: Any,
+    assignee: Any,
+    block_kind: Any,
+    idle: Any,
+) -> dict[str, Any]:
+    """Decide whether an idle worker blocker needs owner reconciliation.
+
+    Worker-selected blocker kinds are observations, not authority decisions.
+    Project overlays use this non-selecting contract after applying their own
+    repository/scope filter, then let the coordinator read canonical evidence
+    and decide whether the prerequisite is internal or genuinely external.
+    """
+
+    status_valid = (
+        _is_token(status, limit=MAX_ACTION_TOKEN_LENGTH, pattern=_TOKEN)
+        and status in _BLOCKED_WORKER_STATES
+    )
+    assignee_valid = _is_token(assignee, limit=MAX_ACTION_TOKEN_LENGTH, pattern=_TOKEN)
+    block_kind_valid = block_kind is None or _is_token(
+        block_kind, limit=MAX_ACTION_TOKEN_LENGTH, pattern=_TOKEN
+    )
+    idle_valid = type(idle) is bool
+    input_valid = bool(
+        status_valid and assignee_valid and block_kind_valid and idle_valid
+    )
+    project = bool(input_valid and idle is True)
+
+    if not input_valid:
+        required_disposition = "hold_malformed_worker_blocker_claim"
+    elif project:
+        required_disposition = "reconcile_internal_prerequisite_or_prove_external_gate"
+    else:
+        required_disposition = "preserve_live_or_nonblocked_task"
+
+    return {
+        "schema_version": 1,
+        "input_valid": input_valid,
+        "project_for_coordinator_reconciliation": project,
+        "worker_blocker_is_authoritative": False,
+        "required_disposition": required_disposition,
+    }
 
 
 def build_coordinator_directive(
