@@ -102,7 +102,7 @@
 +                return "recent_success"
 --- /dev/null
 +++ b/hermes_cli/native_boundary.py
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,246 @@
 +"""Fail-closed native boundary decisions for the versioned Factory artifact.
 +
 +This module is added to a disposable copied Hermes runtime by the artifact
@@ -123,6 +123,10 @@
 +    {"unblocked", "promoted", "reclaimed", "specified", "status"}
 +)
 +_OBSERVATION_EVENT_KINDS = ("commented", "respawn_guarded")
++# SQLite stores a bound Python ``True`` as integer ``1``.  No real Hermes
++# lifecycle row predates 2000-01-01, so a plausibility floor keeps that lossy
++# coercion from becoming durable timestamp authority.
++_MIN_LIFECYCLE_TIMESTAMP = 946_684_800
 +
 +
 +def _row_value(row: Any, key: str, default: Any = None) -> Any:
@@ -166,6 +170,8 @@
 +def _json_object(payload: str | None) -> dict[str, Any] | None:
 +    if payload is None:
 +        return None
++    if type(payload) is not str:
++        return None
 +    try:
 +        value = json.loads(payload)
 +    except (TypeError, ValueError, json.JSONDecodeError):
@@ -179,13 +185,15 @@
 +    maximum: int | None = None,
 +) -> int | None:
 +    """Return a bounded positive SQLite integer timestamp, else fail closed."""
-+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
++    if (
++        type(value) is not int
++        or value < _MIN_LIFECYCLE_TIMESTAMP
++    ):
 +        return None
 +    if maximum is not None:
 +        if (
-+            isinstance(maximum, bool)
-+            or not isinstance(maximum, int)
-+            or maximum <= 0
++            type(maximum) is not int
++            or maximum < _MIN_LIFECYCLE_TIMESTAMP
 +            or value > maximum
 +        ):
 +            return None
@@ -194,28 +202,65 @@
 +
 +def requeue_transition_is_authorized(kind: Any, payload: Any) -> bool:
 +    """Validate durable transition evidence without trusting SQLite types."""
-+    if kind not in _REQUEUE_EVENT_KINDS:
++    if type(kind) is not str or kind not in _REQUEUE_EVENT_KINDS:
 +        return False
 +    if kind == "status":
 +        value = _json_object(payload)
-+        return value is not None and value.get("status") in {"ready", "todo"}
++        status = value.get("status") if value is not None else None
++        return type(status) is str and status in {"ready", "todo"}
 +    if kind == "promoted":
 +        if payload is None:
 +            return True
 +        value = _json_object(payload)
-+        return value is not None and value.get("status") in {"ready", "todo"}
++        status = value.get("status") if value is not None else None
++        return type(status) is str and status in {"ready", "todo"}
++    if kind == "unblocked":
++        # The native direct blocked -> ready event deliberately stores SQL
++        # NULL.  Object/scalar payloads describe another landing phase or are
++        # malformed and cannot authorize this ready-lane continuation.
++        return payload is None
++    if kind == "reclaimed":
++        value = _json_object(payload)
++        if value is None:
++            return False
++        retry_status = value.get("retry_status")
++        if type(retry_status) is not str or retry_status not in {"ready", "todo"}:
++            return False
++        if value.get("manual") is True:
++            previous_lock = value.get("prev_lock")
++            return "prev_lock" in value and (
++                previous_lock is None or type(previous_lock) is str
++            )
++        stale_lock = value.get("stale_lock")
++        observed_now = validated_lifecycle_timestamp(
++            value.get("now"), maximum=int(time.time())
++        )
++        claim_expires = validated_lifecycle_timestamp(
++            value.get("claim_expires"), maximum=observed_now
++        )
++        return (
++            type(stale_lock) is str
++            and bool(stale_lock.strip())
++            and observed_now is not None
++            and claim_expires is not None
++            and claim_expires < observed_now
++        )
 +    if kind == "specified":
 +        value = _json_object(payload)
 +        if value is None:
 +            return False
 +        changed_fields = value.get("changed_fields")
++        previous_status = value.get("previous_status")
++        status = value.get("status")
 +        return (
-+            value.get("previous_status") in {"blocked", "triage"}
-+            and value.get("status") in {"ready", "todo"}
-+            and isinstance(changed_fields, list)
++            type(previous_status) is str
++            and previous_status in {"blocked", "triage"}
++            and type(status) is str
++            and status in {"ready", "todo"}
++            and type(changed_fields) is list
 +            and "body" in changed_fields
 +        )
-+    return True
++    return False
 +
 +
 +def same_owner_requeue_is_authorized(

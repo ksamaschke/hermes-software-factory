@@ -28,6 +28,7 @@ NATIVE_PATH = ARTIFACT / "runtime" / "hermes_cli" / "native_boundary.py"
 # This URL is an opaque, non-routable fixture value. Tests never contact GitHub;
 # the old guard only needs the same URL shape as its production PR detector.
 FIXTURE_PR_URL = "https://github.com/fixture-owner/fixture-repository/pull/123"
+_TEST_LIFECYCLE_BASE = 1_700_000_000
 
 
 def _load_module(name: str, path: Path):
@@ -45,7 +46,7 @@ native_boundary = _load_module("native_boundary_for_tests", NATIVE_PATH)
 def test_static_manifest_and_patch_are_pinned():
     manifest = builder._static_manifest()
     assert manifest["schema"] == "factory.native-boundary.v1"
-    assert manifest["artifact_version"] == "1.0.5"
+    assert manifest["artifact_version"] == "1.0.6"
     assert manifest["copy_policy"] == {
         "fresh_copy_required": True,
         "reject_symlinks": True,
@@ -382,16 +383,16 @@ def _requeue_connection() -> sqlite3.Connection:
         ("task-1", "fixture-worker"),
     )
     conn.execute(
-        "INSERT INTO task_runs VALUES (1, ?, ?, 'blocked', 100)",
-        ("task-1", "fixture-worker"),
+        "INSERT INTO task_runs VALUES (1, ?, ?, 'blocked', ?)",
+        ("task-1", "fixture-worker", _TEST_LIFECYCLE_BASE),
     )
     conn.execute(
-        "INSERT INTO task_events VALUES (1, ?, 'blocked', NULL, 99)",
-        ("task-1",),
+        "INSERT INTO task_events VALUES (1, ?, 'blocked', NULL, ?)",
+        ("task-1", _TEST_LIFECYCLE_BASE - 1),
     )
     conn.execute(
-        "INSERT INTO task_events VALUES (2, ?, 'unblocked', NULL, 101)",
-        ("task-1",),
+        "INSERT INTO task_events VALUES (2, ?, 'unblocked', NULL, ?)",
+        ("task-1", _TEST_LIFECYCLE_BASE + 1),
     )
     conn.commit()
     return conn
@@ -400,19 +401,27 @@ def _requeue_connection() -> sqlite3.Connection:
 def test_same_owner_requeue_ignores_later_comment_but_not_new_lifecycle_state():
     conn = _requeue_connection()
     conn.execute(
-        "INSERT INTO task_events VALUES (3, ?, 'commented', ?, 102)",
-        ("task-1", "existing pull request"),
+        "INSERT INTO task_events VALUES (3, ?, 'commented', ?, ?)",
+        ("task-1", "existing pull request", _TEST_LIFECYCLE_BASE + 2),
     )
     conn.execute(
-        "INSERT INTO task_events VALUES (4, ?, 'respawn_guarded', ?, 103)",
-        ("task-1", json.dumps({"reason": "active_pr"})),
+        "INSERT INTO task_events VALUES (4, ?, 'respawn_guarded', ?, ?)",
+        (
+            "task-1",
+            json.dumps({"reason": "active_pr"}),
+            _TEST_LIFECYCLE_BASE + 3,
+        ),
     )
     conn.commit()
     assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is True
 
     conn.execute(
-        "INSERT INTO task_events VALUES (5, ?, 'status', ?, 104)",
-        ("task-1", json.dumps({"status": "running"})),
+        "INSERT INTO task_events VALUES (5, ?, 'status', ?, ?)",
+        (
+            "task-1",
+            json.dumps({"status": "running"}),
+            _TEST_LIFECYCLE_BASE + 4,
+        ),
     )
     conn.commit()
     assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is False
@@ -429,8 +438,8 @@ def test_material_specification_is_same_owner_readmission_authority():
         "status": "ready",
     }
     conn.execute(
-        "INSERT INTO task_events VALUES (2, ?, 'specified', ?, 101)",
-        ("task-1", json.dumps(payload)),
+        "INSERT INTO task_events VALUES (2, ?, 'specified', ?, ?)",
+        ("task-1", json.dumps(payload), _TEST_LIFECYCLE_BASE + 1),
     )
     conn.commit()
     assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is True
@@ -497,6 +506,22 @@ def test_same_owner_requeue_rejects_future_lifecycle_timestamps():
     conn.close()
 
 
+def test_same_owner_requeue_rejects_sqlite_boolean_timestamps():
+    conn = _requeue_connection()
+    conn.execute("UPDATE task_runs SET ended_at = ? WHERE id = 1", (True,))
+    conn.execute("UPDATE task_events SET created_at = ? WHERE id = 2", (True,))
+    conn.commit()
+
+    assert conn.execute(
+        "SELECT ended_at FROM task_runs WHERE id = 1"
+    ).fetchone()["ended_at"] == 1
+    assert conn.execute(
+        "SELECT created_at FROM task_events WHERE id = 2"
+    ).fetchone()["created_at"] == 1
+    assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is False
+    conn.close()
+
+
 @pytest.mark.parametrize(
     "malformed_payload",
     [
@@ -506,6 +531,8 @@ def test_same_owner_requeue_rejects_future_lifecycle_timestamps():
         "[]",
         '"ready"',
         "{}",
+        json.dumps({"status": []}),
+        json.dumps({"status": {}}),
     ],
 )
 def test_same_owner_requeue_rejects_malformed_promoted_payload(malformed_payload):
@@ -994,6 +1021,7 @@ def test_staged_dispatch_negative_controls(tmp_path):
         ("rate_limited", None, "rate_limit_cooldown"),
         ("completed", "not-a-timestamp", "recent_success"),
         ("completed", None, "recent_success"),
+        ("completed", True, "recent_success"),
         ("blocked", "not-a-timestamp", "recent_success"),
         ("blocked", None, "recent_success"),
         ("failed", "not-a-timestamp", "recent_success"),
@@ -1065,21 +1093,66 @@ def test_staged_dispatch_fails_closed_on_malformed_run_timestamp(
 
 
 @pytest.mark.parametrize(
-    ("payload", "expected_guard"),
+    ("kind", "payload", "expected_guard"),
     [
-        (None, None),
-        (json.dumps({"status": "ready"}), None),
-        ("", "recent_success"),
-        ("{", "recent_success"),
-        ("null", "recent_success"),
-        ("[]", "recent_success"),
-        ('"ready"', "recent_success"),
-        ("{}", "recent_success"),
-        (json.dumps({"status": "running"}), "recent_success"),
+        ("promoted", None, None),
+        ("promoted", json.dumps({"status": "ready"}), None),
+        ("status", json.dumps({"status": "ready"}), None),
+        ("unblocked", None, None),
+        (
+            "reclaimed",
+            json.dumps(
+                {
+                    "manual": True,
+                    "prev_lock": "fixture-lock",
+                    "retry_status": "ready",
+                }
+            ),
+            None,
+        ),
+        (
+            "reclaimed",
+            json.dumps(
+                {
+                    "stale_lock": "fixture-lock",
+                    "claim_expires": _TEST_LIFECYCLE_BASE,
+                    "now": _TEST_LIFECYCLE_BASE + 1,
+                    "retry_status": "ready",
+                }
+            ),
+            None,
+        ),
+        ("promoted", "", "recent_success"),
+        ("promoted", "{", "recent_success"),
+        ("promoted", "null", "recent_success"),
+        ("promoted", "[]", "recent_success"),
+        ("promoted", '"ready"', "recent_success"),
+        ("promoted", "{}", "recent_success"),
+        ("promoted", json.dumps({"status": "running"}), "recent_success"),
+        ("promoted", json.dumps({"status": []}), "recent_success"),
+        ("promoted", json.dumps({"status": {}}), "recent_success"),
+        ("status", json.dumps({"status": []}), "recent_success"),
+        ("status", json.dumps({"status": {}}), "recent_success"),
+        ("unblocked", "{", "recent_success"),
+        ("unblocked", "null", "recent_success"),
+        ("unblocked", "[]", "recent_success"),
+        ("unblocked", '"ready"', "recent_success"),
+        ("unblocked", "{}", "recent_success"),
+        ("unblocked", json.dumps({"status": "ready"}), "recent_success"),
+        ("reclaimed", "{", "recent_success"),
+        ("reclaimed", "null", "recent_success"),
+        ("reclaimed", "[]", "recent_success"),
+        ("reclaimed", '"ready"', "recent_success"),
+        ("reclaimed", "{}", "recent_success"),
+        (
+            "reclaimed",
+            json.dumps({"retry_status": "ready"}),
+            "recent_success",
+        ),
     ],
 )
-def test_staged_dispatch_validates_promoted_requeue_payload(
-    tmp_path, payload, expected_guard
+def test_staged_dispatch_validates_requeue_payload(
+    tmp_path, kind, payload, expected_guard
 ):
     runtime = _staged_runtime()
     script = textwrap.dedent(
@@ -1095,8 +1168,8 @@ def test_staged_dispatch_validates_promoted_requeue_payload(
         with kb.connect_closing(db) as conn:
             task_id = kb.create_task(
                 conn,
-                title="Promoted payload validation",
-                body="Only native ready-promotion evidence may bypass recent success.",
+                title="Requeue payload validation",
+                body="Only valid native requeue evidence may bypass recent success.",
                 assignee="default",
                 created_by="fixture",
             )
@@ -1109,7 +1182,7 @@ def test_staged_dispatch_validates_promoted_requeue_payload(
             )
             conn.execute(
                 "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                "VALUES (?, 'promoted', ?, ?)",
+                "VALUES (?, __KIND__, ?, ?)",
                 (task_id, __PAYLOAD__, now),
             )
             conn.commit()
@@ -1127,14 +1200,14 @@ def test_staged_dispatch_validates_promoted_requeue_payload(
                 "spawned": [item[0] for item in result.spawned],
             }))
         """
-    ).replace("__PAYLOAD__", repr(payload))
+    ).replace("__KIND__", repr(kind)).replace("__PAYLOAD__", repr(payload))
     result = subprocess.run(
         [sys.executable, "-B", "-c", script],
         cwd=runtime,
         env=_private_environment(
             runtime,
             tmp_path,
-            db=tmp_path / "promoted-payload.db",
+            db=tmp_path / f"{kind}-payload.db",
         ),
         capture_output=True,
         text=True,
