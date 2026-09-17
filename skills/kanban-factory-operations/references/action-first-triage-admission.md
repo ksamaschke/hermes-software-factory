@@ -219,6 +219,28 @@ PID, or heartbeat is not progress around the red gate; once the child reaches a
 supported idle state, reconcile the prerequisite and graph without creating a
 sibling writer.
 
+### Link the terminal prerequisite phase
+
+Parentage encodes the last causal mutation required by the downstream phase,
+not merely the first source or review task in a prerequisite lane. When a
+downstream validation needs a prerequisite PR's bytes on a trusted/default
+base, approval of that PR is not base availability. Create or reuse the guarded
+merge phase and any required fail-closed digest/provenance migration, then make
+that terminal phase the downstream validation/review's parent.
+
+The safe graph is `prerequisite source/review -> guarded merge/migration ->
+downstream validation/review`. A direct `prerequisite source/review ->
+downstream validation/review` edge is incomplete when the downstream evidence
+depends on merged base state. Do not release a consumer merely because its
+prerequisite PR passed review.
+
+If an incomplete edge already released the downstream worker, preserve its
+evidence-bearing block, create/reuse and link the missing merge/migration
+parent once the child is idle, and do not re-admit the child until live base
+state and fresh exact-artifact checks prove the terminal prerequisite. Routine
+in-scope trusted-base merge and synchronized digest migration are coordinator-
+owned phases, not human/operator gates.
+
 Use the supported board/coordinator API or command. If a create or mutation
 times out, rediscover by the exact idempotency key before retrying. Never retry
 blindly, create a duplicate, or turn a readback failure into a second action.
@@ -320,6 +342,8 @@ Every report separates:
       than accepted as authoritative ownership decisions.
 - [ ] A parent was completed only after every parent-owned acceptance gate and
       explicit child release condition passed at the exact current artifact.
+- [ ] A downstream validation that depends on merged base state is parented to
+      the guarded merge/migration phase, not merely to source/review approval.
 - [ ] Protected signer/credential lanes were held alone while independent work
       continued.
 - [ ] The action, idempotency key, evidence, and exact board mutation were read
