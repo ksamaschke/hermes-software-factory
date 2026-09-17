@@ -23,11 +23,13 @@ two review kinds, the diff as the scope boundary, and the two-tier budget.
 scheduled coordinator overlays. It preserves a queue-derived product action
 when a liveness/no-progress handoff wakes the coordinator, emits a bounded
 progress contract, and leaves issue selection and mutation to the LLM-owned
-coordinator path. Callers provide their typed action allow-list and candidate
-schema; malformed booleans, unbounded identifiers, stale/malformed handoffs,
-arbitrary or oversized candidate mappings, probe errors, and suppressed gates
-fail closed. Hard probe/gate modes are derived outputs rather than selectable
-source actions.
+coordinator path. It also projects idle worker blocker kinds as
+non-authoritative reconciliation candidates, so `capability`, `needs_input`, or
+another worker label cannot silently decide external ownership. Callers provide
+their typed action allow-list and candidate schema; malformed booleans,
+unbounded identifiers, stale/malformed handoffs, arbitrary or oversized
+candidate mappings, probe errors, and suppressed gates fail closed. Hard
+probe/gate modes are derived outputs rather than selectable source actions.
 
 ## Relationship to the live installation
 

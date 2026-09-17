@@ -173,6 +173,30 @@ The action record must include, at minimum:
 - selected owner, bounded operation, result, and next gate;
 - a secret-safe evidence fingerprint.
 
+### Worker blocker ownership is not authoritative
+
+A worker-selected `block_kind`, including `capability` or `needs_input`, and a
+worker summary that names another owner are evidence only. They are not an
+authoritative internal-versus-external ownership decision. The coordinator
+overlay must project bounded idle blocked/triage candidates to the decision
+owner; it must not discard a candidate solely because the worker selected a
+particular blocker kind.
+
+For each projected worker blocker, re-read the canonical task and dependency
+graph plus the exact source, CI/policy, review, artifact, or runtime evidence
+that caused the stop. A missing condition reachable through an in-scope task
+contract, graph repair, source or CI/policy change, review, merge, publication,
+or rollout phase is an internal prerequisite. Repair or route that prerequisite
+through the canonical lane and stable remediation identity, then continue the
+lane. Do not ask a human to perform routine factory or delivery work, and do
+not create a sibling writer.
+
+Preserve a worker block as external only after independent readback proves a
+genuinely non-delegable boundary such as unavailable authorization, a protected
+signer/credential, or an explicit approval reserved to a human. Ambiguous
+evidence holds only that lane for coordinator reconciliation while independent
+work continues; the worker's label alone never supplies that proof.
+
 Use the supported board/coordinator API or command. If a create or mutation
 times out, rediscover by the exact idempotency key before retrying. Never retry
 blindly, create a duplicate, or turn a readback failure into a second action.
@@ -270,6 +294,8 @@ Every report separates:
       limits, and protected credentials were preserved.
 - [ ] Exactly one bounded admission/remediation action was attempted when safe.
 - [ ] Internal factory defects used a keyed, idempotent remediation path.
+- [ ] Worker blocker kinds were projected and independently reclassified rather
+      than accepted as authoritative ownership decisions.
 - [ ] Protected signer/credential lanes were held alone while independent work
       continued.
 - [ ] The action, idempotency key, evidence, and exact board mutation were read

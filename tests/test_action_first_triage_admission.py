@@ -100,6 +100,26 @@ def test_internal_factory_defects_use_keyed_remediation_not_human_escalation():
     assert text.index("route a keyed remediation") < protected
 
 
+def test_worker_blocker_claims_are_projected_and_reclassified_by_coordinator():
+    text = _compact(REFERENCE)
+
+    for phrase in (
+        "worker blocker ownership is not authoritative",
+        "worker-selected `block_kind`",
+        "evidence only",
+        "must project bounded idle blocked/triage candidates",
+        "must not discard a candidate solely because the worker selected",
+        "an internal prerequisite",
+        "repair or route that prerequisite",
+        "worker's label alone never supplies that proof",
+    ):
+        assert phrase in text
+
+    internal = text.index("an internal prerequisite")
+    external = text.index("preserve a worker block as external")
+    assert internal < external
+
+
 def test_idle_by_gating_requires_complete_scans_and_no_safe_action():
     text = _compact(REFERENCE)
     idle_section = text[text.index("idle-by-gating") :]
@@ -133,6 +153,8 @@ def test_operations_surface_references_the_action_first_contract():
         "coordinator_admission_contract.py",
         "bounded built-in mapping",
         "reserved outputs derived from causal fields",
+        "worker-selected blocker kinds are non-authoritative claims",
+        "a worker label alone is never that proof",
     ):
         assert phrase in operations
 

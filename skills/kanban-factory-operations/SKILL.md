@@ -100,6 +100,13 @@ hold at the same time. Candidate counts must be a bounded built-in mapping with
 exactly the declared keys. `probe_error` and `coordinator_gate_suppressed` are
 reserved outputs derived from causal fields, not source product actions.
 
+Worker-selected blocker kinds are non-authoritative claims. Project bounded
+idle blocked/triage candidates even when a worker selected `capability` or
+`needs_input`; re-read canonical evidence and let the orchestrator classify and
+repair in-scope prerequisites. Preserve an external block only with independent
+proof of a genuinely non-delegable authorization, signer/credential, or human
+approval boundary. A worker label alone is never that proof.
+
 Parked work, unfinished or ambiguous parents, malformed/stale contracts,
 duplicate identities, and WIP-full lanes remain unchanged. Genuine external or
 human gates, including protected signer/credential boundaries, hold only that

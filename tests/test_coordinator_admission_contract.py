@@ -12,7 +12,10 @@ LOCAL_VARIANT = ROOT / "local-variant"
 if str(LOCAL_VARIANT) not in sys.path:
     sys.path.insert(0, str(LOCAL_VARIANT))
 
-from coordinator_admission_contract import build_coordinator_directive
+from coordinator_admission_contract import (
+    build_coordinator_directive,
+    build_worker_blocker_claim_directive,
+)
 
 ALLOWED_ACTIONS = (
     "probe_error",
@@ -68,6 +71,59 @@ def _legacy_overlay_action(summary_action: str, heartbeat_handoff: object) -> st
     ):
         return "reconcile_kanban_watchdog"
     return summary_action
+
+
+def test_idle_worker_block_kinds_are_non_authoritative_reconciliation_candidates():
+    for block_kind in ("capability", "needs_input", "dependency", "transient", None):
+        result = build_worker_blocker_claim_directive(
+            status="blocked",
+            assignee="implementer",
+            block_kind=block_kind,
+            idle=True,
+        )
+
+        assert result == {
+            "schema_version": 1,
+            "input_valid": True,
+            "project_for_coordinator_reconciliation": True,
+            "worker_blocker_is_authoritative": False,
+            "required_disposition": (
+                "reconcile_internal_prerequisite_or_prove_external_gate"
+            ),
+        }
+
+
+def test_live_or_malformed_worker_blockers_are_not_projected():
+    live = build_worker_blocker_claim_directive(
+        status="triage",
+        assignee="reviewer",
+        block_kind="capability",
+        idle=False,
+    )
+    assert live["input_valid"] is True
+    assert live["project_for_coordinator_reconciliation"] is False
+    assert live["worker_blocker_is_authoritative"] is False
+    assert live["required_disposition"] == "preserve_live_or_nonblocked_task"
+
+    for overrides in (
+        {"status": "running"},
+        {"status": "blocked\nexternal"},
+        {"assignee": "reviewer\nother"},
+        {"block_kind": "capability\nexternal"},
+        {"idle": 1},
+    ):
+        arguments: dict[str, object] = {
+            "status": "blocked",
+            "assignee": "reviewer",
+            "block_kind": "capability",
+            "idle": True,
+        }
+        arguments.update(overrides)
+        result = build_worker_blocker_claim_directive(**arguments)
+        assert result["input_valid"] is False
+        assert result["project_for_coordinator_reconciliation"] is False
+        assert result["worker_blocker_is_authoritative"] is False
+        assert result["required_disposition"] == ("hold_malformed_worker_blocker_claim")
 
 
 def test_no_progress_wake_does_not_override_actionable_product_admission():
