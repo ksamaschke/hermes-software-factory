@@ -11,7 +11,8 @@ of the pinned Hermes runtime:
   the prior native run profile. A material blocked/triage `specified` event is
   one such transition; title-only or malformed specifications are not.
   Malformed lifecycle timestamps and malformed/non-object `promoted` payloads
-  fail closed. Comments and PR URLs are evidence only.
+  fail closed in both the helper and the production respawn guard. Comments
+  and PR URLs are evidence only.
 
 The artifact is fail-closed. It pins both input source files and the patch,
 rejects symlinks, hardlinks, special files, path escapes, patch mode/rename

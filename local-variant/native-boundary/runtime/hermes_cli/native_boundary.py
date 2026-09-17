@@ -67,6 +67,13 @@ def _json_object(payload: str | None) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def validated_lifecycle_timestamp(value: Any) -> int | None:
+    """Return a positive SQLite integer timestamp, else fail closed."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
 def same_owner_requeue_is_authorized(
     conn: sqlite3.Connection,
     task_id: str,
@@ -131,11 +138,9 @@ def same_owner_requeue_is_authorized(
         return False
     if transition["kind"] not in _REQUEUE_EVENT_KINDS:
         return False
-    transition_created_at = transition["created_at"]
-    prior_run_ended_at = prior_run["ended_at"]
-    if type(transition_created_at) is not int or type(prior_run_ended_at) is not int:
-        return False
-    if transition_created_at <= 0 or prior_run_ended_at <= 0:
+    transition_created_at = validated_lifecycle_timestamp(transition["created_at"])
+    prior_run_ended_at = validated_lifecycle_timestamp(prior_run["ended_at"])
+    if transition_created_at is None or prior_run_ended_at is None:
         return False
     if transition_created_at < prior_run_ended_at:
         return False
