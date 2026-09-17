@@ -46,7 +46,7 @@ native_boundary = _load_module("native_boundary_for_tests", NATIVE_PATH)
 def test_static_manifest_and_patch_are_pinned():
     manifest = builder._static_manifest()
     assert manifest["schema"] == "factory.native-boundary.v1"
-    assert manifest["artifact_version"] == "1.0.6"
+    assert manifest["artifact_version"] == "1.0.7"
     assert manifest["copy_policy"] == {
         "fresh_copy_required": True,
         "reject_symlinks": True,
@@ -349,6 +349,36 @@ def test_native_quarantine_decision_is_conservative():
     )
 
 
+@pytest.mark.parametrize("recurrences", [None, -1, 0.5, "0", b"0", True])
+def test_native_quarantine_rejects_noncanonical_recurrence_counter(recurrences):
+    rejection = native_boundary.triage_admission_rejection(
+        {
+            "title": "Capability unavailable",
+            "body": "The required provider cannot be reached.",
+            "block_recurrences": recurrences,
+        },
+        title="Resolved fixture",
+        body="Use the bounded local implementation.",
+        recurrence_limit=2,
+    )
+    assert rejection == "invalid quarantine state"
+
+
+@pytest.mark.parametrize("recurrence_limit", [None, 0, -1, 0.5, "2", True])
+def test_native_quarantine_rejects_noncanonical_recurrence_limit(recurrence_limit):
+    rejection = native_boundary.triage_admission_rejection(
+        {
+            "title": "Capability unavailable",
+            "body": "The required provider cannot be reached.",
+            "block_recurrences": 0,
+        },
+        title="Resolved fixture",
+        body="Use the bounded local implementation.",
+        recurrence_limit=recurrence_limit,
+    )
+    assert rejection == "invalid quarantine state"
+
+
 def _requeue_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
@@ -518,6 +548,30 @@ def test_same_owner_requeue_rejects_sqlite_boolean_timestamps():
     assert conn.execute(
         "SELECT created_at FROM task_events WHERE id = 2"
     ).fetchone()["created_at"] == 1
+    assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is False
+    conn.close()
+
+
+@pytest.mark.parametrize("counter", [None, -1, 0.5, b"0"])
+def test_same_owner_requeue_rejects_noncanonical_failure_counter(counter):
+    conn = _requeue_connection()
+    conn.execute(
+        "UPDATE tasks SET consecutive_failures = ? WHERE id = 'task-1'",
+        (counter,),
+    )
+    conn.commit()
+
+    assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is False
+    conn.close()
+
+
+@pytest.mark.parametrize("owner", [b"fixture-worker"])
+def test_same_owner_requeue_rejects_nontext_owner_and_profile(owner):
+    conn = _requeue_connection()
+    conn.execute("UPDATE tasks SET assignee = ? WHERE id = 'task-1'", (owner,))
+    conn.execute("UPDATE task_runs SET profile = ? WHERE id = 1", (owner,))
+    conn.commit()
+
     assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is False
     conn.close()
 
@@ -1011,6 +1065,279 @@ def test_staged_dispatch_negative_controls(tmp_path):
     assert probe["guards"]["live_run"] == "active_pr"
     assert probe["guards"]["quota_auth"] == "blocker_auth"
     assert probe["guards"]["retry_quarantine"] == "rate_limit_cooldown"
+    assert probe["spawned"] == []
+
+
+@pytest.mark.parametrize("counter", [-1, 0.5, b"0"])
+def test_staged_same_owner_requeue_rejects_noncanonical_failure_counter(
+    tmp_path, counter
+):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="Malformed retry counter",
+                body="A noncanonical counter must not authorize continuation.",
+                assignee="default",
+                created_by="fixture",
+            )
+            running = kb.claim_task(conn, task_id, claimer="fixture-owner:1")
+            assert running is not None
+            assert kb.block_task(
+                conn,
+                task_id,
+                reason="explicit fixture resolution",
+                kind="needs_input",
+                expected_run_id=running.current_run_id,
+            )
+            assert kb.unblock_task(conn, task_id)
+            kb.add_comment(conn, task_id, "fixture-controller", __FIXTURE_PR_URL__)
+            conn.execute(
+                "UPDATE tasks SET consecutive_failures = ? WHERE id = ?",
+                (__COUNTER__, task_id),
+            )
+            conn.commit()
+            guard = kb.check_respawn_guard(conn, task_id, lane="ready")
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "task_id": task_id,
+                "guard": guard,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    ).replace("__FIXTURE_PR_URL__", repr(FIXTURE_PR_URL)).replace(
+        "__COUNTER__", repr(counter)
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "malformed-counter.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["guard"] == "active_pr"
+    assert probe["guarded"] == [[probe["task_id"], "active_pr"]]
+    assert probe["spawned"] == []
+
+
+def test_staged_dispatch_fails_closed_on_blob_failure_error(tmp_path):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="Malformed failure evidence",
+                body="A BLOB failure value must fail closed without raising.",
+                assignee="default",
+                created_by="fixture",
+            )
+            conn.execute(
+                "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                (b"401 malformed provider evidence", task_id),
+            )
+            conn.commit()
+            guard = kb.check_respawn_guard(conn, task_id, lane="ready")
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "task_id": task_id,
+                "guard": guard,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "blob-failure.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["guard"] == "blocker_auth"
+    assert probe["guarded"] == [[probe["task_id"], "blocker_auth"]]
+    assert probe["spawned"] == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("body", b"https://github.com/fixture/repository/pull/1"),
+        ("created_at", "not-a-timestamp"),
+    ],
+)
+def test_staged_dispatch_fails_closed_on_malformed_pr_comment(
+    tmp_path, field, value
+):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="Malformed comment evidence",
+                body="Malformed PR evidence must fail closed.",
+                assignee="default",
+                created_by="fixture",
+            )
+            kb.add_comment(conn, task_id, "fixture-controller", __FIXTURE_PR_URL__)
+            conn.execute(
+                "UPDATE task_comments SET __FIELD__ = ? WHERE task_id = ?",
+                (__VALUE__, task_id),
+            )
+            conn.commit()
+            guard = kb.check_respawn_guard(conn, task_id, lane="ready")
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "task_id": task_id,
+                "guard": guard,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    ).replace("__FIXTURE_PR_URL__", repr(FIXTURE_PR_URL)).replace(
+        "__FIELD__", field
+    ).replace("__VALUE__", repr(value))
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "malformed-comment.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["guard"] == "active_pr"
+    assert probe["guarded"] == [[probe["task_id"], "active_pr"]]
+    assert probe["spawned"] == []
+
+
+@pytest.mark.parametrize(
+    ("status", "outcome"),
+    [
+        (b"done", "failed"),
+        ("done", b"failed"),
+    ],
+)
+def test_staged_dispatch_fails_closed_on_malformed_run_state(
+    tmp_path, status, outcome
+):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import time
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="Malformed run state",
+                body="Malformed terminal state must fail closed.",
+                assignee="default",
+                created_by="fixture",
+            )
+            now = int(time.time())
+            conn.execute(
+                "INSERT INTO task_runs "
+                "(task_id, profile, status, started_at, ended_at, outcome) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (task_id, "default", __STATUS__, now, now, __OUTCOME__),
+            )
+            conn.commit()
+            guard = kb.check_respawn_guard(conn, task_id, lane="ready")
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "task_id": task_id,
+                "guard": guard,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    ).replace("__STATUS__", repr(status)).replace("__OUTCOME__", repr(outcome))
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "malformed-run-state.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["guard"] == "recent_success"
+    assert probe["guarded"] == [[probe["task_id"], "recent_success"]]
     assert probe["spawned"] == []
 
 

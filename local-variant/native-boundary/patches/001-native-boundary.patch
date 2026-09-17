@@ -15,22 +15,39 @@
 +            recurrence_limit=BLOCK_RECURRENCE_LIMIT,
 +        )
 +        if quarantine_reason is not None:
-@@ -9813,0 +9825,4 @@
+@@ -9811,0 +9823,4 @@
++    if type(row["status"]) is not str:
++        return "recent_success"
++    if row["block_kind"] is not None and type(row["block_kind"]) is not str:
++        return "recent_success"
+@@ -9813,0 +9829,4 @@
 +    from hermes_cli.native_boundary import (
 +        requeue_transition_is_authorized,
 +        validated_lifecycle_timestamp,
 +    )
-@@ -9822 +9837 @@
+@@ -9822 +9841 @@
 -    #    We look at the LATEST run only (ORDER BY ended_at DESC LIMIT 1): if a
 +    #    We look at the LATEST run only (ORDER BY id DESC LIMIT 1): if a
-@@ -9827,3 +9842,3 @@
+@@ -9827,3 +9846,3 @@
 -        "SELECT outcome, ended_at FROM task_runs "
 -        "WHERE task_id = ? AND ended_at IS NOT NULL "
 -        "ORDER BY ended_at DESC LIMIT 1",
 +        "SELECT status, outcome, ended_at FROM task_runs "
 +        "WHERE task_id = ? "
 +        "ORDER BY id DESC LIMIT 1",
-@@ -9831,0 +9847,12 @@
+@@ -9831,0 +9851,24 @@
++    if latest_run is not None:
++        run_status = latest_run["status"]
++        run_outcome = latest_run["outcome"]
++        if (
++            type(run_status) is not str
++            or not run_status.strip()
++            or (
++                run_outcome is not None
++                and (type(run_outcome) is not str or not run_outcome.strip())
++            )
++        ):
++            return "recent_success"
 +    latest_ended_at = (
 +        validated_lifecycle_timestamp(latest_run["ended_at"], maximum=now)
 +        if latest_run is not None
@@ -43,11 +60,14 @@
 +        if latest_run["outcome"] == "rate_limited":
 +            return "rate_limit_cooldown"
 +        return "recent_success"
-@@ -9841,2 +9868 @@
+@@ -9841,2 +9884 @@
 -        ended_at = latest_run["ended_at"]
 -        if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
 +        if (now - latest_ended_at) < rl_cooldown:
-@@ -9854,0 +9881,9 @@
+@@ -9852,0 +9895,2 @@
++    if err is not None and type(err) is not str:
++        return "blocker_auth"
+@@ -9854,0 +9899,9 @@
 +
 +    # A native explicit same-owner unblock/requeue is durable lifecycle
 +    # authority.  The helper ignores comments and is evaluated only after
@@ -57,14 +77,14 @@
 +
 +        if same_owner_requeue_is_authorized(conn, task_id):
 +            return None
-@@ -9871,3 +9906,3 @@
+@@ -9871,3 +9924,3 @@
 -        "WHERE task_id = ? AND outcome = 'completed' AND ended_at >= ? "
 -        "ORDER BY ended_at DESC LIMIT 1",
 -        (task_id, cutoff),
 +        "WHERE task_id = ? AND outcome = 'completed' "
 +        "ORDER BY id DESC LIMIT 1",
 +        (task_id,),
-@@ -9876,9 +9911,4 @@
+@@ -9876,9 +9929,4 @@
 -        completed_at = int(recent_completed["ended_at"] or 0)
 -        requeued_after = conn.execute(
 -            "SELECT 1 FROM task_events "
@@ -78,7 +98,7 @@
 +            recent_completed["ended_at"], maximum=now
 +        )
 +        if completed_at is None:
-@@ -9885,0 +9916,21 @@
+@@ -9885,0 +9934,21 @@
 +        if completed_at >= cutoff:
 +            latest_requeue = conn.execute(
 +                "SELECT kind, payload, created_at FROM task_events "
@@ -100,9 +120,26 @@
 +                )
 +            ):
 +                return "recent_success"
+@@ -9900,2 +9969,3 @@
+-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+-        (task_id, pr_cutoff),
++        "SELECT body, created_at FROM task_comments "
++        "WHERE task_id = ? ORDER BY id DESC",
++        (task_id,),
+@@ -9903 +9973,9 @@
+-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
++        comment_created_at = validated_lifecycle_timestamp(
++            c["created_at"], maximum=now
++        )
++        body = c["body"]
++        if comment_created_at is None or type(body) is not str:
++            return "active_pr"
++        if comment_created_at < pr_cutoff:
++            continue
++        if body and _RESPAWN_GUARD_PR_URL_RE.search(body):
 --- /dev/null
 +++ b/hermes_cli/native_boundary.py
-@@ -0,0 +1,246 @@
+@@ -0,0 +1,254 @@
 +"""Fail-closed native boundary decisions for the versioned Factory artifact.
 +
 +This module is added to a disposable copied Hermes runtime by the artifact
@@ -152,12 +189,16 @@
 +    out-of-transaction preflight.  Fresh triage rows (zero recurrences) are
 +    always left to the native implementation.
 +    """
-+    try:
-+        recurrences = int(_row_value(existing, "block_recurrences", 0) or 0)
-+        limit = int(recurrence_limit)
-+    except (TypeError, ValueError):
++    recurrences = _row_value(existing, "block_recurrences")
++    limit = recurrence_limit
++    if (
++        type(recurrences) is not int
++        or recurrences < 0
++        or type(limit) is not int
++        or limit < 1
++    ):
 +        return "invalid quarantine state"
-+    if recurrences < max(1, limit):
++    if recurrences < limit:
 +        return None
 +
 +    # A free-form title/body from a specifier is not authority that the
@@ -291,13 +332,14 @@
 +
 +    # A task still carrying a retry-failure streak is not converted into a
 +    # same-writer continuation by a PR comment or a stale transition.
-+    try:
-+        if int(row["consecutive_failures"] or 0) > 0:
-+            return False
-+    except (TypeError, ValueError):
++    consecutive_failures = row["consecutive_failures"]
++    if type(consecutive_failures) is not int or consecutive_failures != 0:
 +        return False
 +
-+    owner = str(row["assignee"] or "").strip().casefold()
++    raw_owner = row["assignee"]
++    if type(raw_owner) is not str:
++        return False
++    owner = raw_owner.strip().casefold()
 +    if not owner:
 +        return False
 +
@@ -309,7 +351,10 @@
 +    ).fetchone()
 +    if prior_run is None:
 +        return False
-+    if str(prior_run["profile"] or "").strip().casefold() != owner:
++    raw_profile = prior_run["profile"]
++    if type(raw_profile) is not str:
++        return False
++    if raw_profile.strip().casefold() != owner:
 +        return False
 +    if prior_run["outcome"] != "blocked":
 +        return False

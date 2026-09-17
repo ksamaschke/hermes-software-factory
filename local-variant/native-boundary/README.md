@@ -12,7 +12,9 @@ of the pinned Hermes runtime:
   one such transition; title-only or malformed specifications are not.
   Missing, malformed, implausibly old, or future lifecycle timestamps and
   malformed/non-object transition payloads fail closed in both the helper and
-  the production respawn guard. Comments and PR URLs are evidence only.
+  the production respawn guard. Retry counters, failure text, run state, and
+  comment evidence are type-checked before they affect admission. Comments and
+  PR URLs are evidence only.
 
 The artifact is fail-closed. It pins both input source files and the patch,
 rejects symlinks, hardlinks, special files, path escapes, patch mode/rename

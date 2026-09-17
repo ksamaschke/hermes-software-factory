@@ -47,12 +47,16 @@ def triage_admission_rejection(
     out-of-transaction preflight.  Fresh triage rows (zero recurrences) are
     always left to the native implementation.
     """
-    try:
-        recurrences = int(_row_value(existing, "block_recurrences", 0) or 0)
-        limit = int(recurrence_limit)
-    except (TypeError, ValueError):
+    recurrences = _row_value(existing, "block_recurrences")
+    limit = recurrence_limit
+    if (
+        type(recurrences) is not int
+        or recurrences < 0
+        or type(limit) is not int
+        or limit < 1
+    ):
         return "invalid quarantine state"
-    if recurrences < max(1, limit):
+    if recurrences < limit:
         return None
 
     # A free-form title/body from a specifier is not authority that the
@@ -186,13 +190,14 @@ def same_owner_requeue_is_authorized(
 
     # A task still carrying a retry-failure streak is not converted into a
     # same-writer continuation by a PR comment or a stale transition.
-    try:
-        if int(row["consecutive_failures"] or 0) > 0:
-            return False
-    except (TypeError, ValueError):
+    consecutive_failures = row["consecutive_failures"]
+    if type(consecutive_failures) is not int or consecutive_failures != 0:
         return False
 
-    owner = str(row["assignee"] or "").strip().casefold()
+    raw_owner = row["assignee"]
+    if type(raw_owner) is not str:
+        return False
+    owner = raw_owner.strip().casefold()
     if not owner:
         return False
 
@@ -204,7 +209,10 @@ def same_owner_requeue_is_authorized(
     ).fetchone()
     if prior_run is None:
         return False
-    if str(prior_run["profile"] or "").strip().casefold() != owner:
+    raw_profile = prior_run["profile"]
+    if type(raw_profile) is not str:
+        return False
+    if raw_profile.strip().casefold() != owner:
         return False
     if prior_run["outcome"] != "blocked":
         return False
