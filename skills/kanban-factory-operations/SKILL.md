@@ -107,6 +107,14 @@ repair in-scope prerequisites. Preserve an external block only with independent
 proof of a genuinely non-delegable authorization, signer/credential, or human
 approval boundary. A worker label alone is never that proof.
 
+A pre-created downstream child does not by itself prove parent completion.
+Before releasing it, verify the exact current artifact, every parent-owned
+acceptance gate, and every explicit child release condition. Failed, skipped,
+missing, stale, or mismatched required checks keep the parent phase incomplete;
+never convert a pushed artifact or terminal worker summary into completion
+around RED evidence. Route an in-scope CI/evaluator/bootstrap/policy or graph
+prerequisite through the canonical lane and keep downstream children gated.
+
 Parked work, unfinished or ambiguous parents, malformed/stale contracts,
 duplicate identities, and WIP-full lanes remain unchanged. Genuine external or
 human gates, including protected signer/credential boundaries, hold only that

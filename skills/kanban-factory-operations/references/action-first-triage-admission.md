@@ -197,6 +197,28 @@ signer/credential, or an explicit approval reserved to a human. Ambiguous
 evidence holds only that lane for coordinator reconciliation while independent
 work continues; the worker's label alone never supplies that proof.
 
+### Parent completion is phase-causal
+
+A pre-created child does not make its parent complete. Before completing a
+blocked parent to release a review, QA, merge, publication, or rollout child,
+read back the exact current artifact and every acceptance gate allocated to the
+parent. A failed, skipped, missing, stale, or mismatched required check means
+the parent phase is incomplete. A pushed artifact or terminal worker summary
+does not override that RED evidence.
+
+Treat a child's explicit release condition as part of the parent boundary. If
+the child says it may start only after a named validation is green, do not call
+the parent-completion transition until that exact validation succeeds. Do not
+move a red parent-owned gate into the child handoff after the fact.
+
+When the missing gate is an in-scope CI, evaluator/bootstrap, policy, graph, or
+other factory-owned prerequisite, re-specify the blocked canonical lane or
+create/reuse and formally link the exact prerequisite. Keep downstream children
+dependency-gated. If a stale completion already released a child, its claim,
+PID, or heartbeat is not progress around the red gate; once the child reaches a
+supported idle state, reconcile the prerequisite and graph without creating a
+sibling writer.
+
 Use the supported board/coordinator API or command. If a create or mutation
 times out, rediscover by the exact idempotency key before retrying. Never retry
 blindly, create a duplicate, or turn a readback failure into a second action.
@@ -296,6 +318,8 @@ Every report separates:
 - [ ] Internal factory defects used a keyed, idempotent remediation path.
 - [ ] Worker blocker kinds were projected and independently reclassified rather
       than accepted as authoritative ownership decisions.
+- [ ] A parent was completed only after every parent-owned acceptance gate and
+      explicit child release condition passed at the exact current artifact.
 - [ ] Protected signer/credential lanes were held alone while independent work
       continued.
 - [ ] The action, idempotency key, evidence, and exact board mutation were read

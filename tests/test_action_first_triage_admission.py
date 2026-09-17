@@ -120,6 +120,27 @@ def test_worker_blocker_claims_are_projected_and_reclassified_by_coordinator():
     assert internal < external
 
 
+def test_parent_completion_preserves_parent_gates_and_child_release_conditions():
+    text = _compact(REFERENCE)
+
+    for phrase in (
+        "parent completion is phase-causal",
+        "a pre-created child does not make its parent complete",
+        "failed, skipped, missing, stale, or mismatched required check",
+        "a pushed artifact or terminal worker summary does not override",
+        "child's explicit release condition",
+        "do not move a red parent-owned gate into the child handoff",
+        "keep downstream children dependency-gated",
+        "is not progress around the red gate",
+    ):
+        assert phrase in text
+
+    completion = text.index("a pre-created child does not make its parent complete")
+    repair = text.index("re-specify the blocked canonical lane", completion)
+    release = text.index("keep downstream children dependency-gated", completion)
+    assert completion < repair < release
+
+
 def test_idle_by_gating_requires_complete_scans_and_no_safe_action():
     text = _compact(REFERENCE)
     idle_section = text[text.index("idle-by-gating") :]
@@ -155,6 +176,8 @@ def test_operations_surface_references_the_action_first_contract():
         "reserved outputs derived from causal fields",
         "worker-selected blocker kinds are non-authoritative claims",
         "a worker label alone is never that proof",
+        "a pre-created downstream child does not by itself prove parent completion",
+        "never convert a pushed artifact or terminal worker summary into completion",
     ):
         assert phrase in operations
 
