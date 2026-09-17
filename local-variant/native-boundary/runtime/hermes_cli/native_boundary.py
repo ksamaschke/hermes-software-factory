@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+import socket
 import sqlite3
 import time
 from typing import Any
@@ -16,7 +17,14 @@ from typing import Any
 # These are lifecycle transitions that can establish an explicit re-admission.
 # Comments are intentionally absent: text is evidence, never authority.
 _REQUEUE_EVENT_KINDS = frozenset(
-    {"unblocked", "promoted", "reclaimed", "specified", "status"}
+    {
+        "changes_requested",
+        "unblocked",
+        "promoted",
+        "reclaimed",
+        "specified",
+        "status",
+    }
 )
 _OBSERVATION_EVENT_KINDS = ("commented", "respawn_guarded")
 # SQLite stores a bound Python ``True`` as integer ``1``.  No real Hermes
@@ -24,6 +32,7 @@ _OBSERVATION_EVENT_KINDS = ("commented", "respawn_guarded")
 # coercion from becoming durable timestamp authority.
 _MIN_LIFECYCLE_TIMESTAMP = 946_684_800
 _MAX_TRANSITION_PAYLOAD_CHARS = 65_536
+_CLAIM_HEARTBEAT_MAX_STALE_SECONDS = 60 * 60
 _PROFILE_ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
 
 # Canonical terminal task-run state pairs emitted by the native kernel.  A
@@ -133,6 +142,54 @@ def _canonical_profile_id(value: Any) -> str | None:
     return value
 
 
+def _positive_row_id(value: Any) -> int | None:
+    return value if type(value) is int and value > 0 else None
+
+
+def _changes_requested_payload(payload: Any) -> dict[str, Any] | None:
+    value = _json_object(payload)
+    if value is None or frozenset(value) != frozenset(
+        {"reason", "implementer", "reviewer", "status"}
+    ):
+        return None
+    reason = value["reason"]
+    implementer = _canonical_profile_id(value["implementer"])
+    reviewer = _canonical_profile_id(value["reviewer"])
+    status = value["status"]
+    if (
+        type(reason) is not str
+        or not reason.strip()
+        or reason != reason.strip()
+        or implementer is None
+        or reviewer is None
+        or type(status) is not str
+        or status not in {"ready", "todo"}
+    ):
+        return None
+    return value
+
+
+def _review_requested_payload(payload: Any) -> dict[str, Any] | None:
+    value = _json_object(payload)
+    if value is None or frozenset(value) != frozenset(
+        {"summary", "implementer", "reviewer"}
+    ):
+        return None
+    summary = value["summary"]
+    if summary is not None and (
+        type(summary) is not str
+        or not summary.strip()
+        or summary != summary.strip()
+        or len(summary) > 400
+    ):
+        return None
+    if _canonical_profile_id(value["implementer"]) is None:
+        return None
+    if _canonical_profile_id(value["reviewer"]) is None:
+        return None
+    return value
+
+
 def _optional_reclaim_metadata_is_canonical(value: dict[str, Any]) -> bool:
     """Validate optional fields emitted by native reclaim implementations."""
     if (
@@ -168,6 +225,34 @@ def _optional_reclaim_metadata_is_canonical(value: dict[str, Any]) -> bool:
     return True
 
 
+def _termination_metadata_is_consistent(
+    value: dict[str, Any],
+    *,
+    lock: Any,
+) -> bool:
+    host_local = value["host_local"]
+    attempted = value["termination_attempted"]
+    terminated = value["terminated"]
+    sigkill = value["sigkill"]
+    previous_pid = value["prev_pid"]
+    if previous_pid is not None and (
+        type(previous_pid) is not int or previous_pid <= 0
+    ):
+        return False
+    local_prefix = f"{socket.gethostname() or 'unknown-host'}:"
+    lock_is_local = type(lock) is str and lock.startswith(local_prefix)
+    expected_host_local = previous_pid is not None and lock_is_local
+    if host_local is not expected_host_local:
+        return False
+    if attempted is not host_local:
+        return False
+    if terminated and not attempted:
+        return False
+    if sigkill and not attempted:
+        return False
+    return True
+
+
 def validated_lifecycle_timestamp(
     value: Any,
     *,
@@ -193,6 +278,8 @@ def requeue_transition_is_authorized(kind: Any, payload: Any) -> bool:
     """Validate durable transition evidence without trusting SQLite types."""
     if type(kind) is not str or kind not in _REQUEUE_EVENT_KINDS:
         return False
+    if kind == "changes_requested":
+        return _changes_requested_payload(payload) is not None
     if kind == "status":
         value = _json_object(payload)
         status = value.get("status") if value is not None else None
@@ -247,7 +334,11 @@ def requeue_transition_is_authorized(kind: Any, payload: Any) -> bool:
                     type(previous_lock) is str
                     and bool(previous_lock.strip())
                 )
-            ) and _optional_reclaim_metadata_is_canonical(value)
+            ) and _optional_reclaim_metadata_is_canonical(
+                value
+            ) and _termination_metadata_is_consistent(
+                value, lock=previous_lock
+            )
         if frozenset(value) != frozenset(
             {
                 "stale_lock",
@@ -277,20 +368,34 @@ def requeue_transition_is_authorized(kind: Any, payload: Any) -> bool:
             value.get("claim_expires"), maximum=observed_now
         )
         heartbeat = value["last_heartbeat_at"]
-        if (
-            heartbeat is not None
-            and validated_lifecycle_timestamp(
-                heartbeat, maximum=observed_now
-            )
-            is None
-        ):
+        heartbeat_at = (
+            validated_lifecycle_timestamp(heartbeat, maximum=observed_now)
+            if heartbeat is not None
+            else None
+        )
+        if heartbeat is not None and heartbeat_at is None:
+            return False
+        if observed_now is None or claim_expires is None:
+            return False
+        if type(stale_lock) is not str or not stale_lock.strip():
+            return False
+        host_prefix = f"{socket.gethostname() or 'unknown-host'}:"
+        claim_host_matches = stale_lock.startswith(host_prefix)
+        expected_heartbeat_stale = (
+            not claim_host_matches
+            or heartbeat_at is None
+            or (observed_now - heartbeat_at)
+            > _CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+        )
+        if value["heartbeat_stale"] is not expected_heartbeat_stale:
             return False
         return (
             type(stale_lock) is str
             and bool(stale_lock.strip())
-            and observed_now is not None
-            and claim_expires is not None
             and claim_expires < observed_now
+            and _termination_metadata_is_consistent(
+                value, lock=stale_lock
+            )
         )
     if kind == "specified":
         value = _json_object(payload)
@@ -371,6 +476,9 @@ def same_owner_requeue_is_authorized(
     ).fetchone()
     if prior_run is None:
         return False
+    prior_run_id = _positive_row_id(prior_run["id"])
+    if prior_run_id is None:
+        return False
     profile = _canonical_profile_id(prior_run["profile"])
     if profile is None or profile != owner:
         return False
@@ -386,6 +494,9 @@ def same_owner_requeue_is_authorized(
         (task_id,),
     ).fetchone()
     if transition is None:
+        return False
+    transition_id = _positive_row_id(transition["id"])
+    if transition_id is None:
         return False
     if not requeue_transition_is_authorized(
         transition["kind"], transition["payload"]
@@ -413,4 +524,166 @@ def same_owner_requeue_is_authorized(
         f"AND kind NOT IN ({placeholders}) ORDER BY id DESC LIMIT 1",
         (task_id, *_OBSERVATION_EVENT_KINDS),
     ).fetchone()
-    return latest is not None and int(latest["id"]) == int(transition["id"])
+    if latest is None:
+        return False
+    latest_id = _positive_row_id(latest["id"])
+    return latest_id is not None and latest_id == transition_id
+
+
+def review_rework_is_authorized(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> bool:
+    """Validate a reviewer-owned changes-requested handoff back to implementer."""
+    row = conn.execute(
+        "SELECT status, assignee, claim_lock, current_run_id, "
+        "       consecutive_failures "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None or row["status"] != "ready":
+        return False
+    if row["claim_lock"] is not None or row["current_run_id"] is not None:
+        return False
+    failures = row["consecutive_failures"]
+    if type(failures) is not int or failures < 0:
+        return False
+    implementer = _canonical_profile_id(row["assignee"])
+    if implementer is None:
+        return False
+
+    prior_run = conn.execute(
+        "SELECT id, profile, status, outcome, started_at, ended_at "
+        "FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if prior_run is None:
+        return False
+    prior_run_id = _positive_row_id(prior_run["id"])
+    reviewer = _canonical_profile_id(prior_run["profile"])
+    run_status = prior_run["status"]
+    run_outcome = prior_run["outcome"]
+    if (
+        prior_run_id is None
+        or reviewer is None
+        or not terminal_run_state_is_authorized(run_status, run_outcome)
+        or run_outcome != "changes_requested"
+    ):
+        return False
+
+    change = conn.execute(
+        "SELECT id, run_id, payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind = 'changes_requested' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if change is None:
+        return False
+    change_id = _positive_row_id(change["id"])
+    change_run_id = _positive_row_id(change["run_id"])
+    payload = _changes_requested_payload(change["payload"])
+    if (
+        change_id is None
+        or change_run_id != prior_run_id
+        or payload is None
+        or payload["implementer"] != implementer
+        or payload["reviewer"] != reviewer
+        or payload["status"] != run_status
+    ):
+        return False
+
+    now = int(time.time())
+    run_started_at = validated_lifecycle_timestamp(
+        prior_run["started_at"], maximum=now
+    )
+    run_ended_at = validated_lifecycle_timestamp(
+        prior_run["ended_at"], maximum=now
+    )
+    change_created_at = validated_lifecycle_timestamp(
+        change["created_at"], maximum=now
+    )
+    if (
+        run_started_at is None
+        or run_ended_at is None
+        or run_ended_at < run_started_at
+        or change_created_at is None
+        or change_created_at < run_ended_at
+    ):
+        return False
+
+    implementation_run = conn.execute(
+        "SELECT id, profile, status, outcome, ended_at FROM task_runs "
+        "WHERE task_id = ? AND id < ? ORDER BY id DESC LIMIT 1",
+        (task_id, prior_run_id),
+    ).fetchone()
+    if implementation_run is None:
+        return False
+    implementation_run_id = _positive_row_id(implementation_run["id"])
+    implementation_profile = _canonical_profile_id(
+        implementation_run["profile"]
+    )
+    implementation_ended_at = validated_lifecycle_timestamp(
+        implementation_run["ended_at"], maximum=run_started_at
+    )
+    if (
+        implementation_run_id is None
+        or implementation_profile != implementer
+        or not terminal_run_state_is_authorized(
+            implementation_run["status"], implementation_run["outcome"]
+        )
+        or implementation_run["outcome"] != "review_requested"
+        or implementation_ended_at is None
+    ):
+        return False
+
+    review_event = conn.execute(
+        "SELECT id, run_id, payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_requested' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if review_event is None:
+        return False
+    review_event_id = _positive_row_id(review_event["id"])
+    review_event_run_id = _positive_row_id(review_event["run_id"])
+    review_payload = _review_requested_payload(review_event["payload"])
+    review_created_at = validated_lifecycle_timestamp(
+        review_event["created_at"], maximum=run_started_at
+    )
+    if (
+        review_event_id is None
+        or review_event_id >= change_id
+        or review_event_run_id != implementation_run_id
+        or review_payload is None
+        or review_payload["implementer"] != implementer
+        or review_payload["reviewer"] != reviewer
+        or review_created_at is None
+        or review_created_at < implementation_ended_at
+    ):
+        return False
+
+    placeholders = ", ".join("?" for _ in _OBSERVATION_EVENT_KINDS)
+    latest = conn.execute(
+        "SELECT id, kind, payload, created_at FROM task_events "
+        "WHERE task_id = ? "
+        f"AND kind NOT IN ({placeholders}) ORDER BY id DESC LIMIT 1",
+        (task_id, *_OBSERVATION_EVENT_KINDS),
+    ).fetchone()
+    if latest is None:
+        return False
+    latest_id = _positive_row_id(latest["id"])
+    if latest_id is None:
+        return False
+    if run_status == "ready":
+        return latest_id == change_id
+    if (
+        run_status != "todo"
+        or latest_id <= change_id
+        or latest["kind"] != "promoted"
+        or latest["payload"] is not None
+    ):
+        return False
+    promoted_at = validated_lifecycle_timestamp(
+        latest["created_at"], maximum=now
+    )
+    return promoted_at is not None and promoted_at >= change_created_at

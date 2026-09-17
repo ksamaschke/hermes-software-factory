@@ -18,6 +18,11 @@ of the pinned Hermes runtime:
   task claim pointers were lost. Retry counters, failure text, run state, and
   comment evidence are type-checked before they affect admission. Comments and
   PR URLs are evidence only.
+- reviewer-requested rework is admitted through a recent PR guard only when
+  the exact terminal review run, `changes_requested` event, implementer,
+  reviewer, status, timestamps, event/run identifiers, and any parent-gate
+  promotion agree. Reclaim evidence additionally enforces native cross-field
+  termination, host-local, and heartbeat consistency.
 
 The artifact is fail-closed. It pins both input source files and the patch,
 rejects symlinks, hardlinks, special files, path escapes, patch mode/rename

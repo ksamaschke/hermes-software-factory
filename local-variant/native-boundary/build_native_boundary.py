@@ -21,7 +21,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 ARTIFACT_SCHEMA = "factory.native-boundary.v1"
-ARTIFACT_VERSION = "1.0.8"
+ARTIFACT_VERSION = "1.0.9"
 ROOT = Path(__file__).resolve().parent
 STATIC_MANIFEST = ROOT / "manifest.json"
 _PATCH_EXECUTABLE = Path("/usr/bin/patch")

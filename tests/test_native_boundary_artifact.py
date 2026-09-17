@@ -46,7 +46,7 @@ native_boundary = _load_module("native_boundary_for_tests", NATIVE_PATH)
 def test_static_manifest_and_patch_are_pinned():
     manifest = builder._static_manifest()
     assert manifest["schema"] == "factory.native-boundary.v1"
-    assert manifest["artifact_version"] == "1.0.8"
+    assert manifest["artifact_version"] == "1.0.9"
     assert manifest["copy_policy"] == {
         "fresh_copy_required": True,
         "reject_symlinks": True,
@@ -401,7 +401,7 @@ def _requeue_connection() -> sqlite3.Connection:
             ended_at INTEGER
         );
         CREATE TABLE task_events (
-            id INTEGER PRIMARY KEY,
+            id,
             task_id TEXT,
             kind TEXT,
             payload TEXT,
@@ -558,6 +558,19 @@ def test_same_owner_requeue_rejects_sqlite_boolean_timestamps():
     conn.close()
 
 
+@pytest.mark.parametrize("event_id", [None, "bad", b"bad", 1.5])
+def test_same_owner_requeue_rejects_noncanonical_event_ids(event_id):
+    conn = _requeue_connection()
+    conn.execute(
+        "UPDATE task_events SET id = ? WHERE kind = 'unblocked'",
+        (event_id,),
+    )
+    conn.commit()
+
+    assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is False
+    conn.close()
+
+
 @pytest.mark.parametrize("counter", [None, -1, 0.5, b"0"])
 def test_same_owner_requeue_rejects_noncanonical_failure_counter(counter):
     conn = _requeue_connection()
@@ -664,6 +677,98 @@ def test_requeue_transition_rejects_ambiguous_or_noncanonical_objects(kind, payl
     assert native_boundary.requeue_transition_is_authorized(kind, payload) is False
 
 
+def _manual_reclaim_payload(**updates):
+    payload = {
+        "manual": True,
+        "reason": None,
+        "prev_lock": "fixture",
+        "retry_status": "ready",
+        "prev_pid": None,
+        "host_local": False,
+        "termination_attempted": False,
+        "terminated": False,
+        "sigkill": False,
+    }
+    payload.update(updates)
+    return json.dumps(payload)
+
+
+def _stale_reclaim_payload(**updates):
+    now = int(time.time())
+    payload = {
+        "stale_lock": "fixture",
+        "worker_pid": None,
+        "prev_pid": None,
+        "host_local": False,
+        "termination_attempted": False,
+        "terminated": False,
+        "sigkill": False,
+        "last_heartbeat_at": None,
+        "heartbeat_stale": True,
+        "claim_expires": now - 10,
+        "now": now,
+        "retry_status": "ready",
+    }
+    payload.update(updates)
+    return json.dumps(payload)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _manual_reclaim_payload(host_local=True),
+        _manual_reclaim_payload(termination_attempted=True),
+        _manual_reclaim_payload(terminated=True),
+        _manual_reclaim_payload(sigkill=True),
+        _manual_reclaim_payload(
+            prev_lock=(
+                f"{native_boundary.socket.gethostname() or 'unknown-host'}:fixture"
+            ),
+            prev_pid=123,
+        ),
+        _stale_reclaim_payload(host_local=True),
+        _stale_reclaim_payload(termination_attempted=True),
+        _stale_reclaim_payload(terminated=True),
+        _stale_reclaim_payload(sigkill=True),
+        _stale_reclaim_payload(heartbeat_stale=False),
+        _stale_reclaim_payload(
+            last_heartbeat_at=int(time.time()) - 4_000,
+            heartbeat_stale=False,
+        ),
+    ],
+)
+def test_reclaim_transition_rejects_inconsistent_metadata(payload):
+    assert native_boundary.requeue_transition_is_authorized(
+        "reclaimed", payload
+    ) is False
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _manual_reclaim_payload(),
+        _manual_reclaim_payload(
+            prev_lock=(
+                f"{native_boundary.socket.gethostname() or 'unknown-host'}:fixture"
+            ),
+            prev_pid=123,
+            host_local=True,
+            termination_attempted=True,
+            terminated=True,
+        ),
+        _stale_reclaim_payload(),
+        _stale_reclaim_payload(
+            last_heartbeat_at=int(time.time()) - 4_000,
+            heartbeat_stale=True,
+        ),
+    ],
+)
+def test_reclaim_transition_accepts_consistent_native_metadata(payload):
+    assert native_boundary.requeue_transition_is_authorized(
+        "reclaimed", payload
+    ) is True
+
+
 @pytest.mark.parametrize(
     "malformed_payload",
     [
@@ -719,6 +824,166 @@ def test_same_owner_requeue_fail_closed_for_ambiguous_history(change):
     conn.commit()
     assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is False
     conn.close()
+
+
+def _review_rework_connection(*, promoted: bool = False) -> sqlite3.Connection:
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE tasks (
+            id TEXT,
+            status TEXT,
+            assignee,
+            claim_lock,
+            current_run_id,
+            consecutive_failures
+        );
+        CREATE TABLE task_runs (
+            id,
+            task_id TEXT,
+            profile,
+            status,
+            outcome,
+            started_at,
+            ended_at
+        );
+        CREATE TABLE task_events (
+            id,
+            task_id TEXT,
+            run_id,
+            kind,
+            payload,
+            created_at
+        );
+        """
+    )
+    now = int(time.time())
+    run_status = "todo" if promoted else "ready"
+    payload = json.dumps(
+        {
+            "reason": "Please fix the finding",
+            "implementer": "fixture-worker",
+            "reviewer": "fixture-reviewer",
+            "status": run_status,
+        }
+    )
+    conn.execute(
+        "INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?)",
+        ("task-1", "ready", "fixture-worker", None, None, 0),
+    )
+    conn.execute(
+        "INSERT INTO task_runs VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            1,
+            "task-1",
+            "fixture-worker",
+            "review",
+            "review_requested",
+            now - 5,
+            now - 4,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO task_runs VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            2,
+            "task-1",
+            "fixture-reviewer",
+            run_status,
+            "changes_requested",
+            now - 3,
+            now - 2,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO task_events VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            1,
+            "task-1",
+            1,
+            "review_requested",
+            json.dumps(
+                {
+                    "summary": "Review the implementation",
+                    "implementer": "fixture-worker",
+                    "reviewer": "fixture-reviewer",
+                }
+            ),
+            now - 4,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO task_events VALUES (?, ?, ?, ?, ?, ?)",
+        (2, "task-1", 2, "changes_requested", payload, now - 1),
+    )
+    if promoted:
+        conn.execute(
+            "INSERT INTO task_events VALUES (?, ?, ?, ?, ?, ?)",
+            (3, "task-1", None, "promoted", None, now - 1),
+        )
+    conn.commit()
+    return conn
+
+
+@pytest.mark.parametrize("promoted", [False, True])
+def test_review_rework_accepts_canonical_handoff(promoted):
+    conn = _review_rework_connection(promoted=promoted)
+    assert native_boundary.review_rework_is_authorized(conn, "task-1") is True
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "UPDATE task_events SET id = NULL WHERE kind = 'changes_requested'",
+        "UPDATE task_events SET id = 'bad' WHERE kind = 'changes_requested'",
+        "UPDATE task_events SET id = X'00' WHERE kind = 'changes_requested'",
+        "UPDATE task_events SET run_id = 99 WHERE kind = 'changes_requested'",
+        "UPDATE task_runs SET id = 'bad' WHERE id = 2",
+        "UPDATE task_runs SET profile = 'other-reviewer' WHERE id = 2",
+        "UPDATE task_runs SET status = 'running' WHERE id = 2",
+        "UPDATE task_runs SET outcome = 'blocked' WHERE id = 2",
+        "UPDATE task_runs SET started_at = 99 WHERE id = 2",
+        "UPDATE task_events SET created_at = 99 WHERE kind = 'changes_requested'",
+        "UPDATE task_events SET payload = '{\"reason\":\"a\",\"reason\":\"b\",\"implementer\":\"fixture-worker\",\"reviewer\":\"fixture-reviewer\",\"status\":\"ready\"}' WHERE kind = 'changes_requested'",
+        "UPDATE task_events SET payload = '{\"reason\":\"fix\",\"implementer\":\"other-worker\",\"reviewer\":\"fixture-reviewer\",\"status\":\"ready\"}' WHERE kind = 'changes_requested'",
+        "DELETE FROM task_events WHERE kind = 'review_requested'",
+        "UPDATE task_events SET id = 'bad' WHERE kind = 'review_requested'",
+        "UPDATE task_events SET run_id = 99 WHERE kind = 'review_requested'",
+        "UPDATE task_events SET payload = '{\"summary\":\"Review the implementation\",\"implementer\":\"other-worker\",\"reviewer\":\"fixture-reviewer\"}' WHERE kind = 'review_requested'",
+        "UPDATE task_runs SET profile = 'other-worker' WHERE id = 1",
+        "UPDATE task_runs SET status = 'completed' WHERE id = 1",
+        "UPDATE task_runs SET outcome = 'completed' WHERE id = 1",
+        "INSERT INTO task_events VALUES (4, 'task-1', NULL, 'status', '{\"status\":\"ready\"}', 2000000000)",
+    ],
+)
+def test_review_rework_rejects_malformed_or_laundered_handoff(change):
+    conn = _review_rework_connection()
+    conn.execute(change)
+    conn.commit()
+
+    assert native_boundary.review_rework_is_authorized(conn, "task-1") is False
+    conn.close()
+
+
+def test_changes_requested_payload_requires_exact_unique_schema():
+    valid = json.dumps(
+        {
+            "reason": "fix",
+            "implementer": "fixture-worker",
+            "reviewer": "fixture-reviewer",
+            "status": "ready",
+        }
+    )
+    assert native_boundary.requeue_transition_is_authorized(
+        "changes_requested", valid
+    ) is True
+    assert native_boundary.requeue_transition_is_authorized(
+        "changes_requested",
+        '{"reason":"a","reason":"b","implementer":"fixture-worker",'
+        '"reviewer":"fixture-reviewer","status":"ready"}',
+    ) is False
 
 
 def _staged_runtime() -> Path:
@@ -1754,6 +2019,26 @@ def test_staged_dispatch_fails_closed_on_malformed_run_timestamp(
             ),
             "recent_success",
         ),
+        (
+            "reclaimed",
+            _manual_reclaim_payload(terminated=True),
+            "recent_success",
+        ),
+        (
+            "reclaimed",
+            _manual_reclaim_payload(sigkill=True),
+            "recent_success",
+        ),
+        (
+            "reclaimed",
+            _manual_reclaim_payload(host_local=True),
+            "recent_success",
+        ),
+        (
+            "reclaimed",
+            _stale_reclaim_payload(heartbeat_stale=False),
+            "recent_success",
+        ),
     ],
 )
 def test_staged_dispatch_validates_requeue_payload(
@@ -2112,3 +2397,112 @@ def test_old_runtime_lifecycle_state_is_admitted_by_staged_runtime(tmp_path):
         check=False,
     )
     assert staged_result.returncode == 0, staged_result.stderr or staged_result.stdout
+
+
+def test_staged_dispatch_admits_canonical_review_rework_handoffs(tmp_path):
+    runtime = _staged_runtime()
+    db = tmp_path / "review-rework.db"
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_ids = []
+            guards = {}
+            for promoted in (False, True):
+                task_id = kb.create_task(
+                    conn,
+                    title=f"Review rework {promoted}",
+                    body="Return reviewed implementation for bounded rework.",
+                    assignee="default",
+                    created_by="fixture",
+                )
+                implementation = kb.claim_task(
+                    conn, task_id, claimer=f"fixture-implementer:{promoted}"
+                )
+                assert implementation is not None
+                assert kb.request_review(
+                    conn,
+                    task_id,
+                    summary="Review the implementation",
+                    reviewer="reviewer",
+                    expected_run_id=implementation.current_run_id,
+                )
+                review = kb.claim_review_task(
+                    conn, task_id, claimer=f"fixture-reviewer:{promoted}"
+                )
+                assert review is not None
+
+                parent_id = None
+                if promoted:
+                    parent_id = kb.create_task(
+                        conn,
+                        title="Open parent gate",
+                        assignee="default",
+                        created_by="fixture",
+                    )
+                    kb.link_tasks(conn, parent_id, task_id)
+
+                assert kb.request_changes(
+                    conn,
+                    task_id,
+                    reason="Please fix the exact finding",
+                    expected_run_id=review.current_run_id,
+                )
+                if parent_id is not None:
+                    parent_run = kb.claim_task(
+                        conn, parent_id, claimer="fixture-parent:1"
+                    )
+                    assert parent_run is not None
+                    assert kb.complete_task(
+                        conn,
+                        parent_id,
+                        summary="Parent gate complete",
+                        expected_run_id=parent_run.current_run_id,
+                        fire_lifecycle_hook=False,
+                    )
+                    kb.recompute_ready(conn)
+
+                kb.add_comment(
+                    conn, task_id, "fixture-controller", __FIXTURE_PR_URL__
+                )
+                task_ids.append(task_id)
+                guards[str(promoted)] = kb.check_respawn_guard(
+                    conn, task_id, lane="ready"
+                )
+
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=10,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "guards": guards,
+                "task_ids": task_ids,
+                "spawned": [item[0] for item in result.spawned],
+                "guarded": result.respawn_guarded,
+            }))
+        """
+    ).replace("__FIXTURE_PR_URL__", repr(FIXTURE_PR_URL))
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(runtime, tmp_path, db=db),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["guards"] == {"False": None, "True": None}
+    assert sorted(probe["spawned"]) == sorted(probe["task_ids"])
+    assert all(
+        task_id not in {item[0] for item in probe["guarded"]}
+        for task_id in probe["task_ids"]
+    )
