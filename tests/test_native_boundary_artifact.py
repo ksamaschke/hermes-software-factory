@@ -46,7 +46,7 @@ native_boundary = _load_module("native_boundary_for_tests", NATIVE_PATH)
 def test_static_manifest_and_patch_are_pinned():
     manifest = builder._static_manifest()
     assert manifest["schema"] == "factory.native-boundary.v1"
-    assert manifest["artifact_version"] == "1.0.9"
+    assert manifest["artifact_version"] == "1.0.10"
     assert manifest["copy_policy"] == {
         "fresh_copy_required": True,
         "reject_symlinks": True,
@@ -704,7 +704,7 @@ def _stale_reclaim_payload(**updates):
         "terminated": False,
         "sigkill": False,
         "last_heartbeat_at": None,
-        "heartbeat_stale": True,
+        "heartbeat_stale": False,
         "claim_expires": now - 10,
         "now": now,
         "retry_status": "ready",
@@ -730,7 +730,7 @@ def _stale_reclaim_payload(**updates):
         _stale_reclaim_payload(termination_attempted=True),
         _stale_reclaim_payload(terminated=True),
         _stale_reclaim_payload(sigkill=True),
-        _stale_reclaim_payload(heartbeat_stale=False),
+        _stale_reclaim_payload(heartbeat_stale=True),
         _stale_reclaim_payload(
             last_heartbeat_at=int(time.time()) - 4_000,
             heartbeat_stale=False,
@@ -757,6 +757,10 @@ def test_reclaim_transition_rejects_inconsistent_metadata(payload):
             terminated=True,
         ),
         _stale_reclaim_payload(),
+        _stale_reclaim_payload(
+            last_heartbeat_at=int(time.time()) - 10,
+            heartbeat_stale=False,
+        ),
         _stale_reclaim_payload(
             last_heartbeat_at=int(time.time()) - 4_000,
             heartbeat_stale=True,
@@ -953,7 +957,6 @@ def test_review_rework_accepts_canonical_handoff(promoted):
         "UPDATE task_events SET run_id = 99 WHERE kind = 'review_requested'",
         "UPDATE task_events SET payload = '{\"summary\":\"Review the implementation\",\"implementer\":\"other-worker\",\"reviewer\":\"fixture-reviewer\"}' WHERE kind = 'review_requested'",
         "UPDATE task_runs SET profile = 'other-worker' WHERE id = 1",
-        "UPDATE task_runs SET status = 'completed' WHERE id = 1",
         "UPDATE task_runs SET outcome = 'completed' WHERE id = 1",
         "INSERT INTO task_events VALUES (4, 'task-1', NULL, 'status', '{\"status\":\"ready\"}', 2000000000)",
     ],
@@ -1959,7 +1962,7 @@ def test_staged_dispatch_fails_closed_on_malformed_run_timestamp(
                     "last_heartbeat_at": None,
                     "now": _TEST_LIFECYCLE_BASE + 1,
                     "host_local": False,
-                    "heartbeat_stale": True,
+                    "heartbeat_stale": False,
                     "retry_status": "ready",
                     "prev_pid": None,
                     "termination_attempted": False,
@@ -2036,7 +2039,7 @@ def test_staged_dispatch_fails_closed_on_malformed_run_timestamp(
         ),
         (
             "reclaimed",
-            _stale_reclaim_payload(heartbeat_stale=False),
+            _stale_reclaim_payload(heartbeat_stale=True),
             "recent_success",
         ),
     ],
@@ -2506,3 +2509,267 @@ def test_staged_dispatch_admits_canonical_review_rework_handoffs(tmp_path):
         task_id not in {item[0] for item in probe["guarded"]}
         for task_id in probe["task_ids"]
     )
+
+
+def test_staged_review_lane_requires_native_handoff_provenance(tmp_path):
+    runtime = _staged_runtime()
+    db = tmp_path / "review-handoff.db"
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        from pathlib import Path
+
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            valid = kb.create_task(
+                conn,
+                title="Canonical review handoff",
+                assignee="default",
+                created_by="fixture",
+            )
+            implementation = kb.claim_task(conn, valid, claimer="fixture:impl")
+            assert implementation is not None
+            assert kb.request_review(
+                conn,
+                valid,
+                summary="Review the exact implementation",
+                reviewer="default",
+                expected_run_id=implementation.current_run_id,
+            )
+            assert kb.check_respawn_guard(conn, valid, lane="review") is None
+
+            forged = kb.create_task(
+                conn,
+                title="Forged review row",
+                assignee="default",
+                created_by="fixture",
+            )
+            conn.execute(
+                "UPDATE tasks SET status = 'review' WHERE id = ?",
+                (forged,),
+            )
+            conn.commit()
+            forged_guard = kb.check_respawn_guard(conn, forged, lane="review")
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=10,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "valid": valid,
+                "forged": forged,
+                "forged_guard": forged_guard,
+                "spawned": [item[0] for item in result.spawned],
+                "guarded": result.respawn_guarded,
+            }))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(runtime, tmp_path, db=db),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["forged_guard"] == "recent_success"
+    assert probe["valid"] in probe["spawned"]
+    assert probe["forged"] not in probe["spawned"]
+    assert [probe["forged"], "recent_success"] in probe["guarded"]
+
+
+def test_staged_remote_reclaim_with_fresh_heartbeat_is_admitted(tmp_path):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import time
+        from pathlib import Path
+
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="Remote stale claim with fresh heartbeat",
+                assignee="default",
+                created_by="fixture",
+            )
+            running = kb.claim_task(
+                conn, task_id, claimer="foreign-host:123"
+            )
+            assert running is not None
+            now = int(time.time())
+            conn.execute(
+                "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ? "
+                "WHERE id = ?",
+                (now - 10, now - 1, task_id),
+            )
+            conn.commit()
+            assert kb.release_stale_claims(conn) == 1
+            event = conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'reclaimed' "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            payload = json.loads(event["payload"])
+            guard = kb.check_respawn_guard(conn, task_id, lane="ready")
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "task_id": task_id,
+                "payload": payload,
+                "guard": guard,
+                "spawned": [item[0] for item in result.spawned],
+                "guarded": result.respawn_guarded,
+            }))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "remote-fresh-heartbeat.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["payload"]["host_local"] is False
+    assert probe["payload"]["heartbeat_stale"] is False
+    assert probe["guard"] is None
+    assert probe["spawned"] == [probe["task_id"]]
+    assert probe["guarded"] == []
+
+
+def test_staged_dispatch_preflight_rejects_malformed_durable_storage(tmp_path):
+    runtime = _staged_runtime()
+    lock_db = tmp_path / "dispatch-lock.db"
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import time
+        from pathlib import Path
+
+        from hermes_cli import kanban_db as kb
+
+        root = Path(os.environ["TMPDIR"])
+        results = []
+
+        def run_case(name, mutate):
+            db = root / f"{name}.db"
+            kb.init_db(db)
+            with kb.connect_closing(db) as conn:
+                task_id = kb.create_task(
+                    conn,
+                    title=f"Malformed {name}",
+                    assignee="default",
+                    created_by="fixture",
+                )
+                mutate(conn, task_id)
+                conn.commit()
+                result = kb.dispatch_once(
+                    conn,
+                    dry_run=True,
+                    max_spawn=10,
+                    reconcile_orphans=True,
+                )
+                results.append({
+                    "name": name,
+                    "spawned": [item[0] for item in result.spawned],
+                    "guarded": result.respawn_guarded,
+                })
+
+        task_updates = {
+            "bad_heartbeat": ("last_heartbeat_at", "not-a-timestamp"),
+            "blob_lock": ("claim_lock", b"not-a-lock"),
+            "bad_pid": ("worker_pid", "not-a-pid"),
+            "bad_failures": ("consecutive_failures", "bad"),
+            "fractional_failures": ("consecutive_failures", 1.5),
+            "fractional_recurrences": ("block_recurrences", 1.5),
+        }
+        for name, (field, value) in task_updates.items():
+            run_case(
+                name,
+                lambda conn, task_id, field=field, value=value: conn.execute(
+                    f"UPDATE tasks SET {field} = ? WHERE id = ?",
+                    (value, task_id),
+                ),
+            )
+
+        payloads = {
+            "deep_json": '{"status":' + ('[' * 1100) + '0' + (']' * 1100) + '}',
+            "duplicate_json": (
+                '{"reason":"a","reason":"b","implementer":"default",'
+                '"reviewer":"default","status":"ready"}'
+            ),
+            "extra_json": (
+                '{"reason":"a","implementer":"default","reviewer":"default",'
+                '"status":"ready","extra":true}'
+            ),
+            "scalar_json": '1',
+            "oversized_json": '{"value":"' + ('x' * 70000) + '"}',
+        }
+        for name, payload in payloads.items():
+            run_case(
+                name,
+                lambda conn, task_id, payload=payload: conn.execute(
+                    "INSERT INTO task_events "
+                    "(task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
+                    (task_id, "changes_requested", payload, int(time.time())),
+                ),
+            )
+
+        run_case(
+            "low_event_id",
+            lambda conn, task_id: conn.execute(
+                "INSERT INTO task_events "
+                "(id, task_id, kind, payload, created_at) VALUES (0, ?, ?, ?, ?)",
+                (task_id, "commented", '{}', int(time.time())),
+            ),
+        )
+        run_case(
+            "low_active_run_id",
+            lambda conn, task_id: conn.execute(
+                "INSERT INTO task_runs "
+                "(id, task_id, profile, status, outcome, started_at, ended_at) "
+                "VALUES (0, ?, 'default', 'running', NULL, ?, NULL)",
+                (task_id, int(time.time())),
+            ),
+        )
+        print(json.dumps(results))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(runtime, tmp_path, db=lock_db),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    results = json.loads(result.stdout)
+    assert len(results) == 13
+    assert all(not item["spawned"] for item in results)
+    assert all(item["guarded"] for item in results)

@@ -44,6 +44,7 @@ _TERMINAL_RUN_STATE_PAIRS = frozenset(
     {
         ("blocked", "blocked"),
         ("completed", "completed"),
+        ("completed", "review_requested"),
         ("done", "completed"),
         ("review_requested", "review_requested"),
         ("review", "review_requested"),
@@ -379,12 +380,9 @@ def requeue_transition_is_authorized(kind: Any, payload: Any) -> bool:
             return False
         if type(stale_lock) is not str or not stale_lock.strip():
             return False
-        host_prefix = f"{socket.gethostname() or 'unknown-host'}:"
-        claim_host_matches = stale_lock.startswith(host_prefix)
         expected_heartbeat_stale = (
-            not claim_host_matches
-            or heartbeat_at is None
-            or (observed_now - heartbeat_at)
+            heartbeat_at is not None
+            and (observed_now - heartbeat_at)
             > _CLAIM_HEARTBEAT_MAX_STALE_SECONDS
         )
         if value["heartbeat_stale"] is not expected_heartbeat_stale:
@@ -428,6 +426,41 @@ def requeue_transition_is_authorized(kind: Any, payload: Any) -> bool:
             and set(changed_fields).issubset({"title", "body", "assignee"})
             and "body" in changed_fields
             and value["block_recurrences_reset"] is True
+        )
+    return False
+
+
+def _durable_requeue_payload_is_canonical(kind: str, payload: Any) -> bool:
+    """Accept native storage forms, including non-authorizing legacy forms."""
+    if requeue_transition_is_authorized(kind, payload):
+        return True
+    value = _json_object(payload)
+    if kind == "status":
+        return (
+            value is not None
+            and frozenset(value)
+            == {"status", "reason", "parent", "previous_status"}
+            and value["status"] == "todo"
+            and value["reason"] == "ancestor_reopened"
+            and type(value["parent"]) is str
+            and bool(value["parent"].strip())
+            and type(value["previous_status"]) is str
+            and bool(value["previous_status"].strip())
+        )
+    if kind == "promoted":
+        return (
+            value is not None
+            and frozenset(value) == {"status"}
+            and value["status"] == "review"
+        )
+    if kind == "unblocked":
+        return (
+            value is not None
+            and frozenset(value) == {"status", "resume_status"}
+            and type(value["status"]) is str
+            and value["status"] in {"ready", "todo", "review"}
+            and type(value["resume_status"]) is str
+            and value["resume_status"] in {"ready", "review"}
         )
     return False
 
@@ -528,6 +561,93 @@ def same_owner_requeue_is_authorized(
         return False
     latest_id = _positive_row_id(latest["id"])
     return latest_id is not None and latest_id == transition_id
+
+
+def review_handoff_is_authorized(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return whether a review-lane task has exact native handoff provenance."""
+    task = conn.execute(
+        "SELECT status, assignee, claim_lock, current_run_id, "
+        "consecutive_failures FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if task is None:
+        return False
+    if (
+        task["status"] != "review"
+        or task["claim_lock"] is not None
+        or task["current_run_id"] is not None
+        or type(task["consecutive_failures"]) is not int
+        or task["consecutive_failures"] < 0
+    ):
+        return False
+    reviewer = _canonical_profile_id(task["assignee"])
+    if reviewer is None:
+        return False
+
+    implementation_run = conn.execute(
+        "SELECT id, profile, status, outcome, started_at, ended_at "
+        "FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if implementation_run is None:
+        return False
+    implementation_run_id = _positive_row_id(implementation_run["id"])
+    implementer = _canonical_profile_id(implementation_run["profile"])
+    if implementation_run_id is None or implementer is None:
+        return False
+    if (
+        implementation_run["outcome"] != "review_requested"
+        or implementation_run["status"] not in {"review", "completed"}
+        or not terminal_run_state_is_authorized(
+            implementation_run["status"], implementation_run["outcome"]
+        )
+    ):
+        return False
+
+    now = int(time.time())
+    started_at = validated_lifecycle_timestamp(
+        implementation_run["started_at"], maximum=now
+    )
+    ended_at = validated_lifecycle_timestamp(
+        implementation_run["ended_at"], maximum=now
+    )
+    if started_at is None or ended_at is None or ended_at < started_at:
+        return False
+
+    review_event = conn.execute(
+        "SELECT id, run_id, payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_requested' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if review_event is None:
+        return False
+    review_event_id = _positive_row_id(review_event["id"])
+    review_event_run_id = _positive_row_id(review_event["run_id"])
+    payload = _review_requested_payload(review_event["payload"])
+    created_at = validated_lifecycle_timestamp(
+        review_event["created_at"], maximum=now
+    )
+    if (
+        review_event_id is None
+        or review_event_run_id != implementation_run_id
+        or payload is None
+        or payload["implementer"] != implementer
+        or payload["reviewer"] != reviewer
+        or created_at is None
+        or created_at < ended_at
+    ):
+        return False
+
+    latest = conn.execute(
+        "SELECT id FROM task_events WHERE task_id = ? "
+        "AND kind NOT IN (?, ?) ORDER BY id DESC LIMIT 1",
+        (task_id, *_OBSERVATION_EVENT_KINDS),
+    ).fetchone()
+    return (
+        latest is not None
+        and _positive_row_id(latest["id"]) == review_event_id
+    )
 
 
 def review_rework_is_authorized(
@@ -687,3 +807,232 @@ def review_rework_is_authorized(
         latest["created_at"], maximum=now
     )
     return promoted_at is not None and promoted_at >= change_created_at
+
+
+def dispatcher_state_rejections(
+    conn: sqlite3.Connection,
+) -> list[tuple[str, str]]:
+    """Find non-terminal durable corruption before any dispatcher mutation.
+
+    The dispatcher performs reclaim and promotion before its per-task respawn
+    guard.  This board-wide read barrier keeps malformed SQLite storage from
+    reaching permissive ``int(...)``/string operations in those native paths.
+    A malformed task therefore defers the entire tick rather than partially
+    mutating state and then admitting work from a corrupted history.
+    """
+    now = int(time.time())
+    rows = conn.execute(
+        "SELECT id, status, assignee, priority, created_at, started_at, "
+        "claim_lock, claim_expires, worker_pid, last_heartbeat_at, "
+        "current_run_id, consecutive_failures, block_recurrences, "
+        "max_retries, max_runtime_seconds, last_failure_error, block_kind "
+        "FROM tasks WHERE status IN "
+        "('todo', 'ready', 'running', 'blocked', 'review')"
+    ).fetchall()
+    rejected: list[tuple[str, str]] = []
+
+    for task in rows:
+        raw_task_id = task["id"]
+        task_id = raw_task_id if type(raw_task_id) is str else "<malformed>"
+        malformed = False
+
+        def reject() -> None:
+            nonlocal malformed
+            malformed = True
+
+        if type(raw_task_id) is not str or not raw_task_id.strip():
+            reject()
+        if type(task["status"]) is not str:
+            reject()
+        assignee = task["assignee"]
+        if assignee is not None and _canonical_profile_id(assignee) is None:
+            reject()
+        for field in ("priority", "consecutive_failures", "block_recurrences"):
+            value = task[field]
+            if type(value) is not int or (
+                field != "priority" and value < 0
+            ):
+                reject()
+        for field in ("created_at", "started_at", "last_heartbeat_at"):
+            value = task[field]
+            if value is not None and validated_lifecycle_timestamp(
+                value, maximum=now
+            ) is None:
+                reject()
+        claim_expires = task["claim_expires"]
+        if claim_expires is not None and (
+            type(claim_expires) is not int
+            or claim_expires < _MIN_LIFECYCLE_TIMESTAMP
+        ):
+            reject()
+        claim_lock = task["claim_lock"]
+        if claim_lock is not None and (
+            type(claim_lock) is not str or not claim_lock.strip()
+        ):
+            reject()
+        worker_pid = task["worker_pid"]
+        if worker_pid is not None and (
+            type(worker_pid) is not int or worker_pid <= 0
+        ):
+            reject()
+        current_run_id = task["current_run_id"]
+        if current_run_id is not None and _positive_row_id(current_run_id) is None:
+            reject()
+        max_retries = task["max_retries"]
+        if max_retries is not None and (
+            type(max_retries) is not int or max_retries < 0
+        ):
+            reject()
+        max_runtime = task["max_runtime_seconds"]
+        if max_runtime is not None and (
+            type(max_runtime) is not int or max_runtime <= 0
+        ):
+            reject()
+        for field in ("last_failure_error", "block_kind"):
+            value = task[field]
+            if value is not None and type(value) is not str:
+                reject()
+
+        runs = conn.execute(
+            "SELECT id, profile, status, outcome, summary, error, metadata, "
+            "started_at, ended_at, claim_lock, claim_expires, worker_pid "
+            "FROM task_runs WHERE task_id = ?",
+            (raw_task_id,),
+        ).fetchall()
+        active_ids: list[int] = []
+        seen_run_ids: set[int] = set()
+        for run in runs:
+            run_id = _positive_row_id(run["id"])
+            if run_id is None or run_id in seen_run_ids:
+                reject()
+                continue
+            seen_run_ids.add(run_id)
+            profile = run["profile"]
+            if profile is not None and _canonical_profile_id(profile) is None:
+                reject()
+            started_at = validated_lifecycle_timestamp(
+                run["started_at"], maximum=now
+            )
+            if started_at is None:
+                reject()
+            status = run["status"]
+            outcome = run["outcome"]
+            ended_at = run["ended_at"]
+            if status == "running" and outcome is None and ended_at is None:
+                active_ids.append(run_id)
+            else:
+                terminal_at = validated_lifecycle_timestamp(
+                    ended_at, maximum=now
+                )
+                if (
+                    not terminal_run_state_is_authorized(status, outcome)
+                    or terminal_at is None
+                    or (started_at is not None and terminal_at < started_at)
+                ):
+                    reject()
+            for field in ("summary", "error"):
+                value = run[field]
+                if value is not None and type(value) is not str:
+                    reject()
+            metadata = run["metadata"]
+            if metadata is not None and _json_object(metadata) is None:
+                reject()
+            run_lock = run["claim_lock"]
+            if run_lock is not None and (
+                type(run_lock) is not str or not run_lock.strip()
+            ):
+                reject()
+            run_expires = run["claim_expires"]
+            if run_expires is not None and (
+                type(run_expires) is not int
+                or run_expires < _MIN_LIFECYCLE_TIMESTAMP
+            ):
+                reject()
+            run_pid = run["worker_pid"]
+            if run_pid is not None and (
+                type(run_pid) is not int or run_pid <= 0
+            ):
+                reject()
+
+        if len(active_ids) > 1:
+            reject()
+        if active_ids:
+            if task["status"] != "running" or current_run_id != active_ids[0]:
+                reject()
+        elif current_run_id is not None:
+            reject()
+        if task["status"] != "running" and current_run_id is not None:
+            reject()
+
+        events = conn.execute(
+            "SELECT id, run_id, kind, payload, created_at FROM task_events "
+            "WHERE task_id = ?",
+            (raw_task_id,),
+        ).fetchall()
+        seen_event_ids: set[int] = set()
+        for event in events:
+            event_id = _positive_row_id(event["id"])
+            if event_id is None or event_id in seen_event_ids:
+                reject()
+            else:
+                seen_event_ids.add(event_id)
+            event_run_id = event["run_id"]
+            if event_run_id is not None and _positive_row_id(event_run_id) is None:
+                reject()
+            kind = event["kind"]
+            if type(kind) is not str or not kind.strip():
+                reject()
+            if validated_lifecycle_timestamp(
+                event["created_at"], maximum=now
+            ) is None:
+                reject()
+            payload = event["payload"]
+            if payload is not None and _json_object(payload) is None:
+                reject()
+
+        latest_lifecycle_event = next(
+            (
+                event
+                for event in reversed(events)
+                if event["kind"] not in _OBSERVATION_EVENT_KINDS
+            ),
+            None,
+        )
+        if latest_lifecycle_event is not None:
+            latest_kind = latest_lifecycle_event["kind"]
+            latest_payload = latest_lifecycle_event["payload"]
+            if (
+                latest_kind in _REQUEUE_EVENT_KINDS
+                and not _durable_requeue_payload_is_canonical(
+                    latest_kind, latest_payload
+                )
+            ):
+                reject()
+            if (
+                latest_kind == "review_requested"
+                and _review_requested_payload(latest_payload) is None
+            ):
+                reject()
+
+        comments = conn.execute(
+            "SELECT id, body, created_at FROM task_comments WHERE task_id = ?",
+            (raw_task_id,),
+        ).fetchall()
+        seen_comment_ids: set[int] = set()
+        for comment in comments:
+            comment_id = _positive_row_id(comment["id"])
+            if comment_id is None or comment_id in seen_comment_ids:
+                reject()
+            else:
+                seen_comment_ids.add(comment_id)
+            if type(comment["body"]) is not str:
+                reject()
+            if validated_lifecycle_timestamp(
+                comment["created_at"], maximum=now
+            ) is None:
+                reject()
+
+        if malformed:
+            rejected.append((task_id, "malformed_durable_state"))
+
+    return rejected

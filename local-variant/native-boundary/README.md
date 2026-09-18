@@ -21,8 +21,15 @@ of the pinned Hermes runtime:
 - reviewer-requested rework is admitted through a recent PR guard only when
   the exact terminal review run, `changes_requested` event, implementer,
   reviewer, status, timestamps, event/run identifiers, and any parent-gate
-  promotion agree. Reclaim evidence additionally enforces native cross-field
-  termination, host-local, and heartbeat consistency.
+  promotion agree. A review-lane worker likewise starts only from an exact
+  implementation-run plus `review_requested` handoff; a bare `review` status
+  is never authority. Reclaim evidence additionally enforces native
+  cross-field termination, host-local, and heartbeat consistency.
+- before reclaim, orphan repair, promotion, or spawn, a board-wide read barrier
+  validates non-terminal task scalars, run/event/comment identifiers and
+  timestamps, run state, JSON storage, transition schemas, counters, PIDs,
+  locks, and claim fields. Any malformed durable row defers the tick before a
+  permissive native coercion can raise, partially mutate state, or spawn work.
 
 The artifact is fail-closed. It pins both input source files and the patch,
 rejects symlinks, hardlinks, special files, path escapes, patch mode/rename
