@@ -46,7 +46,7 @@ native_boundary = _load_module("native_boundary_for_tests", NATIVE_PATH)
 def test_static_manifest_and_patch_are_pinned():
     manifest = builder._static_manifest()
     assert manifest["schema"] == "factory.native-boundary.v1"
-    assert manifest["artifact_version"] == "1.0.13"
+    assert manifest["artifact_version"] == "1.0.14"
     assert manifest["copy_policy"] == {
         "fresh_copy_required": True,
         "reject_symlinks": True,
@@ -2068,16 +2068,20 @@ def test_staged_dispatch_validates_requeue_payload(
                 created_by="fixture",
             )
             now = int(time.time())
-            conn.execute(
+            run_cursor = conn.execute(
                 "INSERT INTO task_runs "
                 "(task_id, profile, status, started_at, ended_at, outcome) "
                 "VALUES (?, ?, 'done', ?, ?, 'completed')",
                 (task_id, "default", now, now),
             )
+            run_id = run_cursor.lastrowid
+            kind = __KIND__
+            event_run_id = run_id if kind == "reclaimed" else None
             conn.execute(
-                "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                "VALUES (?, __KIND__, ?, ?)",
-                (task_id, __PAYLOAD__, now),
+                "INSERT INTO task_events "
+                "(task_id, run_id, kind, payload, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (task_id, event_run_id, kind, __PAYLOAD__, now),
             )
             conn.commit()
             guard = kb.check_respawn_guard(conn, task_id, lane="ready")
@@ -3571,3 +3575,124 @@ def test_staged_unblocked_event_rejects_forged_run_identity(tmp_path):
     ]
     assert probe["guarded"] == [[probe["task_id"], "active_pr"]]
     assert probe["spawned"] == []
+
+
+def test_staged_status_event_rejects_forged_run_identity(tmp_path):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import time
+        from pathlib import Path
+
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.native_boundary import dispatcher_state_rejections
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="Forged status run identity",
+                body="Native ready-lane status transitions are runless.",
+                assignee="default",
+                created_by="fixture",
+            )
+            running = kb.claim_task(conn, task_id, claimer="fixture-owner:1")
+            assert running is not None
+            run_id = running.current_run_id
+            assert kb.complete_task(
+                conn,
+                task_id,
+                summary="completed fixture run",
+                expected_run_id=run_id,
+            )
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', current_run_id = NULL, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ?",
+                (task_id,),
+            )
+            conn.execute(
+                "INSERT INTO task_events(task_id, run_id, kind, payload, created_at) "
+                "VALUES (?, ?, 'status', ?, ?)",
+                (task_id, run_id, '{\"status\":\"ready\"}', int(time.time())),
+            )
+            conn.commit()
+            guard = kb.check_respawn_guard(conn, task_id, lane="ready")
+            rejections = dispatcher_state_rejections(conn)
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "task_id": task_id,
+                "guard": guard,
+                "rejections": rejections,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "status-run-id.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["guard"] == "recent_success"
+    assert probe["rejections"] == [
+        [probe["task_id"], "malformed_durable_state"]
+    ]
+    assert probe["guarded"] == [[probe["task_id"], "recent_success"]]
+    assert probe["spawned"] == []
+
+
+def test_staged_lifecycle_timestamp_accepts_a_bounded_synthetic_clock(tmp_path):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        from hermes_cli.native_boundary import validated_lifecycle_timestamp
+
+        value = 5_000_000
+        print(json.dumps({
+            "synthetic": validated_lifecycle_timestamp(
+                value, maximum=value + 400
+            ),
+            "unbounded": validated_lifecycle_timestamp(value),
+            "real_clock": validated_lifecycle_timestamp(
+                value, maximum=2_000_000_000
+            ),
+            "future": validated_lifecycle_timestamp(
+                value + 401, maximum=value + 400
+            ),
+        }))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(runtime, tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert json.loads(result.stdout) == {
+        "synthetic": 5_000_000,
+        "unbounded": None,
+        "real_clock": None,
+        "future": None,
+    }

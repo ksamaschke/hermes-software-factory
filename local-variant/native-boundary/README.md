@@ -11,15 +11,18 @@ of the pinned Hermes runtime:
   the prior native run profile. A material blocked/triage `specified` event is
   one such authority-bearing transition; title-only or assignee-only native
   specifications remain valid durable history but do not grant readmission.
-  Missing, malformed, implausibly old, or future lifecycle timestamps and
-  malformed/non-object transition payloads fail closed in both the helper and
-  the production respawn guard. Duplicate JSON members, unknown transition
-  fields, empty reclaim locks, and impossible run status/outcome pairs are not
-  authority. A canonical non-terminal run blocks duplicate dispatch; if its
-  task-level claim pointers are lost or disagree with the run, the task is
-  quarantined and orphan reconciliation may not close/re-admit it. Retry
-  counters, failure text, run state, and comment evidence are type-checked
-  before they affect admission. Comments and PR URLs are evidence only.
+  Missing, malformed, implausibly old under the real wall clock, or future
+  lifecycle timestamps and malformed/non-object transition payloads fail closed
+  in both the helper and the production respawn guard. A caller-supplied bounded
+  synthetic clock remains a separate positive test domain and cannot authorize
+  those same low timestamps under the real clock. Duplicate JSON members,
+  unknown transition fields, empty reclaim locks, and impossible run
+  status/outcome pairs are not authority. A canonical non-terminal run blocks
+  duplicate dispatch; if its task-level claim pointers are lost or disagree
+  with the run, the task is quarantined and orphan reconciliation may not
+  close/re-admit it. Retry counters, failure text, run state, and comment
+  evidence are type-checked before they affect admission. Comments and PR URLs
+  are evidence only.
 - reviewer-requested rework is admitted through a recent PR guard only when
   the exact terminal review run, `changes_requested` event, implementer,
   reviewer, status, timestamps, event/run identifiers, and any parent-gate

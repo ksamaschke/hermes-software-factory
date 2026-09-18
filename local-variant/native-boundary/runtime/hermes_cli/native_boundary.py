@@ -265,19 +265,22 @@ def validated_lifecycle_timestamp(
     *,
     maximum: int | None = None,
 ) -> int | None:
-    """Return a bounded positive SQLite integer timestamp, else fail closed."""
-    if (
-        type(value) is not int
-        or value < _MIN_LIFECYCLE_TIMESTAMP
-    ):
+    """Return a bounded positive SQLite integer timestamp, else fail closed.
+
+    Real wall-clock validation retains the plausible epoch floor.  A caller
+    supplying a bounded synthetic clock below that floor (as native deterministic
+    tests do) establishes a separate positive monotonic domain; values from that
+    domain remain bounded by the supplied maximum and cannot become live-board
+    authority under the real clock.
+    """
+    if type(value) is not int or value <= 0:
         return None
-    if maximum is not None:
-        if (
-            type(maximum) is not int
-            or maximum < _MIN_LIFECYCLE_TIMESTAMP
-            or value > maximum
-        ):
-            return None
+    if maximum is None:
+        return value if value >= _MIN_LIFECYCLE_TIMESTAMP else None
+    if type(maximum) is not int or maximum <= 0 or value > maximum:
+        return None
+    if maximum >= _MIN_LIFECYCLE_TIMESTAMP and value < _MIN_LIFECYCLE_TIMESTAMP:
+        return None
     return value
 
 
@@ -514,6 +517,26 @@ def _durable_requeue_payload_is_canonical(kind: str, payload: Any) -> bool:
             and value["resume_status"] in {"ready", "review"}
         )
     return False
+
+
+def requeue_transition_requires_null_run_id(kind: Any, payload: Any) -> bool:
+    """Return whether the native producer emits this transition without a run."""
+    if kind in {"promoted", "unblocked", "specified"}:
+        return True
+    return kind == "status" and requeue_transition_is_authorized(kind, payload)
+
+
+def requeue_transition_provenance_is_authorized(
+    kind: Any,
+    payload: Any,
+    run_id: Any,
+) -> bool:
+    """Validate payload plus the native run/runless producer contract."""
+    if not requeue_transition_is_authorized(kind, payload):
+        return False
+    if requeue_transition_requires_null_run_id(kind, payload):
+        return run_id is None
+    return _positive_row_id(run_id) is not None
 
 
 def same_owner_requeue_is_authorized(
@@ -1079,17 +1102,17 @@ def dispatcher_state_rejections(
                     or canonical_event_run_id not in seen_run_ids
                 ):
                     reject()
+            payload = event["payload"]
+            if payload is not None and _json_object(payload) is None:
+                reject()
             if (
-                kind in {"promoted", "unblocked", "specified"}
+                requeue_transition_requires_null_run_id(kind, payload)
                 and event_run_id is not None
             ):
                 reject()
             if validated_lifecycle_timestamp(
                 event["created_at"], maximum=now
             ) is None:
-                reject()
-            payload = event["payload"]
-            if payload is not None and _json_object(payload) is None:
                 reject()
 
         latest_lifecycle_event = next(
