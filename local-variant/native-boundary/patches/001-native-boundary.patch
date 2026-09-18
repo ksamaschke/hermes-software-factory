@@ -344,7 +344,7 @@
 +        ]
 --- /dev/null
 +++ b/hermes_cli/native_boundary.py
-@@ -0,0 +1,1237 @@
+@@ -0,0 +1,1440 @@
 +"""Fail-closed native boundary decisions for the versioned Factory artifact.
 +
 +This module is added to a disposable copied Hermes runtime by the artifact
@@ -860,6 +860,35 @@
 +    return value
 +
 +
++def _descendant_invalidated_payload(payload: Any) -> dict[str, Any] | None:
++    """Validate the native companion event emitted for ancestor reopening."""
++    value = _json_object(payload)
++    if value is None or frozenset(value) != {
++        "ancestor",
++        "prior_status",
++        "new_status",
++        "resume_status",
++    }:
++        return None
++    prior_status = value["prior_status"]
++    resume_status = value["resume_status"]
++    if (
++        value["new_status"] != "todo"
++        or type(value["ancestor"]) is not str
++        or not value["ancestor"].strip()
++        or type(prior_status) is not str
++        or prior_status not in {"ready", "review", "running", "done"}
++        or type(resume_status) is not str
++        or resume_status not in {"ready", "review"}
++    ):
++        return None
++    if prior_status == "review" and resume_status != "review":
++        return None
++    if prior_status in {"ready", "done"} and resume_status != "ready":
++        return None
++    return value
++
++
 +def _durable_requeue_payload_is_canonical(kind: str, payload: Any) -> bool:
 +    """Accept native storage forms, including non-authorizing legacy forms."""
 +    if requeue_transition_is_authorized(kind, payload):
@@ -1043,6 +1072,176 @@
 +    return latest_id is not None and latest_id == transition_id
 +
 +
++def _review_handoff_after_ancestor_reopen_is_authorized(
++    conn: sqlite3.Connection,
++    task_id: str,
++    reviewer: str,
++) -> bool:
++    """Validate the exact native suffix that resumes a review descendant."""
++    placeholders = ", ".join("?" for _ in _OBSERVATION_EVENT_KINDS)
++    suffix = conn.execute(
++        "SELECT id, run_id, kind, payload, created_at FROM task_events "
++        "WHERE task_id = ? "
++        f"AND kind NOT IN ({placeholders}) ORDER BY id DESC LIMIT 3",
++        (task_id, *_OBSERVATION_EVENT_KINDS),
++    ).fetchall()
++    if len(suffix) != 3:
++        return False
++    promoted, status_event, invalidated = suffix
++    if (
++        promoted["kind"] != "promoted"
++        or status_event["kind"] != "status"
++        or invalidated["kind"] != "descendant_invalidated"
++    ):
++        return False
++    promoted_id = _positive_row_id(promoted["id"])
++    status_id = _positive_row_id(status_event["id"])
++    invalidated_id = _positive_row_id(invalidated["id"])
++    promoted_payload = _json_object(promoted["payload"])
++    status_payload = _ancestor_reopened_status_payload(status_event["payload"])
++    invalidated_payload = _descendant_invalidated_payload(invalidated["payload"])
++    if (
++        promoted_id is None
++        or status_id is None
++        or invalidated_id is None
++        or not (invalidated_id < status_id < promoted_id)
++        or promoted["run_id"] is not None
++        or promoted_payload != {"status": "review"}
++        or status_payload is None
++        or invalidated_payload is None
++        or status_payload["resume_status"] != "review"
++        or invalidated_payload["resume_status"] != "review"
++        or status_payload["parent"] != invalidated_payload["ancestor"]
++        or status_payload["previous_status"] != invalidated_payload["prior_status"]
++    ):
++        return False
++
++    parent = conn.execute(
++        "SELECT p.status FROM task_links l "
++        "JOIN tasks p ON p.id = l.parent_id "
++        "WHERE l.child_id = ? AND l.parent_id = ?",
++        (task_id, status_payload["parent"]),
++    ).fetchone()
++    if parent is None or parent["status"] not in {"done", "archived"}:
++        return False
++
++    now = int(time.time())
++    invalidated_at = validated_lifecycle_timestamp(
++        invalidated["created_at"], maximum=now
++    )
++    status_at = validated_lifecycle_timestamp(status_event["created_at"], maximum=now)
++    promoted_at = validated_lifecycle_timestamp(promoted["created_at"], maximum=now)
++    if (
++        invalidated_at is None
++        or status_at is None
++        or promoted_at is None
++        or not (invalidated_at <= status_at <= promoted_at)
++    ):
++        return False
++
++    latest_run = conn.execute(
++        "SELECT id, profile, status, outcome, started_at, ended_at "
++        "FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
++        (task_id,),
++    ).fetchone()
++    if latest_run is None:
++        return False
++    previous_status = status_payload["previous_status"]
++    if previous_status == "review":
++        if status_event["run_id"] is not None or invalidated["run_id"] is not None:
++            return False
++        implementation_run = latest_run
++    elif previous_status == "running":
++        reviewer_run_id = _positive_row_id(status_event["run_id"])
++        if (
++            reviewer_run_id is None
++            or _positive_row_id(invalidated["run_id"]) != reviewer_run_id
++            or _positive_row_id(latest_run["id"]) != reviewer_run_id
++            or _canonical_profile_id(latest_run["profile"]) != reviewer
++            or latest_run["outcome"] != "reclaimed"
++            or not terminal_run_state_is_authorized(
++                latest_run["status"], latest_run["outcome"]
++            )
++        ):
++            return False
++        reviewer_started_at = validated_lifecycle_timestamp(
++            latest_run["started_at"], maximum=invalidated_at
++        )
++        reviewer_ended_at = validated_lifecycle_timestamp(
++            latest_run["ended_at"], maximum=invalidated_at
++        )
++        if (
++            reviewer_started_at is None
++            or reviewer_ended_at is None
++            or reviewer_ended_at < reviewer_started_at
++        ):
++            return False
++        implementation_run = conn.execute(
++            "SELECT id, profile, status, outcome, started_at, ended_at "
++            "FROM task_runs WHERE task_id = ? AND id < ? "
++            "ORDER BY id DESC LIMIT 1",
++            (task_id, reviewer_run_id),
++        ).fetchone()
++        if implementation_run is None:
++            return False
++    else:
++        return False
++
++    implementation_run_id = _positive_row_id(implementation_run["id"])
++    implementer = _canonical_profile_id(implementation_run["profile"])
++    implementation_started_at = validated_lifecycle_timestamp(
++        implementation_run["started_at"], maximum=now
++    )
++    implementation_ended_at = validated_lifecycle_timestamp(
++        implementation_run["ended_at"], maximum=now
++    )
++    if (
++        implementation_run_id is None
++        or implementer is None
++        or implementation_run["outcome"] != "review_requested"
++        or implementation_run["status"] not in {"review", "completed"}
++        or not terminal_run_state_is_authorized(
++            implementation_run["status"], implementation_run["outcome"]
++        )
++        or implementation_started_at is None
++        or implementation_ended_at is None
++        or implementation_ended_at < implementation_started_at
++    ):
++        return False
++
++    review_event = conn.execute(
++        "SELECT id, run_id, payload, created_at FROM task_events "
++        "WHERE task_id = ? AND kind = 'review_requested' "
++        "ORDER BY id DESC LIMIT 1",
++        (task_id,),
++    ).fetchone()
++    if review_event is None:
++        return False
++    review_event_id = _positive_row_id(review_event["id"])
++    review_payload = _review_requested_payload(review_event["payload"])
++    review_created_at = validated_lifecycle_timestamp(
++        review_event["created_at"], maximum=invalidated_at
++    )
++    if (
++        review_event_id is None
++        or review_event_id >= invalidated_id
++        or _positive_row_id(review_event["run_id"]) != implementation_run_id
++        or review_payload is None
++        or review_payload["implementer"] != implementer
++        or review_payload["reviewer"] != reviewer
++        or review_created_at is None
++        or review_created_at < implementation_ended_at
++    ):
++        return False
++    if previous_status == "running":
++        reviewer_started_at = validated_lifecycle_timestamp(
++            latest_run["started_at"], maximum=invalidated_at
++        )
++        if reviewer_started_at is None or reviewer_started_at < review_created_at:
++            return False
++    return True
++
++
 +def review_handoff_is_authorized(conn: sqlite3.Connection, task_id: str) -> bool:
 +    """Return whether a review-lane task has exact native handoff provenance."""
 +    task = conn.execute(
@@ -1063,6 +1262,10 @@
 +    reviewer = _canonical_profile_id(task["assignee"])
 +    if reviewer is None:
 +        return False
++    if _review_handoff_after_ancestor_reopen_is_authorized(
++        conn, task_id, reviewer
++    ):
++        return True
 +
 +    implementation_run = conn.execute(
 +        "SELECT id, profile, status, outcome, started_at, ended_at "

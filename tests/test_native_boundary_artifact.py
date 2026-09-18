@@ -46,7 +46,7 @@ native_boundary = _load_module("native_boundary_for_tests", NATIVE_PATH)
 def test_static_manifest_and_patch_are_pinned():
     manifest = builder._static_manifest()
     assert manifest["schema"] == "factory.native-boundary.v1"
-    assert manifest["artifact_version"] == "1.0.15"
+    assert manifest["artifact_version"] == "1.0.16"
     assert manifest["copy_policy"] == {
         "fresh_copy_required": True,
         "reject_symlinks": True,
@@ -3914,3 +3914,229 @@ def test_staged_run_scoped_requeue_events_require_real_run_identity(tmp_path):
     }
     assert {task_id for task_id, _ in probe["guarded"]} == malformed
     assert probe["spawned"] == [probe["healthy"]]
+
+
+def test_staged_ancestor_reopen_resumes_all_native_lanes(tmp_path: Path) -> None:
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import time
+        from pathlib import Path
+
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.native_boundary import dispatcher_state_rejections
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            parent = kb.create_task(conn, title="parent", assignee="default")
+            assert kb.complete_task(conn, parent)
+            ready = kb.create_task(conn, title="ready descendant", assignee="default", parents=[parent])
+            done = kb.create_task(conn, title="done descendant", assignee="default", parents=[parent])
+            assert kb.complete_task(conn, done)
+
+            review = kb.create_task(conn, title="review descendant", assignee="default", parents=[parent])
+            implementation = kb.claim_task(conn, review, claimer="fixture-implementer:review")
+            assert implementation is not None
+            assert kb.request_review(
+                conn, review, summary="review handoff", reviewer="default",
+                expected_run_id=implementation.current_run_id,
+            )
+
+            running_ready = kb.create_task(conn, title="running implementer descendant", assignee="default", parents=[parent])
+            assert kb.claim_task(conn, running_ready, claimer="fixture-implementer:running") is not None
+
+            running_review = kb.create_task(conn, title="running reviewer descendant", assignee="default", parents=[parent])
+            implementation = kb.claim_task(conn, running_review, claimer="fixture-implementer:handoff")
+            assert implementation is not None
+            assert kb.request_review(
+                conn, running_review, summary="running reviewer handoff", reviewer="default",
+                expected_run_id=implementation.current_run_id,
+            )
+            reviewer_run = kb.claim_review_task(conn, running_review, claimer="fixture-reviewer:running")
+            assert reviewer_run is not None
+
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status='todo', completed_at=NULL WHERE id=?", (parent,))
+            invalidated = kb.invalidate_descendants_for_parent_reopen(conn, parent, author="fixture")
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status='done', completed_at=? WHERE id=?", (int(time.time()), parent))
+
+            rejections = dispatcher_state_rejections(conn)
+            result = kb.dispatch_once(conn, dry_run=True, max_spawn=10, reconcile_orphans=False)
+            ids = [ready, done, review, running_ready, running_review]
+            rows = conn.execute("SELECT id, status FROM tasks WHERE id IN (?, ?, ?, ?, ?)", ids).fetchall()
+            events = conn.execute(
+                "SELECT task_id, run_id, payload FROM task_events WHERE kind='status' AND task_id IN (?, ?) ORDER BY id",
+                (review, running_review),
+            ).fetchall()
+            print(json.dumps({
+                "ids": ids, "review": review, "running_review": running_review,
+                "reviewer_run": reviewer_run.current_run_id,
+                "invalidated": invalidated, "rejections": rejections,
+                "spawned": [item[0] for item in result.spawned],
+                "guarded": result.respawn_guarded,
+                "statuses": {row["id"]: row["status"] for row in rows},
+                "events": [dict(row) for row in events],
+            }, sort_keys=True))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script], cwd=runtime,
+        env=_private_environment(runtime, tmp_path, db=tmp_path / "ancestor-reopen-lane-matrix.db"),
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["rejections"] == []
+    assert len(probe["invalidated"]["invalidated"]) == 5
+    assert probe["guarded"] == []
+    assert set(probe["spawned"]) == set(probe["ids"])
+    assert probe["statuses"] == {
+        task_id: ("review" if task_id in {probe["review"], probe["running_review"]} else "ready")
+        for task_id in probe["ids"]
+    }
+    payloads = {
+        row["task_id"]: (row["run_id"], json.loads(row["payload"]))
+        for row in probe["events"]
+    }
+    assert payloads[probe["review"]][0] is None
+    assert payloads[probe["review"]][1]["previous_status"] == "review"
+    assert payloads[probe["running_review"]][0] == probe["reviewer_run"]
+    assert payloads[probe["running_review"]][1]["previous_status"] == "running"
+    assert all(payload[1]["resume_status"] == "review" for payload in payloads.values())
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "status_run_null",
+        "invalidated_run_null",
+        "promoted_payload",
+        "missing_invalidated",
+        "reviewer_outcome",
+        "review_handoff_run_null",
+        "missing_parent_link",
+        "later_lifecycle_event",
+    ],
+)
+def test_staged_ancestor_reopen_review_handoff_rejects_tampering(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import time
+        from pathlib import Path
+
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.native_boundary import review_handoff_is_authorized
+
+        mutation = os.environ["FIXTURE_MUTATION"]
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            parent = kb.create_task(conn, title="parent", assignee="default")
+            assert kb.complete_task(conn, parent)
+            task = kb.create_task(
+                conn, title="review descendant", assignee="default", parents=[parent]
+            )
+            implementation = kb.claim_task(conn, task, claimer="implementer")
+            assert implementation is not None
+            assert kb.request_review(
+                conn, task, summary="handoff", reviewer="default",
+                expected_run_id=implementation.current_run_id,
+            )
+            reviewer = kb.claim_review_task(conn, task, claimer="reviewer")
+            assert reviewer is not None
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status='todo', completed_at=NULL WHERE id=?",
+                    (parent,),
+                )
+            kb.invalidate_descendants_for_parent_reopen(conn, parent, author="fixture")
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status='done', completed_at=? WHERE id=?",
+                    (int(time.time()), parent),
+                )
+            assert kb.recompute_ready(conn) == 1
+
+            if mutation == "status_run_null":
+                conn.execute(
+                    "UPDATE task_events SET run_id=NULL WHERE task_id=? AND kind='status'",
+                    (task,),
+                )
+            elif mutation == "invalidated_run_null":
+                conn.execute(
+                    "UPDATE task_events SET run_id=NULL WHERE task_id=? AND kind='descendant_invalidated'",
+                    (task,),
+                )
+            elif mutation == "promoted_payload":
+                conn.execute(
+                    "UPDATE task_events SET payload=? "
+                    "WHERE task_id=? AND kind='promoted'",
+                    (json.dumps({"status": "ready"}), task),
+                )
+            elif mutation == "missing_invalidated":
+                conn.execute(
+                    "DELETE FROM task_events WHERE task_id=? AND kind='descendant_invalidated'",
+                    (task,),
+                )
+            elif mutation == "reviewer_outcome":
+                conn.execute(
+                    "UPDATE task_runs SET outcome='completed' WHERE id=?",
+                    (reviewer.current_run_id,),
+                )
+            elif mutation == "review_handoff_run_null":
+                conn.execute(
+                    "UPDATE task_events SET run_id=NULL WHERE task_id=? AND kind='review_requested'",
+                    (task,),
+                )
+            elif mutation == "missing_parent_link":
+                conn.execute(
+                    "DELETE FROM task_links WHERE parent_id=? AND child_id=?",
+                    (parent, task),
+                )
+            elif mutation == "later_lifecycle_event":
+                conn.execute(
+                    "INSERT INTO task_events(task_id, kind, payload, created_at) "
+                    "VALUES (?, 'status', ?, ?)",
+                    (task, json.dumps({"status": "review"}), int(time.time())),
+                )
+            else:
+                raise AssertionError(mutation)
+            conn.commit()
+
+            authorized = review_handoff_is_authorized(conn, task)
+            guard = kb.check_respawn_guard(conn, task, lane="review")
+            result = kb.dispatch_once(
+                conn, dry_run=True, max_spawn=1, reconcile_orphans=False
+            )
+            print(json.dumps({
+                "task": task,
+                "authorized": authorized,
+                "guard": guard,
+                "spawned": [item[0] for item in result.spawned],
+                "guarded": result.respawn_guarded,
+            }))
+        """
+    )
+    env = _private_environment(
+        runtime, tmp_path, db=tmp_path / f"ancestor-reopen-{mutation}.db"
+    )
+    env["FIXTURE_MUTATION"] = mutation
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script], cwd=runtime, env=env,
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["authorized"] is False
+    assert probe["guard"] is not None
+    assert probe["spawned"] == []

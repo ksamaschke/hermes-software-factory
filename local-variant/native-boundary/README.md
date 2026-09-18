@@ -45,7 +45,11 @@ of the pinned Hermes runtime:
   run-scoped `reclaimed` and `changes_requested` evidence must name an existing
   run belonging to the same task. The legacy `ancestor_reopened` status payload,
   including `resume_status`, remains canonical; only a previously running
-  descendant carries its reclaimed run identity.
+  descendant carries its reclaimed run identity. A review descendant is
+  re-admitted only when the latest durable suffix is the exact native
+  `descendant_invalidated → status(ancestor_reopened) → promoted(review)`
+  sequence, its parent link is satisfied, and the original review handoff plus
+  any reclaimed reviewer run remain fully fenced.
 
 The artifact is fail-closed. It pins both input source files and the patch,
 rejects symlinks, hardlinks, special files, path escapes, patch mode/rename
