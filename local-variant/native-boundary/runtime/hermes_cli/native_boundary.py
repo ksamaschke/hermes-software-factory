@@ -565,7 +565,7 @@ def same_owner_requeue_is_authorized(
     ) or prior_run["outcome"] != "blocked":
         return False
     transition = conn.execute(
-        "SELECT id, kind, payload, created_at FROM task_events "
+        "SELECT id, run_id, kind, payload, created_at FROM task_events "
         "WHERE task_id = ? AND kind IN "
         "('unblocked', 'promoted', 'reclaimed', 'specified', 'status') "
         "ORDER BY id DESC LIMIT 1",
@@ -575,6 +575,8 @@ def same_owner_requeue_is_authorized(
         return False
     transition_id = _positive_row_id(transition["id"])
     if transition_id is None:
+        return False
+    if transition["kind"] == "specified" and transition["run_id"] is not None:
         return False
     if not requeue_transition_is_authorized(
         transition["kind"], transition["payload"]
@@ -856,30 +858,45 @@ def review_rework_is_authorized(
 
 def dispatcher_state_rejections(
     conn: sqlite3.Connection,
-) -> list[tuple[str, str]]:
+) -> list[tuple[Any, str]]:
     """Find non-terminal durable corruption before any dispatcher mutation.
 
     The dispatcher performs reclaim and promotion before its per-task respawn
-    guard.  This board-wide read barrier keeps malformed SQLite storage from
-    reaching permissive ``int(...)``/string operations in those native paths.
-    A malformed task therefore defers the entire tick rather than partially
-    mutating state and then admitting work from a corrupted history.
+    guard. This read barrier keeps malformed SQLite storage from reaching
+    permissive ``int(...)``/string operations in those native paths. Returned
+    identities remain the raw SQLite values so callers can quarantine exactly
+    the offending task while allowing unrelated canonical work to continue.
     """
     now = int(time.time())
     rows = conn.execute(
-        "SELECT id, status, assignee, priority, created_at, started_at, "
+        "SELECT id, CAST(id AS BLOB) AS storage_identity, "
+        "status, assignee, priority, created_at, started_at, "
         "claim_lock, claim_expires, worker_pid, last_heartbeat_at, "
         "current_run_id, consecutive_failures, block_recurrences, "
         "max_retries, max_runtime_seconds, last_failure_error, block_kind "
         "FROM tasks WHERE status IN "
         "('todo', 'ready', 'running', 'blocked', 'review')"
     ).fetchall()
-    rejected: list[tuple[str, str]] = []
+    rejected: list[tuple[Any, str]] = []
+
+    task_ids_by_storage_identity: dict[Any, list[Any]] = {}
+    for task in rows:
+        task_ids_by_storage_identity.setdefault(task["storage_identity"], []).append(
+            task["id"]
+        )
+    malformed_child_task_ids: set[Any] = set()
+    for table in ("task_runs", "task_events", "task_comments"):
+        for child in conn.execute(
+            f"SELECT CAST(task_id AS BLOB) AS storage_identity FROM {table} "
+            "WHERE typeof(task_id) != 'text'"
+        ).fetchall():
+            malformed_child_task_ids.update(
+                task_ids_by_storage_identity.get(child["storage_identity"], ())
+            )
 
     for task in rows:
         raw_task_id = task["id"]
-        task_id = raw_task_id if type(raw_task_id) is str else "<malformed>"
-        malformed = False
+        malformed = raw_task_id in malformed_child_task_ids
 
         def reject() -> None:
             nonlocal malformed
@@ -939,7 +956,7 @@ def dispatcher_state_rejections(
                 reject()
 
         runs = conn.execute(
-            "SELECT id, profile, status, outcome, summary, error, metadata, "
+            "SELECT task_id, id, profile, status, outcome, summary, error, metadata, "
             "started_at, ended_at, claim_lock, claim_expires, worker_pid "
             "FROM task_runs WHERE task_id = ?",
             (raw_task_id,),
@@ -947,6 +964,8 @@ def dispatcher_state_rejections(
         active_ids: list[int] = []
         seen_run_ids: set[int] = set()
         for run in runs:
+            if type(run["task_id"]) is not str or run["task_id"] != raw_task_id:
+                reject()
             run_id = _positive_row_id(run["id"])
             if run_id is None or run_id in seen_run_ids:
                 reject()
@@ -1010,12 +1029,14 @@ def dispatcher_state_rejections(
             reject()
 
         events = conn.execute(
-            "SELECT id, run_id, kind, payload, created_at FROM task_events "
-            "WHERE task_id = ?",
+            "SELECT task_id, id, run_id, kind, payload, created_at "
+            "FROM task_events WHERE task_id = ?",
             (raw_task_id,),
         ).fetchall()
         seen_event_ids: set[int] = set()
         for event in events:
+            if type(event["task_id"]) is not str or event["task_id"] != raw_task_id:
+                reject()
             event_id = _positive_row_id(event["id"])
             if event_id is None or event_id in seen_event_ids:
                 reject()
@@ -1026,6 +1047,8 @@ def dispatcher_state_rejections(
                 reject()
             kind = event["kind"]
             if type(kind) is not str or not kind.strip():
+                reject()
+            if kind == "specified" and event_run_id is not None:
                 reject()
             if validated_lifecycle_timestamp(
                 event["created_at"], maximum=now
@@ -1060,11 +1083,17 @@ def dispatcher_state_rejections(
                 reject()
 
         comments = conn.execute(
-            "SELECT id, body, created_at FROM task_comments WHERE task_id = ?",
+            "SELECT task_id, id, body, created_at FROM task_comments "
+            "WHERE task_id = ?",
             (raw_task_id,),
         ).fetchall()
         seen_comment_ids: set[int] = set()
         for comment in comments:
+            if (
+                type(comment["task_id"]) is not str
+                or comment["task_id"] != raw_task_id
+            ):
+                reject()
             comment_id = _positive_row_id(comment["id"])
             if comment_id is None or comment_id in seen_comment_ids:
                 reject()
@@ -1078,6 +1107,6 @@ def dispatcher_state_rejections(
                 reject()
 
         if malformed:
-            rejected.append((task_id, "malformed_durable_state"))
+            rejected.append((raw_task_id, "malformed_durable_state"))
 
     return rejected

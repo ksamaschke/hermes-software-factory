@@ -31,7 +31,11 @@ of the pinned Hermes runtime:
   timestamps, run state, JSON storage, transition schemas, counters, PIDs,
   locks, and claim fields. Malformed rows are quarantined per task before any
   permissive native coercion; unrelated canonical tasks can still be
-  reconciled, promoted, and dispatched.
+  reconciled, promoted, and dispatched. Raw SQLite task identities remain the
+  quarantine keys even when malformed values are rendered as a safe telemetry
+  sentinel. Byte-equivalent non-TEXT run/event/comment links cannot disappear
+  behind SQLite storage-class equality, and native `specified` events must keep
+  their producer-defined `run_id = NULL` provenance.
 
 The artifact is fail-closed. It pins both input source files and the patch,
 rejects symlinks, hardlinks, special files, path escapes, patch mode/rename
