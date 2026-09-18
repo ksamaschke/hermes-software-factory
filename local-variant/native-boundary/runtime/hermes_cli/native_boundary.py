@@ -408,7 +408,7 @@ def requeue_transition_is_authorized(kind: Any, payload: Any) -> bool:
             }
         ):
             return False
-        changed_fields = value.get("changed_fields")
+        changed_fields = _canonical_specified_fields(value.get("changed_fields"))
         previous_status = value.get("previous_status")
         status = value.get("status")
         return (
@@ -416,24 +416,69 @@ def requeue_transition_is_authorized(kind: Any, payload: Any) -> bool:
             and previous_status in {"blocked", "triage"}
             and type(status) is str
             and status in {"ready", "todo"}
-            and type(changed_fields) is list
-            and bool(changed_fields)
-            and all(
-                type(field) is str and bool(field.strip())
-                for field in changed_fields
-            )
-            and len(set(changed_fields)) == len(changed_fields)
-            and set(changed_fields).issubset({"title", "body", "assignee"})
+            and changed_fields is not None
             and "body" in changed_fields
             and value["block_recurrences_reset"] is True
         )
     return False
 
 
+def _canonical_specified_fields(value: Any) -> list[str] | None:
+    """Return an exact native changed-fields list, otherwise ``None``."""
+    if type(value) is not list or not value:
+        return None
+    if not all(type(field) is str for field in value):
+        return None
+    native_order = [
+        field for field in ("title", "body", "assignee") if field in value
+    ]
+    if value != native_order:
+        return None
+    return value
+
+
+def _native_specified_payload_is_canonical(payload: Any) -> bool:
+    """Validate both native ``specified`` producer storage forms.
+
+    ``specify_triage_task`` stores SQL NULL when no material field changes,
+    otherwise only ``changed_fields``. ``respecify_idle_task`` stores the full
+    transition envelope. Only a full envelope that materially changes ``body``
+    is re-admission authority; the other native forms are valid durable history
+    but grant no active-PR bypass.
+    """
+    if payload is None:
+        return True
+    value = _json_object(payload)
+    if value is None:
+        return False
+    changed_fields = _canonical_specified_fields(value.get("changed_fields"))
+    if changed_fields is None:
+        return False
+    keys = frozenset(value)
+    if keys == {"changed_fields"}:
+        return True
+    if keys != {
+        "changed_fields",
+        "previous_status",
+        "status",
+        "block_recurrences_reset",
+    }:
+        return False
+    return (
+        type(value["previous_status"]) is str
+        and value["previous_status"] in {"blocked", "triage"}
+        and type(value["status"]) is str
+        and value["status"] in {"ready", "todo"}
+        and value["block_recurrences_reset"] is True
+    )
+
+
 def _durable_requeue_payload_is_canonical(kind: str, payload: Any) -> bool:
     """Accept native storage forms, including non-authorizing legacy forms."""
     if requeue_transition_is_authorized(kind, payload):
         return True
+    if kind == "specified":
+        return _native_specified_payload_is_canonical(payload)
     value = _json_object(payload)
     if kind == "status":
         return (

@@ -46,7 +46,7 @@ native_boundary = _load_module("native_boundary_for_tests", NATIVE_PATH)
 def test_static_manifest_and_patch_are_pinned():
     manifest = builder._static_manifest()
     assert manifest["schema"] == "factory.native-boundary.v1"
-    assert manifest["artifact_version"] == "1.0.10"
+    assert manifest["artifact_version"] == "1.0.11"
     assert manifest["copy_policy"] == {
         "fresh_copy_required": True,
         "reject_symlinks": True,
@@ -2773,3 +2773,270 @@ def test_staged_dispatch_preflight_rejects_malformed_durable_storage(tmp_path):
     assert len(results) == 13
     assert all(not item["spawned"] for item in results)
     assert all(item["guarded"] for item in results)
+
+
+@pytest.mark.parametrize(
+    "specification",
+    [
+        {},
+        {"title": "Specified parent-gated child"},
+        {"body": "A concrete parent-gated contract."},
+        {"assignee": "reviewer"},
+    ],
+)
+def test_staged_parent_gated_triage_specification_does_not_block_healthy_dispatch(
+    tmp_path, specification
+):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        from pathlib import Path
+
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.native_boundary import dispatcher_state_rejections
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            parent = kb.create_task(
+                conn,
+                title="Open triage parent",
+                assignee="default",
+                created_by="fixture",
+                triage=True,
+            )
+            child = kb.create_task(
+                conn,
+                title="Parent-gated child",
+                body="Initial child contract.",
+                assignee="default",
+                created_by="fixture",
+                triage=True,
+            )
+            kb.link_tasks(conn, parent, child)
+            assert kb.specify_triage_task(
+                conn,
+                child,
+                author="fixture-controller",
+                **__SPECIFICATION__,
+            )
+            healthy = kb.create_task(
+                conn,
+                title="Independent healthy ready task",
+                assignee="default",
+                created_by="fixture",
+            )
+            task = kb.get_task(conn, child)
+            event = conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'specified' ORDER BY id DESC LIMIT 1",
+                (child,),
+            ).fetchone()
+            rejections = dispatcher_state_rejections(conn)
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "child": child,
+                "child_status": task.status,
+                "healthy": healthy,
+                "payload": event["payload"],
+                "rejections": rejections,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    ).replace("__SPECIFICATION__", repr(specification))
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / f"triage-{len(specification)}.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["child_status"] == "todo"
+    assert probe["rejections"] == []
+    assert probe["guarded"] == []
+    assert probe["spawned"] == [probe["healthy"]]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("title", "Materially corrected title"),
+        ("assignee", "reviewer"),
+    ],
+)
+def test_staged_native_respecification_storage_does_not_quarantine_dispatch(
+    tmp_path, field, value
+):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        from pathlib import Path
+
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.native_boundary import dispatcher_state_rejections
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="Canonical existing-PR continuation",
+                body="Original bounded contract.",
+                assignee="default",
+                created_by="fixture",
+            )
+            running = kb.claim_task(conn, task_id, claimer="fixture-owner:1")
+            assert running is not None
+            assert kb.block_task(
+                conn,
+                task_id,
+                reason="internal lifecycle repair",
+                kind="capability",
+                expected_run_id=running.current_run_id,
+            )
+            assert kb.respecify_idle_task(
+                conn,
+                task_id,
+                author="fixture-controller",
+                **{__FIELD__: __VALUE__},
+            ) == "ready"
+            kb.add_comment(conn, task_id, "fixture-controller", __FIXTURE_PR_URL__)
+            healthy = kb.create_task(
+                conn,
+                title="Independent healthy ready task",
+                assignee="default",
+                created_by="fixture",
+            )
+            guard = kb.check_respawn_guard(conn, task_id, lane="ready")
+            rejections = dispatcher_state_rejections(conn)
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "task_id": task_id,
+                "healthy": healthy,
+                "guard": guard,
+                "rejections": rejections,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    ).replace("__FIELD__", repr(field)).replace(
+        "__VALUE__", repr(value)
+    ).replace("__FIXTURE_PR_URL__", repr(FIXTURE_PR_URL))
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / f"respecify-{field}.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["guard"] == "active_pr"
+    assert probe["rejections"] == []
+    if field == "title":
+        assert [probe["task_id"], "active_pr"] in probe["guarded"]
+    else:
+        # The private HERMES_HOME intentionally has no reviewer profile, so the
+        # reassigned task is skipped before the ready-lane guard is recorded.
+        assert probe["guarded"] == []
+    assert probe["spawned"] == [probe["healthy"]]
+
+
+def test_staged_malformed_task_is_quarantined_without_blocking_healthy_dispatch(
+    tmp_path,
+):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import time
+        from pathlib import Path
+
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            malformed = kb.create_task(
+                conn,
+                title="Malformed quarantined task",
+                assignee="default",
+                created_by="fixture",
+                priority=100,
+            )
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES (?, 'specified', ?, ?)",
+                (
+                    malformed,
+                    '{"changed_fields":["body"],"unexpected":true}',
+                    int(time.time()),
+                ),
+            )
+            healthy = kb.create_task(
+                conn,
+                title="Independent healthy ready task",
+                assignee="default",
+                created_by="fixture",
+            )
+            conn.commit()
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=True,
+            )
+            print(json.dumps({
+                "malformed": malformed,
+                "healthy": healthy,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "task-scoped-preflight.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["guarded"] == [
+        [probe["malformed"], "malformed_durable_state"]
+    ]
+    assert probe["spawned"] == [probe["healthy"]]

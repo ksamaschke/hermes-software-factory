@@ -9,7 +9,8 @@ of the pinned Hermes runtime:
 - a same-owner continuation is admitted only when the task has durable,
   post-run lifecycle requeue evidence and the current assignee still matches
   the prior native run profile. A material blocked/triage `specified` event is
-  one such transition; title-only or malformed specifications are not.
+  one such authority-bearing transition; title-only or assignee-only native
+  specifications remain valid durable history but do not grant readmission.
   Missing, malformed, implausibly old, or future lifecycle timestamps and
   malformed/non-object transition payloads fail closed in both the helper and
   the production respawn guard. Duplicate JSON members, unknown transition
@@ -25,11 +26,12 @@ of the pinned Hermes runtime:
   implementation-run plus `review_requested` handoff; a bare `review` status
   is never authority. Reclaim evidence additionally enforces native
   cross-field termination, host-local, and heartbeat consistency.
-- before reclaim, orphan repair, promotion, or spawn, a board-wide read barrier
+- before reclaim, orphan repair, promotion, or spawn, a durable-state barrier
   validates non-terminal task scalars, run/event/comment identifiers and
   timestamps, run state, JSON storage, transition schemas, counters, PIDs,
-  locks, and claim fields. Any malformed durable row defers the tick before a
-  permissive native coercion can raise, partially mutate state, or spawn work.
+  locks, and claim fields. Malformed rows are quarantined per task before any
+  permissive native coercion; unrelated canonical tasks can still be
+  reconciled, promoted, and dispatched.
 
 The artifact is fail-closed. It pins both input source files and the patch,
 rejects symlinks, hardlinks, special files, path escapes, patch mode/rename
