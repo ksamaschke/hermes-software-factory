@@ -15,10 +15,11 @@ of the pinned Hermes runtime:
   malformed/non-object transition payloads fail closed in both the helper and
   the production respawn guard. Duplicate JSON members, unknown transition
   fields, empty reclaim locks, and impossible run status/outcome pairs are not
-  authority. A canonical non-terminal run blocks duplicate dispatch even when
-  task claim pointers were lost. Retry counters, failure text, run state, and
-  comment evidence are type-checked before they affect admission. Comments and
-  PR URLs are evidence only.
+  authority. A canonical non-terminal run blocks duplicate dispatch; if its
+  task-level claim pointers are lost or disagree with the run, the task is
+  quarantined and orphan reconciliation may not close/re-admit it. Retry
+  counters, failure text, run state, and comment evidence are type-checked
+  before they affect admission. Comments and PR URLs are evidence only.
 - reviewer-requested rework is admitted through a recent PR guard only when
   the exact terminal review run, `changes_requested` event, implementer,
   reviewer, status, timestamps, event/run identifiers, and any parent-gate
@@ -34,8 +35,11 @@ of the pinned Hermes runtime:
   reconciled, promoted, and dispatched. Raw SQLite task identities remain the
   quarantine keys even when malformed values are rendered as a safe telemetry
   sentinel. Byte-equivalent non-TEXT run/event/comment links cannot disappear
-  behind SQLite storage-class equality, and native `specified` events must keep
-  their producer-defined `run_id = NULL` provenance.
+  behind SQLite storage-class equality. Lifecycle events are explicitly ordered
+  by durable row identity before the newest transition is evaluated. Native
+  runless re-admission transitions (minimal `status`, `promoted`, `unblocked`,
+  and `specified`) must keep their producer-defined `run_id = NULL` provenance;
+  a run-scoped event must reference an existing run belonging to the same task.
 
 The artifact is fail-closed. It pins both input source files and the patch,
 rejects symlinks, hardlinks, special files, path escapes, patch mode/rename

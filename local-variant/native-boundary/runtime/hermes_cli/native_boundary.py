@@ -26,6 +26,12 @@ _REQUEUE_EVENT_KINDS = frozenset(
         "status",
     }
 )
+# These transition producers deliberately call ``_append_event`` without a
+# run id. A non-NULL value is forged provenance, even if it names a real
+# historical run for the same task.
+_RUNLESS_REQUEUE_EVENT_KINDS = frozenset(
+    {"status", "promoted", "unblocked", "specified"}
+)
 _OBSERVATION_EVENT_KINDS = ("commented", "respawn_guarded")
 # SQLite stores a bound Python ``True`` as integer ``1``.  No real Hermes
 # lifecycle row predates 2000-01-01, so a plausibility floor keeps that lossy
@@ -576,10 +582,20 @@ def same_owner_requeue_is_authorized(
     transition_id = _positive_row_id(transition["id"])
     if transition_id is None:
         return False
-    if transition["kind"] == "specified" and transition["run_id"] is not None:
+    transition_kind = transition["kind"]
+    transition_run_id = transition["run_id"]
+    if (
+        transition_kind in _RUNLESS_REQUEUE_EVENT_KINDS
+        and transition_run_id is not None
+    ):
+        return False
+    if (
+        transition_kind == "reclaimed"
+        and _positive_row_id(transition_run_id) != prior_run_id
+    ):
         return False
     if not requeue_transition_is_authorized(
-        transition["kind"], transition["payload"]
+        transition_kind, transition["payload"]
     ):
         return False
     now = int(time.time())
@@ -961,7 +977,7 @@ def dispatcher_state_rejections(
             "FROM task_runs WHERE task_id = ?",
             (raw_task_id,),
         ).fetchall()
-        active_ids: list[int] = []
+        active_runs: list[Any] = []
         seen_run_ids: set[int] = set()
         for run in runs:
             if type(run["task_id"]) is not str or run["task_id"] != raw_task_id:
@@ -983,7 +999,7 @@ def dispatcher_state_rejections(
             outcome = run["outcome"]
             ended_at = run["ended_at"]
             if status == "running" and outcome is None and ended_at is None:
-                active_ids.append(run_id)
+                active_runs.append(run)
             else:
                 terminal_at = validated_lifecycle_timestamp(
                     ended_at, maximum=now
@@ -1018,10 +1034,20 @@ def dispatcher_state_rejections(
             ):
                 reject()
 
-        if len(active_ids) > 1:
+        if len(active_runs) > 1:
             reject()
-        if active_ids:
-            if task["status"] != "running" or current_run_id != active_ids[0]:
+        if active_runs:
+            active_run = active_runs[0]
+            active_run_id = _positive_row_id(active_run["id"])
+            if (
+                task["status"] != "running"
+                or current_run_id != active_run_id
+                or task["claim_lock"] is None
+                or task["claim_expires"] is None
+                or task["claim_lock"] != active_run["claim_lock"]
+                or task["claim_expires"] != active_run["claim_expires"]
+                or task["worker_pid"] != active_run["worker_pid"]
+            ):
                 reject()
         elif current_run_id is not None:
             reject()
@@ -1030,7 +1056,7 @@ def dispatcher_state_rejections(
 
         events = conn.execute(
             "SELECT task_id, id, run_id, kind, payload, created_at "
-            "FROM task_events WHERE task_id = ?",
+            "FROM task_events WHERE task_id = ? ORDER BY id ASC",
             (raw_task_id,),
         ).fetchall()
         seen_event_ids: set[int] = set()
@@ -1043,12 +1069,20 @@ def dispatcher_state_rejections(
             else:
                 seen_event_ids.add(event_id)
             event_run_id = event["run_id"]
-            if event_run_id is not None and _positive_row_id(event_run_id) is None:
-                reject()
             kind = event["kind"]
             if type(kind) is not str or not kind.strip():
                 reject()
-            if kind == "specified" and event_run_id is not None:
+            if event_run_id is not None:
+                canonical_event_run_id = _positive_row_id(event_run_id)
+                if (
+                    canonical_event_run_id is None
+                    or canonical_event_run_id not in seen_run_ids
+                ):
+                    reject()
+            if (
+                kind in {"promoted", "unblocked", "specified"}
+                and event_run_id is not None
+            ):
                 reject()
             if validated_lifecycle_timestamp(
                 event["created_at"], maximum=now

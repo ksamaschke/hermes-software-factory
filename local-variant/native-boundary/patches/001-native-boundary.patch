@@ -52,28 +52,52 @@
 +    excluded_task_ids: Optional[set[Any]] = None,
 @@ -9063,0 +9095 @@
 +    excluded_task_ids = excluded_task_ids or set()
-@@ -9071,0 +9104,2 @@
+@@ -9066,2 +9098,2 @@
+-        "SELECT id, claim_lock, claim_expires, worker_pid FROM tasks "
+-        "WHERE status = 'running' "
++        "SELECT id, claim_lock, claim_expires, worker_pid, current_run_id "
++        "FROM tasks WHERE status = 'running' "
+@@ -9071,0 +9104,21 @@
 +        if tid in excluded_task_ids:
 +            continue
-@@ -9211 +9245,5 @@
++        current_run_id = row["current_run_id"]
++        if current_run_id is not None:
++            active_run = conn.execute(
++                "SELECT 1 FROM task_runs WHERE id = ? AND task_id = ? "
++                "AND status = 'running' AND outcome IS NULL "
++                "AND ended_at IS NULL LIMIT 1",
++                (current_run_id, tid),
++            ).fetchone()
++            if active_run is not None:
++                # Lost task-level claim pointers do not prove that the worker
++                # owning a durable active run is dead. Quarantine/repair must
++                # happen before re-admission; never close and duplicate it.
++                _log.warning(
++                    "kanban reconcile: task %s has broken claim bookkeeping "
++                    "but active run %s remains — deferring",
++                    tid,
++                    current_run_id,
++                )
++                continue
+@@ -9211 +9264,5 @@
 -def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 +def detect_crashed_workers(
 +    conn: sqlite3.Connection,
 +    *,
 +    excluded_task_ids: Optional[set[Any]] = None,
 +) -> list[str]:
-@@ -9239,0 +9278 @@
+@@ -9239,0 +9297 @@
 +    excluded_task_ids = excluded_task_ids or set()
-@@ -9259,0 +9299,2 @@
+@@ -9259,0 +9318,2 @@
 +            if row["id"] in excluded_task_ids:
 +                continue
-@@ -9795,0 +9837,5 @@
+@@ -9795,0 +9856,5 @@
 +    ``"active_run"``
 +        The newest durable run is the canonical non-terminal running state.
 +        Even if task claim pointers were lost, dispatch must not start a
 +        duplicate beside a possibly live worker.
 +
-@@ -9811,0 +9858,17 @@
+@@ -9811,0 +9877,17 @@
 +    if type(task_id) is not str or not task_id.strip():
 +        return "recent_success"
 +    if type(row["status"]) is not str:
@@ -91,23 +115,23 @@
 +        return "active_run"
 +    if row["block_kind"] is not None and type(row["block_kind"]) is not str:
 +        return "recent_success"
-@@ -9813,0 +9877,5 @@
+@@ -9813,0 +9896,5 @@
 +    from hermes_cli.native_boundary import (
 +        requeue_transition_is_authorized,
 +        terminal_run_state_is_authorized,
 +        validated_lifecycle_timestamp,
 +    )
-@@ -9822 +9890 @@
+@@ -9822 +9909 @@
 -    #    We look at the LATEST run only (ORDER BY ended_at DESC LIMIT 1): if a
 +    #    We look at the LATEST run only (ORDER BY id DESC LIMIT 1): if a
-@@ -9827,3 +9895,3 @@
+@@ -9827,3 +9914,3 @@
 -        "SELECT outcome, ended_at FROM task_runs "
 -        "WHERE task_id = ? AND ended_at IS NOT NULL "
 -        "ORDER BY ended_at DESC LIMIT 1",
 +        "SELECT status, outcome, ended_at FROM task_runs "
 +        "WHERE task_id = ? "
 +        "ORDER BY id DESC LIMIT 1",
-@@ -9831,0 +9900,17 @@
+@@ -9831,0 +9919,17 @@
 +    if latest_run is not None:
 +        run_status = latest_run["status"]
 +        run_outcome = latest_run["outcome"]
@@ -125,14 +149,14 @@
 +        if latest_run["outcome"] == "rate_limited":
 +            return "rate_limit_cooldown"
 +        return "recent_success"
-@@ -9841,2 +9926 @@
+@@ -9841,2 +9945 @@
 -        ended_at = latest_run["ended_at"]
 -        if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
 +        if (now - latest_ended_at) < rl_cooldown:
-@@ -9852,0 +9937,2 @@
+@@ -9852,0 +9956,2 @@
 +    if err is not None and type(err) is not str:
 +        return "blocker_auth"
-@@ -9856,3 +9942,18 @@
+@@ -9856,3 +9961,18 @@
 -    # Review-lane spawns stop here: a recent completed run and a fresh PR
 -    # URL comment are the canonical *inputs* to a review handoff (worker
 -    # opened a PR, then requested review), not signals of duplicate work.
@@ -154,7 +178,7 @@
 +    # Review-lane spawns require the complete native implementation-run and
 +    # review_requested event chain. A bare status='review' row is durable
 +    # corruption, not authority to start a reviewer.
-@@ -9860 +9961,7 @@
+@@ -9860 +9980,7 @@
 -        return None
 +        from hermes_cli.native_boundary import review_handoff_is_authorized
 +
@@ -163,7 +187,7 @@
 +            if review_handoff_is_authorized(conn, task_id)
 +            else "recent_success"
 +        )
-@@ -9870,4 +9977,4 @@
+@@ -9870,4 +9996,4 @@
 -        "SELECT ended_at FROM task_runs "
 -        "WHERE task_id = ? AND outcome = 'completed' AND ended_at >= ? "
 -        "ORDER BY ended_at DESC LIMIT 1",
@@ -172,7 +196,7 @@
 +        "WHERE task_id = ? AND outcome = 'completed' "
 +        "ORDER BY id DESC LIMIT 1",
 +        (task_id,),
-@@ -9876,9 +9983,3 @@
+@@ -9876,9 +10002,3 @@
 -        completed_at = int(recent_completed["ended_at"] or 0)
 -        requeued_after = conn.execute(
 -            "SELECT 1 FROM task_events "
@@ -185,7 +209,7 @@
 +        if not terminal_run_state_is_authorized(
 +            recent_completed["status"], recent_completed["outcome"]
 +        ):
-@@ -9885,0 +9987,26 @@
+@@ -9885,0 +10006,26 @@
 +        completed_at = validated_lifecycle_timestamp(
 +            recent_completed["ended_at"], maximum=now
 +        )
@@ -212,13 +236,13 @@
 +                )
 +            ):
 +                return "recent_success"
-@@ -9900,2 +10027,3 @@
+@@ -9900,2 +10046,3 @@
 -        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
 -        (task_id, pr_cutoff),
 +        "SELECT body, created_at FROM task_comments "
 +        "WHERE task_id = ? ORDER BY id DESC",
 +        (task_id,),
-@@ -9903 +10031,9 @@
+@@ -9903 +10050,9 @@
 -        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
 +        comment_created_at = validated_lifecycle_timestamp(
 +            c["created_at"], maximum=now
@@ -229,7 +253,7 @@
 +        if comment_created_at < pr_cutoff:
 +            continue
 +        if body and _RESPAWN_GUARD_PR_URL_RE.search(body):
-@@ -10314 +10450,28 @@
+@@ -10314 +10469,28 @@
 -    result.reclaimed = release_stale_claims(conn)
 +    from hermes_cli.native_boundary import dispatcher_state_rejections
 +
@@ -259,22 +283,22 @@
 +    result.reclaimed = release_stale_claims(
 +        conn, excluded_task_ids=rejected_task_ids,
 +    )
-@@ -10319 +10482,3 @@
+@@ -10319 +10501,3 @@
 -        result.reconciled_orphans = reconcile_orphaned_running(conn)
 +        result.reconciled_orphans = reconcile_orphaned_running(
 +            conn, excluded_task_ids=rejected_task_ids,
 +        )
-@@ -10321 +10486,3 @@
+@@ -10321 +10505,3 @@
 -        conn, stale_timeout_seconds=stale_timeout_seconds,
 +        conn,
 +        stale_timeout_seconds=stale_timeout_seconds,
 +        excluded_task_ids=rejected_task_ids,
-@@ -10323 +10490,3 @@
+@@ -10323 +10509,3 @@
 -    result.crashed = detect_crashed_workers(conn)
 +    result.crashed = detect_crashed_workers(
 +        conn, excluded_task_ids=rejected_task_ids,
 +    )
-@@ -10340,2 +10509,8 @@
+@@ -10340,2 +10528,8 @@
 -    result.timed_out = enforce_max_runtime(conn)
 -    result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 +    result.timed_out = enforce_max_runtime(
@@ -285,15 +309,15 @@
 +        failure_limit=failure_limit,
 +        excluded_task_ids=rejected_task_ids,
 +    )
-@@ -10409,0 +10585 @@
+@@ -10409,0 +10604 @@
 +    ready_rows = [row for row in ready_rows if row["id"] not in rejected_task_ids]
-@@ -10418,0 +10595,3 @@
+@@ -10418,0 +10614,3 @@
 +        review_rows = [
 +            row for row in review_rows if row["id"] not in rejected_task_ids
 +        ]
---- a/hermes_cli/native_boundary.py
+--- /dev/null
 +++ b/hermes_cli/native_boundary.py
-@@ -0,0 +1,1112 @@
+@@ -0,0 +1,1146 @@
 +"""Fail-closed native boundary decisions for the versioned Factory artifact.
 +
 +This module is added to a disposable copied Hermes runtime by the artifact
@@ -321,6 +345,12 @@
 +        "specified",
 +        "status",
 +    }
++)
++# These transition producers deliberately call ``_append_event`` without a
++# run id. A non-NULL value is forged provenance, even if it names a real
++# historical run for the same task.
++_RUNLESS_REQUEUE_EVENT_KINDS = frozenset(
++    {"status", "promoted", "unblocked", "specified"}
 +)
 +_OBSERVATION_EVENT_KINDS = ("commented", "respawn_guarded")
 +# SQLite stores a bound Python ``True`` as integer ``1``.  No real Hermes
@@ -872,10 +902,20 @@
 +    transition_id = _positive_row_id(transition["id"])
 +    if transition_id is None:
 +        return False
-+    if transition["kind"] == "specified" and transition["run_id"] is not None:
++    transition_kind = transition["kind"]
++    transition_run_id = transition["run_id"]
++    if (
++        transition_kind in _RUNLESS_REQUEUE_EVENT_KINDS
++        and transition_run_id is not None
++    ):
++        return False
++    if (
++        transition_kind == "reclaimed"
++        and _positive_row_id(transition_run_id) != prior_run_id
++    ):
 +        return False
 +    if not requeue_transition_is_authorized(
-+        transition["kind"], transition["payload"]
++        transition_kind, transition["payload"]
 +    ):
 +        return False
 +    now = int(time.time())
@@ -1257,7 +1297,7 @@
 +            "FROM task_runs WHERE task_id = ?",
 +            (raw_task_id,),
 +        ).fetchall()
-+        active_ids: list[int] = []
++        active_runs: list[Any] = []
 +        seen_run_ids: set[int] = set()
 +        for run in runs:
 +            if type(run["task_id"]) is not str or run["task_id"] != raw_task_id:
@@ -1279,7 +1319,7 @@
 +            outcome = run["outcome"]
 +            ended_at = run["ended_at"]
 +            if status == "running" and outcome is None and ended_at is None:
-+                active_ids.append(run_id)
++                active_runs.append(run)
 +            else:
 +                terminal_at = validated_lifecycle_timestamp(
 +                    ended_at, maximum=now
@@ -1314,10 +1354,20 @@
 +            ):
 +                reject()
 +
-+        if len(active_ids) > 1:
++        if len(active_runs) > 1:
 +            reject()
-+        if active_ids:
-+            if task["status"] != "running" or current_run_id != active_ids[0]:
++        if active_runs:
++            active_run = active_runs[0]
++            active_run_id = _positive_row_id(active_run["id"])
++            if (
++                task["status"] != "running"
++                or current_run_id != active_run_id
++                or task["claim_lock"] is None
++                or task["claim_expires"] is None
++                or task["claim_lock"] != active_run["claim_lock"]
++                or task["claim_expires"] != active_run["claim_expires"]
++                or task["worker_pid"] != active_run["worker_pid"]
++            ):
 +                reject()
 +        elif current_run_id is not None:
 +            reject()
@@ -1326,7 +1376,7 @@
 +
 +        events = conn.execute(
 +            "SELECT task_id, id, run_id, kind, payload, created_at "
-+            "FROM task_events WHERE task_id = ?",
++            "FROM task_events WHERE task_id = ? ORDER BY id ASC",
 +            (raw_task_id,),
 +        ).fetchall()
 +        seen_event_ids: set[int] = set()
@@ -1339,12 +1389,20 @@
 +            else:
 +                seen_event_ids.add(event_id)
 +            event_run_id = event["run_id"]
-+            if event_run_id is not None and _positive_row_id(event_run_id) is None:
-+                reject()
 +            kind = event["kind"]
 +            if type(kind) is not str or not kind.strip():
 +                reject()
-+            if kind == "specified" and event_run_id is not None:
++            if event_run_id is not None:
++                canonical_event_run_id = _positive_row_id(event_run_id)
++                if (
++                    canonical_event_run_id is None
++                    or canonical_event_run_id not in seen_run_ids
++                ):
++                    reject()
++            if (
++                kind in {"promoted", "unblocked", "specified"}
++                and event_run_id is not None
++            ):
 +                reject()
 +            if validated_lifecycle_timestamp(
 +                event["created_at"], maximum=now

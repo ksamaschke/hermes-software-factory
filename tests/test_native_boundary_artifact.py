@@ -46,7 +46,7 @@ native_boundary = _load_module("native_boundary_for_tests", NATIVE_PATH)
 def test_static_manifest_and_patch_are_pinned():
     manifest = builder._static_manifest()
     assert manifest["schema"] == "factory.native-boundary.v1"
-    assert manifest["artifact_version"] == "1.0.12"
+    assert manifest["artifact_version"] == "1.0.13"
     assert manifest["copy_policy"] == {
         "fresh_copy_required": True,
         "reject_symlinks": True,
@@ -3325,4 +3325,249 @@ def test_staged_blob_running_identity_is_not_reclaimed(tmp_path):
     assert probe["current_run_id"] is not None
     assert probe["reclaimed"] == 0
     assert probe["guarded"] == [["<malformed>", "malformed_durable_state"]]
+    assert probe["spawned"] == []
+
+
+def test_staged_active_run_with_lost_claim_pointers_is_quarantined(tmp_path):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        from pathlib import Path
+
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.native_boundary import dispatcher_state_rejections
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="Active run with lost task claim pointers",
+                body="Ambiguous active work must fail closed.",
+                assignee="default",
+                created_by="fixture",
+            )
+            running = kb.claim_task(conn, task_id, claimer="foreign-host:1")
+            assert running is not None
+            conn.execute(
+                "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL WHERE id = ?",
+                (task_id,),
+            )
+            conn.commit()
+            rejections = dispatcher_state_rejections(conn)
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=True,
+            )
+            task = dict(conn.execute(
+                "SELECT status, current_run_id FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone())
+            run = dict(conn.execute(
+                "SELECT status, outcome, ended_at FROM task_runs WHERE id = ?",
+                (running.current_run_id,),
+            ).fetchone())
+            print(json.dumps({
+                "task_id": task_id,
+                "rejections": rejections,
+                "reconciled": result.reconciled_orphans,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+                "task": task,
+                "run": run,
+            }))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "active-run-lost-claim.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["rejections"] == [
+        [probe["task_id"], "malformed_durable_state"]
+    ]
+    assert probe["reconciled"] == []
+    assert probe["guarded"] == [
+        [probe["task_id"], "malformed_durable_state"]
+    ]
+    assert probe["spawned"] == []
+    assert probe["task"]["status"] == "running"
+    assert probe["task"]["current_run_id"] is not None
+    assert probe["run"] == {
+        "status": "running",
+        "outcome": None,
+        "ended_at": None,
+    }
+
+
+def test_staged_newest_lifecycle_event_is_selected_explicitly(tmp_path):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import time
+        from pathlib import Path
+
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.native_boundary import dispatcher_state_rejections
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            conn.execute("PRAGMA reverse_unordered_selects = ON")
+            task_id = kb.create_task(
+                conn,
+                title="Explicit newest lifecycle event",
+                body="Malformed newest durable state must be selected by id.",
+                assignee="default",
+                created_by="fixture",
+            )
+            running = kb.claim_task(conn, task_id, claimer="fixture-owner:1")
+            assert running is not None
+            assert kb.block_task(
+                conn,
+                task_id,
+                reason="repair",
+                kind="capability",
+                expected_run_id=running.current_run_id,
+            )
+            assert kb.unblock_task(conn, task_id)
+            conn.execute(
+                "INSERT INTO task_events "
+                "(task_id, run_id, kind, payload, created_at) "
+                "VALUES (?, NULL, 'status', ?, ?)",
+                (
+                    task_id,
+                    '{"status":"ready","extra":true}',
+                    int(time.time()),
+                ),
+            )
+            conn.commit()
+            rejections = dispatcher_state_rejections(conn)
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "task_id": task_id,
+                "rejections": rejections,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "explicit-newest-event.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["rejections"] == [
+        [probe["task_id"], "malformed_durable_state"]
+    ]
+    assert probe["guarded"] == [
+        [probe["task_id"], "malformed_durable_state"]
+    ]
+    assert probe["spawned"] == []
+
+
+def test_staged_unblocked_event_rejects_forged_run_identity(tmp_path):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        from pathlib import Path
+
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.native_boundary import dispatcher_state_rejections
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="Forged unblocked run identity",
+                body="Native unblocked events are not run-scoped.",
+                assignee="default",
+                created_by="fixture",
+            )
+            running = kb.claim_task(conn, task_id, claimer="fixture-owner:1")
+            assert running is not None
+            assert kb.block_task(
+                conn,
+                task_id,
+                reason="repair",
+                kind="capability",
+                expected_run_id=running.current_run_id,
+            )
+            assert kb.unblock_task(conn, task_id)
+            kb.add_comment(conn, task_id, "fixture", __FIXTURE_PR_URL__)
+            conn.execute(
+                "UPDATE task_events SET run_id = 999999 "
+                "WHERE task_id = ? AND kind = 'unblocked'",
+                (task_id,),
+            )
+            conn.commit()
+            guard = kb.check_respawn_guard(conn, task_id, lane="ready")
+            rejections = dispatcher_state_rejections(conn)
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "task_id": task_id,
+                "guard": guard,
+                "rejections": rejections,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    ).replace("__FIXTURE_PR_URL__", repr(FIXTURE_PR_URL))
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "unblocked-run-id.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["guard"] == "active_pr"
+    assert probe["rejections"] == [
+        [probe["task_id"], "malformed_durable_state"]
+    ]
+    assert probe["guarded"] == [[probe["task_id"], "active_pr"]]
     assert probe["spawned"] == []
