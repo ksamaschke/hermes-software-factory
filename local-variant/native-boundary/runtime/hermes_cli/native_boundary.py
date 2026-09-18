@@ -482,6 +482,37 @@ def _native_specified_payload_is_canonical(payload: Any) -> bool:
     )
 
 
+def _ancestor_reopened_status_payload(payload: Any) -> dict[str, Any] | None:
+    """Validate the legacy status event emitted for descendant invalidation."""
+    value = _json_object(payload)
+    if value is None or frozenset(value) != {
+        "status",
+        "reason",
+        "parent",
+        "previous_status",
+        "resume_status",
+    }:
+        return None
+    previous_status = value["previous_status"]
+    resume_status = value["resume_status"]
+    if (
+        value["status"] != "todo"
+        or value["reason"] != "ancestor_reopened"
+        or type(value["parent"]) is not str
+        or not value["parent"].strip()
+        or type(previous_status) is not str
+        or previous_status not in {"ready", "review", "running", "done"}
+        or type(resume_status) is not str
+        or resume_status not in {"ready", "review"}
+    ):
+        return None
+    if previous_status == "review" and resume_status != "review":
+        return None
+    if previous_status in {"ready", "done"} and resume_status != "ready":
+        return None
+    return value
+
+
 def _durable_requeue_payload_is_canonical(kind: str, payload: Any) -> bool:
     """Accept native storage forms, including non-authorizing legacy forms."""
     if requeue_transition_is_authorized(kind, payload):
@@ -490,17 +521,7 @@ def _durable_requeue_payload_is_canonical(kind: str, payload: Any) -> bool:
         return _native_specified_payload_is_canonical(payload)
     value = _json_object(payload)
     if kind == "status":
-        return (
-            value is not None
-            and frozenset(value)
-            == {"status", "reason", "parent", "previous_status"}
-            and value["status"] == "todo"
-            and value["reason"] == "ancestor_reopened"
-            and type(value["parent"]) is str
-            and bool(value["parent"].strip())
-            and type(value["previous_status"]) is str
-            and bool(value["previous_status"].strip())
-        )
+        return _ancestor_reopened_status_payload(payload) is not None
     if kind == "promoted":
         return (
             value is not None
@@ -537,6 +558,32 @@ def requeue_transition_provenance_is_authorized(
     if requeue_transition_requires_null_run_id(kind, payload):
         return run_id is None
     return _positive_row_id(run_id) is not None
+
+
+def requeue_transition_event_provenance_is_authorized(
+    conn: sqlite3.Connection,
+    task_id: Any,
+    kind: Any,
+    payload: Any,
+    run_id: Any,
+) -> bool:
+    """Validate a requeue event's producer contract and same-task run link."""
+    if type(task_id) is not str or not task_id.strip():
+        return False
+    if not requeue_transition_provenance_is_authorized(kind, payload, run_id):
+        return False
+    if run_id is None:
+        return True
+    canonical_run_id = _positive_row_id(run_id)
+    run = conn.execute(
+        "SELECT task_id FROM task_runs WHERE id = ?",
+        (canonical_run_id,),
+    ).fetchone()
+    return (
+        run is not None
+        and type(run["task_id"]) is str
+        and run["task_id"] == task_id
+    )
 
 
 def same_owner_requeue_is_authorized(
@@ -1108,6 +1155,27 @@ def dispatcher_state_rejections(
             if (
                 requeue_transition_requires_null_run_id(kind, payload)
                 and event_run_id is not None
+            ):
+                reject()
+            if (
+                requeue_transition_is_authorized(kind, payload)
+                and not requeue_transition_event_provenance_is_authorized(
+                    conn,
+                    raw_task_id,
+                    kind,
+                    payload,
+                    event_run_id,
+                )
+            ):
+                reject()
+            ancestor_reopened = (
+                _ancestor_reopened_status_payload(payload)
+                if kind == "status"
+                else None
+            )
+            if ancestor_reopened is not None and (
+                (ancestor_reopened["previous_status"] == "running")
+                is not (event_run_id is not None)
             ):
                 reject()
             if validated_lifecycle_timestamp(

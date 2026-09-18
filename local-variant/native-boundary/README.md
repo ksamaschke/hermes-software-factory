@@ -42,7 +42,10 @@ of the pinned Hermes runtime:
   by durable row identity before the newest transition is evaluated. Native
   runless re-admission transitions (minimal `status`, `promoted`, `unblocked`,
   and `specified`) must keep their producer-defined `run_id = NULL` provenance;
-  a run-scoped event must reference an existing run belonging to the same task.
+  run-scoped `reclaimed` and `changes_requested` evidence must name an existing
+  run belonging to the same task. The legacy `ancestor_reopened` status payload,
+  including `resume_status`, remains canonical; only a previously running
+  descendant carries its reclaimed run identity.
 
 The artifact is fail-closed. It pins both input source files and the patch,
 rejects symlinks, hardlinks, special files, path escapes, patch mode/rename
