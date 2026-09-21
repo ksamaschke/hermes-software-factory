@@ -57,6 +57,21 @@ controllers:
       - scheduler-attempts
       - scheduler-incidents
 
+  # Optional deterministic repair controller. It may terminate only process
+  # groups that the exact task readback and worker environment bind to the same
+  # terminal task. It must emit bounded sanitized status and remain local-only.
+  - id: <terminal-worker-recovery-controller-id>
+    type: deterministic-repair
+    schedule: every 5m
+    no_agent: true
+    script: <factory-recovery-wrapper>
+    deliver: local
+    mutates:
+      - task-owned-terminal-process-groups-only
+    observes:
+      - terminal-kanban-task-state
+      - task-owned-process-groups
+
 # One LLM supervisor consumes every controller output and its own prior result.
 # The context_from values are the job IDs returned when the controllers are
 # created. Do not create one LLM report job per controller.
@@ -71,6 +86,7 @@ supervisor:
     - <repository-state-controller-id>
     - <forgejo-delivery-controller-id>
     - <scheduler-attempts-incidents-controller-id>
+    - <terminal-worker-recovery-controller-id>
   continuity: true
   workdir: <project-workdir>
   enabled_toolsets:

@@ -131,10 +131,21 @@ The deterministic recovery add-ons are installed separately from the skill
 documents:
 
 ```bash
+install -m 755 scripts/kanban_worker_reaper.py ~/.hermes/scripts/kanban_worker_reaper.py
 install -m 755 scripts/kanban_factory_recovery.py ~/.hermes/scripts/kanban_factory_recovery.py
 install -m 755 scripts/kanban_review_successor_recovery.py ~/.hermes/scripts/kanban_review_successor_recovery.py
 install -m 755 scripts/kanban_review_successor_recovery_cron.py ~/.hermes/scripts/kanban_review_successor_recovery_cron.py
 ```
+
+The terminal-worker recovery pass is deliberately bounded. It reads the
+minimal task status from the query-only Kanban SQLite database when the Hermes
+CLI is locked or slow, caps each CLI call at five seconds by default, and caps
+optional full-detail repairs at 30 seconds per tick. A timeout is reported as
+unavailable; it never becomes permission to mutate or kill an unverified task.
+The worker reaper matches the exact task and board identity inherited by the
+worker, revalidates the terminal status immediately before signalling, and
+signals only a fully task-owned process group. It never uses process names,
+shell kill commands, or a broad PID sweep.
 
 Forgejo-backed projects can also install the generic read-only delivery
 observer and copy its non-secret overlay template:
@@ -313,6 +324,7 @@ skills/kanban-progress-evidence/SKILL.md        evidence and closure accounting
 skills/kanban-progress-evidence/references/     closure matrix template
 skills/software-factory-recovery/SKILL.md      autonomous recovery procedure
 scripts/kanban_factory_recovery.py              deterministic recovery add-on
+scripts/kanban_worker_reaper.py                  task-owned terminal worker cleanup
 scripts/kanban_review_successor_recovery.py     review packet guard and recursive successor bridge
 scripts/kanban_review_successor_recovery_cron.py installed no-agent wrapper
 scripts/forgejo_delivery_controller.py          bounded read-only Forgejo delivery observer

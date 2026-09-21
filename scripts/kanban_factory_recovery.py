@@ -20,10 +20,18 @@ import argparse
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from kanban_worker_reaper import reap_terminal_task_workers
 
 
 _COLLISION_RE = re.compile(
@@ -33,19 +41,196 @@ _COLLISION_RE = re.compile(
 )
 
 _PARKED_ACK_MARKER = "[factory] parked backlog acknowledged"
+_DEFAULT_CLI_TIMEOUT_SECONDS = 5.0
+_DEFAULT_RECOVERY_BUDGET_SECONDS = 30.0
+_MAX_WORKER_REPORT_SAMPLE = 8
+_MAX_WORKER_REPORT_REASON = 240
+_REPORT_SECRET_RE = re.compile(
+    r"(?i)\b(token|secret|password|api[_-]?key|authorization|cookie)\b\s*[:=]\s*\S+"
+)
+_REPORT_PATH_RE = re.compile(r"(?<![\w])(?:/[\S]+|[A-Za-z]:[\\/][^\s;,)]+)")
+
+
+def _bounded_worker_text(value: Any) -> str:
+    text = str(value).replace("\x00", " ")
+    text = _REPORT_SECRET_RE.sub(r"\1=<redacted>", text)
+    text = _REPORT_PATH_RE.sub("<path>", text)
+    text = re.sub(r"[\x00-\x1f\x7f]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"(.)\1{31,}", r"\1…", text)
+    if not text:
+        return "unspecified error"
+    if len(text) > _MAX_WORKER_REPORT_REASON:
+        return text[: _MAX_WORKER_REPORT_REASON - 1] + "…"
+    return text
+
+
+def _bounded_worker_sample(value: Any) -> str:
+    if not isinstance(value, (list, tuple)):
+        return ""
+    return ",".join(str(item) for item in list(value)[:_MAX_WORKER_REPORT_SAMPLE])
+
+
+def _factory_cli_timeout_seconds() -> float:
+    raw = os.environ.get("HERMES_FACTORY_CLI_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        return _DEFAULT_CLI_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return _DEFAULT_CLI_TIMEOUT_SECONDS
+    if not 1 <= value <= 30:
+        return _DEFAULT_CLI_TIMEOUT_SECONDS
+    return value
+
+
+def _recovery_budget_seconds() -> float:
+    raw = os.environ.get("HERMES_FACTORY_RECOVERY_BUDGET_SECONDS", "").strip()
+    if not raw:
+        return _DEFAULT_RECOVERY_BUDGET_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return _DEFAULT_RECOVERY_BUDGET_SECONDS
+    if not 5 <= value <= 120:
+        return _DEFAULT_RECOVERY_BUDGET_SECONDS
+    return value
+
+
+def _kanban_db_path(board: str | None = None) -> Path | None:
+    raw = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    if raw:
+        path = Path(raw).expanduser()
+    else:
+        real_home = os.environ.get("HERMES_REAL_HOME", "").strip()
+        hermes_root = (
+            Path(real_home).expanduser() if real_home else Path.home()
+        ) / ".hermes"
+        board_name = str(board or "").strip()
+        if board_name:
+            if Path(board_name).name != board_name or board_name in {".", ".."}:
+                return None
+            path = hermes_root / "kanban" / "boards" / board_name / "kanban.db"
+        else:
+            path = hermes_root / "kanban.db"
+    if not path.exists():
+        return None
+    return path.resolve(strict=False)
+
+
+def _readonly_task_detail(task_id: str, board: str | None = None) -> dict[str, Any] | None:
+    path = _kanban_db_path(board)
+    if path is None:
+        return None
+    run_rows: list[tuple[Any, ...]] = []
+    event_rows: list[tuple[Any, ...]] = []
+    try:
+        conn = sqlite3.connect(
+            f"file:{path}?mode=ro", uri=True, timeout=2
+        )
+        conn.execute("PRAGMA query_only = ON")
+        row = conn.execute(
+            "SELECT id, status, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is not None:
+            try:
+                run_rows = conn.execute(
+                    "SELECT id, status, outcome, ended_at, error "
+                    "FROM task_runs WHERE task_id = ? ORDER BY id",
+                    (task_id,),
+                ).fetchall()
+            except sqlite3.Error:
+                pass
+            try:
+                event_rows = conn.execute(
+                    "SELECT kind, run_id FROM task_events "
+                    "WHERE task_id = ? ORDER BY id",
+                    (task_id,),
+                ).fetchall()
+            except sqlite3.Error:
+                pass
+    except (OSError, sqlite3.Error):
+        return None
+    finally:
+        try:
+            conn.close()
+        except UnboundLocalError:
+            pass
+    if row is None:
+        return None
+    detail: dict[str, Any] = {
+        "task": {
+            "id": str(row[0]),
+            "status": str(row[1]),
+            "current_run_id": row[2],
+        }
+    }
+    if run_rows:
+        detail["runs"] = [
+            {
+                "id": run[0],
+                "status": run[1],
+                "outcome": run[2],
+                "ended_at": run[3],
+                "error": run[4],
+            }
+            for run in run_rows
+        ]
+    if event_rows:
+        detail["events"] = [
+            {"kind": event[0], "run_id": event[1]} for event in event_rows
+        ]
+    return detail
+
+
+def _readonly_blocked_tasks(board: str | None = None) -> list[dict[str, Any]] | None:
+    path = _kanban_db_path(board)
+    if path is None:
+        return None
+    try:
+        conn = sqlite3.connect(
+            f"file:{path}?mode=ro", uri=True, timeout=2
+        )
+        conn.execute("PRAGMA query_only = ON")
+        rows = conn.execute(
+            "SELECT id, title, status, current_run_id "
+            "FROM tasks WHERE status = 'blocked' "
+            "ORDER BY priority DESC, created_at ASC"
+        ).fetchall()
+    except (OSError, sqlite3.Error):
+        return None
+    finally:
+        try:
+            conn.close()
+        except UnboundLocalError:
+            pass
+    return [
+        {
+            "id": str(row[0]),
+            "title": str(row[1] or ""),
+            "status": str(row[2]),
+            "current_run_id": row[3],
+        }
+        for row in rows
+    ]
 
 
 def _run(argv: list[str], *, cwd: Path | None = None) -> tuple[int, str, str]:
-    proc = subprocess.run(
-        argv,
-        cwd=str(cwd) if cwd else None,
-        text=True,
-        capture_output=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=90,
-        check=False,
-    )
+    timeout = _factory_cli_timeout_seconds()
+    try:
+        proc = subprocess.run(
+            argv,
+            cwd=str(cwd) if cwd else None,
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return 124, "", f"command timed out after {timeout:g}s"
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 
@@ -123,7 +308,10 @@ def _task_detail(board: str, task_id: str) -> dict[str, Any] | None:
     try:
         value = _json_command("kanban", "--board", board, "show", "--json", task_id)
     except RuntimeError:
-        return None
+        fallback = _readonly_task_detail(task_id, board)
+        if fallback is not None:
+            fallback["_readback"] = "sqlite"
+        return fallback
     return value if isinstance(value, dict) else None
 
 
@@ -153,7 +341,7 @@ def _acknowledge_parked(
     if not task_id or task.get("status") != "blocked" or not _is_parked(task):
         return None
     detail = _task_detail(board, task_id)
-    if not detail or _parked_acknowledged(detail):
+    if not detail or detail.get("_readback") == "sqlite" or _parked_acknowledged(detail):
         return None
     message = (
         f"{_PARKED_ACK_MARKER}: this task is intentionally parked by policy; "
@@ -180,6 +368,74 @@ def _latest_spawn_error(detail: dict[str, Any]) -> str:
         if run.get("status") in {"spawn_failed", "gave_up"}:
             return str(run.get("error") or "")
     return ""
+
+
+def _worker_reap_grace_seconds() -> float:
+    raw = os.environ.get("HERMES_FACTORY_WORKER_REAP_GRACE_SECONDS", "2").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return 2.0
+    if not 0 <= value <= 30:
+        return 2.0
+    return value
+
+
+def _reconcile_terminal_worker(
+    board: str, task: dict[str, Any], *, dry_run: bool
+) -> str | None:
+    """Remove only a task-owned worker left behind after terminal handoff."""
+
+    raw_task_id = task.get("id")
+    if (
+        not isinstance(raw_task_id, str)
+        or not raw_task_id
+        or raw_task_id != raw_task_id.strip()
+        or task.get("status") != "blocked"
+    ):
+        return None
+    task_id = raw_task_id
+    # The reaper needs only the current status/run identity. Prefer the
+    # query-only row so a locked/hung CLI cannot serialize every blocked task.
+    detail = _readonly_task_detail(task_id, board) or _task_detail(board, task_id)
+    if not detail:
+        return f"{task_id}: terminal worker readback unavailable"
+    row = detail.get("task") or {}
+    if row.get("status") != "blocked" or row.get("current_run_id") is not None:
+        return None
+
+    report = reap_terminal_task_workers(
+        detail,
+        task_id=task_id,
+        board=board,
+        kanban_db=_kanban_db_path(board),
+        refresh=lambda: _task_detail(board, task_id),
+        dry_run=dry_run,
+        grace_seconds=_worker_reap_grace_seconds(),
+    )
+    status = str(report.get("status") or "unknown")
+    if status in {"none", "not_applicable"}:
+        return None
+    fields = []
+    for key in (
+        "pid_count",
+        "process_group_count",
+        "signalled_group_count",
+        "signalled_pid_count",
+        "survivor_count",
+        "error_count",
+    ):
+        value = report.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            fields.append(f"{key}={value}")
+    for key in ("pids", "process_groups", "signalled_groups", "survivors"):
+        sample = _bounded_worker_sample(report.get(key))
+        if sample:
+            fields.append(f"{key}={sample}")
+    if report.get("reason"):
+        fields.append(f"reason={_bounded_worker_text(report['reason'])}")
+    suffix = f" ({'; '.join(fields)})" if fields else ""
+    return f"{task_id}: terminal worker reconciliation={status}{suffix}"
 
 
 def _collision(error: str) -> tuple[str, Path] | None:
@@ -227,7 +483,7 @@ def _worktree_branch(path: Path) -> str | None:
 def _repair_collision(board: str, task: dict[str, Any], *, dry_run: bool) -> str | None:
     task_id = str(task.get("id") or "")
     detail = _task_detail(board, task_id)
-    if not detail:
+    if not detail or detail.get("_readback") == "sqlite":
         return None
     task_row = detail.get("task") or {}
     if task_row.get("status") != "blocked":
@@ -252,6 +508,8 @@ def _repair_collision(board: str, task: dict[str, Any], *, dry_run: bool) -> str
     if not owner_id.startswith("t_"):
         return f"{task_id}: preserved worktree with non-task owner {occupied}"
     owner_detail = _task_detail(board, owner_id)
+    if owner_detail and owner_detail.get("_readback") == "sqlite":
+        owner_detail = None
     owner_status = ((owner_detail or {}).get("task") or {}).get("status")
     if owner_status not in {"done", "archived", "failed", "cancelled"}:
         return f"{task_id}: preserved worktree {occupied} owned by status={owner_status!r}"
@@ -287,22 +545,70 @@ def _repair_collision(board: str, task: dict[str, Any], *, dry_run: bool) -> str
     return f"recovered {task_id}: removed clean {occupied} and read back status={status}"
 
 
-def recover(board: str, *, dry_run: bool = False) -> list[str]:
-    changes = _repair_cron_pins(dry_run=dry_run)
-    try:
-        tasks = _json_command("kanban", "--board", board, "list", "--status", "blocked", "--json")
-    except RuntimeError:
-        return changes
+def recover(
+    board: str, *, dry_run: bool = False, workers_only: bool = False
+) -> list[str]:
+    changes = [] if workers_only else _repair_cron_pins(dry_run=dry_run)
+    if workers_only:
+        tasks = _readonly_blocked_tasks(board)
+        if tasks is None:
+            try:
+                tasks = _json_command(
+                    "kanban", "--board", board, "list", "--status", "blocked", "--json"
+                )
+            except RuntimeError:
+                tasks = None
+    else:
+        try:
+            tasks = _json_command(
+                "kanban", "--board", board, "list", "--status", "blocked", "--json"
+            )
+        except RuntimeError:
+            tasks = _readonly_blocked_tasks(board)
     if not isinstance(tasks, list):
         return changes
-    for task in tasks:
-        if isinstance(task, dict):
-            change = _acknowledge_parked(board, task, dry_run=dry_run)
+    blocked_tasks = [task for task in tasks if isinstance(task, dict)]
+    if workers_only:
+        deadline = time.monotonic() + _recovery_budget_seconds()
+        for task in blocked_tasks:
+            if time.monotonic() >= deadline:
+                changes.append(
+                    "recovery budget exhausted; skipped remaining blocked-task repairs"
+                )
+                break
+            change = _reconcile_terminal_worker(board, task, dry_run=dry_run)
             if change:
                 changes.append(change)
-            change = _repair_collision(board, task, dry_run=dry_run)
-            if change:
-                changes.append(change)
+        return changes
+
+    deadline = time.monotonic() + _recovery_budget_seconds()
+    budget_reported = False
+    for task in blocked_tasks:
+        if time.monotonic() >= deadline:
+            changes.append("recovery budget exhausted; skipped remaining blocked-task repairs")
+            budget_reported = True
+            break
+        change = _reconcile_terminal_worker(board, task, dry_run=dry_run)
+        if change:
+            changes.append(change)
+
+    for task in blocked_tasks:
+        if time.monotonic() >= deadline:
+            if not budget_reported:
+                changes.append("recovery budget exhausted; skipped remaining blocked-task repairs")
+                budget_reported = True
+            break
+        change = _acknowledge_parked(board, task, dry_run=dry_run)
+        if change:
+            changes.append(change)
+        if time.monotonic() >= deadline:
+            if not budget_reported:
+                changes.append("recovery budget exhausted; skipped remaining blocked-task repairs")
+                budget_reported = True
+            break
+        change = _repair_collision(board, task, dry_run=dry_run)
+        if change:
+            changes.append(change)
     return changes
 
 
@@ -310,11 +616,14 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--board", default=os.environ.get("HERMES_FACTORY_BOARD"))
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--workers-only", action="store_true")
     args = parser.parse_args()
     if not args.board:
         parser.error("--board or HERMES_FACTORY_BOARD is required")
     try:
-        changes = recover(args.board, dry_run=args.dry_run)
+        changes = recover(
+            args.board, dry_run=args.dry_run, workers_only=args.workers_only
+        )
     except Exception as exc:
         print(f"factory recovery failed: {exc}", file=sys.stderr)
         return 1
