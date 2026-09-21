@@ -52,7 +52,9 @@ of the pinned Hermes runtime:
   any reclaimed reviewer run remain fully fenced. The producer also records a
   redundant parent-side invalidation marker; if child-side suffix rows are
   deleted, that later marker consumes the older handoff instead of allowing the
-  legacy fallback to re-admit it.
+  legacy fallback to re-admit it. A later malformed marker on a direct parent
+  also consumes the older child handoff fail-closed, while a valid marker for
+  an independent sibling does not.
 
 The artifact is fail-closed. It pins both input source files and the patch,
 rejects symlinks, hardlinks, special files, path escapes, patch mode/rename

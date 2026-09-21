@@ -46,7 +46,7 @@ native_boundary = _load_module("native_boundary_for_tests", NATIVE_PATH)
 def test_static_manifest_and_patch_are_pinned():
     manifest = builder._static_manifest()
     assert manifest["schema"] == "factory.native-boundary.v1"
-    assert manifest["artifact_version"] == "1.0.17"
+    assert manifest["artifact_version"] == builder.ARTIFACT_VERSION
     assert manifest["copy_policy"] == {
         "fresh_copy_required": True,
         "reject_symlinks": True,
@@ -4017,6 +4017,7 @@ def test_staged_ancestor_reopen_resumes_all_native_lanes(tmp_path: Path) -> None
         "promoted_payload",
         "missing_invalidated",
         "missing_all_suffix",
+        "malformed_parent_marker",
         "reviewer_outcome",
         "review_handoff_run_null",
         "missing_parent_link",
@@ -4054,7 +4055,7 @@ def test_staged_ancestor_reopen_review_handoff_rejects_tampering(
                 expected_run_id=implementation.current_run_id,
             )
             reviewer = None
-            if mutation != "missing_all_suffix":
+            if mutation not in {"missing_all_suffix", "malformed_parent_marker"}:
                 reviewer = kb.claim_review_task(conn, task, claimer="reviewer")
                 assert reviewer is not None
             with kb.write_txn(conn):
@@ -4096,6 +4097,17 @@ def test_staged_ancestor_reopen_review_handoff_rejects_tampering(
                     "DELETE FROM task_events WHERE task_id=? "
                     "AND kind IN ('descendant_invalidated', 'status', 'promoted')",
                     (task,),
+                )
+            elif mutation == "malformed_parent_marker":
+                conn.execute(
+                    "DELETE FROM task_events WHERE task_id=? "
+                    "AND kind IN ('descendant_invalidated', 'status', 'promoted')",
+                    (task,),
+                )
+                conn.execute(
+                    "UPDATE task_events SET payload=? WHERE task_id=? "
+                    "AND kind='descendant_invalidation_recorded'",
+                    ("{malformed", parent),
                 )
             elif mutation == "reviewer_outcome":
                 conn.execute(

@@ -771,18 +771,34 @@ def _later_descendant_invalidation_marker_exists(
     """Detect parent-side evidence that consumed an older review handoff."""
     now = int(time.time())
     rows = conn.execute(
-        "SELECT id, run_id, payload, created_at FROM task_events "
-        "WHERE kind = 'descendant_invalidation_recorded' ORDER BY id ASC"
+        "SELECT e.id, e.run_id, e.payload, e.created_at FROM task_events e "
+        "JOIN task_links l ON l.parent_id = e.task_id "
+        "WHERE l.child_id = ? "
+        "AND e.kind = 'descendant_invalidation_recorded' ORDER BY e.id ASC",
+        (task_id,),
     ).fetchall()
     for row in rows:
-        raw_payload = _json_object(row["payload"])
-        if raw_payload is None or raw_payload.get("descendant") != task_id:
-            continue
-        payload = _descendant_invalidation_marker_payload(row["payload"])
         marker_id = _positive_row_id(row["id"])
         marker_created_at = validated_lifecycle_timestamp(
             row["created_at"], maximum=now
         )
+        later_than_handoff = marker_id is None or marker_id > review_event_id
+        if (
+            not later_than_handoff
+            and marker_created_at is not None
+            and marker_created_at > review_created_at
+            and marker_id is not None
+            and marker_id >= review_event_id
+        ):
+            later_than_handoff = True
+        if not later_than_handoff:
+            continue
+
+        # A marker on a direct parent is durable evidence that some descendant
+        # invalidation happened after this handoff.  If its payload cannot be
+        # parsed and validated we cannot safely prove that it belonged to a
+        # different sibling, so the old handoff must be consumed fail-closed.
+        payload = _descendant_invalidation_marker_payload(row["payload"])
         if (
             payload is None
             or row["run_id"] is not None
@@ -790,9 +806,7 @@ def _later_descendant_invalidation_marker_exists(
             or marker_created_at is None
         ):
             return True
-        if marker_id > review_event_id:
-            return True
-        if marker_created_at > review_created_at and marker_id >= review_event_id:
+        if payload["descendant"] == task_id:
             return True
     return False
 
