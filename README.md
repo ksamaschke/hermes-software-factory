@@ -178,19 +178,25 @@ acceptance questions verbatim, creates at most eight lossless two-file successor
 leaves, and preserves an incomplete packet when that bound cannot cover the
 whole scope. Native Boundary artifact `1.0.19` also records a strict standalone
 `CHANGES_REQUESTED` packet as a sticky `blocked/changes_requested`, exact-run,
-active-profile-fenced SQLite outbox receipt. The packet binds canonical
-repository/worktree/Git-dir identity, branch, base/candidate, changed-path
-manifest, three distinct roles, finding, and the complete direct-parent/child
-frontier. The same scheduled recovery add-on verifies the imported native
-contract and consumes only the active coordinator profile's receipts, one
+live-lease, active-profile-fenced SQLite outbox receipt. The packet binds the
+complete immutable task title/body, a clean worktree including untracked files,
+canonical repository/worktree/Git-dir identity, branch, base/candidate,
+changed-path manifest, three distinct roles, finding, and the complete direct-
+parent/child frontier. The same scheduled recovery add-on verifies the imported
+native contract and consumes only the active coordinator profile's receipts, one
 transaction/readback per receipt. It uses a permanent full-digest idempotency
 key, creates or reuses exactly one immutable review-gated remediation task with
-every direct parent preserved, replaces only the unchanged child frontier,
-then archives the old leaf. A malformed receipt cannot suppress unrelated
-receipts. The rejected leaf cannot be recomputed or reclaimed, and a body
-mutation cannot turn the remediation successor into an ordinary completable
-task. Failed create responses are rediscovered by exact idempotency key before
-cleanup. Dry-run performs only read-only inspection and planning.
+every direct parent preserved, replaces only the unchanged child frontier, then
+archives the old leaf. SQLite guards reject generic promote, schedule, unblock,
+respecify, archive, delete, dashboard, receipt-pointer, and graph mutations at
+that boundary; only the native recovery transaction has scoped authority.
+Legacy receipts without v2 provenance are atomically tombstoned. A malformed
+receipt cannot suppress unrelated receipts. The rejected leaf cannot be
+recomputed or reclaimed, and pointer, body, or graph mutation cannot turn the
+remediation successor into an ordinary completable task. Worker transitions and
+heartbeats require the exact current run, claim lock, and unexpired lease. Failed
+create responses are rediscovered by exact idempotency key before cleanup.
+Dry-run performs only read-only inspection and planning.
 
 Run the review add-on in dry-run mode before scheduling it:
 

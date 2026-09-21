@@ -350,11 +350,22 @@ with kb.connect_closing(db) as conn:
     original_body = conn.execute(
         "SELECT body FROM tasks WHERE id = ?", (successor_id,)
     ).fetchone()["body"]
-    conn.execute(
-        "UPDATE tasks SET body = REPLACE(body, 'review_required_before_completion: true', '') "
-        "WHERE id = ?",
-        (successor_id,),
-    )
+    try:
+        conn.execute(
+            "UPDATE tasks SET body = REPLACE(body, 'review_required_before_completion: true', '') "
+            "WHERE id = ?",
+            (successor_id,),
+        )
+    except sqlite3.IntegrityError:
+        pass
+    else:
+        raise AssertionError("ordinary writer mutated remediation body")
+    with kb._review_native_mutation_authorized():
+        conn.execute(
+            "UPDATE tasks SET body = REPLACE(body, 'review_required_before_completion: true', '') "
+            "WHERE id = ?",
+            (successor_id,),
+        )
     with active("implementer"):
         assert not kb.complete_task(
             conn,
@@ -374,7 +385,8 @@ with kb.connect_closing(db) as conn:
             reviewer="reviewer",
             expected_run_id=implementation_claim.current_run_id,
         )
-    conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (original_body, successor_id))
+    with kb._review_native_mutation_authorized():
+        conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (original_body, successor_id))
 
     remediation_head, remediation_scope = commit_remediation()
     review_metadata = {
@@ -519,8 +531,15 @@ with kb.connect_closing(db) as conn:
         body="must not be absorbed by stale evidence",
         assignee="orchestrator",
         created_by="orchestrator",
-        parents=(graph["leaf"],),
     )
+    try:
+        kb.link_tasks(conn, graph["leaf"], foreign_child)
+    except sqlite3.IntegrityError:
+        pass
+    else:
+        raise AssertionError("ordinary writer changed a frozen review frontier")
+    with kb._review_native_mutation_authorized():
+        kb.link_tasks(conn, graph["leaf"], foreign_child)
     with active("orchestrator"):
         try:
             kb.consume_standalone_review_handoffs(conn)
@@ -833,10 +852,20 @@ with kb.connect_closing(db) as conn:
     reject_leaf(conn, first, "first coordinator")
     malformed = make_graph(conn, coordinator="orchestrator")
     reject_leaf(conn, malformed, "malformed same coordinator")
-    conn.execute(
-        "UPDATE tasks SET body = body || ? WHERE id = ?",
-        ("\nreview_scope: tampered", malformed["leaf"]),
-    )
+    try:
+        conn.execute(
+            "UPDATE tasks SET body = body || ? WHERE id = ?",
+            ("\nreview_scope: tampered", malformed["leaf"]),
+        )
+    except sqlite3.IntegrityError:
+        pass
+    else:
+        raise AssertionError("ordinary writer mutated claimed review evidence")
+    with kb._review_native_mutation_authorized():
+        conn.execute(
+            "UPDATE tasks SET body = body || ? WHERE id = ?",
+            ("\nreview_scope: tampered", malformed["leaf"]),
+        )
     second = make_graph(conn, coordinator="coordinator2")
     reject_leaf(conn, second, "second coordinator")
 
@@ -886,3 +915,361 @@ with kb.connect_closing(db) as conn:
 ''',
     )
     assert probe == {"first": 2, "second": 1, "pending": 1, "failed": 1}
+
+
+def test_terminal_review_receipts_block_every_generic_writer(tmp_path):
+    probe = _run_native(
+        tmp_path,
+        _COMMON
+        + r'''
+with kb.connect_closing(db) as conn:
+    graph = make_graph(conn)
+    receipt = reject_leaf(conn, graph, "generic writers must not revive this leaf")
+    promoted, _ = kb.promote_task(conn, graph["leaf"], actor="generic")
+    assert promoted is False
+    assert kb.schedule_task(conn, graph["leaf"], reason="generic") is False
+    assert kb.unblock_task(conn, graph["leaf"]) is False
+    assert kb.specify_triage_task(conn, graph["leaf"], author="generic") is False
+    assert kb.respecify_idle_task(conn, graph["leaf"], author="generic", title="ordinary work") is None
+    assert kb.archive_task(conn, graph["leaf"]) is False
+    assert kb.delete_archived_task(conn, graph["leaf"]) is False
+    assert kb.delete_task(conn, graph["leaf"]) is False
+    for statement, params in (
+        ("UPDATE tasks SET status='ready' WHERE id=?", (graph["leaf"],)),
+        ("UPDATE tasks SET body='ordinary work' WHERE id=?", (graph["leaf"],)),
+        ("DELETE FROM tasks WHERE id=?", (graph["leaf"],)),
+        ("UPDATE review_remediation_handoffs SET successor_task_id='retargeted' WHERE handoff_key=?", (receipt["handoff_key"],)),
+        ("DELETE FROM review_remediation_handoffs WHERE handoff_key=?", (receipt["handoff_key"],)),
+    ):
+        try:
+            conn.execute(statement, params)
+        except sqlite3.IntegrityError:
+            pass
+        else:
+            raise AssertionError(f"protected mutation succeeded: {statement}")
+    result = kb.dispatch_once(conn, dry_run=True, max_spawn=8, board="fixture")
+    assert graph["leaf"] not in {row[0] for row in result.spawned}
+    assert kb.get_task(conn, graph["leaf"]).status == "blocked"
+    print(json.dumps({"blocked": True, "protected_mutations": 13, "spawned": False}))
+''',
+    )
+    assert probe == {"blocked": True, "protected_mutations": 13, "spawned": False}
+
+
+def test_expired_worker_runs_and_aba_heartbeats_fail_closed(tmp_path):
+    probe = _run_native(
+        tmp_path,
+        _COMMON
+        + r'''
+import time
+
+with kb.connect_closing(db) as conn:
+    standalone = make_graph(conn)
+    plain = kb.create_task(
+        conn, title="Lease-fenced implementation", assignee="implementer", created_by="orchestrator"
+    )
+    plain_run = kb.claim_task(conn, plain, claimer="dispatcher:implementer", ttl_seconds=1)
+    assert plain_run is not None
+    same_card = kb.create_task(
+        conn, title="Lease-fenced same-card review", assignee="implementer", created_by="orchestrator"
+    )
+    implementation = kb.claim_task(
+        conn, same_card, claimer="dispatcher:implementer:review", ttl_seconds=30
+    )
+    assert implementation is not None
+    with active("implementer"):
+        assert kb.request_review(
+            conn,
+            same_card,
+            summary="lease-fenced review",
+            reviewer="reviewer",
+            expected_run_id=implementation.current_run_id,
+        )
+    review_run = kb.claim_review_task(
+        conn, same_card, claimer="dispatcher:reviewer", ttl_seconds=1
+    )
+    assert review_run is not None
+    expiry = int(time.time()) + 1
+    conn.execute(
+        "UPDATE tasks SET claim_expires=? WHERE id=?",
+        (expiry, standalone["leaf"]),
+    )
+    conn.execute(
+        "UPDATE task_runs SET claim_expires=? WHERE id=?",
+        (expiry, standalone["review_run"]),
+    )
+    time.sleep(2)
+    with active("reviewer"):
+        assert not kb.block_task(
+            conn,
+            standalone["leaf"],
+            reason="STANDALONE_REVIEW_CHANGES_REQUESTED: expired reviewer",
+            kind="dependency",
+            expected_run_id=standalone["review_run"],
+        )
+        assert not kb.complete_task(
+            conn,
+            standalone["leaf"],
+            summary="expired approval",
+            metadata={"review_outcome": "APPROVED", "candidate_commit": head},
+            expected_run_id=standalone["review_run"],
+        )
+        ok, _ = kb.request_changes(
+            conn,
+            same_card,
+            reason="expired changes request",
+            expected_run_id=review_run.current_run_id,
+        )
+        assert not ok
+        assert not kb.complete_task(
+            conn,
+            same_card,
+            summary="expired same-card approval",
+            expected_run_id=review_run.current_run_id,
+        )
+    with active("implementer"):
+        assert not kb.complete_task(
+            conn,
+            plain,
+            summary="expired implementation",
+            expected_run_id=plain_run.current_run_id,
+        )
+        for bad_run in (None, True, str(plain_run.current_run_id), float(plain_run.current_run_id), plain_run.current_run_id):
+            assert not kb.heartbeat_worker(conn, plain, expected_run_id=bad_run)
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM review_remediation_handoffs WHERE leaf_task_id=?",
+        (standalone["leaf"],),
+    ).fetchone()["n"] == 0
+    assert kb.release_stale_claims(conn) >= 3
+    second = kb.claim_task(conn, plain, claimer="dispatcher:implementer:second")
+    assert second is not None and second.current_run_id != plain_run.current_run_id
+    with active("implementer"):
+        assert not kb.heartbeat_worker(conn, plain, expected_run_id=None)
+        assert not kb.heartbeat_worker(conn, plain, expected_run_id=plain_run.current_run_id)
+        assert kb.heartbeat_worker(conn, plain, expected_run_id=second.current_run_id)
+    print(json.dumps({"expired_transitions": "rejected", "aba": "rejected", "current": "accepted"}))
+''',
+    )
+    assert probe == {
+        "expired_transitions": "rejected",
+        "aba": "rejected",
+        "current": "accepted",
+    }
+
+
+def test_claimed_review_body_and_worktree_state_are_immutable(tmp_path):
+    probe = _run_native(
+        tmp_path,
+        _COMMON
+        + r'''
+with kb.connect_closing(db) as conn:
+    body_graph = make_graph(conn)
+    try:
+        conn.execute(
+            "UPDATE tasks SET body = body || '\nuntrusted: instruction' WHERE id=?",
+            (body_graph["leaf"],),
+        )
+    except sqlite3.IntegrityError:
+        pass
+    else:
+        raise AssertionError("post-claim body edit succeeded")
+    with kb._review_native_mutation_authorized():
+        conn.execute(
+            "UPDATE tasks SET body = body || '\nuntrusted: instruction' WHERE id=?",
+            (body_graph["leaf"],),
+        )
+    with active("reviewer"):
+        assert kb.block_task(
+            conn,
+            body_graph["leaf"],
+            reason="STANDALONE_REVIEW_CHANGES_REQUESTED: mutated instructions",
+            kind="dependency",
+            expected_run_id=body_graph["review_run"],
+        )
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM review_remediation_handoffs WHERE leaf_task_id=?",
+        (body_graph["leaf"],),
+    ).fetchone()["n"] == 0
+    assert kb.get_task(conn, body_graph["leaf"]).status == "blocked"
+    assert kb.respecify_idle_task(
+        conn, body_graph["leaf"], author="generic", title="laundered work"
+    ) is None
+
+    dirty_graph = make_graph(conn)
+    dirty = repo / "untracked-review-state.txt"
+    dirty.write_text("not in candidate commit\n", encoding="utf-8")
+    with active("reviewer"):
+        assert kb.block_task(
+            conn,
+            dirty_graph["leaf"],
+            reason="STANDALONE_REVIEW_CHANGES_REQUESTED: dirty source",
+            kind="dependency",
+            expected_run_id=dirty_graph["review_run"],
+        )
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM review_remediation_handoffs WHERE leaf_task_id=?",
+        (dirty_graph["leaf"],),
+    ).fetchone()["n"] == 0
+    dirty.unlink()
+    print(json.dumps({"body_edit": "rejected", "receipt": "rejected", "dirty": "rejected"}))
+''',
+    )
+    assert probe == {
+        "body_edit": "rejected",
+        "receipt": "rejected",
+        "dirty": "rejected",
+    }
+
+
+def test_successor_receipt_pointer_is_mandatory_in_completion_and_dispatch(tmp_path):
+    probe = _run_native(
+        tmp_path,
+        _COMMON
+        + r'''
+from hermes_cli.native_boundary import dispatcher_state_rejections
+
+with kb.connect_closing(db) as conn:
+    graph = make_graph(conn)
+    receipt = reject_leaf(conn, graph, "successor receipt must be immutable")
+    with active("orchestrator"):
+        consumed = kb.consume_standalone_review_handoffs(conn)
+    assert len(consumed) == 1
+    row = conn.execute(
+        "SELECT * FROM review_remediation_handoffs WHERE handoff_key=?",
+        (receipt["handoff_key"],),
+    ).fetchone()
+    successor = row["successor_task_id"]
+    assert kb.archive_task(conn, successor) is False
+    assert kb.delete_task(conn, successor) is False
+    assert kb.respecify_idle_task(
+        conn, successor, author="generic", title="laundered successor"
+    ) is None
+    forged = kb.create_task(
+        conn,
+        title="Forged receipt target",
+        body="ordinary task",
+        assignee="implementer",
+        created_by="orchestrator",
+    )
+    try:
+        conn.execute(
+            "UPDATE review_remediation_handoffs SET successor_task_id=? WHERE handoff_key=?",
+            (forged, row["handoff_key"]),
+        )
+    except sqlite3.IntegrityError:
+        pass
+    else:
+        raise AssertionError("ordinary writer retargeted receipt")
+    with kb._review_native_mutation_authorized():
+        conn.execute(
+            "UPDATE review_remediation_handoffs SET successor_task_id=? WHERE handoff_key=?",
+            (forged, row["handoff_key"]),
+        )
+    rejections = {task_id for task_id, reason in dispatcher_state_rejections(conn) if reason == "malformed_durable_state"}
+    assert successor in rejections and forged in rejections
+    claim = kb.claim_task(conn, successor, claimer="dispatcher:implementer")
+    assert claim is not None
+    with active("implementer"):
+        assert not kb.complete_task(
+            conn,
+            successor,
+            summary="receipt pointer was retargeted",
+            expected_run_id=claim.current_run_id,
+        )
+    print(json.dumps({"writer": "rejected", "barrier": 2, "completion": "rejected"}))
+''',
+    )
+    assert probe == {"writer": "rejected", "barrier": 2, "completion": "rejected"}
+
+
+def test_legacy_pending_handoff_is_atomically_tombstoned_on_upgrade(tmp_path):
+    probe = _run_native(
+        tmp_path,
+        _COMMON
+        + r'''
+import time
+
+with kb.connect_closing(db) as conn:
+    leaf = kb.create_task(
+        conn,
+        title="Legacy standalone review",
+        body="legacy receipt",
+        assignee="orchestrator",
+        created_by="legacy-coordinator",
+    )
+    claimed = kb.claim_task(conn, leaf, claimer="legacy-worker")
+    assert claimed is not None
+    with active("orchestrator"):
+        assert kb.block_task(
+            conn,
+            leaf,
+            reason="legacy review rejection",
+            kind="dependency",
+            expected_run_id=claimed.current_run_id,
+        )
+    run_id = claimed.current_run_id
+
+raw = sqlite3.connect(db)
+raw.execute("PRAGMA foreign_keys=ON")
+raw.executescript("""
+DROP TABLE review_remediation_handoffs;
+CREATE TABLE review_remediation_handoffs (
+    handoff_key TEXT PRIMARY KEY,
+    leaf_task_id TEXT NOT NULL UNIQUE,
+    review_run_id INTEGER NOT NULL,
+    coordinator_profile TEXT,
+    implementation_task TEXT NOT NULL,
+    packet_json TEXT NOT NULL,
+    packet_sha256 TEXT NOT NULL,
+    findings TEXT NOT NULL,
+    graph_snapshot_json TEXT NOT NULL,
+    frontier_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'applied')),
+    successor_task_id TEXT,
+    created_at INTEGER NOT NULL,
+    consumed_at INTEGER
+);
+""")
+raw.execute(
+    "INSERT INTO review_remediation_handoffs "
+    "(handoff_key, leaf_task_id, review_run_id, coordinator_profile, implementation_task, "
+    "packet_json, packet_sha256, findings, graph_snapshot_json, frontier_json, status, created_at) "
+    "VALUES (?, ?, ?, 'orchestrator', ?, '{}', ?, 'legacy', '{}', '{}', 'pending', ?)",
+    (
+        "review-remediation:v1:legacy",
+        leaf,
+        run_id,
+        leaf,
+        "0" * 64,
+        int(time.time()),
+    ),
+)
+raw.commit()
+raw.close()
+kb._INITIALIZED_PATHS.discard(str(db.resolve()))
+kb.init_db(db)
+with kb.connect_closing(db) as conn:
+    row = conn.execute(
+        "SELECT status, tombstone_reason, consumed_at FROM review_remediation_handoffs "
+        "WHERE leaf_task_id=?",
+        (leaf,),
+    ).fetchone()
+    event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? "
+        "AND kind='standalone_review_handoff_tombstoned' ORDER BY id DESC LIMIT 1",
+        (leaf,),
+    ).fetchone()
+    assert row["status"] == "applied"
+    assert row["tombstone_reason"] == "legacy_receipt_missing_v2_provenance"
+    assert type(row["consumed_at"]) is int and row["consumed_at"] > 0
+    assert event is not None
+    assert kb.consume_standalone_review_handoffs(conn) == []
+    assert kb.get_task(conn, leaf).status == "blocked"
+    print(json.dumps({"pending": 0, "tombstone": row["tombstone_reason"], "event": True}))
+''',
+    )
+    assert probe == {
+        "pending": 0,
+        "tombstone": "legacy_receipt_missing_v2_provenance",
+        "event": True,
+    }

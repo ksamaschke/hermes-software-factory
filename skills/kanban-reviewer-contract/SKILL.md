@@ -1,7 +1,7 @@
 ---
 name: kanban-reviewer-contract
 description: Define bounded, read-only Kanban review work.
-version: 0.4.0
+version: 0.5.0
 author: Karsten Samaschke, Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -205,10 +205,13 @@ orchestrator/tracker lane, never inside the review.
    gate evidence, runtime budgets, retry limit, and stop condition. Completion
    criterion: every required field is present, the scope is a change manifest,
    no full-gate command is requested, and no prohibited mutation is requested.
-2. **Preflight the target.** Confirm the worktree, branch, candidate commit,
-   base reference, project instructions, and named changed paths. Record the
-   review start time and compute the evidence-budget deadline. If the target is
-   missing or the profile cannot resolve its required review capability, return
+2. **Preflight the target.** Confirm the worktree is completely clean (including
+   untracked files), branch, candidate commit, base reference, project
+   instructions, and named changed paths. The native claim receipt binds the
+   complete task title/body and resolved Git/worktree identity; any later task
+   edit or dirty worktree makes the verdict incomplete. Record the review start
+   time and compute the evidence-budget deadline. If the target is missing or
+   the profile cannot resolve its required review capability, return
    `REVIEW-INCOMPLETE`; do not improvise a repository-wide search.
 3. **Read the change set cold.** Inspect the diff for the manifest hunks and the
    acceptance criteria before reading any surrounding code. Keep the working set

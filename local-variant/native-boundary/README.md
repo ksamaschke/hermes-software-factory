@@ -31,28 +31,39 @@ copy of the pinned Hermes runtime:
   is never authority. Reclaim evidence additionally enforces native
   cross-field termination, host-local, and heartbeat consistency.
 - a standalone review leaf claimed from `ready` can record
-  `CHANGES_REQUESTED` only from its exact positive current run and native active
-  reviewer profile, strict immutable packet, resolved repository/worktree/Git-dir
+  `CHANGES_REQUESTED` only from its exact positive current run, still-live lease,
+  matching claim lock, and native active reviewer profile. The claim and verdict
+  bind a strict immutable packet, complete task title/body digest, a completely
+  clean worktree including untracked files, resolved repository/worktree/Git-dir
   identity, branch, base/candidate, changed-path manifest, three distinct roles,
-  finding, and complete direct-parent/child frontier. The same native
-  transaction terminally closes that run as the canonical sticky
-  `blocked/changes_requested` pair and inserts one graph-bound remediation
-  outbox receipt. Recompute, dispatch, and claim paths honor pending/applied
-  receipts, so the rejected leaf cannot run twice. Coordinator consumption is
-  bound to the native active profile and verified runtime contract, isolated per
-  receipt, atomic, race-safe, and idempotent. A full-digest reserved key creates
-  or reuses one implementer successor with every direct parent preserved; its
-  immutable body receipt and native review gate cannot be removed by body
-  editing. Only the unchanged child frontier moves before exact graph readback,
-  old-leaf archive, and receipt application.
+  finding, and complete direct-parent/child frontier. A heartbeat likewise
+  requires the exact current positive run, claim lock, and live lease; there is
+  no runless fallback. The same native transaction terminally closes that run as
+  the canonical sticky `blocked/changes_requested` pair and inserts one
+  graph-bound remediation outbox receipt. Recompute, dispatch, and claim paths
+  honor pending/applied/tombstoned receipts, so the rejected leaf cannot run
+  twice. Coordinator consumption is bound to the native active profile and
+  verified runtime contract, isolated per receipt, atomic, race-safe, and
+  idempotent. A full-digest reserved key creates or reuses one implementer
+  successor with every direct parent preserved; its mandatory pointer, immutable
+  body receipt, graph, and native review gate cannot be removed or retargeted.
+  Only the unchanged child frontier moves before exact graph readback, old-leaf
+  archive, and receipt application.
+- SQLite-level guards protect claimed/terminal review task evidence, remediation
+  receipts, and frozen graph links from generic promote, schedule, unblock,
+  respecify, archive, delete, dashboard, and direct SQL writers. Only the scoped
+  native terminal/recovery transaction receives connection-local mutation
+  authority. Legacy pending receipts that lack current v2 provenance are
+  atomically tombstoned with a durable audit event instead of remaining pending.
 - completion of a standalone leaf or remediation successor requires structured
-  exact `APPROVED` metadata plus matching current reviewer run and native active
-  profile, prior terminal `review_requested` implementation run, immutable
-  packet/body receipt, candidate, changed-path manifest, repository/worktree
-  identity, and local HEAD. Missing, boolean/string/float/stale run IDs,
-  role collisions, non-approval, self-attestation, stale or foreign evidence,
-  and malformed provenance cannot complete the task or release status-gated
-  children.
+  exact `APPROVED` metadata plus matching current reviewer run, native active
+  profile, live lease and claim lock, prior terminal `review_requested`
+  implementation run, immutable packet/body/pointer receipt, clean worktree,
+  candidate, changed-path manifest, repository/worktree identity, and local HEAD.
+  Missing, boolean/string/float/stale/expired run IDs, role collisions,
+  non-approval, self-attestation, stale or foreign evidence, pointer/body/graph
+  tampering, and malformed provenance cannot complete the task or release
+  status-gated children.
 - before reclaim, orphan repair, promotion, or spawn, a durable-state barrier
   validates non-terminal task scalars, run/event/comment identifiers and
   timestamps, run state, JSON storage, transition schemas, counters, PIDs,

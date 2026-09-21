@@ -1,7 +1,7 @@
 ---
 name: kanban-review-orchestration
 description: "Use for Kanban review orchestration and evidence gates."
-version: 1.3.0
+version: 1.4.0
 author: HEX
 license: MIT
 platforms: [macos, linux, windows]
@@ -195,11 +195,16 @@ hand internal repair coordination to the operator. Continue the bounded loop:
    readback. Do not create a parallel manual card. The implementer then starts
    from current remote upstream `main`, not a stale local tracking ref, in a
    fresh clean clone/worktree so user-owned dirty state is never mutated.
-3. The immutable successor receipt remains review-gated even if its body is
-   edited. Its exact implementation run requests a distinct reviewer with only
+3. The immutable successor receipt remains review-gated even if its body,
+   idempotency key, graph links, or durable pointer is edited. Ordinary promote,
+   schedule, unblock, respecify, archive, delete, dashboard, and direct SQL
+   writers cannot mutate a claimed or terminal native review boundary. Its exact
+   unexpired implementation run requests a distinct reviewer with only
    `candidate_commit`, `review_remediation_handoff_key`, and
    `scope_manifest_sha256`; the native boundary validates these against the
-   current repository, branch, base, candidate, and changed-path manifest.
+   current clean repository/worktree, branch, base, candidate, complete task
+   body, and changed-path manifest. Legacy receipts without current provenance
+   are atomically tombstoned rather than left pending.
 4. Verify the implementer commit, exact file scope, focused/full gates, and
    clean worktree. Route exactly one fresh independent review for the new
    candidate; never reuse the old leaf or its verdict.
