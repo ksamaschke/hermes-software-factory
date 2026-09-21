@@ -50,6 +50,16 @@ Report the decision, durable action, progress, non-progress, why, boundary,
 owner, evidence, and next gate. Treat evidence as verification of the action,
 not as a reason to return routine decisions to the operator.
 
+## Review lifecycle models
+
+Distinguish native same-card review from a separate review leaf before routing
+any verdict. A same-card review is claimed from `source_status=review` after a
+durable `review_requested` handoff; it may use `kanban_request_changes`. A
+standalone review leaf is claimed from `source_status=ready`; it completes its
+own card with the terminal verdict, and remediation or continuation is a
+separate orchestrator-owned phase. Never requeue a standalone leaf because
+`kanban_request_changes` rejected its source status.
+
 ## Boundaries
 
 - Do not implement source changes personally when an implementer owns them.

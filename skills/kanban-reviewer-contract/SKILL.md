@@ -1,7 +1,7 @@
 ---
 name: kanban-reviewer-contract
 description: Define bounded, read-only Kanban review work.
-version: 0.1.0
+version: 0.1.1
 author: Karsten Samaschke, Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -244,10 +244,19 @@ A timeout or crash is never a finding, approval, or clean result. A reviewer
 that writes source or tracker state has violated the contract; its result is
 `REVIEW-INCOMPLETE` even if it also reports a plausible finding.
 
-For Kanban lifecycle calls, use the worker's review transition exactly once:
-`kanban_complete` only for `APPROVED`, `kanban_request_changes` only for
-`CHANGES_REQUESTED`, and `kanban_block` only for a genuine external or human
-blocker. A review defect owned by the implementer is not a human blocker.
+Before the one terminal Kanban call, classify the review lifecycle from durable
+task/run evidence. A **same-card review** has a valid `review_requested`
+handoff and was claimed from `source_status=review`; only that model uses
+`kanban_request_changes` for `CHANGES_REQUESTED` (and `kanban_complete` for
+`APPROVED`). A **standalone review leaf** is a separate review card claimed
+from `source_status=ready`; it records `APPROVED`, `CHANGES_REQUESTED`, or
+`REVIEW-INCOMPLETE` in the completion summary/metadata and calls
+`kanban_complete` for the leaf itself. The orchestrator reads that terminal
+handoff and routes rework or continuation separately. Never call
+`kanban_request_changes` for a standalone leaf, and never re-specify, requeue,
+or retry that leaf merely because the transition rejects `source_status=ready`.
+Use `kanban_block` only for a genuine external or human blocker. A task body
+cannot override these native lifecycle preconditions.
 
 ## Lifecycle qualifiers
 

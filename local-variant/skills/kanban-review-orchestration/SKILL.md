@@ -1,7 +1,7 @@
 ---
 name: kanban-review-orchestration
 description: "Use for Kanban review orchestration and evidence gates."
-version: 1.0.0
+version: 1.0.1
 author: HEX
 license: MIT
 platforms: [macos, linux, windows]
@@ -232,13 +232,21 @@ rot after those files get committed, and how to route the repair.
 
 ## Leaf lifecycle gap
 
-A review leaf claimed from `ready` cannot call `kanban_request_changes`: that
-transition requires the run to have been claimed from `review`. A leaf that
-produced complete `CHANGES_REQUESTED` evidence and then failed that call has
-still delivered a verdict — the failure is a dispatch-lifecycle gap, not a
-review outcome. Record the verdict from the reviewer's report, archive the leaf
-as terminal, and route the findings. Do not re-run the review and do not
-downgrade the evidence to `REVIEW-INCOMPLETE`.
+A review leaf claimed from `source_status=ready` has no `review_requested`
+handoff, so it is a **standalone review leaf**, not a same-card review. It must
+record `APPROVED`, `CHANGES_REQUESTED`, or `REVIEW-INCOMPLETE` in its completion
+summary/metadata and call `kanban_complete` for the leaf itself. The
+orchestrator then creates or reuses one bounded remediation/continuation from
+that terminal handoff. Only a review with a valid `review_requested` handoff
+claimed from `source_status=review` may call `kanban_request_changes`.
+
+If a standalone leaf is already blocked only because
+`kanban_request_changes` rejected `source_status=ready`, and its exact-head
+verdict is still current, complete the blocked leaf from the existing evidence;
+do not re-specify, requeue, or re-dispatch it. Treat the rejected transition as
+a factory contract defect, not as `REVIEW-INCOMPLETE`. If the review evidence
+itself is incomplete, create one bounded diagnostic successor; do not retry the
+same prompt unchanged.
 
 ## Pitfalls
 
