@@ -57,10 +57,16 @@ any verdict. A same-card review is claimed from `source_status=review` after a
 durable `review_requested` handoff; its native `kanban_request_changes`
 transition is the sole rework lane and must not be duplicated by a new
 implementer card. A standalone review leaf is claimed from
-`source_status=ready`; only current exact `APPROVED` may complete and release
-its dependants. A non-approval never releases downstream work: block once,
-create or reuse one identity-bound successor, verify the dependency frontier,
-then archive or replace the old leaf. Never requeue the same review.
+`source_status=ready`; exact `APPROVED` completes once with structured outcome
+and candidate metadata, while exact `CHANGES_REQUESTED` blocks once with the
+native `STANDALONE_REVIEW_CHANGES_REQUESTED:` prefix. Native Boundary `1.0.19`
+binds current run, reviewer, packet, worktree HEAD, coordinator, finding, and
+direct frontier into a terminal outbox receipt. The scheduled recovery path
+consumes that receipt atomically to create or reuse one graph-bound remediation
+card, move only the unchanged direct frontier, archive the old leaf after
+readback, and mark the receipt applied. Missing, stale, foreign, malformed,
+self-attested, or changed evidence remains `REVIEW-INCOMPLETE`; never complete,
+release, redispatch, or manually duplicate the native path.
 
 ## Boundaries
 

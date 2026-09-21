@@ -20,6 +20,7 @@ import argparse
 import copy
 from contextlib import contextmanager
 from functools import lru_cache
+import importlib
 import json
 import os
 import re
@@ -203,6 +204,79 @@ def _enrich_task_with_durable_fields(board: str, task: dict[str, Any]) -> dict[s
     enriched = dict(task)
     enriched.update(_durable_task_fields(board, task_id))
     return enriched
+
+
+def _active_profile_name() -> str:
+    try:
+        profiles = importlib.import_module("hermes_cli.profiles")
+        resolver = getattr(profiles, "get_active_profile_name", None)
+        value = resolver() if callable(resolver) else None
+    except Exception as exc:
+        raise RuntimeError("active coordinator profile is unavailable") from exc
+    actor = str(value or "").strip()
+    if not actor:
+        raise RuntimeError("active coordinator profile is unavailable")
+    return actor
+
+
+def _recover_native_review_remediation_handoffs(
+    board: str,
+    *,
+    apply: bool,
+) -> list[str]:
+    """Consume native standalone-review outbox rows through the active runtime."""
+    path = _board_db_path(board)
+    uri = f"{path.as_uri()}?mode=ro"
+    try:
+        with sqlite3.connect(uri, uri=True) as connection:
+            table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'review_remediation_handoffs'"
+            ).fetchone()
+            if table is None:
+                return []
+            pending = [
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT handoff_key FROM review_remediation_handoffs "
+                    "WHERE status = 'pending' ORDER BY created_at, handoff_key"
+                ).fetchall()
+            ]
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"could not read native review handoffs: {exc}") from exc
+    if not pending:
+        return []
+    if not apply:
+        return [f"would consume native review remediation handoff {key}" for key in pending]
+
+    try:
+        native_db = importlib.import_module("hermes_cli.kanban_db")
+    except Exception as exc:
+        raise RuntimeError("active native Kanban runtime is unavailable") from exc
+    consumer = getattr(native_db, "consume_standalone_review_handoffs", None)
+    if not callable(consumer):
+        raise RuntimeError(
+            "pending review remediation handoffs exist but the active runtime has no native consumer"
+        )
+    actor = _active_profile_name()
+    with native_db.connect(path) as connection:
+        raw_results = consumer(connection, actor=actor, limit=max(len(pending), 1))
+    if not isinstance(raw_results, list) or not all(
+        isinstance(result, dict) for result in raw_results
+    ):
+        raise RuntimeError("native review handoff consumer returned malformed readback")
+    results: list[dict[str, Any]] = raw_results
+    consumed = {str(result.get("handoff_key")) for result in results if isinstance(result, dict)}
+    missing = [key for key in pending if key not in consumed]
+    if missing:
+        raise RuntimeError(
+            "native review handoff consumption returned incomplete readback: " + ", ".join(missing)
+        )
+    return [
+        "consumed native review remediation handoff "
+        f"{result['handoff_key']} -> {result['successor_task_id']}"
+        for result in results
+    ]
 
 
 def _task_id(value: Any) -> str:
@@ -1712,8 +1786,9 @@ def _recover_fanins(
 
 
 def recover(board: str, *, apply: bool = False, run_guard: bool = True) -> list[str]:
-    rows = _list(board)
     changes: list[str] = []
+    changes.extend(_recover_native_review_remediation_handoffs(board, apply=apply))
+    rows = _list(board)
     if run_guard:
         changes.extend(guard(board, rows, apply=apply))
         if apply:

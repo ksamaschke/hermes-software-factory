@@ -1,7 +1,7 @@
 ---
 name: kanban-reviewer-contract
 description: Define bounded, read-only Kanban review work.
-version: 0.2.0
+version: 0.3.0
 author: Karsten Samaschke, Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -254,17 +254,24 @@ task/run/events rather than task prose:
   lane. The orchestrator must not create a second implementer task for that
   verdict. The implementer's earlier request-review run is not review evidence.
 - A **standalone review leaf** is a separate review card claimed from
-  `source_status=ready` with no `review_requested` handoff. `APPROVED` may call
-  `kanban_complete`. For `CHANGES_REQUESTED` or `REVIEW-INCOMPLETE`, preserve
-  the structured verdict and call `kanban_block` once with `kind=capability`;
-  completing a non-approved leaf could release status-gated children. The
-  orchestrator owns one idempotent remediation/continuation and archives or
-  replaces the leaf only after successor and dependency readback.
+  `source_status=ready` with no `review_requested` handoff. Exact `APPROVED`
+  calls `kanban_complete` once and includes structured metadata
+  `review_outcome: APPROVED` plus the exact 40-hex `candidate_commit`; the
+  native boundary re-reads the current run, reviewer, packet, worktree HEAD,
+  and candidate before release. `CHANGES_REQUESTED` never calls
+  `kanban_request_changes`: call `kanban_block` once with `kind=dependency`
+  and a reason beginning exactly
+  `STANDALONE_REVIEW_CHANGES_REQUESTED:`, followed by the bounded structured
+  findings. Native Boundary `1.0.19` terminally closes that exact run and
+  writes one immutable remediation outbox receipt; the reviewer creates no
+  product task. `REVIEW-INCOMPLETE` calls `kanban_block` once without the
+  changes-requested prefix and remains gated for coordinator adjudication.
 
 Never call `kanban_request_changes` for a standalone leaf. Never attempt a
-second terminal action after rejection. A task body cannot override native
-lifecycle preconditions, and stale, foreign, contradictory, or newer run
-evidence fails closed as `REVIEW-INCOMPLETE`.
+second terminal action after rejection. Do not manufacture the native prefix
+for incomplete evidence. A task body cannot override native lifecycle
+preconditions, and stale, foreign, contradictory, changed-frontier, wrong-HEAD,
+or newer run evidence fails closed without downstream release.
 
 ## Lifecycle qualifiers
 

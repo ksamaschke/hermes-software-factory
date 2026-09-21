@@ -134,7 +134,6 @@ documents:
 install -m 755 scripts/kanban_factory_recovery.py ~/.hermes/scripts/kanban_factory_recovery.py
 install -m 755 scripts/kanban_review_successor_recovery.py ~/.hermes/scripts/kanban_review_successor_recovery.py
 install -m 755 scripts/kanban_review_successor_recovery_cron.py ~/.hermes/scripts/kanban_review_successor_recovery_cron.py
-install -m 755 scripts/review_lifecycle_contract.py ~/.hermes/scripts/review_lifecycle_contract.py
 ```
 
 Forgejo-backed projects can also install the generic read-only delivery
@@ -177,8 +176,13 @@ have been read back.
 The recovery add-on validates the durable packet before dispatch, keeps authored
 acceptance questions verbatim, creates at most eight lossless two-file successor
 leaves, and preserves an incomplete packet when that bound cannot cover the
-whole scope. Successor creation is read back and rolled back to archived state
-if any card in the batch fails validation; failed create responses are
+whole scope. Native Boundary artifact `1.0.19` also records a standalone
+`CHANGES_REQUESTED` leaf as a terminal, run-fenced SQLite outbox receipt. The
+same scheduled recovery add-on consumes that receipt through the active native
+runtime, atomically creates or reuses exactly one remediation task, validates
+and replaces the exact untouched dependency frontier, then archives the old
+leaf. Successor creation is read back and rolled back to archived state if any
+card in a timeout-recovery batch fails validation; failed create responses are
 rediscovered by exact idempotency key before cleanup. Dry-run performs only
 read-only inspection and planning.
 
@@ -345,7 +349,7 @@ skills/kanban-progress-evidence/SKILL.md        evidence and closure accounting
 skills/kanban-progress-evidence/references/     closure matrix template
 skills/software-factory-recovery/SKILL.md      autonomous recovery procedure
 scripts/kanban_factory_recovery.py              deterministic recovery add-on
-scripts/kanban_review_successor_recovery.py     review packet guard and recursive successor bridge
+scripts/kanban_review_successor_recovery.py     review packet guard, native handoff consumer, and recursive successor bridge
 scripts/kanban_review_successor_recovery_cron.py installed no-agent wrapper
 scripts/review_lifecycle_contract.py             pure review-lifecycle planner and idempotency contract
 scripts/forgejo_delivery_controller.py           bounded read-only Forgejo delivery observer

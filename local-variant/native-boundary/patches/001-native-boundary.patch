@@ -1,24 +1,1055 @@
 --- a/hermes_cli/kanban_db.py
 +++ b/hermes_cli/kanban_db.py
-@@ -4532 +4532,4 @@
+@@ -1479,6 +1479,32 @@ CREATE TABLE IF NOT EXISTS task_runs (
+     error               TEXT
+ );
+
++-- Durable native outbox for standalone review-leaf rejections. The reviewer
++-- only records a terminal, provenance-bound handoff. A coordinator consumes it
++-- exactly once and creates/reuses the remediation task under the same SQLite
++-- writer transaction; workers never create product work from a review run.
++CREATE TABLE IF NOT EXISTS review_remediation_handoffs (
++    handoff_key       TEXT PRIMARY KEY,
++    leaf_task_id      TEXT NOT NULL,
++    review_run_id     INTEGER NOT NULL,
++    reviewer_profile  TEXT NOT NULL,
++    implementer_profile TEXT NOT NULL,
++    coordinator_profile TEXT NOT NULL,
++    implementation_task TEXT NOT NULL,
++    candidate_commit  TEXT NOT NULL,
++    packet_sha256     TEXT NOT NULL,
++    finding_sha256    TEXT NOT NULL,
++    frontier_sha256   TEXT NOT NULL,
++    frontier_json     TEXT NOT NULL,
++    reason            TEXT NOT NULL,
++    status            TEXT NOT NULL DEFAULT 'pending',
++    successor_task_id TEXT,
++    created_at        INTEGER NOT NULL,
++    consumed_at       INTEGER,
++    UNIQUE (leaf_task_id, review_run_id),
++    CHECK (status IN ('pending', 'applied'))
++);
++
+ -- Files attached to a task (PDFs, images, source documents). The blob
+ -- lives on disk under ``attachments_root(board)/<task_id>/<stored_name>``;
+ -- this row carries metadata + the absolute ``stored_path`` so the
+@@ -1524,6 +1550,7 @@ CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, c
+ CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
+ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
+ CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
++CREATE INDEX IF NOT EXISTS idx_review_handoffs_status ON review_remediation_handoffs(status, created_at);
+ CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
+ CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+ """
+@@ -4529,7 +4556,10 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
+
+
+ def recompute_ready(
 -    conn: sqlite3.Connection, failure_limit: int = None,
 +    conn: sqlite3.Connection,
 +    failure_limit: int = None,
 +    *,
 +    excluded_task_ids: Optional[set[Any]] = None,
-@@ -4564,0 +4568 @@
+ ) -> int:
+     """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
+
+@@ -4562,6 +4592,7 @@ def recompute_ready(
+     """
+     if failure_limit is None:
+         failure_limit = DEFAULT_FAILURE_LIMIT
 +    excluded_task_ids = excluded_task_ids or set()
-@@ -4572,0 +4577,2 @@
+     promoted = 0
+     with write_txn(conn):
+         todo_rows = conn.execute(
+@@ -4570,6 +4601,8 @@ def recompute_ready(
+         ).fetchall()
+         for row in todo_rows:
+             task_id = row["id"]
 +            if task_id in excluded_task_ids:
 +                continue
-@@ -4971,0 +4978 @@
+             cur_status = row["status"]
+             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
+                 # Worker / operator asked for explicit human intervention — do not
+@@ -4651,6 +4684,21 @@ def claim_task(
+     lock = claimer or _claimer_id()
+     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+     with write_txn(conn):
++        packet_row = conn.execute(
++            "SELECT body FROM tasks WHERE id = ? AND status = 'ready'",
++            (task_id,),
++        ).fetchone()
++        packet_body = str(packet_row["body"] or "") if packet_row is not None else ""
++        standalone_packet, standalone_packet_error = _review_packet(packet_body)
++        standalone_declared = _review_body_field(packet_body, "review_type") is not None
++        if standalone_declared and standalone_packet_error is not None:
++            _append_event(
++                conn,
++                task_id,
++                "claim_rejected",
++                {"reason": "standalone_review_packet_invalid"},
++            )
++            return None
+         # Structural invariant: never transition ready -> running while any
+         # parent is not yet 'done'. This is the single enforcement point
+         # regardless of which writer (create_task, link_tasks, unblock_task,
+@@ -4746,6 +4794,19 @@ def claim_task(
+             {"lock": lock, "expires": expires, "run_id": run_id},
+             run_id=run_id,
+         )
++        if standalone_packet is not None:
++            _append_event(
++                conn,
++                task_id,
++                "standalone_review_packet_claimed",
++                {
++                    "packet_sha256": _review_sha256(_review_json(standalone_packet)),
++                    "candidate_commit": standalone_packet["candidate_commit"],
++                    "reviewer_profile": standalone_packet["reviewer_profile"],
++                    "source_status": "ready",
++                },
++                run_id=run_id,
++            )
+         claimed = get_task(conn, task_id)
+     _fire_kanban_lifecycle_hook(
+         "kanban_task_claimed",
+@@ -4969,6 +5030,7 @@ def release_stale_claims(
+     conn: sqlite3.Connection,
+     *,
+     signal_fn=None,
 +    excluded_task_ids: Optional[set[Any]] = None,
-@@ -4998,0 +5006 @@
+ ) -> int:
+     """Reset any ``running`` task whose claim has expired.
+
+@@ -4996,6 +5058,7 @@ def release_stale_claims(
+     extensions don't count). Safe to call often.
+     """
+     now = int(time.time())
 +    excluded_task_ids = excluded_task_ids or set()
-@@ -5009,0 +5018,2 @@
+     reclaimed = 0
+     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+     stale = conn.execute(
+@@ -5007,6 +5070,8 @@ def release_stale_claims(
+         (now,),
+     ).fetchall()
+     for row in stale:
 +        if row["id"] in excluded_task_ids:
 +            continue
-@@ -7397,0 +7408,13 @@
+         lock = row["claim_lock"] or ""
+         host_local = lock.startswith(host_prefix)
+         hb = row["last_heartbeat_at"]
+@@ -5566,6 +5631,22 @@ def complete_task(
+     and never blocks.
+     """
+     now = int(time.time())
++    review_rejection = _review_completion_rejection(
++        conn,
++        task_id,
++        metadata=metadata,
++        expected_run_id=expected_run_id,
++    )
++    if review_rejection is not None:
++        with write_txn(conn):
++            _append_event(
++                conn,
++                task_id,
++                "completion_blocked_review_evidence",
++                {"reason": review_rejection, "release_allowed": False},
++                run_id=_current_run_id(conn, task_id),
++            )
++        return False
+     # Fail before validating cards or staging artifacts; re-check inside the
+     # final write transaction below to close the parent-reopen race.
+     if not _parents_satisfied(conn, task_id):
+@@ -5607,6 +5688,21 @@ def complete_task(
+         # ``review`` or ``running``.
+         if not _parents_satisfied(conn, task_id):
+             return False
++        review_rejection = _review_completion_rejection(
++            conn,
++            task_id,
++            metadata=metadata,
++            expected_run_id=expected_run_id,
++        )
++        if review_rejection is not None:
++            _append_event(
++                conn,
++                task_id,
++                "completion_blocked_review_evidence",
++                {"reason": review_rejection, "release_allowed": False},
++                run_id=_current_run_id(conn, task_id),
++            )
++            return False
+         prior = conn.execute(
+             "SELECT status FROM tasks WHERE id = ?",
+             (task_id,),
+@@ -6442,6 +6538,847 @@ def edit_completed_task_result(
+     return True
+
+
++_STANDALONE_REVIEW_CHANGES_PREFIX = "STANDALONE_REVIEW_CHANGES_REQUESTED:"
++_REVIEW_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
++
++
++def _review_sha256(value: str) -> str:
++    return hashlib.sha256(value.encode("utf-8")).hexdigest()
++
++
++def _review_json(value: Any) -> str:
++    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
++
++
++def _review_body_field(body: str, name: str) -> Optional[str]:
++    """Return one unambiguous scalar review-packet field."""
++    matches = re.findall(
++        rf"(?m)^[ \t]*{re.escape(name)}[ \t]*:[ \t]*(.*?)[ \t]*$",
++        str(body or ""),
++    )
++    if len(matches) != 1:
++        return None
++    value = matches[0].strip().strip("`")
++    return value or None
++
++
++def _review_packet(body: str) -> tuple[Optional[dict[str, str]], Optional[str]]:
++    required = (
++        "review_type",
++        "implementation_task",
++        "target_repository",
++        "target_worktree",
++        "candidate_commit",
++        "implementer_profile",
++        "reviewer_profile",
++        "read_only_source",
++        "review_kind",
++        "review_scope",
++    )
++    packet: dict[str, str] = {}
++    for field_name in required:
++        value = _review_body_field(body, field_name)
++        if value is None:
++            return None, f"missing or ambiguous review packet field: {field_name}"
++        packet[field_name] = value
++    if "review leaf" not in packet["review_type"].casefold():
++        return None, "review_type is not a standalone review leaf"
++    if packet["read_only_source"].casefold() != "true":
++        return None, "read_only_source must be true"
++    candidate = packet["candidate_commit"].casefold()
++    if not _REVIEW_COMMIT_RE.fullmatch(candidate):
++        return None, "candidate_commit is not a canonical 40-hex commit"
++    packet["candidate_commit"] = candidate
++    try:
++        packet["implementer_profile"] = _canonical_assignee(
++            packet["implementer_profile"]
++        ) or ""
++        packet["reviewer_profile"] = _canonical_assignee(
++            packet["reviewer_profile"]
++        ) or ""
++    except Exception:
++        return None, "review packet profile is not canonicalizable"
++    if not packet["implementer_profile"] or not packet["reviewer_profile"]:
++        return None, "review packet profile is empty"
++    if not re.fullmatch(r"t_[A-Za-z0-9_]+", packet["implementation_task"]):
++        return None, "implementation_task is malformed"
++    return packet, None
++
++
++def _review_claim_payload(
++    conn: sqlite3.Connection, task_id: str, run_id: int
++) -> tuple[Optional[dict[str, Any]], Optional[str]]:
++    rows = conn.execute(
++        "SELECT payload FROM task_events "
++        "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' ORDER BY id",
++        (task_id, int(run_id)),
++    ).fetchall()
++    if len(rows) != 1 or not rows[0]["payload"]:
++        return None, "review run does not have exactly one claimed event"
++    try:
++        payload = json.loads(rows[0]["payload"])
++    except (json.JSONDecodeError, TypeError):
++        return None, "review claimed event is malformed"
++    if not isinstance(payload, dict):
++        return None, "review claimed event is not an object"
++    return payload, None
++
++
++def _review_packet_claim_receipt(
++    conn: sqlite3.Connection,
++    task_id: str,
++    run_id: int,
++    packet: Mapping[str, str],
++) -> Optional[str]:
++    rows = conn.execute(
++        "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
++        "AND kind = 'standalone_review_packet_claimed' ORDER BY id",
++        (task_id, int(run_id)),
++    ).fetchall()
++    if len(rows) != 1 or not rows[0]["payload"]:
++        return "standalone review run has no unique packet claim receipt"
++    try:
++        payload = json.loads(rows[0]["payload"])
++    except (json.JSONDecodeError, TypeError):
++        return "standalone review packet claim receipt is malformed"
++    expected_sha = _review_sha256(_review_json(dict(packet)))
++    if (
++        not isinstance(payload, dict)
++        or payload.get("source_status") != "ready"
++        or payload.get("packet_sha256") != expected_sha
++        or payload.get("candidate_commit") != packet["candidate_commit"]
++        or payload.get("reviewer_profile") != packet["reviewer_profile"]
++    ):
++        return "standalone review packet changed after claim"
++    return None
++
++
++def _review_graph_snapshot(conn: sqlite3.Connection, leaf_task_id: str) -> dict[str, Any]:
++    parents = [
++        {"id": row["id"], "status": row["status"]}
++        for row in conn.execute(
++            "SELECT t.id, t.status FROM task_links l "
++            "JOIN tasks t ON t.id = l.parent_id "
++            "WHERE l.child_id = ? ORDER BY t.id",
++            (leaf_task_id,),
++        ).fetchall()
++    ]
++    children: list[dict[str, Any]] = []
++    child_rows = conn.execute(
++        "SELECT t.id, t.status, t.started_at, t.current_run_id "
++        "FROM task_links l JOIN tasks t ON t.id = l.child_id "
++        "WHERE l.parent_id = ? ORDER BY t.id",
++        (leaf_task_id,),
++    ).fetchall()
++    for child in child_rows:
++        child_id = str(child["id"])
++        parent_ids = [
++            str(row["parent_id"])
++            for row in conn.execute(
++                "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
++                (child_id,),
++            ).fetchall()
++        ]
++        children.append(
++            {
++                "id": child_id,
++                "status": child["status"],
++                "started_at": child["started_at"],
++                "current_run_id": child["current_run_id"],
++                "parent_ids": parent_ids,
++            }
++        )
++    return {"parents": parents, "children": children}
++
++
++def _review_workspace_head(workspace_path: str) -> Optional[str]:
++    try:
++        workspace = Path(workspace_path).expanduser().resolve(strict=True)
++    except (OSError, RuntimeError):
++        return None
++    git = Path("/usr/bin/git")
++    if not workspace.is_dir() or not git.is_file():
++        return None
++    try:
++        probe = subprocess.run(
++            [str(git), "-C", str(workspace), "rev-parse", "--verify", "HEAD^{commit}"],
++            env={"PATH": "/usr/bin:/bin", "HOME": str(Path.home())},
++            text=True,
++            capture_output=True,
++            timeout=5,
++            check=False,
++        )
++    except (OSError, subprocess.SubprocessError):
++        return None
++    value = probe.stdout.strip().casefold()
++    return value if probe.returncode == 0 and _REVIEW_COMMIT_RE.fullmatch(value) else None
++
++
++def _terminal_review_incomplete(
++    conn: sqlite3.Connection,
++    task_id: str,
++    *,
++    run_id: int,
++    reason: str,
++    reason_code: str,
++) -> bool:
++    cur = conn.execute(
++        "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
++        "claim_expires = NULL, worker_pid = NULL, block_kind = 'dependency' "
++        "WHERE id = ? AND status = 'running' AND current_run_id = ?",
++        (task_id, int(run_id)),
++    )
++    if cur.rowcount != 1:
++        return False
++    closed_run_id = _end_run(
++        conn,
++        task_id,
++        outcome="review_incomplete",
++        status="blocked",
++        summary=reason,
++        metadata={
++            "review_outcome": "REVIEW-INCOMPLETE",
++            "reason_code": reason_code,
++            "native_review_run_id": int(run_id),
++        },
++    )
++    _append_event(
++        conn,
++        task_id,
++        "standalone_review_incomplete",
++        {
++            "reason_code": reason_code,
++            "source_status": "ready",
++            "retry_allowed": False,
++        },
++        run_id=closed_run_id,
++    )
++    return True
++
++
++def _record_standalone_review_rejection(
++    conn: sqlite3.Connection,
++    task_id: str,
++    *,
++    reason: Optional[str],
++    kind: Optional[str],
++    expected_run_id: Optional[int],
++) -> Optional[bool]:
++    """Terminally record a standalone rejection and enqueue one native handoff.
++
++    ``None`` means this is not the structured standalone-review path. A bool is
++    the final block result. The transaction never creates product work; it only
++    writes the coordinator-owned, identity-bound outbox record.
++    """
++    redacted_reason = str(redact_review_value(reason or "")).strip()
++    if not redacted_reason.startswith(_STANDALONE_REVIEW_CHANGES_PREFIX):
++        return None
++    if expected_run_id is None:
++        return False
++    run_id = int(expected_run_id)
++    with write_txn(conn):
++        task = conn.execute(
++            "SELECT id, title, body, assignee, created_by, workspace_path, "
++            "status, current_run_id, claim_lock FROM tasks WHERE id = ?",
++            (task_id,),
++        ).fetchone()
++        if task is None or task["status"] != "running" or task["current_run_id"] != run_id:
++            return False
++        claim, claim_error = _review_claim_payload(conn, task_id, run_id)
++        if claim_error is not None:
++            return _terminal_review_incomplete(
++                conn, task_id, run_id=run_id, reason=redacted_reason,
++                reason_code="claim_provenance_invalid",
++            )
++        source_status = claim.get("source_status") or "ready"
++        if source_status == "review":
++            return False
++        if source_status != "ready" or kind != "dependency":
++            return _terminal_review_incomplete(
++                conn, task_id, run_id=run_id, reason=redacted_reason,
++                reason_code="standalone_transition_invalid",
++            )
++        run = conn.execute(
++            "SELECT id, task_id, profile, status, outcome, ended_at, claim_lock "
++            "FROM task_runs WHERE id = ?",
++            (run_id,),
++        ).fetchone()
++        newest = conn.execute(
++            "SELECT id FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
++            (task_id,),
++        ).fetchone()
++        packet, packet_error = _review_packet(str(task["body"] or ""))
++        validation_error = packet_error
++        if validation_error is None and (
++            run is None
++            or run["task_id"] != task_id
++            or run["status"] != "running"
++            or run["outcome"] is not None
++            or run["ended_at"] is not None
++            or newest is None
++            or int(newest["id"]) != run_id
++            or run["claim_lock"] != task["claim_lock"]
++            or claim.get("lock") != task["claim_lock"]
++        ):
++            validation_error = "current review run is not authoritative"
++        if validation_error is None and packet is not None:
++            reviewer = _canonical_assignee(str(task["assignee"] or ""))
++            run_profile = _canonical_assignee(str(run["profile"] or ""))
++            creator = _canonical_assignee(str(task["created_by"] or ""))
++            if reviewer != packet["reviewer_profile"] or run_profile != reviewer:
++                validation_error = "reviewer identity does not match the native run"
++            elif not creator or creator == reviewer:
++                validation_error = "standalone review leaf has no independent creator provenance"
++            elif str(task["workspace_path"] or "") != packet["target_worktree"]:
++                validation_error = "target_worktree does not match native workspace"
++            else:
++                validation_error = _review_packet_claim_receipt(
++                    conn, task_id, run_id, packet
++                )
++        graph = _review_graph_snapshot(conn, task_id)
++        if validation_error is None and packet is not None:
++            parent = next(
++                (row for row in graph["parents"] if row["id"] == packet["implementation_task"]),
++                None,
++            )
++            if parent is None or parent["status"] != "done":
++                validation_error = "implementation task is not a completed direct parent"
++            elif any(
++                child["status"] != "todo"
++                or child["started_at"] is not None
++                or child["current_run_id"] is not None
++                for child in graph["children"]
++            ):
++                validation_error = "downstream frontier is not untouched and gated"
++            elif _review_workspace_head(packet["target_worktree"]) != packet["candidate_commit"]:
++                validation_error = "workspace HEAD does not match candidate_commit"
++        if validation_error is not None or packet is None:
++            return _terminal_review_incomplete(
++                conn, task_id, run_id=run_id, reason=redacted_reason,
++                reason_code="native_evidence_invalid",
++            )
++
++        finding = redacted_reason[len(_STANDALONE_REVIEW_CHANGES_PREFIX):].strip()
++        if not finding:
++            return _terminal_review_incomplete(
++                conn, task_id, run_id=run_id, reason=redacted_reason,
++                reason_code="finding_missing",
++            )
++        packet_json = _review_json(packet)
++        graph_json = _review_json(graph)
++        packet_sha = _review_sha256(packet_json)
++        finding_sha = _review_sha256(finding)
++        frontier_sha = _review_sha256(graph_json)
++        handoff_key = (
++            f"review-remediation:v1:{task_id}:{run_id}:"
++            f"{finding_sha[:16]}:{frontier_sha[:16]}"
++        )
++        now = int(time.time())
++        try:
++            conn.execute(
++                "INSERT INTO review_remediation_handoffs ("
++                "handoff_key, leaf_task_id, review_run_id, reviewer_profile, "
++                "implementer_profile, coordinator_profile, implementation_task, candidate_commit, "
++                "packet_sha256, finding_sha256, frontier_sha256, frontier_json, "
++                "reason, status, created_at) "
++                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
++                (
++                    handoff_key, task_id, run_id, packet["reviewer_profile"],
++                    packet["implementer_profile"], creator, packet["implementation_task"],
++                    packet["candidate_commit"], packet_sha, finding_sha,
++                    frontier_sha, graph_json, finding, now,
++                ),
++            )
++        except sqlite3.IntegrityError:
++            existing = conn.execute(
++                "SELECT handoff_key, packet_sha256, finding_sha256, frontier_sha256 "
++                "FROM review_remediation_handoffs "
++                "WHERE leaf_task_id = ? AND review_run_id = ?",
++                (task_id, run_id),
++            ).fetchone()
++            if (
++                existing is None
++                or existing["handoff_key"] != handoff_key
++                or existing["packet_sha256"] != packet_sha
++                or existing["finding_sha256"] != finding_sha
++                or existing["frontier_sha256"] != frontier_sha
++            ):
++                return _terminal_review_incomplete(
++                    conn, task_id, run_id=run_id, reason=redacted_reason,
++                    reason_code="handoff_identity_collision",
++                )
++        cur = conn.execute(
++            "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
++            "claim_expires = NULL, worker_pid = NULL, block_kind = 'dependency' "
++            "WHERE id = ? AND status = 'running' AND current_run_id = ?",
++            (task_id, run_id),
++        )
++        if cur.rowcount != 1:
++            return False
++        closed_run_id = _end_run(
++            conn,
++            task_id,
++            outcome="changes_requested",
++            status="blocked",
++            summary=redacted_reason,
++            metadata={
++                "review_outcome": "CHANGES_REQUESTED",
++                "handoff_key": handoff_key,
++                "candidate_commit": packet["candidate_commit"],
++                "packet_sha256": packet_sha,
++                "finding_sha256": finding_sha,
++                "frontier_sha256": frontier_sha,
++                "native_review_run_id": run_id,
++            },
++        )
++        _append_event(
++            conn,
++            task_id,
++            "standalone_review_changes_requested",
++            {
++                "handoff_key": handoff_key,
++                "candidate_commit": packet["candidate_commit"],
++                "packet_sha256": packet_sha,
++                "finding_sha256": finding_sha,
++                "frontier_sha256": frontier_sha,
++                "source_status": "ready",
++                "successor_created": False,
++                "retry_allowed": False,
++            },
++            run_id=closed_run_id,
++        )
++        return True
++
++
++def _handoff_successor_body(
++    *,
++    leaf: sqlite3.Row,
++    handoff: sqlite3.Row,
++    packet: Mapping[str, str],
++) -> str:
++    return "\n".join(
++        [
++            "review_remediation: true",
++            "review_required_before_completion: true",
++            f"review_remediation_handoff_key: {handoff['handoff_key']}",
++            f"standalone_review_leaf: {handoff['leaf_task_id']}",
++            f"standalone_review_run: {handoff['review_run_id']}",
++            f"implementation_task: {handoff['implementation_task']}",
++            f"target_repository: {packet['target_repository']}",
++            f"target_worktree: {packet['target_worktree']}",
++            f"branch: {packet.get('branch') or 'not declared'}",
++            f"reviewed_candidate_commit: {handoff['candidate_commit']}",
++            f"implementer_profile: {handoff['implementer_profile']}",
++            f"reviewer_profile: {handoff['reviewer_profile']}",
++            f"finding_sha256: {handoff['finding_sha256']}",
++            "",
++            "Remediate the independently reviewed finding below in the existing target worktree.",
++            "Before completion, request a same-card review and provide exact candidate_commit evidence.",
++            "The task cannot complete from an implementation run; native policy requires an APPROVED review run.",
++            "",
++            "Reviewer finding:",
++            str(handoff["reason"]),
++        ]
++    )
++
++
++def _existing_handoff_successor(
++    conn: sqlite3.Connection, handoff_key: str
++) -> Optional[sqlite3.Row]:
++    rows = conn.execute(
++        "SELECT * FROM tasks WHERE idempotency_key = ? ORDER BY created_at, id",
++        (handoff_key,),
++    ).fetchall()
++    if len(rows) > 1:
++        raise RuntimeError(f"multiple remediation tasks share {handoff_key}")
++    return rows[0] if rows else None
++
++
++def consume_standalone_review_handoffs(
++    conn: sqlite3.Connection,
++    *,
++    actor: str,
++    limit: int = 16,
++) -> list[dict[str, Any]]:
++    """Consume pending review-rejection receipts under native SQLite fencing.
++
++    Only the configured coordinator profile may call this entry point. Each
++    handoff is validated, created/reused, reparented, archived, and marked
++    applied in one ``BEGIN IMMEDIATE`` transaction. A retry after an ambiguous
++    caller result reads the same applied receipt and never creates a duplicate.
++    """
++    canonical_actor = _canonical_assignee(actor)
++    if not canonical_actor:
++        raise PermissionError("standalone review remediation requires an active coordinator profile")
++    bounded_limit = max(1, min(int(limit), 100))
++    keys = [
++        str(row["handoff_key"])
++        for row in conn.execute(
++            "SELECT handoff_key FROM review_remediation_handoffs "
++            "WHERE status = 'pending' AND coordinator_profile = ? "
++            "ORDER BY created_at, handoff_key LIMIT ?",
++            (canonical_actor, bounded_limit),
++        ).fetchall()
++    ]
++    results: list[dict[str, Any]] = []
++    for handoff_key in keys:
++        with write_txn(conn):
++            handoff = conn.execute(
++                "SELECT * FROM review_remediation_handoffs WHERE handoff_key = ?",
++                (handoff_key,),
++            ).fetchone()
++            if handoff is None:
++                continue
++            if handoff["coordinator_profile"] != canonical_actor:
++                raise PermissionError(f"handoff {handoff_key} belongs to another coordinator")
++            if handoff["status"] == "applied":
++                successor = _existing_handoff_successor(conn, handoff_key)
++                if successor is None or successor["id"] != handoff["successor_task_id"]:
++                    raise RuntimeError(f"applied handoff {handoff_key} lost its successor")
++                results.append(
++                    {"handoff_key": handoff_key, "successor_task_id": successor["id"], "reused": True}
++                )
++                continue
++            leaf = conn.execute(
++                "SELECT * FROM tasks WHERE id = ?",
++                (handoff["leaf_task_id"],),
++            ).fetchone()
++            if leaf is None or leaf["status"] != "blocked" or leaf["current_run_id"] is not None:
++                raise RuntimeError(f"handoff {handoff_key} leaf is no longer terminally blocked")
++            packet, packet_error = _review_packet(str(leaf["body"] or ""))
++            if packet_error is not None or packet is None:
++                raise RuntimeError(f"handoff {handoff_key} packet changed: {packet_error}")
++            receipt_error = _review_packet_claim_receipt(
++                conn, str(leaf["id"]), int(handoff["review_run_id"]), packet
++            )
++            if receipt_error is not None:
++                raise RuntimeError(f"handoff {handoff_key} packet receipt changed: {receipt_error}")
++            packet_sha = _review_sha256(_review_json(packet))
++            graph = _review_graph_snapshot(conn, str(leaf["id"]))
++            graph_json = _review_json(graph)
++            if (
++                packet_sha != handoff["packet_sha256"]
++                or _review_sha256(graph_json) != handoff["frontier_sha256"]
++                or graph_json != handoff["frontier_json"]
++                or packet["candidate_commit"] != handoff["candidate_commit"]
++                or packet["reviewer_profile"] != handoff["reviewer_profile"]
++                or packet["implementer_profile"] != handoff["implementer_profile"]
++                or packet["implementation_task"] != handoff["implementation_task"]
++                or _canonical_assignee(str(leaf["created_by"] or "")) != handoff["coordinator_profile"]
++                or _review_sha256(str(handoff["reason"])) != handoff["finding_sha256"]
++            ):
++                raise RuntimeError(f"handoff {handoff_key} provenance or frontier changed")
++            run = conn.execute(
++                "SELECT * FROM task_runs WHERE id = ? AND task_id = ?",
++                (handoff["review_run_id"], leaf["id"]),
++            ).fetchone()
++            newest = conn.execute(
++                "SELECT id FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
++                (leaf["id"],),
++            ).fetchone()
++            event = conn.execute(
++                "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
++                "AND kind = 'standalone_review_changes_requested' ORDER BY id DESC LIMIT 1",
++                (leaf["id"], handoff["review_run_id"]),
++            ).fetchone()
++            try:
++                event_payload = json.loads(event["payload"]) if event and event["payload"] else {}
++            except (json.JSONDecodeError, TypeError):
++                event_payload = {}
++            if (
++                run is None
++                or newest is None
++                or int(newest["id"]) != int(handoff["review_run_id"])
++                or run["status"] != "blocked"
++                or run["outcome"] != "changes_requested"
++                or run["ended_at"] is None
++                or _canonical_assignee(str(run["profile"] or "")) != handoff["reviewer_profile"]
++                or not isinstance(event_payload, dict)
++                or event_payload.get("handoff_key") != handoff_key
++                or event_payload.get("frontier_sha256") != handoff["frontier_sha256"]
++            ):
++                raise RuntimeError(f"handoff {handoff_key} terminal review receipt is invalid")
++            if _review_workspace_head(packet["target_worktree"]) != handoff["candidate_commit"]:
++                raise RuntimeError(f"handoff {handoff_key} candidate is no longer current")
++
++            successor = _existing_handoff_successor(conn, handoff_key)
++            reused = successor is not None
++            if successor is None:
++                successor_body = _handoff_successor_body(
++                    leaf=leaf, handoff=handoff, packet=packet
++                )
++                successor_id = create_task(
++                    conn,
++                    title=f"Remediate review findings: {leaf['title']}",
++                    body=successor_body,
++                    assignee=handoff["implementer_profile"],
++                    created_by=canonical_actor,
++                    workspace_kind="dir",
++                    workspace_path=packet["target_worktree"],
++                    tenant=leaf["tenant"],
++                    priority=int(leaf["priority"] or 0),
++                    parents=(handoff["implementation_task"],),
++                    idempotency_key=handoff_key,
++                    initial_status="running",
++                )
++                successor = conn.execute(
++                    "SELECT * FROM tasks WHERE id = ?",
++                    (successor_id,),
++                ).fetchone()
++            if (
++                successor is None
++                or successor["status"] == "archived"
++                or successor["idempotency_key"] != handoff_key
++                or successor["assignee"] != handoff["implementer_profile"]
++                or _review_body_field(str(successor["body"] or ""), "review_remediation_handoff_key") != handoff_key
++                or _review_body_field(str(successor["body"] or ""), "review_required_before_completion") != "true"
++            ):
++                raise RuntimeError(f"handoff {handoff_key} successor identity readback failed")
++            successor_id = str(successor["id"])
++
++            for child in graph["children"]:
++                deleted = conn.execute(
++                    "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
++                    (leaf["id"], child["id"]),
++                )
++                if deleted.rowcount != 1:
++                    raise RuntimeError(f"handoff {handoff_key} lost frontier edge {child['id']}")
++                conn.execute(
++                    "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)",
++                    (successor_id, child["id"]),
++                )
++                _append_event(
++                    conn,
++                    child["id"],
++                    "reparented",
++                    {
++                        "from_parent": leaf["id"],
++                        "to_parent": successor_id,
++                        "reason": "standalone_review_remediation",
++                        "handoff_key": handoff_key,
++                    },
++                )
++            archived = conn.execute(
++                "UPDATE tasks SET status = 'archived', completed_at = ?, "
++                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
++                "WHERE id = ? AND status = 'blocked' AND current_run_id IS NULL",
++                (int(time.time()), leaf["id"]),
++            )
++            if archived.rowcount != 1:
++                raise RuntimeError(f"handoff {handoff_key} could not archive its leaf")
++            now = int(time.time())
++            applied = conn.execute(
++                "UPDATE review_remediation_handoffs SET status = 'applied', "
++                "successor_task_id = ?, consumed_at = ? "
++                "WHERE handoff_key = ? AND status = 'pending'",
++                (successor_id, now, handoff_key),
++            )
++            if applied.rowcount != 1:
++                raise RuntimeError(f"handoff {handoff_key} lost its pending receipt")
++            _inherit_notify_subs(conn, successor_id, (str(leaf["id"]),))
++            _append_event(
++                conn,
++                str(leaf["id"]),
++                "standalone_review_handoff_consumed",
++                {
++                    "handoff_key": handoff_key,
++                    "successor_task_id": successor_id,
++                    "reparented_child_ids": [child["id"] for child in graph["children"]],
++                    "coordinator": canonical_actor,
++                },
++                run_id=int(handoff["review_run_id"]),
++            )
++            _append_event(
++                conn,
++                successor_id,
++                "review_remediation_created",
++                {
++                    "handoff_key": handoff_key,
++                    "standalone_review_leaf": leaf["id"],
++                    "review_run_id": int(handoff["review_run_id"]),
++                    "candidate_commit": handoff["candidate_commit"],
++                },
++            )
++            for child in graph["children"]:
++                actual_parents = {
++                    str(row["parent_id"])
++                    for row in conn.execute(
++                        "SELECT parent_id FROM task_links WHERE child_id = ?",
++                        (child["id"],),
++                    ).fetchall()
++                }
++                expected_parents = set(child["parent_ids"])
++                expected_parents.remove(str(leaf["id"]))
++                expected_parents.add(successor_id)
++                if actual_parents != expected_parents:
++                    raise RuntimeError(f"handoff {handoff_key} frontier readback failed")
++            readback = conn.execute(
++                "SELECT status, successor_task_id FROM review_remediation_handoffs "
++                "WHERE handoff_key = ?",
++                (handoff_key,),
++            ).fetchone()
++            leaf_status = conn.execute(
++                "SELECT status FROM tasks WHERE id = ?", (leaf["id"],)
++            ).fetchone()
++            if (
++                readback is None
++                or readback["status"] != "applied"
++                or readback["successor_task_id"] != successor_id
++                or leaf_status is None
++                or leaf_status["status"] != "archived"
++            ):
++                raise RuntimeError(f"handoff {handoff_key} terminal readback failed")
++            results.append(
++                {"handoff_key": handoff_key, "successor_task_id": successor_id, "reused": reused}
++            )
++    return results
++
++
++def _review_completion_rejection(
++    conn: sqlite3.Connection,
++    task_id: str,
++    *,
++    metadata: Optional[dict],
++    expected_run_id: Optional[int],
++) -> Optional[str]:
++    task = conn.execute(
++        "SELECT body, assignee, created_by, workspace_path, status, current_run_id FROM tasks WHERE id = ?",
++        (task_id,),
++    ).fetchone()
++    if task is None:
++        return None
++    body = str(task["body"] or "")
++    packet, packet_error = _review_packet(body)
++    review_required = _review_body_field(body, "review_required_before_completion") == "true"
++    standalone_declared = _review_body_field(body, "review_type") is not None
++    standalone_registered = conn.execute(
++        "SELECT 1 FROM task_events WHERE task_id = ? "
++        "AND kind = 'standalone_review_packet_claimed' LIMIT 1",
++        (task_id,),
++    ).fetchone() is not None
++    is_standalone = packet_error is None and packet is not None
++    if not review_required and not is_standalone and not standalone_declared and not standalone_registered:
++        return None
++    if (standalone_declared or standalone_registered) and not is_standalone:
++        return packet_error or "standalone review packet is invalid"
++    if task["status"] != "running" or task["current_run_id"] is None:
++        return "review-gated task has no active reviewer run"
++    run_id = int(task["current_run_id"])
++    if expected_run_id is not None and run_id != int(expected_run_id):
++        return "review run_id mismatch"
++    claim, claim_error = _review_claim_payload(conn, task_id, run_id)
++    if claim_error is not None or claim is None:
++        return claim_error or "review claim is missing"
++    run = conn.execute(
++        "SELECT profile, status, outcome, ended_at FROM task_runs WHERE id = ? AND task_id = ?",
++        (run_id, task_id),
++    ).fetchone()
++    newest = conn.execute(
++        "SELECT id FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
++        (task_id,),
++    ).fetchone()
++    if (
++        run is None
++        or run["status"] != "running"
++        or run["outcome"] is not None
++        or run["ended_at"] is not None
++        or newest is None
++        or int(newest["id"]) != run_id
++    ):
++        return "review run is not current and active"
++    if not isinstance(metadata, dict):
++        return "structured review completion metadata is required"
++    verdict = str(
++        metadata.get("review_outcome") or metadata.get("overall_verdict") or metadata.get("verdict") or ""
++    ).strip().upper().replace("-", "_").replace(" ", "_")
++    if verdict != "APPROVED":
++        return "only exact APPROVED evidence may complete a review-gated task"
++    candidate = str(metadata.get("candidate_commit") or "").strip().casefold()
++    if not _REVIEW_COMMIT_RE.fullmatch(candidate):
++        return "review approval has no canonical candidate_commit"
++
++    source_status = claim.get("source_status") or "ready"
++    expected_reviewer: Optional[str] = None
++    expected_candidate: Optional[str] = None
++    if is_standalone and packet is not None:
++        if source_status != "ready":
++            return "standalone review was not claimed from ready"
++        receipt_error = _review_packet_claim_receipt(conn, task_id, run_id, packet)
++        if receipt_error is not None:
++            return receipt_error
++        expected_reviewer = packet["reviewer_profile"]
++        expected_candidate = packet["candidate_commit"]
++        creator = _canonical_assignee(str(task["created_by"] or ""))
++        if not creator or creator == expected_reviewer:
++            return "standalone review leaf has no independent creator provenance"
++        if str(task["workspace_path"] or "") != packet["target_worktree"]:
++            return "standalone review workspace changed"
++        graph = _review_graph_snapshot(conn, task_id)
++        parent = next(
++            (row for row in graph["parents"] if row["id"] == packet["implementation_task"]),
++            None,
++        )
++        if parent is None or parent["status"] != "done":
++            return "implementation task is not a completed direct parent"
++        if any(
++            child["status"] != "todo"
++            or child["started_at"] is not None
++            or child["current_run_id"] is not None
++            for child in graph["children"]
++        ):
++            return "downstream frontier is not untouched and gated"
++    elif review_required:
++        if source_status != "review":
++            return "remediation completion requires a same-card review claim"
++        requested = conn.execute(
++            "SELECT run_id, payload FROM task_events WHERE task_id = ? "
++            "AND kind = 'review_requested' ORDER BY id DESC LIMIT 1",
++            (task_id,),
++        ).fetchone()
++        if requested is None or requested["run_id"] is None:
++            return "same-card review has no native review_requested receipt"
++        try:
++            requested_payload = json.loads(requested["payload"]) if requested["payload"] else {}
++        except (json.JSONDecodeError, TypeError):
++            requested_payload = {}
++        if not isinstance(requested_payload, dict):
++            return "review_requested receipt is malformed"
++        expected_reviewer = _canonical_assignee(str(requested_payload.get("reviewer") or ""))
++        implementation_run = conn.execute(
++            "SELECT status, outcome, metadata, ended_at FROM task_runs WHERE id = ? AND task_id = ?",
++            (int(requested["run_id"]), task_id),
++        ).fetchone()
++        if (
++            implementation_run is None
++            or implementation_run["status"] != "review"
++            or implementation_run["outcome"] != "review_requested"
++            or implementation_run["ended_at"] is None
++        ):
++            return "review_requested implementation run is not terminal"
++        try:
++            implementation_metadata = (
++                json.loads(implementation_run["metadata"])
++                if implementation_run["metadata"]
++                else {}
++            )
++        except (json.JSONDecodeError, TypeError):
++            implementation_metadata = {}
++        if not isinstance(implementation_metadata, dict):
++            return "review_requested metadata is malformed"
++        expected_candidate = str(implementation_metadata.get("candidate_commit") or "").strip().casefold()
++        if not _REVIEW_COMMIT_RE.fullmatch(expected_candidate):
++            return "review_requested metadata has no canonical candidate_commit"
++    reviewer = _canonical_assignee(str(run["profile"] or ""))
++    assignee = _canonical_assignee(str(task["assignee"] or ""))
++    if not expected_reviewer or reviewer != expected_reviewer or assignee != reviewer:
++        return "reviewer identity does not match native handoff provenance"
++    if candidate != expected_candidate:
++        return "approved candidate_commit does not match the native review handoff"
++    if _review_workspace_head(str(task["workspace_path"] or "")) != candidate:
++        return "workspace HEAD does not match the approved candidate_commit"
++    return None
++
++
+ def block_task(
+     conn: sqlite3.Connection,
+     task_id: str,
+@@ -6485,6 +7422,15 @@ def block_task(
+         raise ValueError(
+             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
+         )
++    standalone_review_result = _record_standalone_review_rejection(
++        conn,
++        task_id,
++        reason=reason,
++        kind=kind,
++        expected_run_id=expected_run_id,
++    )
++    if standalone_review_result is not None:
++        return standalone_review_result
+     recurrences = 0
+     with write_txn(conn):
+         cur_row = conn.execute(
+@@ -7395,6 +8341,19 @@ def invalidate_descendants_for_parent_reopen(
+                 },
+                 run_id=run_id,
+             )
 +            # Redundant parent-side evidence prevents deletion of the child-side
 +            # suffix from laundering a pre-reopen review handoff.
 +            _append_event(
@@ -32,12 +1063,20 @@
 +                    "resume_status": resume_status,
 +                },
 +            )
-@@ -7578 +7601,2 @@
+             # Inline comment insert (not add_comment: no txn-opening helper
+             # calls inside a txn per file convention).
+             conn.execute(
+@@ -7575,11 +8534,22 @@ def specify_triage_task(
+     assignee = _canonical_assignee(assignee)
+     with write_txn(conn):
+         existing = conn.execute(
 -            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
 +            "SELECT title, body, assignee, block_recurrences "
 +            "FROM tasks WHERE id = ? AND status = 'triage'",
-@@ -7581,0 +7606,10 @@
-+            return False
+             (task_id,),
+         ).fetchone()
+         if existing is None:
+             return False
 +        from hermes_cli.native_boundary import triage_admission_rejection
 +
 +        quarantine_reason = triage_admission_rejection(
@@ -47,31 +1086,84 @@
 +            recurrence_limit=BLOCK_RECURRENCE_LIMIT,
 +        )
 +        if quarantine_reason is not None:
-@@ -8785,0 +8820 @@
++            return False
+         sets: list[str] = ["status = 'todo'"]
+         params: list[Any] = []
+         changed_fields: list[str] = []
+@@ -8783,6 +9753,7 @@ def enforce_max_runtime(
+     conn: sqlite3.Connection,
+     *,
+     signal_fn=None,
 +    excluded_task_ids: Optional[set[Any]] = None,
-@@ -8800,0 +8836 @@
+ ) -> list[str]:
+     """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
+
+@@ -8798,6 +9769,7 @@ def enforce_max_runtime(
+     """
+     import signal
+     timed_out: list[str] = []
 +    excluded_task_ids = excluded_task_ids or set()
-@@ -8814,0 +8851,2 @@
+     now = int(time.time())
+     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+
+@@ -8812,6 +9784,8 @@ def enforce_max_runtime(
+         "  AND t.worker_pid IS NOT NULL"
+     ).fetchall()
+     for row in rows:
 +        if row["id"] in excluded_task_ids:
 +            continue
-@@ -8913,0 +8952 @@
+         lock = row["claim_lock"] or ""
+         if not lock.startswith(host_prefix):
+             continue
+@@ -8911,6 +9885,7 @@ def detect_stale_running(
+     *,
+     stale_timeout_seconds: int = 0,
+     signal_fn=None,
 +    excluded_task_ids: Optional[set[Any]] = None,
-@@ -8941,0 +8981 @@
+ ) -> list[str]:
+     """Reclaim ``running`` tasks that show no progress (heartbeat) within the
+     staleness window.
+@@ -8939,6 +9914,7 @@ def detect_stale_running(
+
+
+     now = int(time.time())
 +    excluded_task_ids = excluded_task_ids or set()
-@@ -8952,0 +8993,2 @@
+     reclaimed: list[str] = []
+
+     rows = conn.execute(
+@@ -8950,6 +9926,8 @@ def detect_stale_running(
+     ).fetchall()
+
+     for row in rows:
 +        if row["id"] in excluded_task_ids:
 +            continue
-@@ -9040,0 +9083,2 @@
+         # Skip if no started_at (shouldn't happen for running, but be safe).
+         if row["active_started_at"] is None:
+             continue
+@@ -9038,6 +10016,8 @@ def detect_stale_running(
+
+ def reconcile_orphaned_running(
+     conn: sqlite3.Connection,
 +    *,
 +    excluded_task_ids: Optional[set[Any]] = None,
-@@ -9063,0 +9108 @@
+ ) -> list[str]:
+     """Reconcile ``running`` cards whose claim bookkeeping is broken.
+
+@@ -9061,14 +10041,36 @@ def reconcile_orphaned_running(
+     Idea from openai/symphony's tracker reconciliation (Apache-2.0).
+     """
+     now = int(time.time())
 +    excluded_task_ids = excluded_task_ids or set()
-@@ -9066,2 +9111,2 @@
+     reconciled: list[str] = []
+     rows = conn.execute(
 -        "SELECT id, claim_lock, claim_expires, worker_pid FROM tasks "
 -        "WHERE status = 'running' "
 +        "SELECT id, claim_lock, claim_expires, worker_pid, current_run_id "
 +        "FROM tasks WHERE status = 'running' "
-@@ -9071,0 +9117,21 @@
+         "  AND (claim_lock IS NULL OR claim_expires IS NULL)"
+     ).fetchall()
+     for row in rows:
+         tid = row["id"]
 +        if tid in excluded_task_ids:
 +            continue
 +        current_run_id = row["current_run_id"]
@@ -93,25 +1185,55 @@
 +                    current_run_id,
 +                )
 +                continue
-@@ -9211 +9277,5 @@
+         pid = row["worker_pid"]
+         if pid and _pid_alive(pid):
+             # The recorded worker may still be doing real work — never
+@@ -9208,7 +10210,11 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
+     return streak
+
+
 -def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 +def detect_crashed_workers(
 +    conn: sqlite3.Connection,
 +    *,
 +    excluded_task_ids: Optional[set[Any]] = None,
 +) -> list[str]:
-@@ -9239,0 +9310 @@
+     """Reclaim ``running`` tasks whose worker PID is no longer alive.
+
+     Appends a ``crashed`` event and restores the task's source phase.
+@@ -9237,6 +10243,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+     (the public return stays the crashed-only ``list[str]``).
+     """
+     crashed: list[str] = []
 +    excluded_task_ids = excluded_task_ids or set()
-@@ -9259,0 +9331,2 @@
+     rate_limited: list[str] = []
+     # Per-crash details collected inside the main txn, used after it
+     # closes to run ``_record_task_failure`` (which needs its own
+@@ -9257,6 +10264,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+         ).fetchall()
+         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+         for row in rows:
 +            if row["id"] in excluded_task_ids:
 +                continue
-@@ -9795,0 +9869,5 @@
+             # Only check liveness for claims owned by this host.
+             lock = row["claim_lock"] or ""
+             if not lock.startswith(host_prefix):
+@@ -9793,6 +10802,11 @@ def check_respawn_guard(
+         explicit re-queue event (status change, promote, unblock, reclaim)
+         arrives AFTER that completion — that's a deliberate re-run request.
+
 +    ``"active_run"``
 +        The newest durable run is the canonical non-terminal running state.
 +        Even if task claim pointers were lost, dispatch must not start a
 +        duplicate beside a possibly live worker.
 +
-@@ -9811,0 +9890,17 @@
+     ``"active_pr"``
+         A GitHub PR URL appears in a recent task comment (within
+         ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
+@@ -9809,8 +10823,55 @@ def check_respawn_guard(
+     ).fetchone()
+     if row is None:
+         return None
 +    if type(task_id) is not str or not task_id.strip():
 +        return "recent_success"
 +    if type(row["status"]) is not str:
@@ -129,7 +1251,8 @@
 +        return "active_run"
 +    if row["block_kind"] is not None and type(row["block_kind"]) is not str:
 +        return "recent_success"
-@@ -9813,0 +9909,30 @@
+
+     now = int(time.time())
 +    from hermes_cli.native_boundary import (
 +        requeue_transition_event_provenance_is_authorized,
 +        requeue_transition_is_authorized,
@@ -160,17 +1283,27 @@
 +        )
 +    ):
 +        return "recent_success"
-@@ -9822 +9947 @@
+
+     # 1. Rate-limit cooldown. The most recent run ended ``rate_limited``
+     #    (quota wall) — defer while inside the cooldown window, then allow a
+@@ -9819,16 +10880,33 @@ def check_respawn_guard(
+     #    the regex would otherwise match → defer forever (no failure counter
+     #    increment on this path means the breaker can never free it).
+     #
 -    #    We look at the LATEST run only (ORDER BY ended_at DESC LIMIT 1): if a
 +    #    We look at the LATEST run only (ORDER BY id DESC LIMIT 1): if a
-@@ -9827,3 +9952,3 @@
+     #    newer crash/completion superseded the rate-limit run, this guard
+     #    no longer applies and the normal paths take over.
+     rl_cooldown = _resolve_rate_limit_cooldown_seconds()
+     latest_run = conn.execute(
 -        "SELECT outcome, ended_at FROM task_runs "
 -        "WHERE task_id = ? AND ended_at IS NOT NULL "
 -        "ORDER BY ended_at DESC LIMIT 1",
 +        "SELECT status, outcome, ended_at FROM task_runs "
 +        "WHERE task_id = ? "
 +        "ORDER BY id DESC LIMIT 1",
-@@ -9831,0 +9957,17 @@
+         (task_id,),
+     ).fetchone()
 +    if latest_run is not None:
 +        run_status = latest_run["status"]
 +        run_outcome = latest_run["outcome"]
@@ -188,14 +1321,28 @@
 +        if latest_run["outcome"] == "rate_limited":
 +            return "rate_limit_cooldown"
 +        return "recent_success"
-@@ -9841,2 +9983 @@
+     if (
+         latest_run is not None
+         and latest_run["outcome"] == "rate_limited"
+@@ -9838,8 +10916,7 @@ def check_respawn_guard(
+             # blocker_auth regex so the stamped rate-limit text doesn't
+             # re-trap the task.
+             return None
 -        ended_at = latest_run["ended_at"]
 -        if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
 +        if (now - latest_ended_at) < rl_cooldown:
-@@ -9852,0 +9994,2 @@
+             return "rate_limit_cooldown"
+         # Cooldown elapsed — allow the respawn. Return early so the
+         # blocker_auth check below doesn't catch the rate-limit text we
+@@ -9850,14 +10927,37 @@ def check_respawn_guard(
+
+     # 2. Quota / auth blocker: retrying immediately will not help.
+     err = row["last_failure_error"]
 +    if err is not None and type(err) is not str:
 +        return "blocker_auth"
-@@ -9856,3 +9999,18 @@
+     if err and _RESPAWN_BLOCKER_RE.search(err):
+         return "blocker_auth"
+
 -    # Review-lane spawns stop here: a recent completed run and a fresh PR
 -    # URL comment are the canonical *inputs* to a review handoff (worker
 -    # opened a PR, then requested review), not signals of duplicate work.
@@ -217,7 +1364,7 @@
 +    # Review-lane spawns require the complete native implementation-run and
 +    # review_requested event chain. A bare status='review' row is durable
 +    # corruption, not authority to start a reviewer.
-@@ -9860 +10018,7 @@
+     if lane == "review":
 -        return None
 +        from hermes_cli.native_boundary import review_handoff_is_authorized
 +
@@ -226,7 +1373,13 @@
 +            if review_handoff_is_authorized(conn, task_id)
 +            else "recent_success"
 +        )
-@@ -9870,4 +10034,4 @@
+
+     # 3. Completed run within guard window — proof of recent success.
+     #    Exception: an explicit re-queue AFTER that success (an operator
+@@ -9867,22 +10967,44 @@ def check_respawn_guard(
+     #    silently held by the guard, until the window elapses.
+     cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
+     recent_completed = conn.execute(
 -        "SELECT ended_at FROM task_runs "
 -        "WHERE task_id = ? AND outcome = 'completed' AND ended_at >= ? "
 -        "ORDER BY ended_at DESC LIMIT 1",
@@ -235,7 +1388,8 @@
 +        "WHERE task_id = ? AND outcome = 'completed' "
 +        "ORDER BY id DESC LIMIT 1",
 +        (task_id,),
-@@ -9876,9 +10040,3 @@
+     ).fetchone()
+     if recent_completed:
 -        completed_at = int(recent_completed["ended_at"] or 0)
 -        requeued_after = conn.execute(
 -            "SELECT 1 FROM task_events "
@@ -248,7 +1402,7 @@
 +        if not terminal_run_state_is_authorized(
 +            recent_completed["status"], recent_completed["outcome"]
 +        ):
-@@ -9885,0 +10044,28 @@
+             return "recent_success"
 +        completed_at = validated_lifecycle_timestamp(
 +            recent_completed["ended_at"], maximum=now
 +        )
@@ -277,13 +1431,19 @@
 +                )
 +            ):
 +                return "recent_success"
-@@ -9900,2 +10086,3 @@
+
+     # A dependency re-admission is an explicit downstream re-queue. Its
+     # durable kind survives the todo -> ready promotion, so do not let a
+@@ -9897,10 +11019,19 @@ def check_respawn_guard(
+     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+     for c in conn.execute(
 -        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
 -        (task_id, pr_cutoff),
 +        "SELECT body, created_at FROM task_comments "
 +        "WHERE task_id = ? ORDER BY id DESC",
 +        (task_id,),
-@@ -9903 +10090,9 @@
+     ).fetchall():
 -        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
 +        comment_created_at = validated_lifecycle_timestamp(
 +            c["created_at"], maximum=now
@@ -294,7 +1454,13 @@
 +        if comment_created_at < pr_cutoff:
 +            continue
 +        if body and _RESPAWN_GUARD_PR_URL_RE.search(body):
-@@ -10314 +10509,28 @@
+             return "active_pr"
+
+     return None
+@@ -10311,16 +11442,49 @@ def _dispatch_once_locked(
+     reap_worker_zombies()
+
+     result = DispatchResult()
 -    result.reclaimed = release_stale_claims(conn)
 +    from hermes_cli.native_boundary import dispatcher_state_rejections
 +
@@ -324,22 +1490,31 @@
 +    result.reclaimed = release_stale_claims(
 +        conn, excluded_task_ids=rejected_task_ids,
 +    )
-@@ -10319 +10541,3 @@
+     if reconcile_orphans:
+         # Orphaned-card reconciliation: requeue 'running' cards whose claim
+         # bookkeeping is broken (no valid claim, dead/gone worker) that the
+         # TTL/crash/stale paths can never see. See reconcile_orphaned_running.
 -        result.reconciled_orphans = reconcile_orphaned_running(conn)
 +        result.reconciled_orphans = reconcile_orphaned_running(
 +            conn, excluded_task_ids=rejected_task_ids,
 +        )
-@@ -10321 +10545,3 @@
+     result.stale = detect_stale_running(
 -        conn, stale_timeout_seconds=stale_timeout_seconds,
 +        conn,
 +        stale_timeout_seconds=stale_timeout_seconds,
 +        excluded_task_ids=rejected_task_ids,
-@@ -10323 +10549,3 @@
--    result.crashed = detect_crashed_workers(conn)
++    )
 +    result.crashed = detect_crashed_workers(
 +        conn, excluded_task_ids=rejected_task_ids,
-+    )
-@@ -10340,2 +10568,8 @@
+     )
+-    result.crashed = detect_crashed_workers(conn)
+     # detect_crashed_workers stashes protocol-violation auto-blocks on
+     # itself so the public list-return stays stable. Pull them into the
+     # DispatchResult here so telemetry / tests see the trip.
+@@ -10337,8 +11501,14 @@ def _dispatch_once_locked(
+     )
+     if _crash_rate_limited:
+         result.rate_limited.extend(_crash_rate_limited)
 -    result.timed_out = enforce_max_runtime(conn)
 -    result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 +    result.timed_out = enforce_max_runtime(
@@ -350,13 +1525,28 @@
 +        failure_limit=failure_limit,
 +        excluded_task_ids=rejected_task_ids,
 +    )
-@@ -10409,0 +10644 @@
+
+     # Count tasks already running so max_spawn enforces concurrency rather
+     # than a per-tick spawn budget. See the docstring above for the full
+@@ -10407,6 +11577,7 @@ def _dispatch_once_locked(
+         "WHERE status = 'ready' AND claim_lock IS NULL "
+         "ORDER BY priority DESC, created_at ASC"
+     ).fetchall()
 +    ready_rows = [row for row in ready_rows if row["id"] not in rejected_task_ids]
-@@ -10418,0 +10654,3 @@
+     # Review rows are enumerated up front (not after the ready loop) so the
+     # budget split below can see whether review work exists at all.
+     review_rows = []
+@@ -10416,6 +11587,9 @@ def _dispatch_once_locked(
+             "WHERE status = 'review' AND claim_lock IS NULL "
+             "ORDER BY priority DESC, created_at ASC"
+         ).fetchall()
 +        review_rows = [
 +            row for row in review_rows if row["id"] not in rejected_task_ids
 +        ]
---- a/hermes_cli/native_boundary.py
+     # Review-lane reservation (OOF-30 review finding): the ready loop runs
+     # first and used to consume the ENTIRE shared budget, so a sustained
+     # ready backlog permanently starved autonomous reviews — completed work
+--- /dev/null
 +++ b/hermes_cli/native_boundary.py
 @@ -0,0 +1,1534 @@
 +"""Fail-closed native boundary decisions for the versioned Factory artifact.

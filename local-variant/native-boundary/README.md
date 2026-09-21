@@ -1,8 +1,8 @@
 # Factory native-boundary compatibility artifact
 
 This is the versioned `factory.native-boundary.v1` prerequisite for the
-Factory runtime. It repairs two native SQLite boundaries in a disposable copy
-of the pinned Hermes runtime:
+Factory runtime. It repairs native SQLite lifecycle boundaries in a disposable
+copy of the pinned Hermes runtime:
 
 - repeated-blocker triage admission is rejected inside the existing native
   write transaction before any task fields are changed;
@@ -30,6 +30,19 @@ of the pinned Hermes runtime:
   implementation-run plus `review_requested` handoff; a bare `review` status
   is never authority. Reclaim evidence additionally enforces native
   cross-field termination, host-local, and heartbeat consistency.
+- a standalone review leaf claimed from `ready` can record
+  `CHANGES_REQUESTED` only from its exact current reviewer run, immutable packet,
+  checked-out candidate HEAD, coordinator identity, finding, and current direct
+  dependency frontier. The same native transaction terminally closes that run
+  and inserts one graph-bound remediation outbox receipt. Coordinator
+  consumption is actor-bound, atomic, race-safe, and idempotent: it creates or
+  reuses one implementer successor, moves only the unchanged direct frontier,
+  reads the graph back, archives the old leaf, and marks the receipt applied.
+- completion of a standalone leaf requires structured exact `APPROVED` metadata
+  plus matching current reviewer run, prior terminal `review_requested`
+  implementation run, immutable packet, candidate, scope, and local worktree
+  HEAD. Non-approval, self-attestation, stale or foreign evidence, and malformed
+  provenance cannot complete the leaf or release status-gated children.
 - before reclaim, orphan repair, promotion, or spawn, a durable-state barrier
   validates non-terminal task scalars, run/event/comment identifiers and
   timestamps, run state, JSON storage, transition schemas, counters, PIDs,
