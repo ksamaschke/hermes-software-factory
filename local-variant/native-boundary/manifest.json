@@ -15,7 +15,7 @@
   "patches": [
     {
       "path": "patches/001-native-boundary.patch",
-      "sha256": "86c9eea14f3b0929867efd2770bc11ca98834a3f30bd0028b35aae8de48f75d1"
+      "sha256": "cef4f0c50a4a7456a55d8825bd5b9b24edfe4db88a15e2a2f826057970e2830c"
     }
   ],
   "patched_paths": [

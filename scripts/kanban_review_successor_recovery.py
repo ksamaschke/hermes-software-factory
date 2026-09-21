@@ -56,6 +56,7 @@ MAX_FILES_PER_SUCCESSOR = 2
 # larger decompositions are preserved as incomplete instead of partially
 # creating an unbounded or lossy successor set.
 MAX_SUCCESSOR_SPECS = 8
+NATIVE_REVIEW_REMEDIATION_CONTRACT = "factory.native-boundary.review-remediation.v2"
 
 # Change-scoped review budgets. See docs/change-scoped-review.md.
 #
@@ -226,6 +227,8 @@ def _recover_native_review_remediation_handoffs(
 ) -> list[str]:
     """Consume native standalone-review outbox rows through the active runtime."""
     path = _board_db_path(board)
+    actor = _active_profile_name()
+    bounded_limit = 100
     uri = f"{path.as_uri()}?mode=ro"
     try:
         with sqlite3.connect(uri, uri=True) as connection:
@@ -239,7 +242,9 @@ def _recover_native_review_remediation_handoffs(
                 str(row[0])
                 for row in connection.execute(
                     "SELECT handoff_key FROM review_remediation_handoffs "
-                    "WHERE status = 'pending' ORDER BY created_at, handoff_key"
+                    "WHERE status = 'pending' AND coordinator_profile = ? "
+                    "ORDER BY created_at, handoff_key LIMIT ?",
+                    (actor, bounded_limit),
                 ).fetchall()
             ]
     except sqlite3.Error as exc:
@@ -251,32 +256,73 @@ def _recover_native_review_remediation_handoffs(
 
     try:
         native_db = importlib.import_module("hermes_cli.kanban_db")
+        native_boundary = importlib.import_module("hermes_cli.native_boundary")
     except Exception as exc:
         raise RuntimeError("active native Kanban runtime is unavailable") from exc
+    native_root = Path(str(getattr(native_db, "__file__", ""))).resolve().parent
+    boundary_root = Path(str(getattr(native_boundary, "__file__", ""))).resolve().parent
+    if (
+        native_root != boundary_root
+        or getattr(native_boundary, "REVIEW_REMEDIATION_CONTRACT_VERSION", None)
+        != NATIVE_REVIEW_REMEDIATION_CONTRACT
+    ):
+        raise RuntimeError("active native review runtime contract is unverified")
     consumer = getattr(native_db, "consume_standalone_review_handoffs", None)
     if not callable(consumer):
         raise RuntimeError(
             "pending review remediation handoffs exist but the active runtime has no native consumer"
         )
-    actor = _active_profile_name()
+    results: list[dict[str, Any]] = []
     with native_db.connect(path) as connection:
-        raw_results = consumer(connection, actor=actor, limit=max(len(pending), 1))
-    if not isinstance(raw_results, list) or not all(
-        isinstance(result, dict) for result in raw_results
-    ):
-        raise RuntimeError("native review handoff consumer returned malformed readback")
-    results: list[dict[str, Any]] = raw_results
-    consumed = {str(result.get("handoff_key")) for result in results if isinstance(result, dict)}
-    missing = [key for key in pending if key not in consumed]
-    if missing:
-        raise RuntimeError(
-            "native review handoff consumption returned incomplete readback: " + ", ".join(missing)
+        for key in pending:
+            try:
+                rows = consumer(connection, limit=1, handoff_key=key)
+            except Exception as exc:
+                results.append(
+                    {
+                        "handoff_key": key,
+                        "status": "error",
+                        "error": str(exc),
+                    }
+                )
+                continue
+            if not isinstance(rows, list) or not all(
+                isinstance(result, dict) for result in rows
+            ):
+                results.append(
+                    {
+                        "handoff_key": key,
+                        "status": "error",
+                        "error": "native consumer returned malformed readback",
+                    }
+                )
+                continue
+            matching = [
+                result for result in rows if str(result.get("handoff_key")) == key
+            ]
+            if len(matching) != 1:
+                results.append(
+                    {
+                        "handoff_key": key,
+                        "status": "error",
+                        "error": "native consumer returned incomplete readback",
+                    }
+                )
+                continue
+            results.append(matching[0])
+    messages: list[str] = []
+    for result in results:
+        key = str(result["handoff_key"])
+        if result.get("status") == "error":
+            messages.append(
+                f"failed native review remediation handoff {key}: {result['error']}"
+            )
+            continue
+        messages.append(
+            "consumed native review remediation handoff "
+            f"{key} -> {result['successor_task_id']}"
         )
-    return [
-        "consumed native review remediation handoff "
-        f"{result['handoff_key']} -> {result['successor_task_id']}"
-        for result in results
-    ]
+    return messages
 
 
 def _task_id(value: Any) -> str:

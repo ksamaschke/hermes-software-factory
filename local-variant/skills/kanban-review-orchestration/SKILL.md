@@ -1,7 +1,7 @@
 ---
 name: kanban-review-orchestration
 description: "Use for Kanban review orchestration and evidence gates."
-version: 1.2.0
+version: 1.3.0
 author: HEX
 license: MIT
 platforms: [macos, linux, windows]
@@ -190,18 +190,23 @@ hand internal repair coordination to the operator. Continue the bounded loop:
    not create a successor implementer task.
 2. For a standalone `CHANGES_REQUESTED`, require the current terminal native
    remediation receipt and let `kanban_review_successor_recovery.py --apply`
-   atomically create or reuse exactly one narrow remediation card, replace only
-   the unchanged direct dependency frontier, and archive the old leaf after
+   consume only the active coordinator's receipt, preserve every direct parent,
+   replace only the unchanged child frontier, and archive the old leaf after
    readback. Do not create a parallel manual card. The implementer then starts
    from current remote upstream `main`, not a stale local tracking ref, in a
    fresh clean clone/worktree so user-owned dirty state is never mutated.
-3. Verify the implementer commit, exact file scope, focused/full gates, and
+3. The immutable successor receipt remains review-gated even if its body is
+   edited. Its exact implementation run requests a distinct reviewer with only
+   `candidate_commit`, `review_remediation_handoff_key`, and
+   `scope_manifest_sha256`; the native boundary validates these against the
+   current repository, branch, base, candidate, and changed-path manifest.
+4. Verify the implementer commit, exact file scope, focused/full gates, and
    clean worktree. Route exactly one fresh independent review for the new
    candidate; never reuse the old leaf or its verdict.
-4. After a fresh `APPROVED`, hand the candidate to a separate integration owner
+5. After a fresh `APPROVED`, hand the candidate to a separate integration owner
    for upstream PR creation, CI, branch-policy checks, merge, and merged-commit
    readback. A local branch or worker summary is not upstream delivery.
-5. Hand only the verified merged commit to a separate release owner. Back up the
+6. Hand only the verified merged commit to a separate release owner. Back up the
    installed artifact, install atomically from the merged source, and read back
    checksum, mode, compilation/help, and non-mutating smoke evidence. Do not
    install an unmerged worktree.
@@ -242,10 +247,12 @@ rot after those files get committed, and how to route the repair.
 A standalone leaf claimed from `source_status=ready` must never call
 `kanban_request_changes`. Exact `APPROVED` calls `kanban_complete` once with
 `review_outcome: APPROVED` and the exact `candidate_commit`; Native Boundary
-`1.0.19` re-reads the latest run, reviewer, packet, prior implementation
-handoff, worktree HEAD, and scope before release. A self-attested, stale,
-foreign, malformed, or wrong-head approval remains blocked and cannot release
-children.
+`1.0.19` requires an exact positive current run ID from the native active
+reviewer profile, re-reads the strict packet, immutable claim receipt, resolved
+worktree/Git-dir identity, repository, branch, base, candidate, and changed-path
+manifest before release. A missing/string/float/stale run ID, role collision,
+self-attested, foreign, malformed, wrong-repository, or wrong-head approval
+remains blocked and cannot release children.
 
 For exact `CHANGES_REQUESTED`, the reviewer calls `kanban_block` once with
 `kind=dependency` and a reason beginning
@@ -256,13 +263,22 @@ it terminally closes the run and inserts one immutable SQLite outbox receipt.
 `REVIEW-INCOMPLETE` never uses that prefix and remains gated for coordinator
 adjudication.
 
-The scheduled recovery add-on consumes only receipts owned by its active
-profile. In one `BEGIN IMMEDIATE` transaction it validates the same evidence,
-derives a graph-bound handoff identity, creates or reuses exactly one
-implementer successor, moves only the unchanged direct frontier, reads back
-the graph, archives the old leaf, and marks the receipt applied. Concurrent or
+The scheduled recovery add-on verifies that the imported runtime carries the
+same Native Boundary contract and consumes only receipts owned by its native
+active profile. Each receipt has its own `BEGIN IMMEDIATE` transaction and
+readback, so one malformed receipt does not suppress unrelated current work. It
+revalidates the immutable packet/worktree receipt and complete direct-parent
+and child frontier, uses a full-digest reserved idempotency key, creates or
+reuses exactly one successor with the complete parent set, moves only the
+unchanged child frontier, records an immutable successor-body digest and review
+gate, reads the graph back, archives the old leaf, and marks the receipt applied.
+The rejected leaf remains in the canonical sticky
+`blocked/changes_requested` terminal state and cannot be recomputed or claimed
+again. A remediation successor cannot complete until its exact implementation
+run requests a distinct reviewer with candidate, handoff, and changed-path
+manifest metadata and that exact review run returns `APPROVED`. Concurrent or
 repeated consumption is idempotent. Any frontier change, identity collision,
-missing function, or malformed state fails closed without successor,
+missing function, or malformed state fails closed without duplicate successor,
 archival, or downstream release. The coordinator never manually duplicates
 this native path.
 

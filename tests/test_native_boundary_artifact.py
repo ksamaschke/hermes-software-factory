@@ -1008,9 +1008,12 @@ def _private_environment(
     task_file: Path | None = None,
 ) -> dict[str, str]:
     """Build a fresh child environment with no inherited identity or secrets."""
+    home = tmp_path / "home"
+    for profile in ("default", "reviewer"):
+        (home / ".hermes" / "profiles" / profile).mkdir(parents=True, exist_ok=True)
     environment = {
-        "HERMES_HOME": str(tmp_path / "hermes-home"),
-        "HOME": str(tmp_path / "home"),
+        "HERMES_HOME": str(home / ".hermes" / "profiles" / "default"),
+        "HOME": str(home),
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "PYTHONHASHSEED": "0",
         "PYTHONNOUSERSITE": "1",
@@ -2456,12 +2459,15 @@ def test_staged_dispatch_admits_canonical_review_rework_handoffs(tmp_path):
                     )
                     kb.link_tasks(conn, parent_id, task_id)
 
+                profile_root = Path(os.environ["HOME"]) / ".hermes" / "profiles"
+                os.environ["HERMES_HOME"] = str(profile_root / "reviewer")
                 assert kb.request_changes(
                     conn,
                     task_id,
                     reason="Please fix the exact finding",
                     expected_run_id=review.current_run_id,
                 )
+                os.environ["HERMES_HOME"] = str(profile_root / "default")
                 if parent_id is not None:
                     parent_run = kb.claim_task(
                         conn, parent_id, claimer="fixture-parent:1"
@@ -2542,7 +2548,7 @@ def test_staged_review_lane_requires_native_handoff_provenance(tmp_path):
                 conn,
                 valid,
                 summary="Review the exact implementation",
-                reviewer="default",
+                reviewer="reviewer",
                 expected_run_id=implementation.current_run_id,
             )
             assert kb.check_respawn_guard(conn, valid, lane="review") is None
@@ -2965,12 +2971,7 @@ def test_staged_native_respecification_storage_does_not_quarantine_dispatch(
     probe = json.loads(result.stdout)
     assert probe["guard"] == "active_pr"
     assert probe["rejections"] == []
-    if field == "title":
-        assert [probe["task_id"], "active_pr"] in probe["guarded"]
-    else:
-        # The private HERMES_HOME intentionally has no reviewer profile, so the
-        # reassigned task is skipped before the ready-lane guard is recorded.
-        assert probe["guarded"] == []
+    assert [probe["task_id"], "active_pr"] in probe["guarded"]
     assert probe["spawned"] == [probe["healthy"]]
 
 
@@ -3941,7 +3942,7 @@ def test_staged_ancestor_reopen_resumes_all_native_lanes(tmp_path: Path) -> None
             implementation = kb.claim_task(conn, review, claimer="fixture-implementer:review")
             assert implementation is not None
             assert kb.request_review(
-                conn, review, summary="review handoff", reviewer="default",
+                conn, review, summary="review handoff", reviewer="reviewer",
                 expected_run_id=implementation.current_run_id,
             )
 
@@ -3952,7 +3953,7 @@ def test_staged_ancestor_reopen_resumes_all_native_lanes(tmp_path: Path) -> None
             implementation = kb.claim_task(conn, running_review, claimer="fixture-implementer:handoff")
             assert implementation is not None
             assert kb.request_review(
-                conn, running_review, summary="running reviewer handoff", reviewer="default",
+                conn, running_review, summary="running reviewer handoff", reviewer="reviewer",
                 expected_run_id=implementation.current_run_id,
             )
             reviewer_run = kb.claim_review_task(conn, running_review, claimer="fixture-reviewer:running")
@@ -4051,7 +4052,7 @@ def test_staged_ancestor_reopen_review_handoff_rejects_tampering(
             implementation = kb.claim_task(conn, task, claimer="implementer")
             assert implementation is not None
             assert kb.request_review(
-                conn, task, summary="handoff", reviewer="default",
+                conn, task, summary="handoff", reviewer="reviewer",
                 expected_run_id=implementation.current_run_id,
             )
             reviewer = None

@@ -56,17 +56,23 @@ Distinguish native same-card review from a separate review leaf before routing
 any verdict. A same-card review is claimed from `source_status=review` after a
 durable `review_requested` handoff; its native `kanban_request_changes`
 transition is the sole rework lane and must not be duplicated by a new
-implementer card. A standalone review leaf is claimed from
-`source_status=ready`; exact `APPROVED` completes once with structured outcome
-and candidate metadata, while exact `CHANGES_REQUESTED` blocks once with the
-native `STANDALONE_REVIEW_CHANGES_REQUESTED:` prefix. Native Boundary `1.0.19`
-binds current run, reviewer, packet, worktree HEAD, coordinator, finding, and
-direct frontier into a terminal outbox receipt. The scheduled recovery path
-consumes that receipt atomically to create or reuse one graph-bound remediation
-card, move only the unchanged direct frontier, archive the old leaf after
-readback, and mark the receipt applied. Missing, stale, foreign, malformed,
-self-attested, or changed evidence remains `REVIEW-INCOMPLETE`; never complete,
-release, redispatch, or manually duplicate the native path.
+implementation card. A standalone review leaf is claimed from
+`source_status=ready`; exact `APPROVED` completes once with an exact positive
+current run ID, active independent reviewer profile, and structured outcome and
+candidate metadata. Exact `CHANGES_REQUESTED` blocks once with the native
+`STANDALONE_REVIEW_CHANGES_REQUESTED:` prefix. Native Boundary `1.0.19`
+binds the strict owner/repository, resolved worktree/Git-dir identity, branch,
+base/candidate, changed-path manifest, distinct roles, exact run, finding, and
+complete direct-parent/child frontier into a sticky terminal outbox receipt.
+The scheduled recovery path verifies the active runtime contract and native
+coordinator profile, consumes each receipt independently, uses a full-digest
+reserved idempotency key, preserves every direct parent, records an immutable
+successor/body review gate, moves only the unchanged child frontier, archives
+the old leaf after exact readback, and marks the receipt applied. Missing,
+stale, foreign, malformed, self-attested, changed-frontier, wrong-repository,
+wrong-head, body-tampered, or unfenced evidence remains
+`REVIEW-INCOMPLETE`; never complete, release, redispatch, or manually duplicate
+the native path.
 
 ## Boundaries
 

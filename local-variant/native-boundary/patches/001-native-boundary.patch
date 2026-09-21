@@ -1,6 +1,35 @@
 --- a/hermes_cli/kanban_db.py
 +++ b/hermes_cli/kanban_db.py
-@@ -1479,6 +1479,32 @@ CREATE TABLE IF NOT EXISTS task_runs (
+@@ -71,6 +71,7 @@ new locking.
+ from __future__ import annotations
+
+ import contextlib
++import contextvars
+ import hashlib
+ import json
+ import os
+@@ -90,6 +91,10 @@ from pathlib import Path
+ from typing import Any, Iterable, Mapping, Optional
+
+ from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
++from hermes_cli.native_boundary import (
++    REVIEW_REMEDIATION_CONTRACT_VERSION,
++    _json_object as _strict_json_object,
++)
+ from toolsets import get_toolset_names
+
+ _log = logging.getLogger(__name__)
+@@ -159,6 +164,9 @@ def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
+
+
+ KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
++_REVIEW_REMEDIATION_CREATE_AUTH: contextvars.ContextVar[bool] = contextvars.ContextVar(
++    "review_remediation_create_auth", default=False
++)
+ _IS_WINDOWS = sys.platform == "win32"
+ KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
+
+@@ -1479,6 +1487,37 @@ CREATE TABLE IF NOT EXISTS task_runs (
      error               TEXT
  );
 
@@ -17,6 +46,7 @@
 +    coordinator_profile TEXT NOT NULL,
 +    implementation_task TEXT NOT NULL,
 +    candidate_commit  TEXT NOT NULL,
++    workspace_identity_json TEXT NOT NULL,
 +    packet_sha256     TEXT NOT NULL,
 +    finding_sha256    TEXT NOT NULL,
 +    frontier_sha256   TEXT NOT NULL,
@@ -24,16 +54,20 @@
 +    reason            TEXT NOT NULL,
 +    status            TEXT NOT NULL DEFAULT 'pending',
 +    successor_task_id TEXT,
++    successor_body_sha256 TEXT,
 +    created_at        INTEGER NOT NULL,
 +    consumed_at       INTEGER,
 +    UNIQUE (leaf_task_id, review_run_id),
 +    CHECK (status IN ('pending', 'applied'))
 +);
++CREATE UNIQUE INDEX IF NOT EXISTS idx_review_remediation_task_key
++    ON tasks(idempotency_key)
++    WHERE idempotency_key GLOB 'review-remediation:v2:*';
 +
  -- Files attached to a task (PDFs, images, source documents). The blob
  -- lives on disk under ``attachments_root(board)/<task_id>/<stored_name>``;
  -- this row carries metadata + the absolute ``stored_path`` so the
-@@ -1524,6 +1550,7 @@ CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, c
+@@ -1524,6 +1563,7 @@ CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, c
  CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
  CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
  CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
@@ -41,7 +75,103 @@
  CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
  CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
  """
-@@ -4529,7 +4556,10 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
+@@ -2777,6 +2817,38 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
+                 conn, "kanban_notify_subs", "delivery_metadata", "delivery_metadata TEXT"
+             )
+
++    handoff_table = conn.execute(
++        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
++        "AND name = 'review_remediation_handoffs'"
++    ).fetchone()
++    if handoff_table is not None:
++        handoff_columns = {
++            row["name"]
++            for row in conn.execute("PRAGMA table_info(review_remediation_handoffs)")
++        }
++        for column, definition in (
++            ("coordinator_profile", "coordinator_profile TEXT"),
++            ("workspace_identity_json", "workspace_identity_json TEXT"),
++            ("successor_body_sha256", "successor_body_sha256 TEXT"),
++        ):
++            if column not in handoff_columns:
++                _add_column_if_missing(
++                    conn,
++                    "review_remediation_handoffs",
++                    column,
++                    definition,
++                )
++        conn.execute(
++            "CREATE UNIQUE INDEX IF NOT EXISTS idx_review_remediation_successor "
++            "ON review_remediation_handoffs(successor_task_id) "
++            "WHERE successor_task_id IS NOT NULL"
++        )
++        conn.execute(
++            "CREATE INDEX IF NOT EXISTS idx_review_remediation_pending "
++            "ON review_remediation_handoffs("
++            "coordinator_profile, status, created_at, handoff_key)"
++        )
++
+     # One-shot backfill: any task that is 'running' before runs existed
+     # had its claim_lock / claim_expires / worker_pid on the task row.
+     # Synthesize a matching task_runs row so subsequent end-run / heartbeat
+@@ -3406,11 +3478,15 @@ def create_task(
+             )
+         skills_list = cleaned
+
+-    # Idempotency check — return the existing task instead of creating a
+-    # duplicate. Done BEFORE entering write_txn to keep the fast path fast
+-    # and to avoid holding a write lock during the lookup. Race is
+-    # acceptable: two concurrent creators with the same key might both
+-    # insert, at which point both rows exist but the next lookup stabilises.
++    if (
++        idempotency_key
++        and idempotency_key.startswith("review-remediation:v2:")
++        and not _REVIEW_REMEDIATION_CREATE_AUTH.get()
++    ):
++        raise PermissionError("native review remediation keys are reserved")
++
++    # Idempotency fast path. The same predicate is rechecked under the writer
++    # transaction below; callers must never rely on this unlocked read alone.
+     if idempotency_key:
+         row = conn.execute(
+             "SELECT id FROM tasks WHERE idempotency_key = ? "
+@@ -3451,6 +3527,14 @@ def create_task(
+             # compose create_task calls under one outer commit so the
+             # dispatcher can never observe a partially constructed graph.
+             with write_txn(conn, allow_nested=True):
++                if idempotency_key:
++                    existing = conn.execute(
++                        "SELECT id FROM tasks WHERE idempotency_key = ? "
++                        "AND status != 'archived' ORDER BY created_at DESC LIMIT 1",
++                        (idempotency_key,),
++                    ).fetchone()
++                    if existing is not None:
++                        return str(existing["id"])
+                 # Determine task status from parent status, unless the caller
+                 # parks it directly in blocked for human-ops review or in
+                 # triage for a specifier.
+@@ -4490,12 +4574,18 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
+     row = conn.execute(
+         "SELECT kind FROM task_events "
+         "WHERE task_id = ? AND kind IN ("
+-        "'blocked', 'dependency_parent_missing', 'unblocked'"
++        "'blocked', 'dependency_parent_missing', 'unblocked', "
++        "'standalone_review_changes_requested', 'standalone_review_incomplete'"
+         ") "
+         "ORDER BY id DESC LIMIT 1",
+         (task_id,),
+     ).fetchone()
+-    return bool(row) and row["kind"] in {"blocked", "dependency_parent_missing"}
++    return bool(row) and row["kind"] in {
++        "blocked",
++        "dependency_parent_missing",
++        "standalone_review_changes_requested",
++        "standalone_review_incomplete",
++    }
+
+
+ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
+@@ -4529,7 +4619,10 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
 
 
  def recompute_ready(
@@ -53,7 +183,7 @@
  ) -> int:
      """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
 
-@@ -4562,6 +4592,7 @@ def recompute_ready(
+@@ -4562,6 +4655,7 @@ def recompute_ready(
      """
      if failure_limit is None:
          failure_limit = DEFAULT_FAILURE_LIMIT
@@ -61,26 +191,55 @@
      promoted = 0
      with write_txn(conn):
          todo_rows = conn.execute(
-@@ -4570,6 +4601,8 @@ def recompute_ready(
+@@ -4570,7 +4664,16 @@ def recompute_ready(
          ).fetchall()
          for row in todo_rows:
              task_id = row["id"]
 +            if task_id in excluded_task_ids:
 +                continue
              cur_status = row["status"]
++            review_handoff = conn.execute(
++                "SELECT status FROM review_remediation_handoffs "
++                "WHERE leaf_task_id = ? ORDER BY created_at DESC LIMIT 1",
++                (task_id,),
++            ).fetchone()
++            if review_handoff is not None and review_handoff["status"] in {"pending", "applied"}:
++                continue
              if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                  # Worker / operator asked for explicit human intervention — do not
-@@ -4651,6 +4684,21 @@ def claim_task(
+                 # silently auto-recover.  ``unblock_task`` is the only
+@@ -4651,6 +4754,73 @@ def claim_task(
      lock = claimer or _claimer_id()
      expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
      with write_txn(conn):
++        terminal_handoff = conn.execute(
++            "SELECT status FROM review_remediation_handoffs "
++            "WHERE leaf_task_id = ? ORDER BY created_at DESC LIMIT 1",
++            (task_id,),
++        ).fetchone()
++        if terminal_handoff is not None and terminal_handoff["status"] in {"pending", "applied"}:
++            landing = "blocked" if terminal_handoff["status"] == "pending" else "archived"
++            conn.execute(
++                "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
++                "worker_pid = NULL WHERE id = ? AND status = 'ready'",
++                (landing, task_id),
++            )
++            _append_event(
++                conn,
++                task_id,
++                "claim_rejected",
++                {"reason": "standalone_review_terminal_handoff", "handoff_status": terminal_handoff["status"]},
++            )
++            return None
 +        packet_row = conn.execute(
-+            "SELECT body FROM tasks WHERE id = ? AND status = 'ready'",
++            "SELECT body, assignee, created_by, workspace_path FROM tasks "
++            "WHERE id = ? AND status = 'ready'",
 +            (task_id,),
 +        ).fetchone()
 +        packet_body = str(packet_row["body"] or "") if packet_row is not None else ""
 +        standalone_packet, standalone_packet_error = _review_packet(packet_body)
 +        standalone_declared = _review_body_field(packet_body, "review_type") is not None
++        standalone_workspace_identity: Optional[dict[str, Any]] = None
 +        if standalone_declared and standalone_packet_error is not None:
 +            _append_event(
 +                conn,
@@ -89,30 +248,78 @@
 +                {"reason": "standalone_review_packet_invalid"},
 +            )
 +            return None
++        if standalone_packet is not None:
++            reviewer = _canonical_assignee(str(packet_row["assignee"] or ""))
++            creator = _canonical_assignee(str(packet_row["created_by"] or ""))
++            if (
++                reviewer != standalone_packet["reviewer_profile"]
++                or not creator
++                or creator in {
++                    standalone_packet["reviewer_profile"],
++                    standalone_packet["implementer_profile"],
++                }
++                or str(packet_row["workspace_path"] or "")
++                != standalone_packet["target_worktree"]
++            ):
++                _append_event(
++                    conn,
++                    task_id,
++                    "claim_rejected",
++                    {"reason": "standalone_review_role_or_workspace_invalid"},
++                )
++                return None
++            standalone_workspace_identity, identity_error = _review_workspace_identity(
++                standalone_packet
++            )
++            if identity_error is not None or standalone_workspace_identity is None:
++                _append_event(
++                    conn,
++                    task_id,
++                    "claim_rejected",
++                    {"reason": "standalone_review_workspace_invalid"},
++                )
++                return None
          # Structural invariant: never transition ready -> running while any
          # parent is not yet 'done'. This is the single enforcement point
          # regardless of which writer (create_task, link_tasks, unblock_task,
-@@ -4746,6 +4794,19 @@ def claim_task(
+@@ -4746,6 +4916,36 @@ def claim_task(
              {"lock": lock, "expires": expires, "run_id": run_id},
              run_id=run_id,
          )
-+        if standalone_packet is not None:
++        if standalone_packet is not None and standalone_workspace_identity is not None:
++            packet_sha = _review_sha256(_review_json(standalone_packet))
++            workspace_identity_sha = _review_sha256(
++                _review_json(standalone_workspace_identity)
++            )
 +            _append_event(
 +                conn,
 +                task_id,
 +                "standalone_review_packet_claimed",
 +                {
-+                    "packet_sha256": _review_sha256(_review_json(standalone_packet)),
-+                    "candidate_commit": standalone_packet["candidate_commit"],
-+                    "reviewer_profile": standalone_packet["reviewer_profile"],
++                    "contract_version": REVIEW_REMEDIATION_CONTRACT_VERSION,
++                    "task_id": task_id,
++                    "run_id": run_id,
++                    "claim_lock": lock,
++                    "claim_expires": expires,
 +                    "source_status": "ready",
++                    "packet_sha256": packet_sha,
++                    "workspace_identity_sha256": workspace_identity_sha,
++                    "workspace_identity": standalone_workspace_identity,
++                    "base_commit": standalone_packet["base_commit"],
++                    "candidate_commit": standalone_packet["candidate_commit"],
++                    "scope_manifest_sha256": standalone_packet["scope_manifest_sha256"],
++                    "implementer_profile": standalone_packet["implementer_profile"],
++                    "reviewer_profile": standalone_packet["reviewer_profile"],
++                    "coordinator_profile": _canonical_assignee(
++                        str(packet_row["created_by"] or "")
++                    ),
 +                },
 +                run_id=run_id,
 +            )
          claimed = get_task(conn, task_id)
      _fire_kanban_lifecycle_hook(
          "kanban_task_claimed",
-@@ -4969,6 +5030,7 @@ def release_stale_claims(
+@@ -4969,6 +5169,7 @@ def release_stale_claims(
      conn: sqlite3.Connection,
      *,
      signal_fn=None,
@@ -120,7 +327,7 @@
  ) -> int:
      """Reset any ``running`` task whose claim has expired.
 
-@@ -4996,6 +5058,7 @@ def release_stale_claims(
+@@ -4996,6 +5197,7 @@ def release_stale_claims(
      extensions don't count). Safe to call often.
      """
      now = int(time.time())
@@ -128,7 +335,7 @@
      reclaimed = 0
      host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
      stale = conn.execute(
-@@ -5007,6 +5070,8 @@ def release_stale_claims(
+@@ -5007,6 +5209,8 @@ def release_stale_claims(
          (now,),
      ).fetchall()
      for row in stale:
@@ -137,15 +344,29 @@
          lock = row["claim_lock"] or ""
          host_local = lock.startswith(host_prefix)
          hb = row["last_heartbeat_at"]
-@@ -5566,6 +5631,22 @@ def complete_task(
+@@ -5566,6 +5770,36 @@ def complete_task(
      and never blocks.
      """
      now = int(time.time())
++    if expected_run_id is not None and _exact_positive_run_id(expected_run_id) is None:
++        return False
++    initial = conn.execute(
++        "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)
++    ).fetchone()
++    if initial is None:
++        return False
++    if initial["current_run_id"] is not None:
++        run_rejection = _active_worker_run_rejection(conn, task_id, expected_run_id)
++        if run_rejection is not None:
++            return False
++    elif expected_run_id is not None:
++        return False
++    fenced_run_id = _exact_positive_run_id(expected_run_id)
 +    review_rejection = _review_completion_rejection(
 +        conn,
 +        task_id,
 +        metadata=metadata,
-+        expected_run_id=expected_run_id,
++        expected_run_id=fenced_run_id,
 +    )
 +    if review_rejection is not None:
 +        with write_txn(conn):
@@ -160,7 +381,22 @@
      # Fail before validating cards or staging artifacts; re-check inside the
      # final write transaction below to close the parent-reopen race.
      if not _parents_satisfied(conn, task_id):
-@@ -5607,6 +5688,21 @@ def complete_task(
+@@ -5602,11 +5836,36 @@ def complete_task(
+         conn, task_id, metadata, summary=summary, result=result,
+     )
+     with write_txn(conn):
++        live_task = conn.execute(
++            "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)
++        ).fetchone()
++        if live_task is None:
++            return False
++        if live_task["current_run_id"] is not None:
++            if _active_worker_run_rejection(conn, task_id, fenced_run_id) is not None:
++                return False
++        elif fenced_run_id is not None:
++            return False
+         # Parent completion is a hard invariant even for direct human review
+         # approval. A parent may have been reopened after this task entered
          # ``review`` or ``running``.
          if not _parents_satisfied(conn, task_id):
              return False
@@ -182,12 +418,46 @@
          prior = conn.execute(
              "SELECT status FROM tasks WHERE id = ?",
              (task_id,),
-@@ -6442,6 +6538,847 @@ def edit_completed_task_result(
+@@ -5626,7 +5885,7 @@ def complete_task(
+                 "reparented_sibling_ids": sibling_ids,
+                 "source_run_id": source_run_id,
+             }
+-        if expected_run_id is None:
++        if fenced_run_id is None:
+             cur = conn.execute(
+                 """
+                 UPDATE tasks
+@@ -5639,7 +5898,8 @@ def complete_task(
+                        block_kind   = NULL,
+                        block_recurrences = 0
+                  WHERE id = ?
+-                   AND status IN ('running', 'ready', 'blocked', 'review')
++                   AND status IN ('ready', 'blocked', 'review')
++                   AND current_run_id IS NULL
+                 """,
+                 (result, now, task_id),
+             )
+@@ -5656,10 +5916,10 @@ def complete_task(
+                        block_kind   = NULL,
+                        block_recurrences = 0
+                  WHERE id = ?
+-                   AND status IN ('running', 'ready', 'blocked', 'review')
++                   AND status = 'running'
+                    AND current_run_id = ?
+                 """,
+-                (result, now, task_id, int(expected_run_id)),
++                (result, now, task_id, fenced_run_id),
+             )
+         if cur.rowcount != 1:
+             return False
+@@ -6442,56 +6702,1391 @@ def edit_completed_task_result(
      return True
 
 
+-def block_task(
 +_STANDALONE_REVIEW_CHANGES_PREFIX = "STANDALONE_REVIEW_CHANGES_REQUESTED:"
 +_REVIEW_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
++_REVIEW_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 +
 +
 +def _review_sha256(value: str) -> str:
@@ -198,6 +468,222 @@
 +    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 +
 +
++def _exact_positive_run_id(value: Any) -> Optional[int]:
++    return value if type(value) is int and value > 0 else None
++
++
++def _active_native_profile() -> Optional[str]:
++    try:
++        from hermes_cli.profiles import get_active_profile_name
++        from hermes_constants import get_hermes_home
++
++        value = get_active_profile_name()
++        profile_home = Path(get_hermes_home()).expanduser().resolve(strict=True)
++        user_home = Path.home().resolve(strict=True)
++    except Exception:
++        return None
++    profile = _canonical_assignee(value)
++    if not profile:
++        return None
++    default_home = user_home / ".hermes"
++    expected_home = user_home / ".hermes" / "profiles" / profile
++    if profile == "default" and profile_home == default_home:
++        return profile
++    if profile_home != expected_home or not profile_home.is_dir():
++        return None
++    return profile
++
++
++def _strict_review_payload(
++    payload: Any,
++    expected_keys: frozenset[str],
++) -> Optional[dict[str, Any]]:
++    value = _strict_json_object(payload)
++    if value is None or frozenset(value) != expected_keys:
++        return None
++    return value
++
++
++def _repository_from_remote_url(value: str) -> Optional[str]:
++    remote = str(value or "").strip()
++    if not remote or any(char in remote for char in ("\n", "\r", "\x00")):
++        return None
++    without_query = remote.split("?", 1)[0].split("#", 1)[0].rstrip("/")
++    if without_query.endswith(".git"):
++        without_query = without_query[:-4]
++    if "://" in without_query:
++        path = without_query.split("://", 1)[1].split("/", 1)
++        if len(path) != 2:
++            return None
++        repo_path = path[1]
++    elif ":" in without_query and "@" in without_query.split(":", 1)[0]:
++        repo_path = without_query.split(":", 1)[1]
++    else:
++        repo_path = without_query
++    parts = [part for part in repo_path.split("/") if part]
++    if len(parts) < 2:
++        return None
++    repository = "/".join(parts[-2:])
++    return repository if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) else None
++
++
++def _review_workspace_identity(
++    packet: Mapping[str, str],
++) -> tuple[Optional[dict[str, Any]], Optional[str]]:
++    raw_workspace = Path(packet["target_worktree"]).expanduser()
++    try:
++        if raw_workspace.is_symlink():
++            return None, "target_worktree must not be a symlink"
++        workspace = raw_workspace.resolve(strict=True)
++        workspace_stat = workspace.stat()
++    except (OSError, RuntimeError):
++        return None, "target_worktree is not a stable directory"
++    if not workspace.is_dir():
++        return None, "target_worktree is not a directory"
++
++    def git_text(*arguments: str) -> Optional[str]:
++        try:
++            probe = subprocess.run(
++                ["/usr/bin/git", "-C", str(workspace), *arguments],
++                env={"PATH": "/usr/bin:/bin", "HOME": str(Path.home())},
++                text=True,
++                capture_output=True,
++                check=False,
++                timeout=15,
++            )
++        except (OSError, subprocess.TimeoutExpired):
++            return None
++        return probe.stdout.strip() if probe.returncode == 0 else None
++
++    root_text = git_text("rev-parse", "--show-toplevel")
++    git_dir_text = git_text("rev-parse", "--git-dir")
++    origin_url = git_text("config", "--get", "remote.origin.url")
++    head = git_text("rev-parse", "--verify", "HEAD^{commit}")
++    branch = git_text("symbolic-ref", "--quiet", "--short", "HEAD")
++    base = git_text("rev-parse", "--verify", f"{packet['base_commit']}^{{commit}}")
++    candidate = git_text("rev-parse", "--verify", f"{packet['candidate_commit']}^{{commit}}")
++    if not all((root_text, git_dir_text, origin_url, head, branch, base, candidate)):
++        return None, "review worktree Git provenance is incomplete"
++    try:
++        root = Path(root_text).resolve(strict=True)
++        git_dir_candidate = Path(git_dir_text)
++        git_dir = (
++            git_dir_candidate
++            if git_dir_candidate.is_absolute()
++            else workspace / git_dir_candidate
++        ).resolve(strict=True)
++        git_dir_stat = git_dir.stat()
++    except (OSError, RuntimeError):
++        return None, "review worktree Git paths are unstable"
++    if root != workspace:
++        return None, "target_worktree is not the repository root"
++    if _repository_from_remote_url(origin_url) != packet["target_repository"]:
++        return None, "target_repository does not match origin"
++    if branch != packet["branch"]:
++        return None, "review branch does not match the checked out branch"
++    if head.casefold() != packet["candidate_commit"] or candidate.casefold() != packet["candidate_commit"]:
++        return None, "workspace HEAD does not match candidate_commit"
++    if base.casefold() != packet["base_commit"]:
++        return None, "base_commit is not present in the review repository"
++    try:
++        scope_probe = subprocess.run(
++            [
++                "/usr/bin/git",
++                "-C",
++                str(workspace),
++                "diff",
++                "--name-only",
++                "--no-renames",
++                "-z",
++                packet["base_commit"],
++                packet["candidate_commit"],
++            ],
++            env={"PATH": "/usr/bin:/bin", "HOME": str(Path.home())},
++            capture_output=True,
++            check=False,
++            timeout=15,
++        )
++    except (OSError, subprocess.TimeoutExpired):
++        return None, "review scope could not be read"
++    if scope_probe.returncode != 0:
++        return None, "review scope could not be read"
++    paths = sorted(path for path in scope_probe.stdout.split(b"\x00") if path)
++    scope_bytes = b"\x00".join(paths) + (b"\x00" if paths else b"")
++    if hashlib.sha256(scope_bytes).hexdigest() != packet["scope_manifest_sha256"]:
++        return None, "review scope manifest does not match the candidate diff"
++    return {
++        "contract_version": REVIEW_REMEDIATION_CONTRACT_VERSION,
++        "repository": packet["target_repository"],
++        "branch": packet["branch"],
++        "base_commit": packet["base_commit"],
++        "candidate_commit": packet["candidate_commit"],
++        "scope_manifest_sha256": packet["scope_manifest_sha256"],
++        "workspace_realpath": str(workspace),
++        "workspace_device": int(workspace_stat.st_dev),
++        "workspace_inode": int(workspace_stat.st_ino),
++        "git_dir_realpath": str(git_dir),
++        "git_dir_device": int(git_dir_stat.st_dev),
++        "git_dir_inode": int(git_dir_stat.st_ino),
++    }, None
++
++
++def _active_worker_run_rejection(
+     conn: sqlite3.Connection,
+     task_id: str,
+-    *,
+-    reason: Optional[str] = None,
+-    kind: Optional[str] = None,
+-    expected_run_id: Optional[int] = None,
+-) -> bool:
+-    """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
++    expected_run_id: Any,
++) -> Optional[str]:
++    expected = _exact_positive_run_id(expected_run_id)
++    if expected is None:
++        return "an exact positive built-in expected_run_id is required"
++    task = conn.execute(
++        "SELECT status, assignee, current_run_id, claim_lock, claim_expires "
++        "FROM tasks WHERE id = ?",
++        (task_id,),
++    ).fetchone()
++    if task is None or task["status"] != "running":
++        return "task is not in an active worker run"
++    current = _exact_positive_run_id(task["current_run_id"])
++    if current != expected:
++        return "run_id mismatch"
++    run = conn.execute(
++        "SELECT profile, status, outcome, ended_at, claim_lock, claim_expires "
++        "FROM task_runs WHERE id = ? AND task_id = ?",
++        (expected, task_id),
++    ).fetchone()
++    active_profile = _active_native_profile()
++    task_profile = _canonical_assignee(str(task["assignee"] or ""))
++    if (
++        run is None
++        or run["status"] != "running"
++        or run["outcome"] is not None
++        or run["ended_at"] is not None
++        or run["claim_lock"] != task["claim_lock"]
++        or run["claim_expires"] != task["claim_expires"]
++        or _canonical_assignee(str(run["profile"] or "")) != task_profile
++        or active_profile != task_profile
++    ):
++        return "active worker identity or lease provenance is invalid"
++    return None
+
+-    ``kind`` (one of :data:`VALID_BLOCK_KINDS`, or ``None`` for a legacy
+-    un-typed block) drives routing instead of every block landing in one
+-    undifferentiated ``blocked`` bucket:
+
+-    * ``dependency`` — the task is only waiting on another task. When an
+-      unfinished parent is already linked it goes to ``todo`` so existing
+-      parent-gating promotes it automatically once that parent finishes. When
+-      a running worker discovers a dependency but no unfinished parent exists,
+-      the new gate is not yet bound to the graph: it stays sticky ``blocked``
+-      and emits ``dependency_parent_missing`` until the orchestrator links the
+-      prerequisite. A never-started ``ready`` task retains the legacy explicit
+-      downstream re-admission path. This prevents an all-parents-done worker
+-      retry storm without changing that established contract.
 +def _review_body_field(body: str, name: str) -> Optional[str]:
 +    """Return one unambiguous scalar review-packet field."""
 +    matches = re.findall(
@@ -216,7 +702,10 @@
 +        "implementation_task",
 +        "target_repository",
 +        "target_worktree",
++        "branch",
++        "base_commit",
 +        "candidate_commit",
++        "scope_manifest_sha256",
 +        "implementer_profile",
 +        "reviewer_profile",
 +        "read_only_source",
@@ -229,14 +718,32 @@
 +        if value is None:
 +            return None, f"missing or ambiguous review packet field: {field_name}"
 +        packet[field_name] = value
-+    if "review leaf" not in packet["review_type"].casefold():
-+        return None, "review_type is not a standalone review leaf"
-+    if packet["read_only_source"].casefold() != "true":
++    if packet["review_type"] != "read-only adversarial code review leaf":
++        return None, "review_type is not the exact standalone review contract"
++    if packet["read_only_source"] != "true":
 +        return None, "read_only_source must be true"
-+    candidate = packet["candidate_commit"].casefold()
-+    if not _REVIEW_COMMIT_RE.fullmatch(candidate):
-+        return None, "candidate_commit is not a canonical 40-hex commit"
-+    packet["candidate_commit"] = candidate
++    if packet["review_kind"] not in {"pre_commit", "pre_merge", "exact_head"}:
++        return None, "review_kind is not supported"
++    if packet["review_scope"] != "change_set":
++        return None, "review_scope must be change_set"
++    if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", packet["target_repository"]) is None:
++        return None, "target_repository is not canonical owner/repository"
++    if (
++        not packet["branch"]
++        or packet["branch"].startswith(("/", "."))
++        or ".." in packet["branch"]
++        or re.fullmatch(r"[A-Za-z0-9._/-]+", packet["branch"]) is None
++    ):
++        return None, "branch is not canonical"
++    for commit_field in ("base_commit", "candidate_commit"):
++        commit = packet[commit_field].casefold()
++        if not _REVIEW_COMMIT_RE.fullmatch(commit):
++            return None, f"{commit_field} is not a canonical 40-hex commit"
++        packet[commit_field] = commit
++    scope_digest = packet["scope_manifest_sha256"].casefold()
++    if re.fullmatch(r"[0-9a-f]{64}", scope_digest) is None:
++        return None, "scope_manifest_sha256 is not a canonical SHA-256"
++    packet["scope_manifest_sha256"] = scope_digest
 +    try:
 +        packet["implementer_profile"] = _canonical_assignee(
 +            packet["implementer_profile"]
@@ -248,6 +755,8 @@
 +        return None, "review packet profile is not canonicalizable"
 +    if not packet["implementer_profile"] or not packet["reviewer_profile"]:
 +        return None, "review packet profile is empty"
++    if packet["implementer_profile"] == packet["reviewer_profile"]:
++        return None, "implementer and reviewer profiles must be distinct"
 +    if not re.fullmatch(r"t_[A-Za-z0-9_]+", packet["implementation_task"]):
 +        return None, "implementation_task is malformed"
 +    return packet, None
@@ -259,19 +768,42 @@
 +    rows = conn.execute(
 +        "SELECT payload FROM task_events "
 +        "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' ORDER BY id",
-+        (task_id, int(run_id)),
++        (task_id, run_id),
 +    ).fetchall()
 +    if len(rows) != 1 or not rows[0]["payload"]:
 +        return None, "review run does not have exactly one claimed event"
-+    try:
-+        payload = json.loads(rows[0]["payload"])
-+    except (json.JSONDecodeError, TypeError):
++    payload = _strict_json_object(rows[0]["payload"])
++    if payload is None:
 +        return None, "review claimed event is malformed"
-+    if not isinstance(payload, dict):
-+        return None, "review claimed event is not an object"
++    keys = frozenset(payload)
++    ready_keys = frozenset({"lock", "expires", "run_id"})
++    review_keys = frozenset({"lock", "expires", "run_id", "source_status"})
++    if keys not in {ready_keys, review_keys}:
++        return None, "review claimed event has an invalid schema"
++    if (
++        type(payload.get("lock")) is not str
++        or not payload["lock"].strip()
++        or type(payload.get("expires")) is not int
++        or payload["expires"] <= 0
++        or _exact_positive_run_id(payload.get("run_id")) != run_id
++    ):
++        return None, "review claimed event has invalid typed fields"
++    if keys == review_keys and payload.get("source_status") != "review":
++        return None, "review claimed event has an invalid source_status"
++    payload["source_status"] = "review" if keys == review_keys else "ready"
 +    return payload, None
-+
-+
+
+-    * ``needs_input`` / ``capability`` / ``None`` — "truly blocked" (Dale's
+-      "Type 1"). Lands in ``blocked`` for a human. BUT: each time such a task
+-      is re-blocked for the SAME kind after having been unblocked, the
+-      unblock-loop counter (``block_recurrences``) increments. When it reaches
+-      :data:`BLOCK_RECURRENCE_LIMIT`, the task is routed to ``triage`` instead
+-      of ``blocked`` — breaking the cron-unblock ↔ worker-re-block loop and
+-      forcing a human-in-the-loop triage decision.
+
+-    * ``transient`` — treated like a generic block for routing, but a worker
+-      can use it to signal "this might clear on its own"; it still participates
+-      in the loop breaker so a forever-flaky task eventually escalates.
 +def _review_packet_claim_receipt(
 +    conn: sqlite3.Connection,
 +    task_id: str,
@@ -281,25 +813,72 @@
 +    rows = conn.execute(
 +        "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
 +        "AND kind = 'standalone_review_packet_claimed' ORDER BY id",
-+        (task_id, int(run_id)),
++        (task_id, run_id),
 +    ).fetchall()
 +    if len(rows) != 1 or not rows[0]["payload"]:
 +        return "standalone review run has no unique packet claim receipt"
-+    try:
-+        payload = json.loads(rows[0]["payload"])
-+    except (json.JSONDecodeError, TypeError):
++    expected_keys = frozenset(
++        {
++            "contract_version",
++            "task_id",
++            "run_id",
++            "claim_lock",
++            "claim_expires",
++            "source_status",
++            "packet_sha256",
++            "workspace_identity_sha256",
++            "workspace_identity",
++            "base_commit",
++            "candidate_commit",
++            "scope_manifest_sha256",
++            "implementer_profile",
++            "reviewer_profile",
++            "coordinator_profile",
++        }
++    )
++    payload = _strict_review_payload(rows[0]["payload"], expected_keys)
++    if payload is None:
 +        return "standalone review packet claim receipt is malformed"
-+    expected_sha = _review_sha256(_review_json(dict(packet)))
++    live_identity, identity_error = _review_workspace_identity(packet)
++    if identity_error is not None or live_identity is None:
++        return identity_error or "standalone review workspace identity is unavailable"
++    expected_packet_sha = _review_sha256(_review_json(dict(packet)))
++    expected_identity_sha = _review_sha256(_review_json(live_identity))
++    task = conn.execute(
++        "SELECT created_by FROM tasks WHERE id = ?",
++        (task_id,),
++    ).fetchone()
++    coordinator = (
++        _canonical_assignee(str(task["created_by"] or "")) if task is not None else None
++    )
 +    if (
-+        not isinstance(payload, dict)
++        payload.get("contract_version") != REVIEW_REMEDIATION_CONTRACT_VERSION
++        or payload.get("task_id") != task_id
++        or _exact_positive_run_id(payload.get("run_id")) != run_id
++        or type(payload.get("claim_lock")) is not str
++        or not payload["claim_lock"].strip()
++        or type(payload.get("claim_expires")) is not int
++        or payload["claim_expires"] <= 0
 +        or payload.get("source_status") != "ready"
-+        or payload.get("packet_sha256") != expected_sha
++        or payload.get("packet_sha256") != expected_packet_sha
++        or payload.get("workspace_identity_sha256") != expected_identity_sha
++        or payload.get("workspace_identity") != live_identity
++        or payload.get("base_commit") != packet["base_commit"]
 +        or payload.get("candidate_commit") != packet["candidate_commit"]
++        or payload.get("scope_manifest_sha256") != packet["scope_manifest_sha256"]
++        or payload.get("implementer_profile") != packet["implementer_profile"]
 +        or payload.get("reviewer_profile") != packet["reviewer_profile"]
++        or payload.get("coordinator_profile") != coordinator
 +    ):
 +        return "standalone review packet changed after claim"
 +    return None
-+
+
+-    Returns True on any successful transition (to ``blocked``, ``todo``, or
+-    ``triage``), False when the task wasn't in a blockable state.
+-    """
+-    if kind is not None and kind not in VALID_BLOCK_KINDS:
+-        raise ValueError(
+-            f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
 +
 +def _review_graph_snapshot(conn: sqlite3.Connection, leaf_task_id: str) -> dict[str, Any]:
 +    parents = [
@@ -335,7 +914,8 @@
 +                "current_run_id": child["current_run_id"],
 +                "parent_ids": parent_ids,
 +            }
-+        )
+         )
+-    recurrences = 0
 +    return {"parents": parents, "children": children}
 +
 +
@@ -421,15 +1001,20 @@
 +    redacted_reason = str(redact_review_value(reason or "")).strip()
 +    if not redacted_reason.startswith(_STANDALONE_REVIEW_CHANGES_PREFIX):
 +        return None
-+    if expected_run_id is None:
++    run_id = _exact_positive_run_id(expected_run_id)
++    if run_id is None:
 +        return False
-+    run_id = int(expected_run_id)
-+    with write_txn(conn):
+     with write_txn(conn):
+-        cur_row = conn.execute(
+-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
++        if _active_worker_run_rejection(conn, task_id, run_id) is not None:
++            return False
 +        task = conn.execute(
 +            "SELECT id, title, body, assignee, created_by, workspace_path, "
 +            "status, current_run_id, claim_lock FROM tasks WHERE id = ?",
-+            (task_id,),
-+        ).fetchone()
+             (task_id,),
+         ).fetchone()
+-        if cur_row is None:
 +        if task is None or task["status"] != "running" or task["current_run_id"] != run_id:
 +            return False
 +        claim, claim_error = _review_claim_payload(conn, task_id, run_id)
@@ -464,7 +1049,7 @@
 +            or run["outcome"] is not None
 +            or run["ended_at"] is not None
 +            or newest is None
-+            or int(newest["id"]) != run_id
++            or _exact_positive_run_id(newest["id"]) != run_id
 +            or run["claim_lock"] != task["claim_lock"]
 +            or claim.get("lock") != task["claim_lock"]
 +        ):
@@ -475,8 +1060,11 @@
 +            creator = _canonical_assignee(str(task["created_by"] or ""))
 +            if reviewer != packet["reviewer_profile"] or run_profile != reviewer:
 +                validation_error = "reviewer identity does not match the native run"
-+            elif not creator or creator == reviewer:
-+                validation_error = "standalone review leaf has no independent creator provenance"
++            elif not creator or creator in {
++                reviewer,
++                packet["implementer_profile"],
++            }:
++                validation_error = "standalone review role separation is invalid"
 +            elif str(task["workspace_path"] or "") != packet["target_worktree"]:
 +                validation_error = "target_worktree does not match native workspace"
 +            else:
@@ -484,6 +1072,7 @@
 +                    conn, task_id, run_id, packet
 +                )
 +        graph = _review_graph_snapshot(conn, task_id)
++        workspace_identity: Optional[dict[str, Any]] = None
 +        if validation_error is None and packet is not None:
 +            parent = next(
 +                (row for row in graph["parents"] if row["id"] == packet["implementation_task"]),
@@ -492,15 +1081,20 @@
 +            if parent is None or parent["status"] != "done":
 +                validation_error = "implementation task is not a completed direct parent"
 +            elif any(
++                parent_row["status"] not in {"done", "archived"}
++                for parent_row in graph["parents"]
++            ):
++                validation_error = "direct parent frontier is not terminal"
++            elif any(
 +                child["status"] != "todo"
 +                or child["started_at"] is not None
 +                or child["current_run_id"] is not None
 +                for child in graph["children"]
 +            ):
 +                validation_error = "downstream frontier is not untouched and gated"
-+            elif _review_workspace_head(packet["target_worktree"]) != packet["candidate_commit"]:
-+                validation_error = "workspace HEAD does not match candidate_commit"
-+        if validation_error is not None or packet is None:
++            else:
++                workspace_identity, validation_error = _review_workspace_identity(packet)
++        if validation_error is not None or packet is None or workspace_identity is None:
 +            return _terminal_review_incomplete(
 +                conn, task_id, run_id=run_id, reason=redacted_reason,
 +                reason_code="native_evidence_invalid",
@@ -518,28 +1112,30 @@
 +        finding_sha = _review_sha256(finding)
 +        frontier_sha = _review_sha256(graph_json)
 +        handoff_key = (
-+            f"review-remediation:v1:{task_id}:{run_id}:"
-+            f"{finding_sha[:16]}:{frontier_sha[:16]}"
++            f"review-remediation:v2:{task_id}:{run_id}:"
++            f"{packet_sha}:{finding_sha}:{frontier_sha}"
 +        )
++        workspace_identity_json = _review_json(workspace_identity)
 +        now = int(time.time())
 +        try:
 +            conn.execute(
 +                "INSERT INTO review_remediation_handoffs ("
 +                "handoff_key, leaf_task_id, review_run_id, reviewer_profile, "
 +                "implementer_profile, coordinator_profile, implementation_task, candidate_commit, "
-+                "packet_sha256, finding_sha256, frontier_sha256, frontier_json, "
++                "workspace_identity_json, packet_sha256, finding_sha256, frontier_sha256, frontier_json, "
 +                "reason, status, created_at) "
-+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
++                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
 +                (
 +                    handoff_key, task_id, run_id, packet["reviewer_profile"],
 +                    packet["implementer_profile"], creator, packet["implementation_task"],
-+                    packet["candidate_commit"], packet_sha, finding_sha,
++                    packet["candidate_commit"], workspace_identity_json, packet_sha, finding_sha,
 +                    frontier_sha, graph_json, finding, now,
 +                ),
 +            )
 +        except sqlite3.IntegrityError:
 +            existing = conn.execute(
-+                "SELECT handoff_key, packet_sha256, finding_sha256, frontier_sha256 "
++                "SELECT handoff_key, workspace_identity_json, packet_sha256, "
++                "finding_sha256, frontier_sha256 "
 +                "FROM review_remediation_handoffs "
 +                "WHERE leaf_task_id = ? AND review_run_id = ?",
 +                (task_id, run_id),
@@ -547,6 +1143,7 @@
 +            if (
 +                existing is None
 +                or existing["handoff_key"] != handoff_key
++                or existing["workspace_identity_json"] != workspace_identity_json
 +                or existing["packet_sha256"] != packet_sha
 +                or existing["finding_sha256"] != finding_sha
 +                or existing["frontier_sha256"] != frontier_sha
@@ -576,6 +1173,8 @@
 +                "packet_sha256": packet_sha,
 +                "finding_sha256": finding_sha,
 +                "frontier_sha256": frontier_sha,
++                "workspace_identity_sha256": _review_sha256(workspace_identity_json),
++                "contract_version": REVIEW_REMEDIATION_CONTRACT_VERSION,
 +                "native_review_run_id": run_id,
 +            },
 +        )
@@ -589,6 +1188,8 @@
 +                "packet_sha256": packet_sha,
 +                "finding_sha256": finding_sha,
 +                "frontier_sha256": frontier_sha,
++                "workspace_identity_sha256": _review_sha256(workspace_identity_json),
++                "contract_version": REVIEW_REMEDIATION_CONTRACT_VERSION,
 +                "source_status": "ready",
 +                "successor_created": False,
 +                "retry_allowed": False,
@@ -609,12 +1210,15 @@
 +            "review_remediation: true",
 +            "review_required_before_completion: true",
 +            f"review_remediation_handoff_key: {handoff['handoff_key']}",
++            f"review_remediation_contract: {REVIEW_REMEDIATION_CONTRACT_VERSION}",
 +            f"standalone_review_leaf: {handoff['leaf_task_id']}",
 +            f"standalone_review_run: {handoff['review_run_id']}",
 +            f"implementation_task: {handoff['implementation_task']}",
 +            f"target_repository: {packet['target_repository']}",
 +            f"target_worktree: {packet['target_worktree']}",
-+            f"branch: {packet.get('branch') or 'not declared'}",
++            f"branch: {packet['branch']}",
++            f"base_commit: {packet['base_commit']}",
++            f"scope_manifest_sha256: {packet['scope_manifest_sha256']}",
 +            f"reviewed_candidate_commit: {handoff['candidate_commit']}",
 +            f"implementer_profile: {handoff['implementer_profile']}",
 +            f"reviewer_profile: {handoff['reviewer_profile']}",
@@ -645,29 +1249,38 @@
 +def consume_standalone_review_handoffs(
 +    conn: sqlite3.Connection,
 +    *,
-+    actor: str,
 +    limit: int = 16,
++    handoff_key: Optional[str] = None,
 +) -> list[dict[str, Any]]:
-+    """Consume pending review-rejection receipts under native SQLite fencing.
++    """Consume coordinator-owned review receipts under native SQLite fencing.
 +
-+    Only the configured coordinator profile may call this entry point. Each
-+    handoff is validated, created/reused, reparented, archived, and marked
-+    applied in one ``BEGIN IMMEDIATE`` transaction. A retry after an ambiguous
-+    caller result reads the same applied receipt and never creates a duplicate.
++    The mutating actor is resolved from the active Hermes profile; callers
++    cannot provide or spoof an actor string. Each handoff is validated,
++    created/reused, reparented, archived, and marked applied in one
++    ``BEGIN IMMEDIATE`` transaction.
 +    """
-+    canonical_actor = _canonical_assignee(actor)
++    canonical_actor = _active_native_profile()
 +    if not canonical_actor:
-+        raise PermissionError("standalone review remediation requires an active coordinator profile")
++        raise PermissionError("standalone review remediation requires an active native profile")
 +    bounded_limit = max(1, min(int(limit), 100))
-+    keys = [
-+        str(row["handoff_key"])
-+        for row in conn.execute(
-+            "SELECT handoff_key FROM review_remediation_handoffs "
-+            "WHERE status = 'pending' AND coordinator_profile = ? "
-+            "ORDER BY created_at, handoff_key LIMIT ?",
-+            (canonical_actor, bounded_limit),
-+        ).fetchall()
-+    ]
++    if handoff_key is not None:
++        if type(handoff_key) is not str or not handoff_key.startswith("review-remediation:v2:"):
++            raise ValueError("handoff_key must be an exact native remediation key")
++        keys = [handoff_key] if conn.execute(
++            "SELECT 1 FROM review_remediation_handoffs "
++            "WHERE handoff_key = ? AND status = 'pending' AND coordinator_profile = ?",
++            (handoff_key, canonical_actor),
++        ).fetchone() is not None else []
++    else:
++        keys = [
++            str(row["handoff_key"])
++            for row in conn.execute(
++                "SELECT handoff_key FROM review_remediation_handoffs "
++                "WHERE status = 'pending' AND coordinator_profile = ? "
++                "ORDER BY created_at, handoff_key LIMIT ?",
++                (canonical_actor, bounded_limit),
++            ).fetchall()
++        ]
 +    results: list[dict[str, Any]] = []
 +    for handoff_key in keys:
 +        with write_txn(conn):
@@ -701,11 +1314,18 @@
 +            )
 +            if receipt_error is not None:
 +                raise RuntimeError(f"handoff {handoff_key} packet receipt changed: {receipt_error}")
++            workspace_identity, workspace_error = _review_workspace_identity(packet)
++            if workspace_error is not None or workspace_identity is None:
++                raise RuntimeError(
++                    f"handoff {handoff_key} workspace identity changed: {workspace_error}"
++                )
++            workspace_identity_json = _review_json(workspace_identity)
 +            packet_sha = _review_sha256(_review_json(packet))
 +            graph = _review_graph_snapshot(conn, str(leaf["id"]))
 +            graph_json = _review_json(graph)
 +            if (
 +                packet_sha != handoff["packet_sha256"]
++                or workspace_identity_json != handoff["workspace_identity_json"]
 +                or _review_sha256(graph_json) != handoff["frontier_sha256"]
 +                or graph_json != handoff["frontier_json"]
 +                or packet["candidate_commit"] != handoff["candidate_commit"]
@@ -729,57 +1349,97 @@
 +                "AND kind = 'standalone_review_changes_requested' ORDER BY id DESC LIMIT 1",
 +                (leaf["id"], handoff["review_run_id"]),
 +            ).fetchone()
-+            try:
-+                event_payload = json.loads(event["payload"]) if event and event["payload"] else {}
-+            except (json.JSONDecodeError, TypeError):
-+                event_payload = {}
++            event_payload = (
++                _strict_review_payload(
++                    event["payload"],
++                    frozenset(
++                        {
++                            "handoff_key",
++                            "candidate_commit",
++                            "packet_sha256",
++                            "finding_sha256",
++                            "frontier_sha256",
++                            "workspace_identity_sha256",
++                            "contract_version",
++                            "source_status",
++                            "successor_created",
++                            "retry_allowed",
++                        }
++                    ),
++                )
++                if event is not None
++                else None
++            )
 +            if (
 +                run is None
 +                or newest is None
-+                or int(newest["id"]) != int(handoff["review_run_id"])
++                or _exact_positive_run_id(newest["id"]) != _exact_positive_run_id(handoff["review_run_id"])
 +                or run["status"] != "blocked"
 +                or run["outcome"] != "changes_requested"
 +                or run["ended_at"] is None
 +                or _canonical_assignee(str(run["profile"] or "")) != handoff["reviewer_profile"]
-+                or not isinstance(event_payload, dict)
++                or event_payload is None
 +                or event_payload.get("handoff_key") != handoff_key
++                or event_payload.get("candidate_commit") != handoff["candidate_commit"]
++                or event_payload.get("packet_sha256") != handoff["packet_sha256"]
++                or event_payload.get("finding_sha256") != handoff["finding_sha256"]
 +                or event_payload.get("frontier_sha256") != handoff["frontier_sha256"]
++                or event_payload.get("workspace_identity_sha256")
++                != _review_sha256(workspace_identity_json)
++                or event_payload.get("contract_version") != REVIEW_REMEDIATION_CONTRACT_VERSION
++                or event_payload.get("source_status") != "ready"
++                or event_payload.get("successor_created") is not False
++                or event_payload.get("retry_allowed") is not False
 +            ):
 +                raise RuntimeError(f"handoff {handoff_key} terminal review receipt is invalid")
 +            if _review_workspace_head(packet["target_worktree"]) != handoff["candidate_commit"]:
 +                raise RuntimeError(f"handoff {handoff_key} candidate is no longer current")
 +
 +            successor = _existing_handoff_successor(conn, handoff_key)
++            successor_body = _handoff_successor_body(
++                leaf=leaf, handoff=handoff, packet=packet
++            )
++            successor_body_sha = _review_sha256(successor_body)
++            parent_ids = tuple(str(parent["id"]) for parent in graph["parents"])
 +            reused = successor is not None
 +            if successor is None:
-+                successor_body = _handoff_successor_body(
-+                    leaf=leaf, handoff=handoff, packet=packet
-+                )
-+                successor_id = create_task(
-+                    conn,
-+                    title=f"Remediate review findings: {leaf['title']}",
-+                    body=successor_body,
-+                    assignee=handoff["implementer_profile"],
-+                    created_by=canonical_actor,
-+                    workspace_kind="dir",
-+                    workspace_path=packet["target_worktree"],
-+                    tenant=leaf["tenant"],
-+                    priority=int(leaf["priority"] or 0),
-+                    parents=(handoff["implementation_task"],),
-+                    idempotency_key=handoff_key,
-+                    initial_status="running",
-+                )
++                token = _REVIEW_REMEDIATION_CREATE_AUTH.set(True)
++                try:
++                    successor_id = create_task(
++                        conn,
++                        title=f"Remediate review findings: {leaf['title']}",
++                        body=successor_body,
++                        assignee=handoff["implementer_profile"],
++                        created_by=canonical_actor,
++                        workspace_kind="dir",
++                        workspace_path=packet["target_worktree"],
++                        tenant=leaf["tenant"],
++                        priority=int(leaf["priority"] or 0),
++                        parents=parent_ids,
++                        idempotency_key=handoff_key,
++                        initial_status="running",
++                    )
++                finally:
++                    _REVIEW_REMEDIATION_CREATE_AUTH.reset(token)
 +                successor = conn.execute(
 +                    "SELECT * FROM tasks WHERE id = ?",
 +                    (successor_id,),
 +                ).fetchone()
++            successor_parent_ids = tuple(
++                str(row["parent_id"])
++                for row in conn.execute(
++                    "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
++                    (successor["id"] if successor is not None else "",),
++                ).fetchall()
++            )
 +            if (
 +                successor is None
 +                or successor["status"] == "archived"
 +                or successor["idempotency_key"] != handoff_key
 +                or successor["assignee"] != handoff["implementer_profile"]
-+                or _review_body_field(str(successor["body"] or ""), "review_remediation_handoff_key") != handoff_key
-+                or _review_body_field(str(successor["body"] or ""), "review_required_before_completion") != "true"
++                or str(successor["body"] or "") != successor_body
++                or _review_sha256(str(successor["body"] or "")) != successor_body_sha
++                or successor_parent_ids != tuple(sorted(parent_ids))
 +            ):
 +                raise RuntimeError(f"handoff {handoff_key} successor identity readback failed")
 +            successor_id = str(successor["id"])
@@ -817,9 +1477,9 @@
 +            now = int(time.time())
 +            applied = conn.execute(
 +                "UPDATE review_remediation_handoffs SET status = 'applied', "
-+                "successor_task_id = ?, consumed_at = ? "
++                "successor_task_id = ?, successor_body_sha256 = ?, consumed_at = ? "
 +                "WHERE handoff_key = ? AND status = 'pending'",
-+                (successor_id, now, handoff_key),
++                (successor_id, successor_body_sha, now, handoff_key),
 +            )
 +            if applied.rowcount != 1:
 +                raise RuntimeError(f"handoff {handoff_key} lost its pending receipt")
@@ -882,6 +1542,66 @@
 +    return results
 +
 +
++def _validated_remediation_successor(
++    conn: sqlite3.Connection,
++    task_id: str,
++    task: sqlite3.Row,
++) -> tuple[Optional[sqlite3.Row], Optional[dict[str, str]], Optional[str]]:
++    rows = conn.execute(
++        "SELECT * FROM review_remediation_handoffs "
++        "WHERE successor_task_id = ? ORDER BY created_at, handoff_key",
++        (task_id,),
++    ).fetchall()
++    if not rows:
++        return None, None, None
++    if len(rows) != 1:
++        return None, None, "remediation successor has ambiguous durable receipts"
++    handoff = rows[0]
++    if handoff["status"] != "applied" or handoff["successor_body_sha256"] is None:
++        return None, None, "remediation successor receipt is not terminally applied"
++    leaf = conn.execute(
++        "SELECT * FROM tasks WHERE id = ?", (handoff["leaf_task_id"],)
++    ).fetchone()
++    if leaf is None or leaf["status"] != "archived":
++        return None, None, "remediation successor lost its archived review leaf"
++    packet, packet_error = _review_packet(str(leaf["body"] or ""))
++    if packet_error is not None or packet is None:
++        return None, None, packet_error or "archived review packet is invalid"
++    expected_body = _handoff_successor_body(leaf=leaf, handoff=handoff, packet=packet)
++    actual_body = str(task["body"] or "")
++    try:
++        frontier = _strict_json_object(str(handoff["frontier_json"] or ""))
++    except ValueError:
++        frontier = None
++    parent_rows = frontier.get("parents") if isinstance(frontier, dict) else None
++    if not isinstance(parent_rows, list) or not all(
++        isinstance(row, dict)
++        and set(row) == {"id", "status"}
++        and isinstance(row.get("id"), str)
++        and isinstance(row.get("status"), str)
++        for row in parent_rows
++    ):
++        return None, None, "remediation successor frontier receipt is malformed"
++    expected_parents = tuple(sorted(str(row["id"]) for row in parent_rows))
++    actual_parents = tuple(
++        str(row["parent_id"])
++        for row in conn.execute(
++            "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
++            (task_id,),
++        ).fetchall()
++    )
++    if (
++        task["idempotency_key"] != handoff["handoff_key"]
++        or _canonical_assignee(str(task["created_by"] or "")) != handoff["coordinator_profile"]
++        or str(task["workspace_path"] or "") != packet["target_worktree"]
++        or actual_body != expected_body
++        or _review_sha256(actual_body) != handoff["successor_body_sha256"]
++        or actual_parents != expected_parents
++    ):
++        return None, None, "remediation successor durable identity changed"
++    return handoff, packet, None
++
++
 +def _review_completion_rejection(
 +    conn: sqlite3.Connection,
 +    task_id: str,
@@ -890,14 +1610,23 @@
 +    expected_run_id: Optional[int],
 +) -> Optional[str]:
 +    task = conn.execute(
-+        "SELECT body, assignee, created_by, workspace_path, status, current_run_id FROM tasks WHERE id = ?",
++        "SELECT id, body, assignee, created_by, workspace_path, status, "
++        "current_run_id, idempotency_key FROM tasks WHERE id = ?",
 +        (task_id,),
 +    ).fetchone()
 +    if task is None:
 +        return None
 +    body = str(task["body"] or "")
++    remediation_handoff, remediation_packet, remediation_error = (
++        _validated_remediation_successor(conn, task_id, task)
++    )
++    if remediation_error is not None:
++        return remediation_error
 +    packet, packet_error = _review_packet(body)
-+    review_required = _review_body_field(body, "review_required_before_completion") == "true"
++    review_required = (
++        _review_body_field(body, "review_required_before_completion") == "true"
++        or remediation_handoff is not None
++    )
 +    standalone_declared = _review_body_field(body, "review_type") is not None
 +    standalone_registered = conn.execute(
 +        "SELECT 1 FROM task_events WHERE task_id = ? "
@@ -911,8 +1640,10 @@
 +        return packet_error or "standalone review packet is invalid"
 +    if task["status"] != "running" or task["current_run_id"] is None:
 +        return "review-gated task has no active reviewer run"
-+    run_id = int(task["current_run_id"])
-+    if expected_run_id is not None and run_id != int(expected_run_id):
++    run_id = _exact_positive_run_id(task["current_run_id"])
++    if run_id is None:
++        return "review-gated task has no exact active reviewer run"
++    if _exact_positive_run_id(expected_run_id) != run_id:
 +        return "review run_id mismatch"
 +    claim, claim_error = _review_claim_payload(conn, task_id, run_id)
 +    if claim_error is not None or claim is None:
@@ -931,7 +1662,7 @@
 +        or run["outcome"] is not None
 +        or run["ended_at"] is not None
 +        or newest is None
-+        or int(newest["id"]) != run_id
++        or _exact_positive_run_id(newest["id"]) != run_id
 +    ):
 +        return "review run is not current and active"
 +    if not isinstance(metadata, dict):
@@ -957,8 +1688,11 @@
 +        expected_reviewer = packet["reviewer_profile"]
 +        expected_candidate = packet["candidate_commit"]
 +        creator = _canonical_assignee(str(task["created_by"] or ""))
-+        if not creator or creator == expected_reviewer:
-+            return "standalone review leaf has no independent creator provenance"
++        if not creator or creator in {
++            expected_reviewer,
++            packet["implementer_profile"],
++        }:
++            return "standalone review role separation is invalid"
 +        if str(task["workspace_path"] or "") != packet["target_worktree"]:
 +            return "standalone review workspace changed"
 +        graph = _review_graph_snapshot(conn, task_id)
@@ -968,6 +1702,11 @@
 +        )
 +        if parent is None or parent["status"] != "done":
 +            return "implementation task is not a completed direct parent"
++        if any(
++            parent_row["status"] not in {"done", "archived"}
++            for parent_row in graph["parents"]
++        ):
++            return "direct parent frontier is not terminal"
 +        if any(
 +            child["status"] != "todo"
 +            or child["started_at"] is not None
@@ -985,37 +1724,82 @@
 +        ).fetchone()
 +        if requested is None or requested["run_id"] is None:
 +            return "same-card review has no native review_requested receipt"
-+        try:
-+            requested_payload = json.loads(requested["payload"]) if requested["payload"] else {}
-+        except (json.JSONDecodeError, TypeError):
-+            requested_payload = {}
-+        if not isinstance(requested_payload, dict):
++        requested_payload = _strict_review_payload(
++            requested["payload"],
++            frozenset({"summary", "metadata", "implementer", "reviewer"}),
++        )
++        if requested_payload is None:
 +            return "review_requested receipt is malformed"
 +        expected_reviewer = _canonical_assignee(str(requested_payload.get("reviewer") or ""))
++        requested_implementer = _canonical_assignee(
++            str(requested_payload.get("implementer") or "")
++        )
++        requested_run_id = _exact_positive_run_id(requested["run_id"])
++        if requested_run_id is None:
++            return "review_requested receipt has no exact implementation run"
 +        implementation_run = conn.execute(
-+            "SELECT status, outcome, metadata, ended_at FROM task_runs WHERE id = ? AND task_id = ?",
-+            (int(requested["run_id"]), task_id),
++            "SELECT profile, status, outcome, metadata, ended_at FROM task_runs "
++            "WHERE id = ? AND task_id = ?",
++            (requested_run_id, task_id),
 +        ).fetchone()
 +        if (
 +            implementation_run is None
 +            or implementation_run["status"] != "review"
 +            or implementation_run["outcome"] != "review_requested"
 +            or implementation_run["ended_at"] is None
++            or _canonical_assignee(str(implementation_run["profile"] or ""))
++            != requested_implementer
++            or not expected_reviewer
++            or not requested_implementer
++            or expected_reviewer == requested_implementer
 +        ):
-+            return "review_requested implementation run is not terminal"
++            return "review_requested implementation run is not terminal or role-separated"
 +        try:
-+            implementation_metadata = (
-+                json.loads(implementation_run["metadata"])
-+                if implementation_run["metadata"]
-+                else {}
++            implementation_metadata = _strict_json_object(
++                str(implementation_run["metadata"] or "{}")
 +            )
-+        except (json.JSONDecodeError, TypeError):
-+            implementation_metadata = {}
++        except ValueError:
++            implementation_metadata = None
 +        if not isinstance(implementation_metadata, dict):
 +            return "review_requested metadata is malformed"
-+        expected_candidate = str(implementation_metadata.get("candidate_commit") or "").strip().casefold()
++        if requested_payload.get("metadata") != implementation_metadata:
++            return "review_requested event and run metadata differ"
++        expected_candidate = str(
++            implementation_metadata.get("candidate_commit") or ""
++        ).strip().casefold()
 +        if not _REVIEW_COMMIT_RE.fullmatch(expected_candidate):
 +            return "review_requested metadata has no canonical candidate_commit"
++        if remediation_handoff is not None and remediation_packet is not None:
++            expected_metadata_keys = {
++                "candidate_commit",
++                "review_remediation_handoff_key",
++                "scope_manifest_sha256",
++            }
++            if set(implementation_metadata) != expected_metadata_keys:
++                return "remediation review metadata schema is not exact"
++            if (
++                implementation_metadata.get("review_remediation_handoff_key")
++                != remediation_handoff["handoff_key"]
++                or requested_implementer != remediation_handoff["implementer_profile"]
++                or expected_reviewer != remediation_handoff["reviewer_profile"]
++            ):
++                return "remediation review role or handoff provenance differs"
++            if (
++                metadata.get("review_remediation_handoff_key")
++                != remediation_handoff["handoff_key"]
++                or metadata.get("scope_manifest_sha256")
++                != implementation_metadata["scope_manifest_sha256"]
++            ):
++                return "approved remediation metadata does not match the native handoff"
++            current_packet = dict(remediation_packet)
++            current_packet["base_commit"] = str(remediation_handoff["candidate_commit"])
++            current_packet["candidate_commit"] = expected_candidate
++            current_packet["scope_manifest_sha256"] = str(
++                implementation_metadata.get("scope_manifest_sha256") or ""
++            )
++            _, workspace_error = _review_workspace_identity(current_packet)
++            if workspace_error is not None:
++                return f"remediation review workspace evidence is invalid: {workspace_error}"
 +    reviewer = _canonical_assignee(str(run["profile"] or ""))
 +    assignee = _canonical_assignee(str(task["assignee"] or ""))
 +    if not expected_reviewer or reviewer != expected_reviewer or assignee != reviewer:
@@ -1027,13 +1811,49 @@
 +    return None
 +
 +
- def block_task(
-     conn: sqlite3.Connection,
-     task_id: str,
-@@ -6485,6 +7422,15 @@ def block_task(
-         raise ValueError(
-             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
-         )
++def block_task(
++    conn: sqlite3.Connection,
++    task_id: str,
++    *,
++    reason: Optional[str] = None,
++    kind: Optional[str] = None,
++    expected_run_id: Optional[int] = None,
++) -> bool:
++    """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
++
++    ``kind`` (one of :data:`VALID_BLOCK_KINDS`, or ``None`` for a legacy
++    un-typed block) drives routing instead of every block landing in one
++    undifferentiated ``blocked`` bucket:
++
++    * ``dependency`` — the task is only waiting on another task. When an
++      unfinished parent is already linked it goes to ``todo`` so existing
++      parent-gating promotes it automatically once that parent finishes. When
++      a running worker discovers a dependency but no unfinished parent exists,
++      the new gate is not yet bound to the graph: it stays sticky ``blocked``
++      and emits ``dependency_parent_missing`` until the orchestrator links the
++      prerequisite. A never-started ``ready`` task retains the legacy explicit
++      downstream re-admission path. This prevents an all-parents-done worker
++      retry storm without changing that established contract.
++
++    * ``needs_input`` / ``capability`` / ``None`` — "truly blocked" (Dale's
++      "Type 1"). Lands in ``blocked`` for a human. BUT: each time such a task
++      is re-blocked for the SAME kind after having been unblocked, the
++      unblock-loop counter (``block_recurrences``) increments. When it reaches
++      :data:`BLOCK_RECURRENCE_LIMIT`, the task is routed to ``triage`` instead
++      of ``blocked`` — breaking the cron-unblock ↔ worker-re-block loop and
++      forcing a human-in-the-loop triage decision.
++
++    * ``transient`` — treated like a generic block for routing, but a worker
++      can use it to signal "this might clear on its own"; it still participates
++      in the loop breaker so a forever-flaky task eventually escalates.
++
++    Returns True on any successful transition (to ``blocked``, ``todo``, or
++    ``triage``), False when the task wasn't in a blockable state.
++    """
++    if kind is not None and kind not in VALID_BLOCK_KINDS:
++        raise ValueError(
++            f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
++        )
 +    standalone_review_result = _record_standalone_review_rejection(
 +        conn,
 +        task_id,
@@ -1043,10 +1863,371 @@
 +    )
 +    if standalone_review_result is not None:
 +        return standalone_review_result
-     recurrences = 0
++    if expected_run_id is not None and _exact_positive_run_id(expected_run_id) is None:
++        return False
++    fenced_run_id = _exact_positive_run_id(expected_run_id)
++    recurrences = 0
++    with write_txn(conn):
++        cur_row = conn.execute(
++            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
++            (task_id,),
++        ).fetchone()
++        if cur_row is None:
++            return False
++        if cur_row["status"] == "running":
++            if _active_worker_run_rejection(conn, task_id, fenced_run_id) is not None:
++                return False
++        elif fenced_run_id is not None:
+             return False
+         source_status = (
+             _retry_status_for_run(conn, task_id)
+@@ -6527,9 +8122,9 @@ def block_task(
+                        block_kind    = ?
+                  WHERE id = ?
+                    AND status IN ('running', 'ready')
+-                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
+-                (target_status, kind, task_id) if expected_run_id is None
+-                else (target_status, kind, task_id, int(expected_run_id)),
++                """ + ("" if fenced_run_id is None else " AND current_run_id = ?"),
++                (target_status, kind, task_id) if fenced_run_id is None
++                else (target_status, kind, task_id, fenced_run_id),
+             )
+             if cur.rowcount != 1:
+                 return False
+@@ -6607,9 +8202,9 @@ def block_task(
+                        block_recurrences = ?
+                  WHERE id = ?
+                    AND status IN ('running', 'ready')
+-                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
+-                (kind, recurrences, task_id) if expected_run_id is None
+-                else (kind, recurrences, task_id, int(expected_run_id)),
++                """ + ("" if fenced_run_id is None else " AND current_run_id = ?"),
++                (kind, recurrences, task_id) if fenced_run_id is None
++                else (kind, recurrences, task_id, fenced_run_id),
+             )
+             if cur.rowcount != 1:
+                 return False
+@@ -6634,7 +8229,7 @@ def block_task(
+                 run_id=run_id,
+             )
+         else:
+-            if expected_run_id is None:
++            if fenced_run_id is None:
+                 cur = conn.execute(
+                     """
+                     UPDATE tasks
+@@ -6663,7 +8258,7 @@ def block_task(
+                        AND status IN ('running', 'ready')
+                        AND current_run_id = ?
+                     """,
+-                    (kind, recurrences, task_id, int(expected_run_id)),
++                    (kind, recurrences, task_id, fenced_run_id),
+                 )
+             if cur.rowcount != 1:
+                 return False
+@@ -6754,30 +8349,28 @@ def request_review(
+
+     summary = redact_review_value(summary)
+     metadata = redact_review_value(metadata)
++    fenced_run_id = _exact_positive_run_id(expected_run_id)
++    if force or fenced_run_id is None:
++        return _ret(
++            False,
++            "request_review requires an exact active worker run; use a separate admin transition",
++        )
      with write_txn(conn):
-         cur_row = conn.execute(
-@@ -7395,6 +8341,19 @@ def invalidate_descendants_for_parent_reopen(
++        run_rejection = _active_worker_run_rejection(conn, task_id, fenced_run_id)
++        if run_rejection is not None:
++            return _ret(False, run_rejection)
+         if not _parents_satisfied(conn, task_id):
+             return _ret(False, "parent dependencies are not satisfied")
+         trow = conn.execute(
+-            "SELECT assignee, status, claim_lock, current_run_id "
++            "SELECT id, body, assignee, created_by, workspace_path, idempotency_key, "
++            "status, claim_lock, claim_expires, current_run_id "
+             "FROM tasks WHERE id = ?", (task_id,),
+         ).fetchone()
+         if trow is None:
+             return _ret(False, "task not found")
+-        # Refuse to clear a live worker's claim without proof of ownership
+-        # (expected_run_id) or an explicit human override (force=True).
+-        if (
+-            expected_run_id is None
+-            and not force
+-            and trow["status"] == "running"
+-            and trow["claim_lock"] is not None
+-        ):
+-            return _ret(
+-                False,
+-                "task is running under a live claim; pass expected_run_id "
+-                "(worker ownership) or force=True (explicit operator "
+-                "override) instead of clearing the live run's claim",
+-            )
+-        implementer = trow["assignee"]
++        implementer = _canonical_assignee(str(trow["assignee"] or ""))
++        if not implementer:
++            return _ret(False, "implementation run has no canonical implementer")
+         if reviewer is None:
+             changes_run = conn.execute(
+                 "SELECT id FROM task_runs "
+@@ -6794,17 +8387,17 @@ def request_review(
+                     "ORDER BY id DESC LIMIT 1",
+                     (task_id, int(changes_run["id"])),
+                 ).fetchone()
+-            try:
+-                changes_payload = (
+-                    json.loads(changes_event["payload"])
+-                    if changes_event and changes_event["payload"]
+-                    else {}
++            changes_payload = (
++                _strict_review_payload(
++                    changes_event["payload"],
++                    frozenset({"reason", "implementer", "reviewer", "status"}),
+                 )
+-            except (json.JSONDecodeError, TypeError):
+-                changes_payload = {}
++                if changes_event is not None
++                else None
++            )
+             prior_reviewer = (
+                 changes_payload.get("reviewer")
+-                if isinstance(changes_payload, dict)
++                if changes_payload is not None
+                 else None
+             )
+             if changes_run is not None:
+@@ -6817,30 +8410,62 @@ def request_review(
+                     )
+                 reviewer = prior_reviewer
+         reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
+-        assignee_sql = ", assignee = ?" if reviewer is not None else ""
+-        params: tuple[Any, ...]
+-        if expected_run_id is None:
+-            params = (reviewer, task_id) if reviewer is not None else (task_id,)
+-            run_guard = ""
+-        else:
+-            params = (
+-                (reviewer, task_id, int(expected_run_id))
+-                if reviewer is not None
+-                else (task_id, int(expected_run_id))
++        if not reviewer or reviewer == implementer:
++            return _ret(False, "reviewer must be a distinct canonical profile")
++        remediation_handoff, remediation_packet, remediation_error = (
++            _validated_remediation_successor(conn, task_id, trow)
++        )
++        if remediation_error is not None:
++            return _ret(False, remediation_error)
++        if remediation_handoff is not None and remediation_packet is not None:
++            if (
++                implementer != remediation_handoff["implementer_profile"]
++                or reviewer != remediation_handoff["reviewer_profile"]
++            ):
++                return _ret(False, "remediation request has a role collision")
++            if not isinstance(metadata, dict) or set(metadata) != {
++                "candidate_commit",
++                "review_remediation_handoff_key",
++                "scope_manifest_sha256",
++            }:
++                return _ret(False, "remediation review metadata schema is not exact")
++            candidate = str(metadata.get("candidate_commit") or "").strip().casefold()
++            candidate_valid = _REVIEW_COMMIT_RE.fullmatch(candidate) is not None
++            handoff_matches = (
++                metadata.get("review_remediation_handoff_key")
++                == remediation_handoff["handoff_key"]
+             )
+-            run_guard = " AND current_run_id = ?"
++            scope_valid = _REVIEW_SHA256_RE.fullmatch(
++                str(metadata.get("scope_manifest_sha256") or "").strip().casefold()
++            ) is not None
++            if not candidate_valid or not handoff_matches or not scope_valid:
++                return _ret(
++                    False,
++                    "remediation review metadata is invalid "
++                    f"(candidate={candidate_valid}, handoff={handoff_matches}, scope={scope_valid})",
++                )
++            current_packet = dict(remediation_packet)
++            current_packet["base_commit"] = str(remediation_handoff["candidate_commit"])
++            current_packet["candidate_commit"] = candidate
++            current_packet["scope_manifest_sha256"] = str(
++                metadata["scope_manifest_sha256"]
++            ).strip().casefold()
++            _, workspace_error = _review_workspace_identity(current_packet)
++            if workspace_error is not None:
++                return _ret(False, f"remediation workspace evidence is invalid: {workspace_error}")
+         cur = conn.execute(
+             """
+             UPDATE tasks
+                SET status        = 'review',
+                    claim_lock    = NULL,
+                    claim_expires = NULL,
+-                   worker_pid    = NULL
+-            """ + assignee_sql + """
++                   worker_pid    = NULL,
++                   assignee      = ?
+              WHERE id = ?
+-               AND status IN ('running', 'ready')
+-            """ + run_guard,
+-            params,
++               AND status = 'running'
++               AND current_run_id = ?
++            """,
++            (reviewer, task_id, fenced_run_id),
+         )
+         if cur.rowcount != 1:
+             return _ret(
+@@ -6872,6 +8497,7 @@ def request_review(
+             "review_requested",
+             {
+                 "summary": event_summary or None,
++                "metadata": metadata,
+                 "implementer": implementer,
+                 "reviewer": reviewer,
+             },
+@@ -6898,36 +8524,29 @@ def request_changes(
+     reason = str(redact_review_value(reason or "")).strip()
+     if not reason:
+         return False, "reason is required"
++    fenced_run_id = _exact_positive_run_id(expected_run_id)
++    if fenced_run_id is None:
++        return False, "an exact positive built-in expected_run_id is required"
+
+     with write_txn(conn):
++        run_rejection = _active_worker_run_rejection(conn, task_id, fenced_run_id)
++        if run_rejection is not None:
++            return False, run_rejection
+         task_row = conn.execute(
+             "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+             (task_id,),
+         ).fetchone()
+         if task_row is None:
+             return False, "task not found"
+-        current_run_id = task_row["current_run_id"]
+-        if task_row["status"] != "running" or current_run_id is None:
+-            return False, "task is not in an active review run"
+-        if expected_run_id is not None and int(current_run_id) != int(expected_run_id):
+-            return False, "run_id mismatch"
++        current_run_id = _exact_positive_run_id(task_row["current_run_id"])
++        if task_row["status"] != "running" or current_run_id != fenced_run_id:
++            return False, "task is not in the exact active review run"
+
+-        claimed_event = conn.execute(
+-            "SELECT payload FROM task_events "
+-            "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
+-            "ORDER BY id DESC LIMIT 1",
+-            (task_id, int(current_run_id)),
+-        ).fetchone()
+-        try:
+-            claimed_payload = (
+-                json.loads(claimed_event["payload"])
+-                if claimed_event and claimed_event["payload"]
+-                else {}
+-            )
+-        except (json.JSONDecodeError, TypeError):
+-            claimed_payload = {}
+-        if not isinstance(claimed_payload, dict):
+-            claimed_payload = {}
++        claimed_payload, claim_error = _review_claim_payload(
++            conn, task_id, fenced_run_id
++        )
++        if claim_error is not None or claimed_payload is None:
++            return False, claim_error or "review claim is missing"
+         if claimed_payload.get("source_status") != "review":
+             return False, "active run was not claimed from review"
+
+@@ -6939,24 +8558,26 @@ def request_changes(
+         ).fetchone()
+         if requested_event is None:
+             return False, "no prior review_requested event"
+-        try:
+-            requested_payload = (
+-                json.loads(requested_event["payload"])
+-                if requested_event["payload"]
+-                else {}
+-            )
+-        except (json.JSONDecodeError, TypeError):
+-            requested_payload = {}
+-        if not isinstance(requested_payload, dict):
+-            requested_payload = {}
+-        implementer = requested_payload.get("implementer")
+-        if not isinstance(implementer, str) or not implementer.strip():
+-            return False, "review handoff has no valid implementer provenance"
+-        reviewer = task_row["assignee"]
+-        if isinstance(reviewer, str) and reviewer.strip():
+-            reviewer = _canonical_assignee(reviewer)
+-        else:
+-            reviewer = None
++        requested_payload = _strict_review_payload(
++            requested_event["payload"],
++            frozenset({"summary", "metadata", "implementer", "reviewer"}),
++        )
++        if requested_payload is None:
++            return False, "review_requested receipt is malformed"
++        implementer = _canonical_assignee(
++            str(requested_payload.get("implementer") or "")
++        )
++        reviewer = _canonical_assignee(str(task_row["assignee"] or ""))
++        requested_reviewer = _canonical_assignee(
++            str(requested_payload.get("reviewer") or "")
++        )
++        if (
++            not implementer
++            or not reviewer
++            or requested_reviewer != reviewer
++            or implementer == reviewer
++        ):
++            return False, "review handoff role provenance is invalid"
+
+         new_status = _landing_status_after_parents(conn, task_id)
+         # NOTE: consecutive_failures is deliberately PRESERVED (neither
+@@ -6973,7 +8594,7 @@ def request_changes(
+                    worker_pid = NULL
+              WHERE id = ? AND status = 'running' AND current_run_id = ?
+             """,
+-            (new_status, implementer, task_id, int(current_run_id)),
++            (new_status, implementer, task_id, fenced_run_id),
+         )
+         if cur.rowcount != 1:
+             return False, "task changed during review handoff"
+@@ -7217,23 +8838,22 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
+             "ORDER BY id DESC LIMIT 1",
+             (task_id,),
+         ).fetchone()
+-        try:
+-            handoff = (
+-                json.loads(review_event["payload"])
+-                if review_event and review_event["payload"]
+-                else {}
+-            )
+-        except (json.JSONDecodeError, TypeError):
+-            handoff = {}
+-        implementer = handoff.get("implementer")
+-        if not isinstance(implementer, str) or not implementer.strip():
+-            implementer = None
+-        assignee_sql = ", assignee = ?" if implementer else ""
+-        params: tuple[Any, ...] = (
+-            (new_status, implementer, task_id)
+-            if implementer
+-            else (new_status, task_id)
++        handoff = (
++            _strict_review_payload(
++                review_event["payload"],
++                frozenset({"summary", "metadata", "implementer", "reviewer"}),
++            )
++            if review_event is not None
++            else None
+         )
++        if handoff is None:
++            return False
++        implementer = _canonical_assignee(handoff.get("implementer"))
++        reviewer = _canonical_assignee(handoff.get("reviewer"))
++        if not implementer or not reviewer or implementer == reviewer:
++            return False
++        assignee_sql = ", assignee = ?"
++        params: tuple[Any, ...] = (new_status, implementer, task_id)
+         cur = conn.execute(
+             "UPDATE tasks SET status = ?, current_run_id = NULL, "
+             "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+@@ -7395,6 +9015,19 @@ def invalidate_descendants_for_parent_reopen(
                  },
                  run_id=run_id,
              )
@@ -1066,7 +2247,7 @@
              # Inline comment insert (not add_comment: no txn-opening helper
              # calls inside a txn per file convention).
              conn.execute(
-@@ -7575,11 +8534,22 @@ def specify_triage_task(
+@@ -7575,11 +9208,22 @@ def specify_triage_task(
      assignee = _canonical_assignee(assignee)
      with write_txn(conn):
          existing = conn.execute(
@@ -1090,7 +2271,7 @@
          sets: list[str] = ["status = 'todo'"]
          params: list[Any] = []
          changed_fields: list[str] = []
-@@ -8783,6 +9753,7 @@ def enforce_max_runtime(
+@@ -8783,6 +10427,7 @@ def enforce_max_runtime(
      conn: sqlite3.Connection,
      *,
      signal_fn=None,
@@ -1098,7 +2279,7 @@
  ) -> list[str]:
      """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
 
-@@ -8798,6 +9769,7 @@ def enforce_max_runtime(
+@@ -8798,6 +10443,7 @@ def enforce_max_runtime(
      """
      import signal
      timed_out: list[str] = []
@@ -1106,7 +2287,7 @@
      now = int(time.time())
      host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
 
-@@ -8812,6 +9784,8 @@ def enforce_max_runtime(
+@@ -8812,6 +10458,8 @@ def enforce_max_runtime(
          "  AND t.worker_pid IS NOT NULL"
      ).fetchall()
      for row in rows:
@@ -1115,7 +2296,7 @@
          lock = row["claim_lock"] or ""
          if not lock.startswith(host_prefix):
              continue
-@@ -8911,6 +9885,7 @@ def detect_stale_running(
+@@ -8911,6 +10559,7 @@ def detect_stale_running(
      *,
      stale_timeout_seconds: int = 0,
      signal_fn=None,
@@ -1123,7 +2304,7 @@
  ) -> list[str]:
      """Reclaim ``running`` tasks that show no progress (heartbeat) within the
      staleness window.
-@@ -8939,6 +9914,7 @@ def detect_stale_running(
+@@ -8939,6 +10588,7 @@ def detect_stale_running(
 
 
      now = int(time.time())
@@ -1131,7 +2312,7 @@
      reclaimed: list[str] = []
 
      rows = conn.execute(
-@@ -8950,6 +9926,8 @@ def detect_stale_running(
+@@ -8950,6 +10600,8 @@ def detect_stale_running(
      ).fetchall()
 
      for row in rows:
@@ -1140,7 +2321,7 @@
          # Skip if no started_at (shouldn't happen for running, but be safe).
          if row["active_started_at"] is None:
              continue
-@@ -9038,6 +10016,8 @@ def detect_stale_running(
+@@ -9038,6 +10690,8 @@ def detect_stale_running(
 
  def reconcile_orphaned_running(
      conn: sqlite3.Connection,
@@ -1149,7 +2330,7 @@
  ) -> list[str]:
      """Reconcile ``running`` cards whose claim bookkeeping is broken.
 
-@@ -9061,14 +10041,36 @@ def reconcile_orphaned_running(
+@@ -9061,14 +10715,36 @@ def reconcile_orphaned_running(
      Idea from openai/symphony's tracker reconciliation (Apache-2.0).
      """
      now = int(time.time())
@@ -1188,7 +2369,7 @@
          pid = row["worker_pid"]
          if pid and _pid_alive(pid):
              # The recorded worker may still be doing real work — never
-@@ -9208,7 +10210,11 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
+@@ -9208,7 +10884,11 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
      return streak
 
 
@@ -1201,7 +2382,7 @@
      """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
      Appends a ``crashed`` event and restores the task's source phase.
-@@ -9237,6 +10243,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+@@ -9237,6 +10917,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
      (the public return stays the crashed-only ``list[str]``).
      """
      crashed: list[str] = []
@@ -1209,7 +2390,7 @@
      rate_limited: list[str] = []
      # Per-crash details collected inside the main txn, used after it
      # closes to run ``_record_task_failure`` (which needs its own
-@@ -9257,6 +10264,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+@@ -9257,6 +10938,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
          ).fetchall()
          host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
          for row in rows:
@@ -1218,7 +2399,7 @@
              # Only check liveness for claims owned by this host.
              lock = row["claim_lock"] or ""
              if not lock.startswith(host_prefix):
-@@ -9793,6 +10802,11 @@ def check_respawn_guard(
+@@ -9793,6 +11476,11 @@ def check_respawn_guard(
          explicit re-queue event (status change, promote, unblock, reclaim)
          arrives AFTER that completion — that's a deliberate re-run request.
 
@@ -1230,7 +2411,7 @@
      ``"active_pr"``
          A GitHub PR URL appears in a recent task comment (within
          ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
-@@ -9809,8 +10823,55 @@ def check_respawn_guard(
+@@ -9809,8 +11497,55 @@ def check_respawn_guard(
      ).fetchone()
      if row is None:
          return None
@@ -1286,7 +2467,7 @@
 
      # 1. Rate-limit cooldown. The most recent run ended ``rate_limited``
      #    (quota wall) — defer while inside the cooldown window, then allow a
-@@ -9819,16 +10880,33 @@ def check_respawn_guard(
+@@ -9819,16 +11554,33 @@ def check_respawn_guard(
      #    the regex would otherwise match → defer forever (no failure counter
      #    increment on this path means the breaker can never free it).
      #
@@ -1324,7 +2505,7 @@
      if (
          latest_run is not None
          and latest_run["outcome"] == "rate_limited"
-@@ -9838,8 +10916,7 @@ def check_respawn_guard(
+@@ -9838,8 +11590,7 @@ def check_respawn_guard(
              # blocker_auth regex so the stamped rate-limit text doesn't
              # re-trap the task.
              return None
@@ -1334,7 +2515,7 @@
              return "rate_limit_cooldown"
          # Cooldown elapsed — allow the respawn. Return early so the
          # blocker_auth check below doesn't catch the rate-limit text we
-@@ -9850,14 +10927,37 @@ def check_respawn_guard(
+@@ -9850,14 +11601,37 @@ def check_respawn_guard(
 
      # 2. Quota / auth blocker: retrying immediately will not help.
      err = row["last_failure_error"]
@@ -1376,7 +2557,7 @@
 
      # 3. Completed run within guard window — proof of recent success.
      #    Exception: an explicit re-queue AFTER that success (an operator
-@@ -9867,22 +10967,44 @@ def check_respawn_guard(
+@@ -9867,22 +11641,44 @@ def check_respawn_guard(
      #    silently held by the guard, until the window elapses.
      cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
      recent_completed = conn.execute(
@@ -1434,7 +2615,7 @@
 
      # A dependency re-admission is an explicit downstream re-queue. Its
      # durable kind survives the todo -> ready promotion, so do not let a
-@@ -9897,10 +11019,19 @@ def check_respawn_guard(
+@@ -9897,10 +11693,19 @@ def check_respawn_guard(
      # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
      pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
      for c in conn.execute(
@@ -1457,7 +2638,7 @@
              return "active_pr"
 
      return None
-@@ -10311,16 +11442,49 @@ def _dispatch_once_locked(
+@@ -10311,16 +12116,49 @@ def _dispatch_once_locked(
      reap_worker_zombies()
 
      result = DispatchResult()
@@ -1511,7 +2692,7 @@
      # detect_crashed_workers stashes protocol-violation auto-blocks on
      # itself so the public list-return stays stable. Pull them into the
      # DispatchResult here so telemetry / tests see the trip.
-@@ -10337,8 +11501,14 @@ def _dispatch_once_locked(
+@@ -10337,8 +12175,14 @@ def _dispatch_once_locked(
      )
      if _crash_rate_limited:
          result.rate_limited.extend(_crash_rate_limited)
@@ -1528,7 +2709,7 @@
 
      # Count tasks already running so max_spawn enforces concurrency rather
      # than a per-tick spawn budget. See the docstring above for the full
-@@ -10407,6 +11577,7 @@ def _dispatch_once_locked(
+@@ -10407,6 +12251,7 @@ def _dispatch_once_locked(
          "WHERE status = 'ready' AND claim_lock IS NULL "
          "ORDER BY priority DESC, created_at ASC"
      ).fetchall()
@@ -1536,7 +2717,7 @@
      # Review rows are enumerated up front (not after the ready loop) so the
      # budget split below can see whether review work exists at all.
      review_rows = []
-@@ -10416,6 +11587,9 @@ def _dispatch_once_locked(
+@@ -10416,6 +12261,9 @@ def _dispatch_once_locked(
              "WHERE status = 'review' AND claim_lock IS NULL "
              "ORDER BY priority DESC, created_at ASC"
          ).fetchall()
@@ -1548,7 +2729,7 @@
      # ready backlog permanently starved autonomous reviews — completed work
 --- /dev/null
 +++ b/hermes_cli/native_boundary.py
-@@ -0,0 +1,1534 @@
+@@ -0,0 +1,1539 @@
 +"""Fail-closed native boundary decisions for the versioned Factory artifact.
 +
 +This module is added to a disposable copied Hermes runtime by the artifact
@@ -1595,6 +2776,7 @@
 +_MAX_TRANSITION_PAYLOAD_CHARS = 65_536
 +_CLAIM_HEARTBEAT_MAX_STALE_SECONDS = 60 * 60
 +_PROFILE_ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
++REVIEW_REMEDIATION_CONTRACT_VERSION = "factory.native-boundary.review-remediation.v2"
 +
 +# Canonical terminal task-run state pairs emitted by the native kernel.  A
 +# synthetic terminal row uses the outcome as its status; claimed runs use the
@@ -1604,6 +2786,8 @@
 +_TERMINAL_RUN_STATE_PAIRS = frozenset(
 +    {
 +        ("blocked", "blocked"),
++        ("blocked", "changes_requested"),
++        ("blocked", "review_incomplete"),
 +        ("completed", "completed"),
 +        ("completed", "review_requested"),
 +        ("done", "completed"),
@@ -1734,7 +2918,7 @@
 +def _review_requested_payload(payload: Any) -> dict[str, Any] | None:
 +    value = _json_object(payload)
 +    if value is None or frozenset(value) != frozenset(
-+        {"summary", "implementer", "reviewer"}
++        {"summary", "metadata", "implementer", "reviewer"}
 +    ):
 +        return None
 +    summary = value["summary"]
@@ -1745,9 +2929,11 @@
 +        or len(summary) > 400
 +    ):
 +        return None
-+    if _canonical_profile_id(value["implementer"]) is None:
++    if value["metadata"] is not None and not isinstance(value["metadata"], dict):
 +        return None
-+    if _canonical_profile_id(value["reviewer"]) is None:
++    implementer = _canonical_profile_id(value["implementer"])
++    reviewer = _canonical_profile_id(value["reviewer"])
++    if implementer is None or reviewer is None or implementer == reviewer:
 +        return None
 +    return value
 +

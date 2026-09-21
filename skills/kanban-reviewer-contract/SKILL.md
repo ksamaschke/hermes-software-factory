@@ -1,7 +1,7 @@
 ---
 name: kanban-reviewer-contract
 description: Define bounded, read-only Kanban review work.
-version: 0.3.0
+version: 0.4.0
 author: Karsten Samaschke, Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -254,13 +254,20 @@ task/run/events rather than task prose:
   lane. The orchestrator must not create a second implementer task for that
   verdict. The implementer's earlier request-review run is not review evidence.
 - A **standalone review leaf** is a separate review card claimed from
-  `source_status=ready` with no `review_requested` handoff. Exact `APPROVED`
-  calls `kanban_complete` once and includes structured metadata
-  `review_outcome: APPROVED` plus the exact 40-hex `candidate_commit`; the
-  native boundary re-reads the current run, reviewer, packet, worktree HEAD,
-  and candidate before release. `CHANGES_REQUESTED` never calls
-  `kanban_request_changes`: call `kanban_block` once with `kind=dependency`
-  and a reason beginning exactly
+  `source_status=ready` with no `review_requested` handoff. Its exact body
+  schema names `review_type: read-only adversarial code review leaf`, direct
+  `implementation_task`, canonical `owner/repository`, real worktree, branch,
+  40-hex base and candidate commits, a SHA-256 of the NUL-delimited sorted
+  changed-path manifest, distinct implementer/reviewer profiles,
+  `read_only_source: true`, supported review kind, and
+  `review_scope: change_set`. The native claim persists resolved worktree and
+  Git-dir identities and rejects wrong repos, branches, symlinks, scope, or
+  role collisions. Exact `APPROVED` calls `kanban_complete` once and includes
+  structured metadata `review_outcome: APPROVED` plus the exact 40-hex
+  `candidate_commit`; the native boundary re-reads the exact positive run ID,
+  active reviewer profile, packet, worktree identity and HEAD, and candidate
+  before release. `CHANGES_REQUESTED` never calls `kanban_request_changes`:
+  call `kanban_block` once with `kind=dependency` and a reason beginning exactly
   `STANDALONE_REVIEW_CHANGES_REQUESTED:`, followed by the bounded structured
   findings. Native Boundary `1.0.19` terminally closes that exact run and
   writes one immutable remediation outbox receipt; the reviewer creates no

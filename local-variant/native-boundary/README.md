@@ -31,18 +31,28 @@ copy of the pinned Hermes runtime:
   is never authority. Reclaim evidence additionally enforces native
   cross-field termination, host-local, and heartbeat consistency.
 - a standalone review leaf claimed from `ready` can record
-  `CHANGES_REQUESTED` only from its exact current reviewer run, immutable packet,
-  checked-out candidate HEAD, coordinator identity, finding, and current direct
-  dependency frontier. The same native transaction terminally closes that run
-  and inserts one graph-bound remediation outbox receipt. Coordinator
-  consumption is actor-bound, atomic, race-safe, and idempotent: it creates or
-  reuses one implementer successor, moves only the unchanged direct frontier,
-  reads the graph back, archives the old leaf, and marks the receipt applied.
-- completion of a standalone leaf requires structured exact `APPROVED` metadata
-  plus matching current reviewer run, prior terminal `review_requested`
-  implementation run, immutable packet, candidate, scope, and local worktree
-  HEAD. Non-approval, self-attestation, stale or foreign evidence, and malformed
-  provenance cannot complete the leaf or release status-gated children.
+  `CHANGES_REQUESTED` only from its exact positive current run and native active
+  reviewer profile, strict immutable packet, resolved repository/worktree/Git-dir
+  identity, branch, base/candidate, changed-path manifest, three distinct roles,
+  finding, and complete direct-parent/child frontier. The same native
+  transaction terminally closes that run as the canonical sticky
+  `blocked/changes_requested` pair and inserts one graph-bound remediation
+  outbox receipt. Recompute, dispatch, and claim paths honor pending/applied
+  receipts, so the rejected leaf cannot run twice. Coordinator consumption is
+  bound to the native active profile and verified runtime contract, isolated per
+  receipt, atomic, race-safe, and idempotent. A full-digest reserved key creates
+  or reuses one implementer successor with every direct parent preserved; its
+  immutable body receipt and native review gate cannot be removed by body
+  editing. Only the unchanged child frontier moves before exact graph readback,
+  old-leaf archive, and receipt application.
+- completion of a standalone leaf or remediation successor requires structured
+  exact `APPROVED` metadata plus matching current reviewer run and native active
+  profile, prior terminal `review_requested` implementation run, immutable
+  packet/body receipt, candidate, changed-path manifest, repository/worktree
+  identity, and local HEAD. Missing, boolean/string/float/stale run IDs,
+  role collisions, non-approval, self-attestation, stale or foreign evidence,
+  and malformed provenance cannot complete the task or release status-gated
+  children.
 - before reclaim, orphan repair, promotion, or spawn, a durable-state barrier
   validates non-terminal task scalars, run/event/comment identifiers and
   timestamps, run state, JSON storage, transition schemas, counters, PIDs,
