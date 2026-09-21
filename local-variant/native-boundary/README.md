@@ -49,7 +49,10 @@ of the pinned Hermes runtime:
   re-admitted only when the latest durable suffix is the exact native
   `descendant_invalidated → status(ancestor_reopened) → promoted(review)`
   sequence, its parent link is satisfied, and the original review handoff plus
-  any reclaimed reviewer run remain fully fenced.
+  any reclaimed reviewer run remain fully fenced. The producer also records a
+  redundant parent-side invalidation marker; if child-side suffix rows are
+  deleted, that later marker consumes the older handoff instead of allowing the
+  legacy fallback to re-admit it.
 
 The artifact is fail-closed. It pins both input source files and the patch,
 rejects symlinks, hardlinks, special files, path escapes, patch mode/rename

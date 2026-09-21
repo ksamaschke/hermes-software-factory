@@ -46,7 +46,7 @@ native_boundary = _load_module("native_boundary_for_tests", NATIVE_PATH)
 def test_static_manifest_and_patch_are_pinned():
     manifest = builder._static_manifest()
     assert manifest["schema"] == "factory.native-boundary.v1"
-    assert manifest["artifact_version"] == "1.0.16"
+    assert manifest["artifact_version"] == "1.0.17"
     assert manifest["copy_policy"] == {
         "fresh_copy_required": True,
         "reject_symlinks": True,
@@ -4016,6 +4016,7 @@ def test_staged_ancestor_reopen_resumes_all_native_lanes(tmp_path: Path) -> None
         "invalidated_run_null",
         "promoted_payload",
         "missing_invalidated",
+        "missing_all_suffix",
         "reviewer_outcome",
         "review_handoff_run_null",
         "missing_parent_link",
@@ -4052,8 +4053,10 @@ def test_staged_ancestor_reopen_review_handoff_rejects_tampering(
                 conn, task, summary="handoff", reviewer="default",
                 expected_run_id=implementation.current_run_id,
             )
-            reviewer = kb.claim_review_task(conn, task, claimer="reviewer")
-            assert reviewer is not None
+            reviewer = None
+            if mutation != "missing_all_suffix":
+                reviewer = kb.claim_review_task(conn, task, claimer="reviewer")
+                assert reviewer is not None
             with kb.write_txn(conn):
                 conn.execute(
                     "UPDATE tasks SET status='todo', completed_at=NULL WHERE id=?",
@@ -4086,6 +4089,12 @@ def test_staged_ancestor_reopen_review_handoff_rejects_tampering(
             elif mutation == "missing_invalidated":
                 conn.execute(
                     "DELETE FROM task_events WHERE task_id=? AND kind='descendant_invalidated'",
+                    (task,),
+                )
+            elif mutation == "missing_all_suffix":
+                conn.execute(
+                    "DELETE FROM task_events WHERE task_id=? "
+                    "AND kind IN ('descendant_invalidated', 'status', 'promoted')",
                     (task,),
                 )
             elif mutation == "reviewer_outcome":

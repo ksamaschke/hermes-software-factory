@@ -32,7 +32,11 @@ _REQUEUE_EVENT_KINDS = frozenset(
 _RUNLESS_REQUEUE_EVENT_KINDS = frozenset(
     {"status", "promoted", "unblocked", "specified"}
 )
-_OBSERVATION_EVENT_KINDS = ("commented", "respawn_guarded")
+_OBSERVATION_EVENT_KINDS = (
+    "commented",
+    "descendant_invalidation_recorded",
+    "respawn_guarded",
+)
 # SQLite stores a bound Python ``True`` as integer ``1``.  No real Hermes
 # lifecycle row predates 2000-01-01, so a plausibility floor keeps that lossy
 # coercion from becoming durable timestamp authority.
@@ -542,6 +546,38 @@ def _descendant_invalidated_payload(payload: Any) -> dict[str, Any] | None:
     return value
 
 
+def _descendant_invalidation_marker_payload(
+    payload: Any,
+) -> dict[str, Any] | None:
+    """Validate redundant parent-side descendant invalidation evidence."""
+    value = _json_object(payload)
+    if value is None or frozenset(value) != {
+        "descendant",
+        "prior_status",
+        "new_status",
+        "resume_status",
+    }:
+        return None
+    descendant = value["descendant"]
+    prior_status = value["prior_status"]
+    resume_status = value["resume_status"]
+    if (
+        type(descendant) is not str
+        or not descendant.strip()
+        or value["new_status"] != "todo"
+        or type(prior_status) is not str
+        or prior_status not in {"ready", "review", "running", "done"}
+        or type(resume_status) is not str
+        or resume_status not in {"ready", "review"}
+    ):
+        return None
+    if prior_status == "review" and resume_status != "review":
+        return None
+    if prior_status in {"ready", "done"} and resume_status != "ready":
+        return None
+    return value
+
+
 def _durable_requeue_payload_is_canonical(kind: str, payload: Any) -> bool:
     """Accept native storage forms, including non-authorizing legacy forms."""
     if requeue_transition_is_authorized(kind, payload):
@@ -723,6 +759,42 @@ def same_owner_requeue_is_authorized(
         return False
     latest_id = _positive_row_id(latest["id"])
     return latest_id is not None and latest_id == transition_id
+
+
+def _later_descendant_invalidation_marker_exists(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    review_event_id: int,
+    review_created_at: int,
+) -> bool:
+    """Detect parent-side evidence that consumed an older review handoff."""
+    now = int(time.time())
+    rows = conn.execute(
+        "SELECT id, run_id, payload, created_at FROM task_events "
+        "WHERE kind = 'descendant_invalidation_recorded' ORDER BY id ASC"
+    ).fetchall()
+    for row in rows:
+        raw_payload = _json_object(row["payload"])
+        if raw_payload is None or raw_payload.get("descendant") != task_id:
+            continue
+        payload = _descendant_invalidation_marker_payload(row["payload"])
+        marker_id = _positive_row_id(row["id"])
+        marker_created_at = validated_lifecycle_timestamp(
+            row["created_at"], maximum=now
+        )
+        if (
+            payload is None
+            or row["run_id"] is not None
+            or marker_id is None
+            or marker_created_at is None
+        ):
+            return True
+        if marker_id > review_event_id:
+            return True
+        if marker_created_at > review_created_at and marker_id >= review_event_id:
+            return True
+    return False
 
 
 def _review_handoff_after_ancestor_reopen_is_authorized(
@@ -974,10 +1046,18 @@ def review_handoff_is_authorized(conn: sqlite3.Connection, task_id: str) -> bool
         or created_at < ended_at
     ):
         return False
+    if _later_descendant_invalidation_marker_exists(
+        conn,
+        task_id,
+        review_event_id=review_event_id,
+        review_created_at=created_at,
+    ):
+        return False
 
+    placeholders = ", ".join("?" for _ in _OBSERVATION_EVENT_KINDS)
     latest = conn.execute(
         "SELECT id FROM task_events WHERE task_id = ? "
-        "AND kind NOT IN (?, ?) ORDER BY id DESC LIMIT 1",
+        f"AND kind NOT IN ({placeholders}) ORDER BY id DESC LIMIT 1",
         (task_id, *_OBSERVATION_EVENT_KINDS),
     ).fetchone()
     return (
