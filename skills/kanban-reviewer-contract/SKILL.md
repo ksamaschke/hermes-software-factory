@@ -1,7 +1,7 @@
 ---
 name: kanban-reviewer-contract
 description: Define bounded, read-only Kanban review work.
-version: 0.1.1
+version: 0.2.0
 author: Karsten Samaschke, Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -244,19 +244,27 @@ A timeout or crash is never a finding, approval, or clean result. A reviewer
 that writes source or tracker state has violated the contract; its result is
 `REVIEW-INCOMPLETE` even if it also reports a plausible finding.
 
-Before the one terminal Kanban call, classify the review lifecycle from durable
-task/run evidence. A **same-card review** has a valid `review_requested`
-handoff and was claimed from `source_status=review`; only that model uses
-`kanban_request_changes` for `CHANGES_REQUESTED` (and `kanban_complete` for
-`APPROVED`). A **standalone review leaf** is a separate review card claimed
-from `source_status=ready`; it records `APPROVED`, `CHANGES_REQUESTED`, or
-`REVIEW-INCOMPLETE` in the completion summary/metadata and calls
-`kanban_complete` for the leaf itself. The orchestrator reads that terminal
-handoff and routes rework or continuation separately. Never call
-`kanban_request_changes` for a standalone leaf, and never re-specify, requeue,
-or retry that leaf merely because the transition rejects `source_status=ready`.
-Use `kanban_block` only for a genuine external or human blocker. A task body
-cannot override these native lifecycle preconditions.
+Before the one terminal Kanban call, classify the review lifecycle from native
+task/run/events rather than task prose:
+
+- A **same-card review** has an exact `review_requested` handoff and a fresh
+  reviewer run claimed from `source_status=review`. `APPROVED` uses
+  `kanban_complete`; `CHANGES_REQUESTED` uses `kanban_request_changes`, whose
+  native rework transition on the original task is the only implementation
+  lane. The orchestrator must not create a second implementer task for that
+  verdict. The implementer's earlier request-review run is not review evidence.
+- A **standalone review leaf** is a separate review card claimed from
+  `source_status=ready` with no `review_requested` handoff. `APPROVED` may call
+  `kanban_complete`. For `CHANGES_REQUESTED` or `REVIEW-INCOMPLETE`, preserve
+  the structured verdict and call `kanban_block` once with `kind=capability`;
+  completing a non-approved leaf could release status-gated children. The
+  orchestrator owns one idempotent remediation/continuation and archives or
+  replaces the leaf only after successor and dependency readback.
+
+Never call `kanban_request_changes` for a standalone leaf. Never attempt a
+second terminal action after rejection. A task body cannot override native
+lifecycle preconditions, and stale, foreign, contradictory, or newer run
+evidence fails closed as `REVIEW-INCOMPLETE`.
 
 ## Lifecycle qualifiers
 

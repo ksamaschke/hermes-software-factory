@@ -1,7 +1,7 @@
 ---
 name: kanban-review-orchestration
 description: "Use for Kanban review orchestration and evidence gates."
-version: 1.0.1
+version: 1.1.0
 author: HEX
 license: MIT
 platforms: [macos, linux, windows]
@@ -58,11 +58,18 @@ fresh exact-scope reviewer leaf(s)
 bounded fan-in / coverage reconciliation
 ```
 
-A reviewer leaf is a separate Kanban task. Reassigning an implementation card
-to a reviewer, or using a same-card `request-review` run as the final
-independent review, is invalid for closure. If a worker puts an implementation
-card back into the review lane, reclaim or reclassify that card and create a
-fresh reviewer task.
+The factory supports two review lifecycle models and must never mix them:
+
+- **same-card review** — the implementation task has a durable
+  `review_requested` handoff, then a fresh independent reviewer run/profile
+  claims that same task from `source_status=review`. The implementer's
+  request-review run is not review evidence; the later reviewer run is.
+- **standalone review leaf** — a separate review task is claimed from
+  `source_status=ready` and carries no same-card handoff.
+
+Choose one model before dispatch. Do not create a redundant standalone leaf for
+a valid same-card review, and do not treat a standalone leaf as same-card merely
+because its body says `request_changes`.
 
 Create true dependencies in the original task creation call. A fan-in task
 must depend on every required leaf. Do not create an apparently-ready child and
@@ -178,19 +185,16 @@ missing or contradictory board field.
 `CHANGES_REQUESTED` is a routing result, not a reason to stop the factory or
 hand internal repair coordination to the operator. Continue the bounded loop:
 
-1. Convert each reviewer finding into a narrow implementation acceptance slice
-   and a new implementer card. Start from the current remote upstream `main`,
-   not a stale local tracking ref, and use a fresh clean clone/worktree so a
-   user-owned dirty checkout is never mutated.
-2. Verify the implementer commit, exact file scope, focused/full gates, and
-   clean worktree. Mark that implementation handoff terminal; do not call a
-   same-card `request-review` path when it can route the implementation card to
-   a generic reviewer or reuse its run history.
-3. Create a fresh reviewer child with the implementation card as a completed
-   parent. Revalidate the exact packet, durable budget/one-retry fields,
-   read-only boundary, and the configured independent reviewer route before
-   dispatch. Only that fresh reviewer verdict can reopen the loop or authorize
-   integration.
+1. Classify the durable claim. For a same-card `CHANGES_REQUESTED`, use only the
+   native `kanban_request_changes` rework transition on the original task; do
+   not create a successor implementer task.
+2. For a standalone `CHANGES_REQUESTED`, create or reuse exactly one narrow
+   remediation card from the current terminal handoff identity. Start from the
+   current remote upstream `main`, not a stale local tracking ref, and use a
+   fresh clean clone/worktree so a user-owned dirty checkout is never mutated.
+3. Verify the implementer commit, exact file scope, focused/full gates, and
+   clean worktree. Route exactly one fresh independent review for the new
+   candidate; never reuse the old leaf or its verdict.
 4. After a fresh `APPROVED`, hand the candidate to a separate integration owner
    for upstream PR creation, CI, branch-policy checks, merge, and merged-commit
    readback. A local branch or worker summary is not upstream delivery.
@@ -232,21 +236,29 @@ rot after those files get committed, and how to route the repair.
 
 ## Leaf lifecycle gap
 
-A review leaf claimed from `source_status=ready` has no `review_requested`
-handoff, so it is a **standalone review leaf**, not a same-card review. It must
-record `APPROVED`, `CHANGES_REQUESTED`, or `REVIEW-INCOMPLETE` in its completion
-summary/metadata and call `kanban_complete` for the leaf itself. The
-orchestrator then creates or reuses one bounded remediation/continuation from
-that terminal handoff. Only a review with a valid `review_requested` handoff
-claimed from `source_status=review` may call `kanban_request_changes`.
+A standalone leaf claimed from `source_status=ready` must never call
+`kanban_request_changes`. `APPROVED` may complete the leaf. Preserve
+`CHANGES_REQUESTED` or `REVIEW-INCOMPLETE` in a structured handoff and block
+once as a lifecycle capability mismatch; a non-approval must not release a
+fan-in, integration, or deployment child through status-only dependency logic.
 
-If a standalone leaf is already blocked only because
-`kanban_request_changes` rejected `source_status=ready`, and its exact-head
-verdict is still current, complete the blocked leaf from the existing evidence;
-do not re-specify, requeue, or re-dispatch it. Treat the rejected transition as
-a factory contract defect, not as `REVIEW-INCOMPLETE`. If the review evidence
-itself is incomplete, create one bounded diagnostic successor; do not retry the
-same prompt unchanged.
+Before recovering a blocked legacy leaf, read native events and bind all of:
+task ID, current/latest run ID, reviewer identity, claim source, exact
+candidate/base/scope, review round, verdict/finding identity, and the structured
+transition rejection from that same run. Ignore body assertions. Any missing,
+stale, foreign, contradictory, or newer evidence remains
+`REVIEW-INCOMPLETE`; do not re-specify, requeue, or re-dispatch the leaf.
+
+For a valid non-approved standalone handoff, derive
+`review-handoff:<sha256(canonical identity JSON)>` over implementation task,
+leaf task, source run, reviewer, round, candidate, base, scope, verdict,
+finding, and successor kind. Use that as the native idempotency key to atomically
+create or reuse exactly one remediation/continuation; read back key, parents,
+candidate, scope, and route. If the old leaf has children, replace the fan-in
+frontier before archival. Archive the old leaf only after the successor and
+dependency graph read back correctly. A collision with different identity fails
+closed. `scripts/review_lifecycle_contract.py` is the deterministic planner for
+this decision; it never mutates the board.
 
 ## Pitfalls
 

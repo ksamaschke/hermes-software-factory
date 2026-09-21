@@ -54,11 +54,13 @@ not as a reason to return routine decisions to the operator.
 
 Distinguish native same-card review from a separate review leaf before routing
 any verdict. A same-card review is claimed from `source_status=review` after a
-durable `review_requested` handoff; it may use `kanban_request_changes`. A
-standalone review leaf is claimed from `source_status=ready`; it completes its
-own card with the terminal verdict, and remediation or continuation is a
-separate orchestrator-owned phase. Never requeue a standalone leaf because
-`kanban_request_changes` rejected its source status.
+durable `review_requested` handoff; its native `kanban_request_changes`
+transition is the sole rework lane and must not be duplicated by a new
+implementer card. A standalone review leaf is claimed from
+`source_status=ready`; only current exact `APPROVED` may complete and release
+its dependants. A non-approval never releases downstream work: block once,
+create or reuse one identity-bound successor, verify the dependency frontier,
+then archive or replace the old leaf. Never requeue the same review.
 
 ## Boundaries
 

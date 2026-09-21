@@ -134,6 +134,7 @@ documents:
 install -m 755 scripts/kanban_factory_recovery.py ~/.hermes/scripts/kanban_factory_recovery.py
 install -m 755 scripts/kanban_review_successor_recovery.py ~/.hermes/scripts/kanban_review_successor_recovery.py
 install -m 755 scripts/kanban_review_successor_recovery_cron.py ~/.hermes/scripts/kanban_review_successor_recovery_cron.py
+install -m 755 scripts/review_lifecycle_contract.py ~/.hermes/scripts/review_lifecycle_contract.py
 ```
 
 Forgejo-backed projects can also install the generic read-only delivery
@@ -346,7 +347,8 @@ skills/software-factory-recovery/SKILL.md      autonomous recovery procedure
 scripts/kanban_factory_recovery.py              deterministic recovery add-on
 scripts/kanban_review_successor_recovery.py     review packet guard and recursive successor bridge
 scripts/kanban_review_successor_recovery_cron.py installed no-agent wrapper
-scripts/forgejo_delivery_controller.py          bounded read-only Forgejo delivery observer
+scripts/review_lifecycle_contract.py             pure review-lifecycle planner and idempotency contract
+scripts/forgejo_delivery_controller.py           bounded read-only Forgejo delivery observer
 scripts/pydantic_agent_baseline.py               synthetic corpus validator and replay summary
 examples/project-policy.yaml                    adaptable tracker policy template
 examples/forgejo-delivery-overlay.json           anonymized observer overlay template
