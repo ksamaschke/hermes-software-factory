@@ -9,8 +9,52 @@ of the pinned Hermes runtime:
 - a same-owner continuation is admitted only when the task has durable,
   post-run lifecycle requeue evidence and the current assignee still matches
   the prior native run profile. A material blocked/triage `specified` event is
-  one such transition; title-only or malformed specifications are not.
-  Comments and PR URLs are evidence only.
+  one such authority-bearing transition; title-only or assignee-only native
+  specifications remain valid durable history but do not grant readmission.
+  Missing, malformed, implausibly old under the real wall clock, or future
+  lifecycle timestamps and malformed/non-object transition payloads fail closed
+  in both the helper and the production respawn guard. A caller-supplied bounded
+  synthetic clock remains a separate positive test domain and cannot authorize
+  those same low timestamps under the real clock. Duplicate JSON members,
+  unknown transition fields, empty reclaim locks, and impossible run
+  status/outcome pairs are not authority. A canonical non-terminal run blocks
+  duplicate dispatch; if its task-level claim pointers are lost or disagree
+  with the run, the task is quarantined and orphan reconciliation may not
+  close/re-admit it. Retry counters, failure text, run state, and comment
+  evidence are type-checked before they affect admission. Comments and PR URLs
+  are evidence only.
+- reviewer-requested rework is admitted through a recent PR guard only when
+  the exact terminal review run, `changes_requested` event, implementer,
+  reviewer, status, timestamps, event/run identifiers, and any parent-gate
+  promotion agree. A review-lane worker likewise starts only from an exact
+  implementation-run plus `review_requested` handoff; a bare `review` status
+  is never authority. Reclaim evidence additionally enforces native
+  cross-field termination, host-local, and heartbeat consistency.
+- before reclaim, orphan repair, promotion, or spawn, a durable-state barrier
+  validates non-terminal task scalars, run/event/comment identifiers and
+  timestamps, run state, JSON storage, transition schemas, counters, PIDs,
+  locks, and claim fields. Malformed rows are quarantined per task before any
+  permissive native coercion; unrelated canonical tasks can still be
+  reconciled, promoted, and dispatched. Raw SQLite task identities remain the
+  quarantine keys even when malformed values are rendered as a safe telemetry
+  sentinel. Byte-equivalent non-TEXT run/event/comment links cannot disappear
+  behind SQLite storage-class equality. Lifecycle events are explicitly ordered
+  by durable row identity before the newest transition is evaluated. Native
+  runless re-admission transitions (minimal `status`, `promoted`, `unblocked`,
+  and `specified`) must keep their producer-defined `run_id = NULL` provenance;
+  run-scoped `reclaimed` and `changes_requested` evidence must name an existing
+  run belonging to the same task. The legacy `ancestor_reopened` status payload,
+  including `resume_status`, remains canonical; only a previously running
+  descendant carries its reclaimed run identity. A review descendant is
+  re-admitted only when the latest durable suffix is the exact native
+  `descendant_invalidated → status(ancestor_reopened) → promoted(review)`
+  sequence, its parent link is satisfied, and the original review handoff plus
+  any reclaimed reviewer run remain fully fenced. The producer also records a
+  redundant parent-side invalidation marker; if child-side suffix rows are
+  deleted, that later marker consumes the older handoff instead of allowing the
+  legacy fallback to re-admit it. A later malformed marker on a direct parent
+  also consumes the older child handoff fail-closed, while a valid marker for
+  an independent sibling does not.
 
 The artifact is fail-closed. It pins both input source files and the patch,
 rejects symlinks, hardlinks, special files, path escapes, patch mode/rename

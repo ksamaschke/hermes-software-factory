@@ -16,6 +16,7 @@ import sqlite3
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,7 @@ NATIVE_PATH = ARTIFACT / "runtime" / "hermes_cli" / "native_boundary.py"
 # This URL is an opaque, non-routable fixture value. Tests never contact GitHub;
 # the old guard only needs the same URL shape as its production PR detector.
 FIXTURE_PR_URL = "https://github.com/fixture-owner/fixture-repository/pull/123"
+_TEST_LIFECYCLE_BASE = 1_700_000_000
 
 
 def _load_module(name: str, path: Path):
@@ -44,7 +46,7 @@ native_boundary = _load_module("native_boundary_for_tests", NATIVE_PATH)
 def test_static_manifest_and_patch_are_pinned():
     manifest = builder._static_manifest()
     assert manifest["schema"] == "factory.native-boundary.v1"
-    assert manifest["artifact_version"] == "1.0.1"
+    assert manifest["artifact_version"] == builder.ARTIFACT_VERSION
     assert manifest["copy_policy"] == {
         "fresh_copy_required": True,
         "reject_symlinks": True,
@@ -347,6 +349,36 @@ def test_native_quarantine_decision_is_conservative():
     )
 
 
+@pytest.mark.parametrize("recurrences", [None, -1, 0.5, "0", b"0", True])
+def test_native_quarantine_rejects_noncanonical_recurrence_counter(recurrences):
+    rejection = native_boundary.triage_admission_rejection(
+        {
+            "title": "Capability unavailable",
+            "body": "The required provider cannot be reached.",
+            "block_recurrences": recurrences,
+        },
+        title="Resolved fixture",
+        body="Use the bounded local implementation.",
+        recurrence_limit=2,
+    )
+    assert rejection == "invalid quarantine state"
+
+
+@pytest.mark.parametrize("recurrence_limit", [None, 0, -1, 0.5, "2", True])
+def test_native_quarantine_rejects_noncanonical_recurrence_limit(recurrence_limit):
+    rejection = native_boundary.triage_admission_rejection(
+        {
+            "title": "Capability unavailable",
+            "body": "The required provider cannot be reached.",
+            "block_recurrences": 0,
+        },
+        title="Resolved fixture",
+        body="Use the bounded local implementation.",
+        recurrence_limit=recurrence_limit,
+    )
+    assert rejection == "invalid quarantine state"
+
+
 def _requeue_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
@@ -364,12 +396,14 @@ def _requeue_connection() -> sqlite3.Connection:
             id INTEGER PRIMARY KEY,
             task_id TEXT,
             profile TEXT,
+            status TEXT,
             outcome TEXT,
             ended_at INTEGER
         );
         CREATE TABLE task_events (
-            id INTEGER PRIMARY KEY,
+            id,
             task_id TEXT,
+            run_id INTEGER,
             kind TEXT,
             payload TEXT,
             created_at INTEGER
@@ -381,16 +415,16 @@ def _requeue_connection() -> sqlite3.Connection:
         ("task-1", "fixture-worker"),
     )
     conn.execute(
-        "INSERT INTO task_runs VALUES (1, ?, ?, 'blocked', 100)",
-        ("task-1", "fixture-worker"),
+        "INSERT INTO task_runs VALUES (1, ?, ?, 'blocked', 'blocked', ?)",
+        ("task-1", "fixture-worker", _TEST_LIFECYCLE_BASE),
     )
     conn.execute(
-        "INSERT INTO task_events VALUES (1, ?, 'blocked', NULL, 99)",
-        ("task-1",),
+        "INSERT INTO task_events VALUES (1, ?, NULL, 'blocked', NULL, ?)",
+        ("task-1", _TEST_LIFECYCLE_BASE - 1),
     )
     conn.execute(
-        "INSERT INTO task_events VALUES (2, ?, 'unblocked', NULL, 101)",
-        ("task-1",),
+        "INSERT INTO task_events VALUES (2, ?, NULL, 'unblocked', NULL, ?)",
+        ("task-1", _TEST_LIFECYCLE_BASE + 1),
     )
     conn.commit()
     return conn
@@ -399,19 +433,27 @@ def _requeue_connection() -> sqlite3.Connection:
 def test_same_owner_requeue_ignores_later_comment_but_not_new_lifecycle_state():
     conn = _requeue_connection()
     conn.execute(
-        "INSERT INTO task_events VALUES (3, ?, 'commented', ?, 102)",
-        ("task-1", "existing pull request"),
+        "INSERT INTO task_events VALUES (3, ?, NULL, 'commented', ?, ?)",
+        ("task-1", "existing pull request", _TEST_LIFECYCLE_BASE + 2),
     )
     conn.execute(
-        "INSERT INTO task_events VALUES (4, ?, 'respawn_guarded', ?, 103)",
-        ("task-1", json.dumps({"reason": "active_pr"})),
+        "INSERT INTO task_events VALUES (4, ?, NULL, 'respawn_guarded', ?, ?)",
+        (
+            "task-1",
+            json.dumps({"reason": "active_pr"}),
+            _TEST_LIFECYCLE_BASE + 3,
+        ),
     )
     conn.commit()
     assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is True
 
     conn.execute(
-        "INSERT INTO task_events VALUES (5, ?, 'status', ?, 104)",
-        ("task-1", json.dumps({"status": "running"})),
+        "INSERT INTO task_events VALUES (5, ?, NULL, 'status', ?, ?)",
+        (
+            "task-1",
+            json.dumps({"status": "running"}),
+            _TEST_LIFECYCLE_BASE + 4,
+        ),
     )
     conn.commit()
     assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is False
@@ -426,19 +468,23 @@ def test_material_specification_is_same_owner_readmission_authority():
         "changed_fields": ["title", "body"],
         "previous_status": "blocked",
         "status": "ready",
+        "block_recurrences_reset": True,
     }
     conn.execute(
-        "INSERT INTO task_events VALUES (2, ?, 'specified', ?, 101)",
-        ("task-1", json.dumps(payload)),
+        "INSERT INTO task_events VALUES (2, ?, NULL, 'specified', ?, ?)",
+        ("task-1", json.dumps(payload), _TEST_LIFECYCLE_BASE + 1),
     )
     conn.commit()
     assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is True
 
     for invalid in (
         {**payload, "changed_fields": ["title"]},
+        {**payload, "changed_fields": ["body", "unexpected"]},
         {**payload, "previous_status": "ready"},
         {**payload, "status": "running"},
         {**payload, "changed_fields": "body"},
+        {**payload, "block_recurrences_reset": False},
+        {key: value for key, value in payload.items() if key != "block_recurrences_reset"},
     ):
         conn.execute(
             "UPDATE task_events SET payload = ? WHERE id = 2",
@@ -447,6 +493,322 @@ def test_material_specification_is_same_owner_readmission_authority():
         conn.commit()
         assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is False
 
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    ("table", "column", "row_id"),
+    [
+        ("task_events", "created_at", 2),
+        ("task_runs", "ended_at", 1),
+    ],
+)
+def test_same_owner_requeue_rejects_malformed_lifecycle_timestamps(
+    table, column, row_id
+):
+    conn = _requeue_connection()
+    conn.execute(
+        f"UPDATE {table} SET {column} = 'not-a-timestamp' WHERE id = ?",
+        (row_id,),
+    )
+    conn.commit()
+
+    assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is False
+    conn.close()
+
+
+@pytest.mark.parametrize("outcome", ["blocked", "completed"])
+def test_same_owner_requeue_rejects_newer_null_ended_run(outcome):
+    conn = _requeue_connection()
+    conn.execute(
+        "INSERT INTO task_runs "
+        "(id, task_id, profile, status, outcome, ended_at) "
+        "VALUES (2, ?, ?, ?, ?, NULL)",
+        ("task-1", "fixture-worker", outcome, outcome),
+    )
+    conn.commit()
+
+    assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is False
+    conn.close()
+
+
+def test_same_owner_requeue_rejects_future_lifecycle_timestamps():
+    conn = _requeue_connection()
+    future = int(time.time()) + 1_000_000
+    conn.execute("UPDATE task_runs SET ended_at = ? WHERE id = 1", (future,))
+    conn.execute("UPDATE task_events SET created_at = ? WHERE id = 2", (future + 1,))
+    conn.commit()
+
+    assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is False
+    conn.close()
+
+
+def test_same_owner_requeue_rejects_sqlite_boolean_timestamps():
+    conn = _requeue_connection()
+    conn.execute("UPDATE task_runs SET ended_at = ? WHERE id = 1", (True,))
+    conn.execute("UPDATE task_events SET created_at = ? WHERE id = 2", (True,))
+    conn.commit()
+
+    assert conn.execute(
+        "SELECT ended_at FROM task_runs WHERE id = 1"
+    ).fetchone()["ended_at"] == 1
+    assert conn.execute(
+        "SELECT created_at FROM task_events WHERE id = 2"
+    ).fetchone()["created_at"] == 1
+    assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is False
+    conn.close()
+
+
+@pytest.mark.parametrize("event_id", [None, "bad", b"bad", 1.5])
+def test_same_owner_requeue_rejects_noncanonical_event_ids(event_id):
+    conn = _requeue_connection()
+    conn.execute(
+        "UPDATE task_events SET id = ? WHERE kind = 'unblocked'",
+        (event_id,),
+    )
+    conn.commit()
+
+    assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is False
+    conn.close()
+
+
+@pytest.mark.parametrize("counter", [None, -1, 0.5, b"0"])
+def test_same_owner_requeue_rejects_noncanonical_failure_counter(counter):
+    conn = _requeue_connection()
+    conn.execute(
+        "UPDATE tasks SET consecutive_failures = ? WHERE id = 'task-1'",
+        (counter,),
+    )
+    conn.commit()
+
+    assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is False
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    "owner",
+    [
+        b"fixture-worker",
+        " fixture-worker",
+        "fixture-worker ",
+        "Fixture-Worker",
+        "fixture.worker",
+        "fixture-worker\x00",
+        "a" * 65,
+    ],
+)
+def test_same_owner_requeue_rejects_noncanonical_owner_and_profile(owner):
+    conn = _requeue_connection()
+    conn.execute("UPDATE tasks SET assignee = ? WHERE id = 'task-1'", (owner,))
+    conn.execute("UPDATE task_runs SET profile = ? WHERE id = 1", (owner,))
+    conn.commit()
+
+    assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is False
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    ("status", "outcome"),
+    [
+        ("running", "blocked"),
+        ("garbage", "blocked"),
+        ("blocked", "garbage"),
+        (b"blocked", "blocked"),
+        ("blocked", b"blocked"),
+    ],
+)
+def test_same_owner_requeue_requires_canonical_blocked_run_state(status, outcome):
+    conn = _requeue_connection()
+    conn.execute(
+        "UPDATE task_runs SET status = ?, outcome = ? WHERE id = 1",
+        (status, outcome),
+    )
+    conn.commit()
+
+    assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is False
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    ("kind", "payload"),
+    [
+        ("status", '{"status":"running","status":"ready"}'),
+        ("status", '{"status":"ready","unexpected":true}'),
+        ("status", '{"status":' + "[" * 2_000 + '"ready"' + "]" * 2_000 + "}"),
+        (
+            "status",
+            json.dumps({"status": "ready", "padding": "x" * 70_000}),
+        ),
+        (
+            "reclaimed",
+            json.dumps(
+                {
+                    "manual": True,
+                    "reason": None,
+                    "prev_lock": "",
+                    "retry_status": "ready",
+                    "prev_pid": None,
+                    "host_local": False,
+                    "termination_attempted": False,
+                    "terminated": False,
+                    "sigkill": False,
+                }
+            ),
+        ),
+        (
+            "reclaimed",
+            json.dumps(
+                {
+                    "manual": True,
+                    "reason": None,
+                    "prev_lock": "fixture",
+                    "retry_status": "ready",
+                    "prev_pid": None,
+                    "host_local": False,
+                    "termination_attempted": False,
+                    "terminated": False,
+                    "sigkill": False,
+                    "unexpected": True,
+                }
+            ),
+        ),
+    ],
+)
+def test_requeue_transition_rejects_ambiguous_or_noncanonical_objects(kind, payload):
+    assert native_boundary.requeue_transition_is_authorized(kind, payload) is False
+
+
+def _manual_reclaim_payload(**updates):
+    payload = {
+        "manual": True,
+        "reason": None,
+        "prev_lock": "fixture",
+        "retry_status": "ready",
+        "prev_pid": None,
+        "host_local": False,
+        "termination_attempted": False,
+        "terminated": False,
+        "sigkill": False,
+    }
+    payload.update(updates)
+    return json.dumps(payload)
+
+
+def _stale_reclaim_payload(**updates):
+    now = int(time.time())
+    payload = {
+        "stale_lock": "fixture",
+        "worker_pid": None,
+        "prev_pid": None,
+        "host_local": False,
+        "termination_attempted": False,
+        "terminated": False,
+        "sigkill": False,
+        "last_heartbeat_at": None,
+        "heartbeat_stale": False,
+        "claim_expires": now - 10,
+        "now": now,
+        "retry_status": "ready",
+    }
+    payload.update(updates)
+    return json.dumps(payload)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _manual_reclaim_payload(host_local=True),
+        _manual_reclaim_payload(termination_attempted=True),
+        _manual_reclaim_payload(terminated=True),
+        _manual_reclaim_payload(sigkill=True),
+        _manual_reclaim_payload(
+            prev_lock=(
+                f"{native_boundary.socket.gethostname() or 'unknown-host'}:fixture"
+            ),
+            prev_pid=123,
+        ),
+        _stale_reclaim_payload(host_local=True),
+        _stale_reclaim_payload(termination_attempted=True),
+        _stale_reclaim_payload(terminated=True),
+        _stale_reclaim_payload(sigkill=True),
+        _stale_reclaim_payload(heartbeat_stale=True),
+        _stale_reclaim_payload(
+            last_heartbeat_at=int(time.time()) - 4_000,
+            heartbeat_stale=False,
+        ),
+    ],
+)
+def test_reclaim_transition_rejects_inconsistent_metadata(payload):
+    assert native_boundary.requeue_transition_is_authorized(
+        "reclaimed", payload
+    ) is False
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _manual_reclaim_payload(),
+        _manual_reclaim_payload(
+            prev_lock=(
+                f"{native_boundary.socket.gethostname() or 'unknown-host'}:fixture"
+            ),
+            prev_pid=123,
+            host_local=True,
+            termination_attempted=True,
+            terminated=True,
+        ),
+        _stale_reclaim_payload(),
+        _stale_reclaim_payload(
+            last_heartbeat_at=int(time.time()) - 10,
+            heartbeat_stale=False,
+        ),
+        _stale_reclaim_payload(
+            last_heartbeat_at=int(time.time()) - 4_000,
+            heartbeat_stale=True,
+        ),
+    ],
+)
+def test_reclaim_transition_accepts_consistent_native_metadata(payload):
+    assert native_boundary.requeue_transition_is_authorized(
+        "reclaimed", payload
+    ) is True
+
+
+@pytest.mark.parametrize(
+    "malformed_payload",
+    [
+        "",
+        "{",
+        "null",
+        "[]",
+        '"ready"',
+        "{}",
+        json.dumps({"status": []}),
+        json.dumps({"status": {}}),
+    ],
+)
+def test_same_owner_requeue_rejects_malformed_promoted_payload(malformed_payload):
+    conn = _requeue_connection()
+    conn.execute(
+        "UPDATE task_events SET kind = 'promoted', payload = ? WHERE id = 2",
+        (malformed_payload,),
+    )
+    conn.commit()
+
+    assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is False
+    conn.close()
+
+
+@pytest.mark.parametrize("payload", [None, json.dumps({"status": "ready"})])
+def test_same_owner_requeue_accepts_well_formed_ready_promotion(payload):
+    conn = _requeue_connection()
+    conn.execute(
+        "UPDATE task_events SET kind = 'promoted', payload = ? WHERE id = 2",
+        (payload,),
+    )
+    conn.commit()
+
+    assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is True
     conn.close()
 
 
@@ -467,6 +829,165 @@ def test_same_owner_requeue_fail_closed_for_ambiguous_history(change):
     conn.commit()
     assert native_boundary.same_owner_requeue_is_authorized(conn, "task-1") is False
     conn.close()
+
+
+def _review_rework_connection(*, promoted: bool = False) -> sqlite3.Connection:
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE tasks (
+            id TEXT,
+            status TEXT,
+            assignee,
+            claim_lock,
+            current_run_id,
+            consecutive_failures
+        );
+        CREATE TABLE task_runs (
+            id,
+            task_id TEXT,
+            profile,
+            status,
+            outcome,
+            started_at,
+            ended_at
+        );
+        CREATE TABLE task_events (
+            id,
+            task_id TEXT,
+            run_id,
+            kind,
+            payload,
+            created_at
+        );
+        """
+    )
+    now = int(time.time())
+    run_status = "todo" if promoted else "ready"
+    payload = json.dumps(
+        {
+            "reason": "Please fix the finding",
+            "implementer": "fixture-worker",
+            "reviewer": "fixture-reviewer",
+            "status": run_status,
+        }
+    )
+    conn.execute(
+        "INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?)",
+        ("task-1", "ready", "fixture-worker", None, None, 0),
+    )
+    conn.execute(
+        "INSERT INTO task_runs VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            1,
+            "task-1",
+            "fixture-worker",
+            "review",
+            "review_requested",
+            now - 5,
+            now - 4,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO task_runs VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            2,
+            "task-1",
+            "fixture-reviewer",
+            run_status,
+            "changes_requested",
+            now - 3,
+            now - 2,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO task_events VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            1,
+            "task-1",
+            1,
+            "review_requested",
+            json.dumps(
+                {
+                    "summary": "Review the implementation",
+                    "implementer": "fixture-worker",
+                    "reviewer": "fixture-reviewer",
+                }
+            ),
+            now - 4,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO task_events VALUES (?, ?, ?, ?, ?, ?)",
+        (2, "task-1", 2, "changes_requested", payload, now - 1),
+    )
+    if promoted:
+        conn.execute(
+            "INSERT INTO task_events VALUES (?, ?, ?, ?, ?, ?)",
+            (3, "task-1", None, "promoted", None, now - 1),
+        )
+    conn.commit()
+    return conn
+
+
+@pytest.mark.parametrize("promoted", [False, True])
+def test_review_rework_accepts_canonical_handoff(promoted):
+    conn = _review_rework_connection(promoted=promoted)
+    assert native_boundary.review_rework_is_authorized(conn, "task-1") is True
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "UPDATE task_events SET id = NULL WHERE kind = 'changes_requested'",
+        "UPDATE task_events SET id = 'bad' WHERE kind = 'changes_requested'",
+        "UPDATE task_events SET id = X'00' WHERE kind = 'changes_requested'",
+        "UPDATE task_events SET run_id = 99 WHERE kind = 'changes_requested'",
+        "UPDATE task_runs SET id = 'bad' WHERE id = 2",
+        "UPDATE task_runs SET profile = 'other-reviewer' WHERE id = 2",
+        "UPDATE task_runs SET status = 'running' WHERE id = 2",
+        "UPDATE task_runs SET outcome = 'blocked' WHERE id = 2",
+        "UPDATE task_runs SET started_at = 99 WHERE id = 2",
+        "UPDATE task_events SET created_at = 99 WHERE kind = 'changes_requested'",
+        "UPDATE task_events SET payload = '{\"reason\":\"a\",\"reason\":\"b\",\"implementer\":\"fixture-worker\",\"reviewer\":\"fixture-reviewer\",\"status\":\"ready\"}' WHERE kind = 'changes_requested'",
+        "UPDATE task_events SET payload = '{\"reason\":\"fix\",\"implementer\":\"other-worker\",\"reviewer\":\"fixture-reviewer\",\"status\":\"ready\"}' WHERE kind = 'changes_requested'",
+        "DELETE FROM task_events WHERE kind = 'review_requested'",
+        "UPDATE task_events SET id = 'bad' WHERE kind = 'review_requested'",
+        "UPDATE task_events SET run_id = 99 WHERE kind = 'review_requested'",
+        "UPDATE task_events SET payload = '{\"summary\":\"Review the implementation\",\"implementer\":\"other-worker\",\"reviewer\":\"fixture-reviewer\"}' WHERE kind = 'review_requested'",
+        "UPDATE task_runs SET profile = 'other-worker' WHERE id = 1",
+        "UPDATE task_runs SET outcome = 'completed' WHERE id = 1",
+        "INSERT INTO task_events VALUES (4, 'task-1', NULL, 'status', '{\"status\":\"ready\"}', 2000000000)",
+    ],
+)
+def test_review_rework_rejects_malformed_or_laundered_handoff(change):
+    conn = _review_rework_connection()
+    conn.execute(change)
+    conn.commit()
+
+    assert native_boundary.review_rework_is_authorized(conn, "task-1") is False
+    conn.close()
+
+
+def test_changes_requested_payload_requires_exact_unique_schema():
+    valid = json.dumps(
+        {
+            "reason": "fix",
+            "implementer": "fixture-worker",
+            "reviewer": "fixture-reviewer",
+            "status": "ready",
+        }
+    )
+    assert native_boundary.requeue_transition_is_authorized(
+        "changes_requested", valid
+    ) is True
+    assert native_boundary.requeue_transition_is_authorized(
+        "changes_requested",
+        '{"reason":"a","reason":"b","implementer":"fixture-worker",'
+        '"reviewer":"fixture-reviewer","status":"ready"}',
+    ) is False
 
 
 def _staged_runtime() -> Path:
@@ -861,7 +1382,7 @@ def test_staged_dispatch_negative_controls(tmp_path):
             now = int(time.time())
             conn.execute(
                 "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome) "
-                "VALUES (?, ?, 'done', ?, ?, 'rate_limited')",
+                "VALUES (?, ?, 'rate_limited', ?, ?, 'rate_limited')",
                 (retry, "default", now, now),
             )
             conn.commit()
@@ -898,9 +1419,902 @@ def test_staged_dispatch_negative_controls(tmp_path):
     assert probe["guards"]["comment_only"] == "active_pr"
     assert probe["guards"]["wrong_owner"] == "active_pr"
     assert probe["guards"]["unknown_owner"] == "active_pr"
-    assert probe["guards"]["live_run"] == "active_pr"
+    assert probe["guards"]["live_run"] == "active_run"
     assert probe["guards"]["quota_auth"] == "blocker_auth"
     assert probe["guards"]["retry_quarantine"] == "rate_limit_cooldown"
+    assert probe["spawned"] == []
+
+
+@pytest.mark.parametrize("counter", [-1, 0.5, b"0"])
+def test_staged_same_owner_requeue_rejects_noncanonical_failure_counter(
+    tmp_path, counter
+):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="Malformed retry counter",
+                body="A noncanonical counter must not authorize continuation.",
+                assignee="default",
+                created_by="fixture",
+            )
+            running = kb.claim_task(conn, task_id, claimer="fixture-owner:1")
+            assert running is not None
+            assert kb.block_task(
+                conn,
+                task_id,
+                reason="explicit fixture resolution",
+                kind="needs_input",
+                expected_run_id=running.current_run_id,
+            )
+            assert kb.unblock_task(conn, task_id)
+            kb.add_comment(conn, task_id, "fixture-controller", __FIXTURE_PR_URL__)
+            conn.execute(
+                "UPDATE tasks SET consecutive_failures = ? WHERE id = ?",
+                (__COUNTER__, task_id),
+            )
+            conn.commit()
+            guard = kb.check_respawn_guard(conn, task_id, lane="ready")
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "task_id": task_id,
+                "guard": guard,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    ).replace("__FIXTURE_PR_URL__", repr(FIXTURE_PR_URL)).replace(
+        "__COUNTER__", repr(counter)
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "malformed-counter.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["guard"] == "active_pr"
+    assert probe["guarded"] == [[probe["task_id"], "active_pr"]]
+    assert probe["spawned"] == []
+
+
+def test_staged_dispatch_fails_closed_on_blob_failure_error(tmp_path):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="Malformed failure evidence",
+                body="A BLOB failure value must fail closed without raising.",
+                assignee="default",
+                created_by="fixture",
+            )
+            conn.execute(
+                "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                (b"401 malformed provider evidence", task_id),
+            )
+            conn.commit()
+            guard = kb.check_respawn_guard(conn, task_id, lane="ready")
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "task_id": task_id,
+                "guard": guard,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "blob-failure.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["guard"] == "blocker_auth"
+    assert probe["guarded"] == [[probe["task_id"], "blocker_auth"]]
+    assert probe["spawned"] == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("body", b"https://github.com/fixture/repository/pull/1"),
+        ("created_at", "not-a-timestamp"),
+    ],
+)
+def test_staged_dispatch_fails_closed_on_malformed_pr_comment(
+    tmp_path, field, value
+):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="Malformed comment evidence",
+                body="Malformed PR evidence must fail closed.",
+                assignee="default",
+                created_by="fixture",
+            )
+            kb.add_comment(conn, task_id, "fixture-controller", __FIXTURE_PR_URL__)
+            conn.execute(
+                "UPDATE task_comments SET __FIELD__ = ? WHERE task_id = ?",
+                (__VALUE__, task_id),
+            )
+            conn.commit()
+            guard = kb.check_respawn_guard(conn, task_id, lane="ready")
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "task_id": task_id,
+                "guard": guard,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    ).replace("__FIXTURE_PR_URL__", repr(FIXTURE_PR_URL)).replace(
+        "__FIELD__", field
+    ).replace("__VALUE__", repr(value))
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "malformed-comment.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["guard"] == "active_pr"
+    assert probe["guarded"] == [[probe["task_id"], "active_pr"]]
+    assert probe["spawned"] == []
+
+
+@pytest.mark.parametrize(
+    ("status", "outcome"),
+    [
+        (b"done", "failed"),
+        ("done", b"failed"),
+        ("running", "blocked"),
+        ("nonsense", "failed"),
+        ("done", "nonsense"),
+    ],
+)
+def test_staged_dispatch_fails_closed_on_malformed_run_state(
+    tmp_path, status, outcome
+):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import time
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="Malformed run state",
+                body="Malformed terminal state must fail closed.",
+                assignee="default",
+                created_by="fixture",
+            )
+            now = int(time.time())
+            conn.execute(
+                "INSERT INTO task_runs "
+                "(task_id, profile, status, started_at, ended_at, outcome) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (task_id, "default", __STATUS__, now, now, __OUTCOME__),
+            )
+            conn.commit()
+            guard = kb.check_respawn_guard(conn, task_id, lane="ready")
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "task_id": task_id,
+                "guard": guard,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    ).replace("__STATUS__", repr(status)).replace("__OUTCOME__", repr(outcome))
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "malformed-run-state.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["guard"] == "recent_success"
+    assert probe["guarded"] == [[probe["task_id"], "recent_success"]]
+    assert probe["spawned"] == []
+
+
+def test_staged_dispatch_guards_orphaned_active_run(tmp_path):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import time
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="Orphaned active run",
+                body="A durable active run must prevent duplicate dispatch.",
+                assignee="default",
+                created_by="fixture",
+            )
+            now = int(time.time())
+            conn.execute(
+                "INSERT INTO task_runs "
+                "(task_id, profile, status, started_at, ended_at, outcome) "
+                "VALUES (?, ?, 'running', ?, NULL, NULL)",
+                (task_id, "default", now),
+            )
+            conn.commit()
+            guard = kb.check_respawn_guard(conn, task_id, lane="ready")
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "task_id": task_id,
+                "guard": guard,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "orphaned-active-run.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["guard"] == "active_run"
+    assert probe["guarded"] == [[probe["task_id"], "active_run"]]
+    assert probe["spawned"] == []
+
+
+def test_staged_dispatch_rejects_malformed_older_completion(tmp_path):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import time
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="Malformed historical completion",
+                body="An impossible completion must not become requeue authority.",
+                assignee="default",
+                created_by="fixture",
+            )
+            now = int(time.time())
+            conn.execute(
+                "INSERT INTO task_runs "
+                "(task_id, profile, status, started_at, ended_at, outcome) "
+                "VALUES (?, ?, 'nonsense', ?, ?, 'completed')",
+                (task_id, "default", now - 2, now - 1),
+            )
+            conn.execute(
+                "INSERT INTO task_runs "
+                "(task_id, profile, status, started_at, ended_at, outcome) "
+                "VALUES (?, ?, 'crashed', ?, ?, 'crashed')",
+                (task_id, "default", now - 1, now),
+            )
+            kb._append_event(conn, task_id, "status", {"status": "ready"})
+            conn.commit()
+            guard = kb.check_respawn_guard(conn, task_id, lane="ready")
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "task_id": task_id,
+                "guard": guard,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "malformed-older-completion.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["guard"] == "recent_success"
+    assert probe["guarded"] == [[probe["task_id"], "recent_success"]]
+    assert probe["spawned"] == []
+
+
+@pytest.mark.parametrize(
+    ("status", "outcome", "ended_at", "expected_guard"),
+    [
+        ("rate_limited", "rate_limited", "not-a-timestamp", "rate_limit_cooldown"),
+        ("rate_limited", "rate_limited", None, "rate_limit_cooldown"),
+        ("done", "completed", "not-a-timestamp", "recent_success"),
+        ("done", "completed", None, "recent_success"),
+        ("done", "completed", True, "recent_success"),
+        ("blocked", "blocked", "not-a-timestamp", "recent_success"),
+        ("blocked", "blocked", None, "recent_success"),
+        ("failed", "failed", "not-a-timestamp", "recent_success"),
+        ("failed", "failed", None, "recent_success"),
+    ],
+)
+def test_staged_dispatch_fails_closed_on_malformed_run_timestamp(
+    tmp_path, status, outcome, ended_at, expected_guard
+):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import time
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="Malformed run timestamp",
+                body="The production guard must fail closed without raising.",
+                assignee="default",
+                created_by="fixture",
+            )
+            now = int(time.time())
+            conn.execute(
+                "INSERT INTO task_runs "
+                "(task_id, profile, status, started_at, ended_at, outcome) "
+                "VALUES (?, ?, __STATUS__, ?, ?, ?)",
+                (task_id, "default", now, __ENDED_AT__, __OUTCOME__),
+            )
+            conn.commit()
+            guard = kb.check_respawn_guard(conn, task_id, lane="ready")
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "task_id": task_id,
+                "guard": guard,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    ).replace("__STATUS__", repr(status)).replace(
+        "__OUTCOME__", repr(outcome)
+    ).replace("__ENDED_AT__", repr(ended_at))
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / f"malformed-{outcome}.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["guard"] == expected_guard
+    assert probe["guarded"] == [[probe["task_id"], expected_guard]]
+    assert probe["spawned"] == []
+
+
+@pytest.mark.parametrize(
+    ("kind", "payload", "expected_guard"),
+    [
+        ("promoted", None, None),
+        ("promoted", json.dumps({"status": "ready"}), None),
+        ("status", json.dumps({"status": "ready"}), None),
+        ("unblocked", None, None),
+        (
+            "reclaimed",
+            json.dumps(
+                {
+                    "manual": True,
+                    "reason": None,
+                    "prev_lock": "fixture-lock",
+                    "retry_status": "ready",
+                    "prev_pid": None,
+                    "host_local": False,
+                    "termination_attempted": False,
+                    "terminated": False,
+                    "sigkill": False,
+                }
+            ),
+            None,
+        ),
+        (
+            "reclaimed",
+            json.dumps(
+                {
+                    "manual": True,
+                    "reason": None,
+                    "prev_lock": None,
+                    "retry_status": "ready",
+                    "prev_pid": None,
+                    "host_local": False,
+                    "termination_attempted": False,
+                    "terminated": False,
+                    "sigkill": False,
+                }
+            ),
+            None,
+        ),
+        (
+            "reclaimed",
+            json.dumps(
+                {
+                    "stale_lock": "fixture-lock",
+                    "worker_pid": None,
+                    "claim_expires": _TEST_LIFECYCLE_BASE,
+                    "last_heartbeat_at": None,
+                    "now": _TEST_LIFECYCLE_BASE + 1,
+                    "host_local": False,
+                    "heartbeat_stale": False,
+                    "retry_status": "ready",
+                    "prev_pid": None,
+                    "termination_attempted": False,
+                    "terminated": False,
+                    "sigkill": False,
+                }
+            ),
+            None,
+        ),
+        ("promoted", "", "recent_success"),
+        ("promoted", "{", "recent_success"),
+        ("promoted", "null", "recent_success"),
+        ("promoted", "[]", "recent_success"),
+        ("promoted", '"ready"', "recent_success"),
+        ("promoted", "{}", "recent_success"),
+        ("promoted", json.dumps({"status": "running"}), "recent_success"),
+        ("promoted", json.dumps({"status": []}), "recent_success"),
+        ("promoted", json.dumps({"status": {}}), "recent_success"),
+        ("status", json.dumps({"status": []}), "recent_success"),
+        ("status", json.dumps({"status": {}}), "recent_success"),
+        ("status", '{"status":"running","status":"ready"}', "recent_success"),
+        (
+            "status",
+            json.dumps({"status": "ready", "unexpected": True}),
+            "recent_success",
+        ),
+        ("unblocked", "{", "recent_success"),
+        ("unblocked", "null", "recent_success"),
+        ("unblocked", "[]", "recent_success"),
+        ("unblocked", '"ready"', "recent_success"),
+        ("unblocked", "{}", "recent_success"),
+        ("unblocked", json.dumps({"status": "ready"}), "recent_success"),
+        ("reclaimed", "{", "recent_success"),
+        ("reclaimed", "null", "recent_success"),
+        ("reclaimed", "[]", "recent_success"),
+        ("reclaimed", '"ready"', "recent_success"),
+        ("reclaimed", "{}", "recent_success"),
+        (
+            "reclaimed",
+            json.dumps({"retry_status": "ready"}),
+            "recent_success",
+        ),
+        (
+            "reclaimed",
+            json.dumps(
+                {
+                    "manual": True,
+                    "reason": None,
+                    "prev_lock": "",
+                    "retry_status": "ready",
+                    "prev_pid": None,
+                    "host_local": False,
+                    "termination_attempted": False,
+                    "terminated": False,
+                    "sigkill": False,
+                }
+            ),
+            "recent_success",
+        ),
+        (
+            "reclaimed",
+            _manual_reclaim_payload(terminated=True),
+            "recent_success",
+        ),
+        (
+            "reclaimed",
+            _manual_reclaim_payload(sigkill=True),
+            "recent_success",
+        ),
+        (
+            "reclaimed",
+            _manual_reclaim_payload(host_local=True),
+            "recent_success",
+        ),
+        (
+            "reclaimed",
+            _stale_reclaim_payload(heartbeat_stale=True),
+            "recent_success",
+        ),
+    ],
+)
+def test_staged_dispatch_validates_requeue_payload(
+    tmp_path, kind, payload, expected_guard
+):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import time
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="Requeue payload validation",
+                body="Only valid native requeue evidence may bypass recent success.",
+                assignee="default",
+                created_by="fixture",
+            )
+            now = int(time.time())
+            run_cursor = conn.execute(
+                "INSERT INTO task_runs "
+                "(task_id, profile, status, started_at, ended_at, outcome) "
+                "VALUES (?, ?, 'done', ?, ?, 'completed')",
+                (task_id, "default", now, now),
+            )
+            run_id = run_cursor.lastrowid
+            kind = __KIND__
+            event_run_id = run_id if kind == "reclaimed" else None
+            conn.execute(
+                "INSERT INTO task_events "
+                "(task_id, run_id, kind, payload, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (task_id, event_run_id, kind, __PAYLOAD__, now),
+            )
+            conn.commit()
+            guard = kb.check_respawn_guard(conn, task_id, lane="ready")
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "task_id": task_id,
+                "guard": guard,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    ).replace("__KIND__", repr(kind)).replace("__PAYLOAD__", repr(payload))
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / f"{kind}-payload.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["guard"] == expected_guard
+    if expected_guard is None:
+        assert probe["guarded"] == []
+        assert probe["spawned"] == [probe["task_id"]]
+    else:
+        assert probe["guarded"] == [[probe["task_id"], expected_guard]]
+        assert probe["spawned"] == []
+
+
+def test_staged_dispatch_fails_closed_on_malformed_requeue_timestamp(tmp_path):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import time
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            def completed_task(title):
+                task_id = kb.create_task(
+                    conn,
+                    title=title,
+                    body="Malformed requeue evidence must not bypass recent success.",
+                    assignee="default",
+                    created_by="fixture",
+                )
+                now = int(time.time())
+                conn.execute(
+                    "INSERT INTO task_runs "
+                    "(task_id, profile, status, started_at, ended_at, outcome) "
+                    "VALUES (?, ?, 'done', ?, ?, 'completed')",
+                    (task_id, "default", now, now),
+                )
+                return task_id
+
+            malformed = completed_task("Malformed lifecycle requeue")
+            kb._append_event(conn, malformed, "status", {"status": "ready"})
+            conn.execute(
+                "UPDATE task_events SET created_at = 'not-a-timestamp' "
+                "WHERE task_id = ? AND kind = 'status'",
+                (malformed,),
+            )
+
+            observation = completed_task("Malformed observation timestamp")
+            kb._append_event(
+                conn,
+                observation,
+                "respawn_guarded",
+                {"reason": "active_pr"},
+            )
+            conn.execute(
+                "UPDATE task_events SET created_at = 'not-a-timestamp' "
+                "WHERE task_id = ? AND kind = 'respawn_guarded'",
+                (observation,),
+            )
+            conn.commit()
+
+            guards = {
+                "malformed": kb.check_respawn_guard(conn, malformed, lane="ready"),
+                "observation": kb.check_respawn_guard(conn, observation, lane="ready"),
+            }
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=2,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "guards": guards,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "malformed-requeue.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["guards"] == {
+        "malformed": "recent_success",
+        "observation": "recent_success",
+    }
+    assert sorted(reason for _task_id, reason in probe["guarded"]) == [
+        "recent_success",
+        "recent_success",
+    ]
+    assert probe["spawned"] == []
+
+
+def test_staged_dispatch_fails_closed_on_future_lifecycle_timestamps(tmp_path):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import time
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            now = int(time.time())
+            future = now + 1_000_000
+
+            future_terminal = kb.create_task(
+                conn,
+                title="Future terminal timestamp",
+                body="Future terminal evidence must fail closed.",
+                assignee="default",
+                created_by="fixture",
+            )
+            conn.execute(
+                "INSERT INTO task_runs "
+                "(task_id, profile, status, started_at, ended_at, outcome) "
+                "VALUES (?, ?, 'done', ?, ?, 'completed')",
+                (future_terminal, "default", now, future),
+            )
+
+            future_transition = kb.create_task(
+                conn,
+                title="Future transition timestamp",
+                body="Future requeue evidence must not bypass recent success.",
+                assignee="default",
+                created_by="fixture",
+            )
+            conn.execute(
+                "INSERT INTO task_runs "
+                "(task_id, profile, status, started_at, ended_at, outcome) "
+                "VALUES (?, ?, 'done', ?, ?, 'completed')",
+                (future_transition, "default", now, now),
+            )
+            kb._append_event(
+                conn,
+                future_transition,
+                "status",
+                {"status": "ready"},
+            )
+            conn.execute(
+                "UPDATE task_events SET created_at = ? "
+                "WHERE task_id = ? AND kind = 'status'",
+                (future, future_transition),
+            )
+            conn.commit()
+
+            guards = {
+                "future_terminal": kb.check_respawn_guard(
+                    conn, future_terminal, lane="ready"
+                ),
+                "future_transition": kb.check_respawn_guard(
+                    conn, future_transition, lane="ready"
+                ),
+            }
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=2,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "guards": guards,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "future-lifecycle.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["guards"] == {
+        "future_terminal": "recent_success",
+        "future_transition": "recent_success",
+    }
+    assert sorted(reason for _task_id, reason in probe["guarded"]) == [
+        "recent_success",
+        "recent_success",
+    ]
     assert probe["spawned"] == []
 
 
@@ -991,3 +2405,1759 @@ def test_old_runtime_lifecycle_state_is_admitted_by_staged_runtime(tmp_path):
         check=False,
     )
     assert staged_result.returncode == 0, staged_result.stderr or staged_result.stdout
+
+
+def test_staged_dispatch_admits_canonical_review_rework_handoffs(tmp_path):
+    runtime = _staged_runtime()
+    db = tmp_path / "review-rework.db"
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_ids = []
+            guards = {}
+            for promoted in (False, True):
+                task_id = kb.create_task(
+                    conn,
+                    title=f"Review rework {promoted}",
+                    body="Return reviewed implementation for bounded rework.",
+                    assignee="default",
+                    created_by="fixture",
+                )
+                implementation = kb.claim_task(
+                    conn, task_id, claimer=f"fixture-implementer:{promoted}"
+                )
+                assert implementation is not None
+                assert kb.request_review(
+                    conn,
+                    task_id,
+                    summary="Review the implementation",
+                    reviewer="reviewer",
+                    expected_run_id=implementation.current_run_id,
+                )
+                review = kb.claim_review_task(
+                    conn, task_id, claimer=f"fixture-reviewer:{promoted}"
+                )
+                assert review is not None
+
+                parent_id = None
+                if promoted:
+                    parent_id = kb.create_task(
+                        conn,
+                        title="Open parent gate",
+                        assignee="default",
+                        created_by="fixture",
+                    )
+                    kb.link_tasks(conn, parent_id, task_id)
+
+                assert kb.request_changes(
+                    conn,
+                    task_id,
+                    reason="Please fix the exact finding",
+                    expected_run_id=review.current_run_id,
+                )
+                if parent_id is not None:
+                    parent_run = kb.claim_task(
+                        conn, parent_id, claimer="fixture-parent:1"
+                    )
+                    assert parent_run is not None
+                    assert kb.complete_task(
+                        conn,
+                        parent_id,
+                        summary="Parent gate complete",
+                        expected_run_id=parent_run.current_run_id,
+                        fire_lifecycle_hook=False,
+                    )
+                    kb.recompute_ready(conn)
+
+                kb.add_comment(
+                    conn, task_id, "fixture-controller", __FIXTURE_PR_URL__
+                )
+                task_ids.append(task_id)
+                guards[str(promoted)] = kb.check_respawn_guard(
+                    conn, task_id, lane="ready"
+                )
+
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=10,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "guards": guards,
+                "task_ids": task_ids,
+                "spawned": [item[0] for item in result.spawned],
+                "guarded": result.respawn_guarded,
+            }))
+        """
+    ).replace("__FIXTURE_PR_URL__", repr(FIXTURE_PR_URL))
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(runtime, tmp_path, db=db),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["guards"] == {"False": None, "True": None}
+    assert sorted(probe["spawned"]) == sorted(probe["task_ids"])
+    assert all(
+        task_id not in {item[0] for item in probe["guarded"]}
+        for task_id in probe["task_ids"]
+    )
+
+
+def test_staged_review_lane_requires_native_handoff_provenance(tmp_path):
+    runtime = _staged_runtime()
+    db = tmp_path / "review-handoff.db"
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        from pathlib import Path
+
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            valid = kb.create_task(
+                conn,
+                title="Canonical review handoff",
+                assignee="default",
+                created_by="fixture",
+            )
+            implementation = kb.claim_task(conn, valid, claimer="fixture:impl")
+            assert implementation is not None
+            assert kb.request_review(
+                conn,
+                valid,
+                summary="Review the exact implementation",
+                reviewer="default",
+                expected_run_id=implementation.current_run_id,
+            )
+            assert kb.check_respawn_guard(conn, valid, lane="review") is None
+
+            forged = kb.create_task(
+                conn,
+                title="Forged review row",
+                assignee="default",
+                created_by="fixture",
+            )
+            conn.execute(
+                "UPDATE tasks SET status = 'review' WHERE id = ?",
+                (forged,),
+            )
+            conn.commit()
+            forged_guard = kb.check_respawn_guard(conn, forged, lane="review")
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=10,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "valid": valid,
+                "forged": forged,
+                "forged_guard": forged_guard,
+                "spawned": [item[0] for item in result.spawned],
+                "guarded": result.respawn_guarded,
+            }))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(runtime, tmp_path, db=db),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["forged_guard"] == "recent_success"
+    assert probe["valid"] in probe["spawned"]
+    assert probe["forged"] not in probe["spawned"]
+    assert [probe["forged"], "recent_success"] in probe["guarded"]
+
+
+def test_staged_remote_reclaim_with_fresh_heartbeat_is_admitted(tmp_path):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import time
+        from pathlib import Path
+
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="Remote stale claim with fresh heartbeat",
+                assignee="default",
+                created_by="fixture",
+            )
+            running = kb.claim_task(
+                conn, task_id, claimer="foreign-host:123"
+            )
+            assert running is not None
+            now = int(time.time())
+            conn.execute(
+                "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ? "
+                "WHERE id = ?",
+                (now - 10, now - 1, task_id),
+            )
+            conn.commit()
+            assert kb.release_stale_claims(conn) == 1
+            event = conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'reclaimed' "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            payload = json.loads(event["payload"])
+            guard = kb.check_respawn_guard(conn, task_id, lane="ready")
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "task_id": task_id,
+                "payload": payload,
+                "guard": guard,
+                "spawned": [item[0] for item in result.spawned],
+                "guarded": result.respawn_guarded,
+            }))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "remote-fresh-heartbeat.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["payload"]["host_local"] is False
+    assert probe["payload"]["heartbeat_stale"] is False
+    assert probe["guard"] is None
+    assert probe["spawned"] == [probe["task_id"]]
+    assert probe["guarded"] == []
+
+
+def test_staged_dispatch_preflight_rejects_malformed_durable_storage(tmp_path):
+    runtime = _staged_runtime()
+    lock_db = tmp_path / "dispatch-lock.db"
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import time
+        from pathlib import Path
+
+        from hermes_cli import kanban_db as kb
+
+        root = Path(os.environ["TMPDIR"])
+        results = []
+
+        def run_case(name, mutate):
+            db = root / f"{name}.db"
+            kb.init_db(db)
+            with kb.connect_closing(db) as conn:
+                task_id = kb.create_task(
+                    conn,
+                    title=f"Malformed {name}",
+                    assignee="default",
+                    created_by="fixture",
+                )
+                mutate(conn, task_id)
+                conn.commit()
+                result = kb.dispatch_once(
+                    conn,
+                    dry_run=True,
+                    max_spawn=10,
+                    reconcile_orphans=True,
+                )
+                results.append({
+                    "name": name,
+                    "spawned": [item[0] for item in result.spawned],
+                    "guarded": result.respawn_guarded,
+                })
+
+        task_updates = {
+            "bad_heartbeat": ("last_heartbeat_at", "not-a-timestamp"),
+            "blob_lock": ("claim_lock", b"not-a-lock"),
+            "bad_pid": ("worker_pid", "not-a-pid"),
+            "bad_failures": ("consecutive_failures", "bad"),
+            "fractional_failures": ("consecutive_failures", 1.5),
+            "fractional_recurrences": ("block_recurrences", 1.5),
+        }
+        for name, (field, value) in task_updates.items():
+            run_case(
+                name,
+                lambda conn, task_id, field=field, value=value: conn.execute(
+                    f"UPDATE tasks SET {field} = ? WHERE id = ?",
+                    (value, task_id),
+                ),
+            )
+
+        payloads = {
+            "deep_json": '{"status":' + ('[' * 1100) + '0' + (']' * 1100) + '}',
+            "duplicate_json": (
+                '{"reason":"a","reason":"b","implementer":"default",'
+                '"reviewer":"default","status":"ready"}'
+            ),
+            "extra_json": (
+                '{"reason":"a","implementer":"default","reviewer":"default",'
+                '"status":"ready","extra":true}'
+            ),
+            "scalar_json": '1',
+            "oversized_json": '{"value":"' + ('x' * 70000) + '"}',
+        }
+        for name, payload in payloads.items():
+            run_case(
+                name,
+                lambda conn, task_id, payload=payload: conn.execute(
+                    "INSERT INTO task_events "
+                    "(task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
+                    (task_id, "changes_requested", payload, int(time.time())),
+                ),
+            )
+
+        run_case(
+            "low_event_id",
+            lambda conn, task_id: conn.execute(
+                "INSERT INTO task_events "
+                "(id, task_id, kind, payload, created_at) VALUES (0, ?, ?, ?, ?)",
+                (task_id, "commented", '{}', int(time.time())),
+            ),
+        )
+        run_case(
+            "low_active_run_id",
+            lambda conn, task_id: conn.execute(
+                "INSERT INTO task_runs "
+                "(id, task_id, profile, status, outcome, started_at, ended_at) "
+                "VALUES (0, ?, 'default', 'running', NULL, ?, NULL)",
+                (task_id, int(time.time())),
+            ),
+        )
+        print(json.dumps(results))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(runtime, tmp_path, db=lock_db),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    results = json.loads(result.stdout)
+    assert len(results) == 13
+    assert all(not item["spawned"] for item in results)
+    assert all(item["guarded"] for item in results)
+
+
+@pytest.mark.parametrize(
+    "specification",
+    [
+        {},
+        {"title": "Specified parent-gated child"},
+        {"body": "A concrete parent-gated contract."},
+        {"assignee": "reviewer"},
+    ],
+)
+def test_staged_parent_gated_triage_specification_does_not_block_healthy_dispatch(
+    tmp_path, specification
+):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        from pathlib import Path
+
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.native_boundary import dispatcher_state_rejections
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            parent = kb.create_task(
+                conn,
+                title="Open triage parent",
+                assignee="default",
+                created_by="fixture",
+                triage=True,
+            )
+            child = kb.create_task(
+                conn,
+                title="Parent-gated child",
+                body="Initial child contract.",
+                assignee="default",
+                created_by="fixture",
+                triage=True,
+            )
+            kb.link_tasks(conn, parent, child)
+            assert kb.specify_triage_task(
+                conn,
+                child,
+                author="fixture-controller",
+                **__SPECIFICATION__,
+            )
+            healthy = kb.create_task(
+                conn,
+                title="Independent healthy ready task",
+                assignee="default",
+                created_by="fixture",
+            )
+            task = kb.get_task(conn, child)
+            event = conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'specified' ORDER BY id DESC LIMIT 1",
+                (child,),
+            ).fetchone()
+            rejections = dispatcher_state_rejections(conn)
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "child": child,
+                "child_status": task.status,
+                "healthy": healthy,
+                "payload": event["payload"],
+                "rejections": rejections,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    ).replace("__SPECIFICATION__", repr(specification))
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / f"triage-{len(specification)}.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["child_status"] == "todo"
+    assert probe["rejections"] == []
+    assert probe["guarded"] == []
+    assert probe["spawned"] == [probe["healthy"]]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("title", "Materially corrected title"),
+        ("assignee", "reviewer"),
+    ],
+)
+def test_staged_native_respecification_storage_does_not_quarantine_dispatch(
+    tmp_path, field, value
+):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        from pathlib import Path
+
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.native_boundary import dispatcher_state_rejections
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="Canonical existing-PR continuation",
+                body="Original bounded contract.",
+                assignee="default",
+                created_by="fixture",
+            )
+            running = kb.claim_task(conn, task_id, claimer="fixture-owner:1")
+            assert running is not None
+            assert kb.block_task(
+                conn,
+                task_id,
+                reason="internal lifecycle repair",
+                kind="capability",
+                expected_run_id=running.current_run_id,
+            )
+            assert kb.respecify_idle_task(
+                conn,
+                task_id,
+                author="fixture-controller",
+                **{__FIELD__: __VALUE__},
+            ) == "ready"
+            kb.add_comment(conn, task_id, "fixture-controller", __FIXTURE_PR_URL__)
+            healthy = kb.create_task(
+                conn,
+                title="Independent healthy ready task",
+                assignee="default",
+                created_by="fixture",
+            )
+            guard = kb.check_respawn_guard(conn, task_id, lane="ready")
+            rejections = dispatcher_state_rejections(conn)
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "task_id": task_id,
+                "healthy": healthy,
+                "guard": guard,
+                "rejections": rejections,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    ).replace("__FIELD__", repr(field)).replace(
+        "__VALUE__", repr(value)
+    ).replace("__FIXTURE_PR_URL__", repr(FIXTURE_PR_URL))
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / f"respecify-{field}.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["guard"] == "active_pr"
+    assert probe["rejections"] == []
+    if field == "title":
+        assert [probe["task_id"], "active_pr"] in probe["guarded"]
+    else:
+        # The private HERMES_HOME intentionally has no reviewer profile, so the
+        # reassigned task is skipped before the ready-lane guard is recorded.
+        assert probe["guarded"] == []
+    assert probe["spawned"] == [probe["healthy"]]
+
+
+def test_staged_malformed_task_is_quarantined_without_blocking_healthy_dispatch(
+    tmp_path,
+):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import time
+        from pathlib import Path
+
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            malformed = kb.create_task(
+                conn,
+                title="Malformed quarantined task",
+                assignee="default",
+                created_by="fixture",
+                priority=100,
+            )
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES (?, 'specified', ?, ?)",
+                (
+                    malformed,
+                    '{"changed_fields":["body"],"unexpected":true}',
+                    int(time.time()),
+                ),
+            )
+            healthy = kb.create_task(
+                conn,
+                title="Independent healthy ready task",
+                assignee="default",
+                created_by="fixture",
+            )
+            conn.commit()
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=True,
+            )
+            print(json.dumps({
+                "malformed": malformed,
+                "healthy": healthy,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "task-scoped-preflight.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["guarded"] == [
+        [probe["malformed"], "malformed_durable_state"]
+    ]
+    assert probe["spawned"] == [probe["healthy"]]
+
+
+def test_staged_blob_task_identity_is_quarantined_by_raw_identity(tmp_path):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        from pathlib import Path
+
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            original = kb.create_task(
+                conn,
+                title="Malformed BLOB identity",
+                assignee="default",
+                created_by="fixture",
+                priority=100,
+            )
+            conn.execute(
+                "UPDATE tasks SET id = ? WHERE id = ?",
+                (b"bad-id", original),
+            )
+            healthy = kb.create_task(
+                conn,
+                title="Independent canonical task",
+                assignee="default",
+                created_by="fixture",
+            )
+            conn.commit()
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=True,
+            )
+            malformed_status = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (b"bad-id",)
+            ).fetchone()["status"]
+            print(json.dumps({
+                "healthy": healthy,
+                "malformed_status": malformed_status,
+                "guarded": [[repr(item[0]), item[1]] for item in result.respawn_guarded],
+                "spawned": [repr(item[0]) for item in result.spawned],
+            }))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "blob-task-id.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["malformed_status"] == "ready"
+    assert probe["guarded"] == [[repr("<malformed>"), "malformed_durable_state"]]
+    assert probe["spawned"] == [repr(probe["healthy"])]
+
+
+def test_staged_blob_run_identity_fences_canonical_task(tmp_path):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import time
+        from pathlib import Path
+
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.native_boundary import dispatcher_state_rejections
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="Canonical task with BLOB-linked active run",
+                assignee="default",
+                created_by="fixture",
+            )
+            conn.execute(
+                "INSERT INTO task_runs "
+                "(task_id, profile, status, started_at, outcome) "
+                "VALUES (?, 'default', 'running', ?, NULL)",
+                (task_id.encode("utf-8"), int(time.time())),
+            )
+            conn.commit()
+            guard = kb.check_respawn_guard(conn, task_id, lane="ready")
+            rejections = dispatcher_state_rejections(conn)
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=True,
+            )
+            print(json.dumps({
+                "task_id": task_id,
+                "guard": guard,
+                "rejections": rejections,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "blob-run-task-id.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["guard"] == "active_run"
+    assert probe["rejections"] == [
+        [probe["task_id"], "malformed_durable_state"]
+    ]
+    assert probe["guarded"] == [[probe["task_id"], "active_run"]]
+    assert probe["spawned"] == []
+
+
+def test_staged_specified_event_rejects_forged_run_identity(tmp_path):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        from pathlib import Path
+
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.native_boundary import dispatcher_state_rejections
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="Forged specified run identity",
+                body="Original contract.",
+                assignee="default",
+                created_by="fixture",
+            )
+            running = kb.claim_task(conn, task_id, claimer="fixture-owner:1")
+            assert running is not None
+            assert kb.block_task(
+                conn,
+                task_id,
+                reason="needs a material correction",
+                kind="capability",
+                expected_run_id=running.current_run_id,
+            )
+            assert kb.respecify_idle_task(
+                conn,
+                task_id,
+                body="Materially corrected contract.",
+                author="fixture-controller",
+            ) == "ready"
+            conn.execute(
+                "UPDATE task_events SET run_id = 999 "
+                "WHERE task_id = ? AND kind = 'specified'",
+                (task_id,),
+            )
+            kb.add_comment(conn, task_id, "fixture-controller", __FIXTURE_PR_URL__)
+            conn.commit()
+            guard = kb.check_respawn_guard(conn, task_id, lane="ready")
+            rejections = dispatcher_state_rejections(conn)
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "task_id": task_id,
+                "guard": guard,
+                "rejections": rejections,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    ).replace("__FIXTURE_PR_URL__", repr(FIXTURE_PR_URL))
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "specified-run-id.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["guard"] == "recent_success"
+    assert probe["rejections"] == [
+        [probe["task_id"], "malformed_durable_state"]
+    ]
+    assert probe["guarded"] == [[probe["task_id"], "recent_success"]]
+    assert probe["spawned"] == []
+
+
+def test_staged_blob_running_identity_is_not_reclaimed(tmp_path):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import time
+        from pathlib import Path
+
+        from hermes_cli import kanban_db as kb
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            original = kb.create_task(
+                conn,
+                title="Malformed running BLOB identity",
+                assignee="default",
+                created_by="fixture",
+            )
+            running = kb.claim_task(conn, original, claimer="fixture-owner:1")
+            assert running is not None
+            stale = int(time.time()) - 120
+            conn.execute(
+                "UPDATE tasks SET id = ?, claim_expires = ?, "
+                "last_heartbeat_at = ? WHERE id = ?",
+                (b"bad-running-id", stale, stale, original),
+            )
+            conn.commit()
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=True,
+            )
+            task = conn.execute(
+                "SELECT status, current_run_id FROM tasks WHERE id = ?",
+                (b"bad-running-id",),
+            ).fetchone()
+            print(json.dumps({
+                "status": task["status"],
+                "current_run_id": task["current_run_id"],
+                "reclaimed": result.reclaimed,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "blob-running-task-id.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["status"] == "running"
+    assert probe["current_run_id"] is not None
+    assert probe["reclaimed"] == 0
+    assert probe["guarded"] == [["<malformed>", "malformed_durable_state"]]
+    assert probe["spawned"] == []
+
+
+def test_staged_active_run_with_lost_claim_pointers_is_quarantined(tmp_path):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        from pathlib import Path
+
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.native_boundary import dispatcher_state_rejections
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="Active run with lost task claim pointers",
+                body="Ambiguous active work must fail closed.",
+                assignee="default",
+                created_by="fixture",
+            )
+            running = kb.claim_task(conn, task_id, claimer="foreign-host:1")
+            assert running is not None
+            conn.execute(
+                "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL WHERE id = ?",
+                (task_id,),
+            )
+            conn.commit()
+            rejections = dispatcher_state_rejections(conn)
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=True,
+            )
+            task = dict(conn.execute(
+                "SELECT status, current_run_id FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone())
+            run = dict(conn.execute(
+                "SELECT status, outcome, ended_at FROM task_runs WHERE id = ?",
+                (running.current_run_id,),
+            ).fetchone())
+            print(json.dumps({
+                "task_id": task_id,
+                "rejections": rejections,
+                "reconciled": result.reconciled_orphans,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+                "task": task,
+                "run": run,
+            }))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "active-run-lost-claim.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["rejections"] == [
+        [probe["task_id"], "malformed_durable_state"]
+    ]
+    assert probe["reconciled"] == []
+    assert probe["guarded"] == [
+        [probe["task_id"], "malformed_durable_state"]
+    ]
+    assert probe["spawned"] == []
+    assert probe["task"]["status"] == "running"
+    assert probe["task"]["current_run_id"] is not None
+    assert probe["run"] == {
+        "status": "running",
+        "outcome": None,
+        "ended_at": None,
+    }
+
+
+def test_staged_newest_lifecycle_event_is_selected_explicitly(tmp_path):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import time
+        from pathlib import Path
+
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.native_boundary import dispatcher_state_rejections
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            conn.execute("PRAGMA reverse_unordered_selects = ON")
+            task_id = kb.create_task(
+                conn,
+                title="Explicit newest lifecycle event",
+                body="Malformed newest durable state must be selected by id.",
+                assignee="default",
+                created_by="fixture",
+            )
+            running = kb.claim_task(conn, task_id, claimer="fixture-owner:1")
+            assert running is not None
+            assert kb.block_task(
+                conn,
+                task_id,
+                reason="repair",
+                kind="capability",
+                expected_run_id=running.current_run_id,
+            )
+            assert kb.unblock_task(conn, task_id)
+            conn.execute(
+                "INSERT INTO task_events "
+                "(task_id, run_id, kind, payload, created_at) "
+                "VALUES (?, NULL, 'status', ?, ?)",
+                (
+                    task_id,
+                    '{"status":"ready","extra":true}',
+                    int(time.time()),
+                ),
+            )
+            conn.commit()
+            rejections = dispatcher_state_rejections(conn)
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "task_id": task_id,
+                "rejections": rejections,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "explicit-newest-event.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["rejections"] == [
+        [probe["task_id"], "malformed_durable_state"]
+    ]
+    assert probe["guarded"] == [
+        [probe["task_id"], "malformed_durable_state"]
+    ]
+    assert probe["spawned"] == []
+
+
+def test_staged_unblocked_event_rejects_forged_run_identity(tmp_path):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        from pathlib import Path
+
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.native_boundary import dispatcher_state_rejections
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="Forged unblocked run identity",
+                body="Native unblocked events are not run-scoped.",
+                assignee="default",
+                created_by="fixture",
+            )
+            running = kb.claim_task(conn, task_id, claimer="fixture-owner:1")
+            assert running is not None
+            assert kb.block_task(
+                conn,
+                task_id,
+                reason="repair",
+                kind="capability",
+                expected_run_id=running.current_run_id,
+            )
+            assert kb.unblock_task(conn, task_id)
+            kb.add_comment(conn, task_id, "fixture", __FIXTURE_PR_URL__)
+            conn.execute(
+                "UPDATE task_events SET run_id = 999999 "
+                "WHERE task_id = ? AND kind = 'unblocked'",
+                (task_id,),
+            )
+            conn.commit()
+            guard = kb.check_respawn_guard(conn, task_id, lane="ready")
+            rejections = dispatcher_state_rejections(conn)
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "task_id": task_id,
+                "guard": guard,
+                "rejections": rejections,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    ).replace("__FIXTURE_PR_URL__", repr(FIXTURE_PR_URL))
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "unblocked-run-id.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["guard"] == "recent_success"
+    assert probe["rejections"] == [
+        [probe["task_id"], "malformed_durable_state"]
+    ]
+    assert probe["guarded"] == [[probe["task_id"], "recent_success"]]
+    assert probe["spawned"] == []
+
+
+def test_staged_status_event_rejects_forged_run_identity(tmp_path):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import time
+        from pathlib import Path
+
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.native_boundary import dispatcher_state_rejections
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="Forged status run identity",
+                body="Native ready-lane status transitions are runless.",
+                assignee="default",
+                created_by="fixture",
+            )
+            running = kb.claim_task(conn, task_id, claimer="fixture-owner:1")
+            assert running is not None
+            run_id = running.current_run_id
+            assert kb.complete_task(
+                conn,
+                task_id,
+                summary="completed fixture run",
+                expected_run_id=run_id,
+            )
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', current_run_id = NULL, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ?",
+                (task_id,),
+            )
+            conn.execute(
+                "INSERT INTO task_events(task_id, run_id, kind, payload, created_at) "
+                "VALUES (?, ?, 'status', ?, ?)",
+                (task_id, run_id, '{\"status\":\"ready\"}', int(time.time())),
+            )
+            conn.commit()
+            guard = kb.check_respawn_guard(conn, task_id, lane="ready")
+            rejections = dispatcher_state_rejections(conn)
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "task_id": task_id,
+                "guard": guard,
+                "rejections": rejections,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "status-run-id.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["guard"] == "recent_success"
+    assert probe["rejections"] == [
+        [probe["task_id"], "malformed_durable_state"]
+    ]
+    assert probe["guarded"] == [[probe["task_id"], "recent_success"]]
+    assert probe["spawned"] == []
+
+
+def test_staged_lifecycle_timestamp_accepts_a_bounded_synthetic_clock(tmp_path):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        from hermes_cli.native_boundary import validated_lifecycle_timestamp
+
+        value = 5_000_000
+        print(json.dumps({
+            "synthetic": validated_lifecycle_timestamp(
+                value, maximum=value + 400
+            ),
+            "unbounded": validated_lifecycle_timestamp(value),
+            "real_clock": validated_lifecycle_timestamp(
+                value, maximum=2_000_000_000
+            ),
+            "future": validated_lifecycle_timestamp(
+                value + 401, maximum=value + 400
+            ),
+        }))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(runtime, tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert json.loads(result.stdout) == {
+        "synthetic": 5_000_000,
+        "unbounded": None,
+        "real_clock": None,
+        "future": None,
+    }
+
+
+def test_staged_native_ancestor_reopen_payload_can_progress(tmp_path):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        from pathlib import Path
+
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.native_boundary import dispatcher_state_rejections
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            parent_id = kb.create_task(
+                conn, title="ancestor", assignee="planner"
+            )
+            assert kb.complete_task(conn, parent_id)
+            child_id = kb.create_task(
+                conn,
+                title="descendant",
+                assignee="default",
+                parents=[parent_id],
+            )
+            assert kb.complete_task(conn, child_id)
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status = 'todo', completed_at = NULL "
+                    "WHERE id = ?",
+                    (parent_id,),
+                )
+            invalidated = kb.invalidate_descendants_for_parent_reopen(
+                conn, parent_id, author="fixture"
+            )
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status = 'done', completed_at = ? "
+                    "WHERE id = ?",
+                    (int(__import__('time').time()), parent_id),
+                )
+            status_event = conn.execute(
+                "SELECT run_id, payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'status' "
+                "ORDER BY id DESC LIMIT 1",
+                (child_id,),
+            ).fetchone()
+            rejections = dispatcher_state_rejections(conn)
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "parent_id": parent_id,
+                "child_id": child_id,
+                "invalidated": invalidated["invalidated"],
+                "status_event": {
+                    "run_id": status_event["run_id"],
+                    "payload": json.loads(status_event["payload"]),
+                },
+                "rejections": rejections,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "ancestor-reopen.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["status_event"] == {
+        "run_id": None,
+        "payload": {
+            "status": "todo",
+            "reason": "ancestor_reopened",
+            "parent": probe["parent_id"],
+            "previous_status": "done",
+            "resume_status": "ready",
+        },
+    }
+    assert probe["rejections"] == []
+    assert probe["guarded"] == []
+    assert probe["spawned"] == [probe["child_id"]]
+
+
+def test_staged_run_scoped_requeue_events_require_real_run_identity(tmp_path):
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import time
+        from pathlib import Path
+
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.native_boundary import dispatcher_state_rejections
+
+        def reclaimed_payload():
+            return {
+                "manual": True,
+                "reason": "operator",
+                "prev_lock": None,
+                "retry_status": "ready",
+                "prev_pid": None,
+                "host_local": False,
+                "termination_attempted": False,
+                "terminated": False,
+                "sigkill": False,
+            }
+
+        def changes_payload():
+            return {
+                "reason": "fix",
+                "implementer": "default",
+                "reviewer": "default",
+                "status": "ready",
+            }
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        now = int(time.time())
+        with kb.connect_closing(db) as conn:
+            reclaimed = kb.create_task(
+                conn, title="reclaimed-null", assignee="default"
+            )
+            conn.execute(
+                "INSERT INTO task_runs "
+                "(task_id, profile, status, outcome, started_at, ended_at) "
+                "VALUES (?, 'default', 'reclaimed', 'reclaimed', ?, ?)",
+                (reclaimed, now, now),
+            )
+            conn.execute(
+                "INSERT INTO task_events "
+                "(task_id, run_id, kind, payload, created_at) "
+                "VALUES (?, NULL, 'reclaimed', ?, ?)",
+                (reclaimed, json.dumps(reclaimed_payload()), now),
+            )
+            changed = kb.create_task(
+                conn, title="changes-null", assignee="default"
+            )
+            conn.execute(
+                "INSERT INTO task_runs "
+                "(task_id, profile, status, outcome, started_at, ended_at) "
+                "VALUES (?, 'default', 'ready', 'changes_requested', ?, ?)",
+                (changed, now, now),
+            )
+            conn.execute(
+                "INSERT INTO task_events "
+                "(task_id, run_id, kind, payload, created_at) "
+                "VALUES (?, NULL, 'changes_requested', ?, ?)",
+                (changed, json.dumps(changes_payload()), now),
+            )
+            healthy = kb.create_task(
+                conn, title="healthy", assignee="default"
+            )
+            conn.commit()
+            rejections = dispatcher_state_rejections(conn)
+            guards = {
+                reclaimed: kb.check_respawn_guard(conn, reclaimed, lane="ready"),
+                changed: kb.check_respawn_guard(conn, changed, lane="ready"),
+                healthy: kb.check_respawn_guard(conn, healthy, lane="ready"),
+            }
+            result = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=3,
+                reconcile_orphans=False,
+            )
+            print(json.dumps({
+                "reclaimed": reclaimed,
+                "changed": changed,
+                "healthy": healthy,
+                "rejections": rejections,
+                "guards": guards,
+                "guarded": result.respawn_guarded,
+                "spawned": [item[0] for item in result.spawned],
+            }))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(
+            runtime,
+            tmp_path,
+            db=tmp_path / "run-scoped-null.db",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    malformed = {probe["reclaimed"], probe["changed"]}
+    assert {task_id for task_id, _ in probe["rejections"]} == malformed
+    assert {reason for _, reason in probe["rejections"]} == {
+        "malformed_durable_state"
+    }
+    assert probe["guards"] == {
+        probe["reclaimed"]: "recent_success",
+        probe["changed"]: "recent_success",
+        probe["healthy"]: None,
+    }
+    assert {task_id for task_id, _ in probe["guarded"]} == malformed
+    assert probe["spawned"] == [probe["healthy"]]
+
+
+def test_staged_ancestor_reopen_resumes_all_native_lanes(tmp_path: Path) -> None:
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import time
+        from pathlib import Path
+
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.native_boundary import dispatcher_state_rejections
+
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            parent = kb.create_task(conn, title="parent", assignee="default")
+            assert kb.complete_task(conn, parent)
+            ready = kb.create_task(conn, title="ready descendant", assignee="default", parents=[parent])
+            done = kb.create_task(conn, title="done descendant", assignee="default", parents=[parent])
+            assert kb.complete_task(conn, done)
+
+            review = kb.create_task(conn, title="review descendant", assignee="default", parents=[parent])
+            implementation = kb.claim_task(conn, review, claimer="fixture-implementer:review")
+            assert implementation is not None
+            assert kb.request_review(
+                conn, review, summary="review handoff", reviewer="default",
+                expected_run_id=implementation.current_run_id,
+            )
+
+            running_ready = kb.create_task(conn, title="running implementer descendant", assignee="default", parents=[parent])
+            assert kb.claim_task(conn, running_ready, claimer="fixture-implementer:running") is not None
+
+            running_review = kb.create_task(conn, title="running reviewer descendant", assignee="default", parents=[parent])
+            implementation = kb.claim_task(conn, running_review, claimer="fixture-implementer:handoff")
+            assert implementation is not None
+            assert kb.request_review(
+                conn, running_review, summary="running reviewer handoff", reviewer="default",
+                expected_run_id=implementation.current_run_id,
+            )
+            reviewer_run = kb.claim_review_task(conn, running_review, claimer="fixture-reviewer:running")
+            assert reviewer_run is not None
+
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status='todo', completed_at=NULL WHERE id=?", (parent,))
+            invalidated = kb.invalidate_descendants_for_parent_reopen(conn, parent, author="fixture")
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status='done', completed_at=? WHERE id=?", (int(time.time()), parent))
+
+            rejections = dispatcher_state_rejections(conn)
+            result = kb.dispatch_once(conn, dry_run=True, max_spawn=10, reconcile_orphans=False)
+            ids = [ready, done, review, running_ready, running_review]
+            rows = conn.execute("SELECT id, status FROM tasks WHERE id IN (?, ?, ?, ?, ?)", ids).fetchall()
+            events = conn.execute(
+                "SELECT task_id, run_id, payload FROM task_events WHERE kind='status' AND task_id IN (?, ?) ORDER BY id",
+                (review, running_review),
+            ).fetchall()
+            print(json.dumps({
+                "ids": ids, "review": review, "running_review": running_review,
+                "reviewer_run": reviewer_run.current_run_id,
+                "invalidated": invalidated, "rejections": rejections,
+                "spawned": [item[0] for item in result.spawned],
+                "guarded": result.respawn_guarded,
+                "statuses": {row["id"]: row["status"] for row in rows},
+                "events": [dict(row) for row in events],
+            }, sort_keys=True))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script], cwd=runtime,
+        env=_private_environment(runtime, tmp_path, db=tmp_path / "ancestor-reopen-lane-matrix.db"),
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["rejections"] == []
+    assert len(probe["invalidated"]["invalidated"]) == 5
+    assert probe["guarded"] == []
+    assert set(probe["spawned"]) == set(probe["ids"])
+    assert probe["statuses"] == {
+        task_id: ("review" if task_id in {probe["review"], probe["running_review"]} else "ready")
+        for task_id in probe["ids"]
+    }
+    payloads = {
+        row["task_id"]: (row["run_id"], json.loads(row["payload"]))
+        for row in probe["events"]
+    }
+    assert payloads[probe["review"]][0] is None
+    assert payloads[probe["review"]][1]["previous_status"] == "review"
+    assert payloads[probe["running_review"]][0] == probe["reviewer_run"]
+    assert payloads[probe["running_review"]][1]["previous_status"] == "running"
+    assert all(payload[1]["resume_status"] == "review" for payload in payloads.values())
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "status_run_null",
+        "invalidated_run_null",
+        "promoted_payload",
+        "missing_invalidated",
+        "missing_all_suffix",
+        "malformed_parent_marker",
+        "reviewer_outcome",
+        "review_handoff_run_null",
+        "missing_parent_link",
+        "later_lifecycle_event",
+    ],
+)
+def test_staged_ancestor_reopen_review_handoff_rejects_tampering(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    runtime = _staged_runtime()
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import time
+        from pathlib import Path
+
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.native_boundary import review_handoff_is_authorized
+
+        mutation = os.environ["FIXTURE_MUTATION"]
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            parent = kb.create_task(conn, title="parent", assignee="default")
+            assert kb.complete_task(conn, parent)
+            task = kb.create_task(
+                conn, title="review descendant", assignee="default", parents=[parent]
+            )
+            implementation = kb.claim_task(conn, task, claimer="implementer")
+            assert implementation is not None
+            assert kb.request_review(
+                conn, task, summary="handoff", reviewer="default",
+                expected_run_id=implementation.current_run_id,
+            )
+            reviewer = None
+            if mutation not in {"missing_all_suffix", "malformed_parent_marker"}:
+                reviewer = kb.claim_review_task(conn, task, claimer="reviewer")
+                assert reviewer is not None
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status='todo', completed_at=NULL WHERE id=?",
+                    (parent,),
+                )
+            kb.invalidate_descendants_for_parent_reopen(conn, parent, author="fixture")
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status='done', completed_at=? WHERE id=?",
+                    (int(time.time()), parent),
+                )
+            assert kb.recompute_ready(conn) == 1
+
+            if mutation == "status_run_null":
+                conn.execute(
+                    "UPDATE task_events SET run_id=NULL WHERE task_id=? AND kind='status'",
+                    (task,),
+                )
+            elif mutation == "invalidated_run_null":
+                conn.execute(
+                    "UPDATE task_events SET run_id=NULL WHERE task_id=? AND kind='descendant_invalidated'",
+                    (task,),
+                )
+            elif mutation == "promoted_payload":
+                conn.execute(
+                    "UPDATE task_events SET payload=? "
+                    "WHERE task_id=? AND kind='promoted'",
+                    (json.dumps({"status": "ready"}), task),
+                )
+            elif mutation == "missing_invalidated":
+                conn.execute(
+                    "DELETE FROM task_events WHERE task_id=? AND kind='descendant_invalidated'",
+                    (task,),
+                )
+            elif mutation == "missing_all_suffix":
+                conn.execute(
+                    "DELETE FROM task_events WHERE task_id=? "
+                    "AND kind IN ('descendant_invalidated', 'status', 'promoted')",
+                    (task,),
+                )
+            elif mutation == "malformed_parent_marker":
+                conn.execute(
+                    "DELETE FROM task_events WHERE task_id=? "
+                    "AND kind IN ('descendant_invalidated', 'status', 'promoted')",
+                    (task,),
+                )
+                conn.execute(
+                    "UPDATE task_events SET payload=? WHERE task_id=? "
+                    "AND kind='descendant_invalidation_recorded'",
+                    ("{malformed", parent),
+                )
+            elif mutation == "reviewer_outcome":
+                conn.execute(
+                    "UPDATE task_runs SET outcome='completed' WHERE id=?",
+                    (reviewer.current_run_id,),
+                )
+            elif mutation == "review_handoff_run_null":
+                conn.execute(
+                    "UPDATE task_events SET run_id=NULL WHERE task_id=? AND kind='review_requested'",
+                    (task,),
+                )
+            elif mutation == "missing_parent_link":
+                conn.execute(
+                    "DELETE FROM task_links WHERE parent_id=? AND child_id=?",
+                    (parent, task),
+                )
+            elif mutation == "later_lifecycle_event":
+                conn.execute(
+                    "INSERT INTO task_events(task_id, kind, payload, created_at) "
+                    "VALUES (?, 'status', ?, ?)",
+                    (task, json.dumps({"status": "review"}), int(time.time())),
+                )
+            else:
+                raise AssertionError(mutation)
+            conn.commit()
+
+            authorized = review_handoff_is_authorized(conn, task)
+            guard = kb.check_respawn_guard(conn, task, lane="review")
+            result = kb.dispatch_once(
+                conn, dry_run=True, max_spawn=1, reconcile_orphans=False
+            )
+            print(json.dumps({
+                "task": task,
+                "authorized": authorized,
+                "guard": guard,
+                "spawned": [item[0] for item in result.spawned],
+                "guarded": result.respawn_guarded,
+            }))
+        """
+    )
+    env = _private_environment(
+        runtime, tmp_path, db=tmp_path / f"ancestor-reopen-{mutation}.db"
+    )
+    env["FIXTURE_MUTATION"] = mutation
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script], cwd=runtime, env=env,
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    probe = json.loads(result.stdout)
+    assert probe["authorized"] is False
+    assert probe["guard"] is not None
+    assert probe["spawned"] == []
