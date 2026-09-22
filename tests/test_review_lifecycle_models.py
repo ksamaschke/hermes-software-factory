@@ -360,7 +360,7 @@ with kb.connect_closing(db) as conn:
         pass
     else:
         raise AssertionError("ordinary writer mutated remediation body")
-    with kb._review_native_mutation_authorized():
+    with kb._review_native_mutation_authorized(conn):
         conn.execute(
             "UPDATE tasks SET body = REPLACE(body, 'review_required_before_completion: true', '') "
             "WHERE id = ?",
@@ -385,7 +385,7 @@ with kb.connect_closing(db) as conn:
             reviewer="reviewer",
             expected_run_id=implementation_claim.current_run_id,
         )
-    with kb._review_native_mutation_authorized():
+    with kb._review_native_mutation_authorized(conn):
         conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (original_body, successor_id))
 
     remediation_head, remediation_scope = commit_remediation()
@@ -538,13 +538,20 @@ with kb.connect_closing(db) as conn:
         pass
     else:
         raise AssertionError("ordinary writer changed a frozen review frontier")
-    with kb._review_native_mutation_authorized():
-        kb.link_tasks(conn, graph["leaf"], foreign_child)
+    with kb._review_native_mutation_authorized(conn):
+        conn.execute(
+            "INSERT INTO task_links(parent_id, child_id) VALUES (?, ?)",
+            (graph["leaf"], foreign_child),
+        )
+        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (foreign_child,))
     with active("orchestrator"):
         try:
             kb.consume_standalone_review_handoffs(conn)
         except RuntimeError as exc:
-            assert "provenance or frontier changed" in str(exc)
+            assert (
+                "provenance or frontier changed" in str(exc)
+                or "packet receipt changed" in str(exc)
+            )
         else:
             raise AssertionError("changed frontier was accepted")
     assert kb.get_task(conn, graph["leaf"]).status == "blocked"
@@ -746,10 +753,20 @@ with kb.connect_closing(db) as conn:
     duplicate_packet = (
         '{"packet_sha256":"' + ("0" * 64) + '",' + packet_items + '}'
     )
-    conn.execute(
-        "UPDATE task_events SET payload = ? WHERE id = ?",
-        (duplicate_packet, packet_event["id"]),
-    )
+    try:
+        conn.execute(
+            "UPDATE task_events SET payload = ? WHERE id = ?",
+            (duplicate_packet, packet_event["id"]),
+        )
+    except sqlite3.IntegrityError:
+        pass
+    else:
+        raise AssertionError("ordinary writer changed immutable review evidence")
+    with kb._review_native_mutation_authorized(conn):
+        conn.execute(
+            "UPDATE task_events SET payload = ? WHERE id = ?",
+            (duplicate_packet, packet_event["id"]),
+        )
     with active("reviewer"):
         assert kb.block_task(
             conn,
@@ -861,7 +878,7 @@ with kb.connect_closing(db) as conn:
         pass
     else:
         raise AssertionError("ordinary writer mutated claimed review evidence")
-    with kb._review_native_mutation_authorized():
+    with kb._review_native_mutation_authorized(conn):
         conn.execute(
             "UPDATE tasks SET body = body || ? WHERE id = ?",
             ("\nreview_scope: tampered", malformed["leaf"]),
@@ -990,10 +1007,11 @@ with kb.connect_closing(db) as conn:
     )
     assert review_run is not None
     expiry = int(time.time()) + 1
-    conn.execute(
-        "UPDATE tasks SET claim_expires=? WHERE id=?",
-        (expiry, standalone["leaf"]),
-    )
+    with kb._review_native_mutation_authorized(conn):
+        conn.execute(
+            "UPDATE tasks SET claim_expires=? WHERE id=?",
+            (expiry, standalone["leaf"]),
+        )
     conn.execute(
         "UPDATE task_runs SET claim_expires=? WHERE id=?",
         (expiry, standalone["review_run"]),
@@ -1044,6 +1062,19 @@ with kb.connect_closing(db) as conn:
     second = kb.claim_task(conn, plain, claimer="dispatcher:implementer:second")
     assert second is not None and second.current_run_id != plain_run.current_run_id
     with active("implementer"):
+        assert not kb.heartbeat_claim(conn, plain, claimer=second.claim_lock)
+        assert not kb.heartbeat_claim(
+            conn,
+            plain,
+            claimer=second.claim_lock,
+            expected_run_id=plain_run.current_run_id,
+        )
+        assert kb.heartbeat_claim(
+            conn,
+            plain,
+            claimer=second.claim_lock,
+            expected_run_id=second.current_run_id,
+        )
         assert not kb.heartbeat_worker(conn, plain, expected_run_id=None)
         assert not kb.heartbeat_worker(conn, plain, expected_run_id=plain_run.current_run_id)
         assert kb.heartbeat_worker(conn, plain, expected_run_id=second.current_run_id)
@@ -1073,7 +1104,7 @@ with kb.connect_closing(db) as conn:
         pass
     else:
         raise AssertionError("post-claim body edit succeeded")
-    with kb._review_native_mutation_authorized():
+    with kb._review_native_mutation_authorized(conn):
         conn.execute(
             "UPDATE tasks SET body = body || '\nuntrusted: instruction' WHERE id=?",
             (body_graph["leaf"],),
@@ -1160,7 +1191,7 @@ with kb.connect_closing(db) as conn:
         pass
     else:
         raise AssertionError("ordinary writer retargeted receipt")
-    with kb._review_native_mutation_authorized():
+    with kb._review_native_mutation_authorized(conn):
         conn.execute(
             "UPDATE review_remediation_handoffs SET successor_task_id=? WHERE handoff_key=?",
             (forged, row["handoff_key"]),
@@ -1168,14 +1199,7 @@ with kb.connect_closing(db) as conn:
     rejections = {task_id for task_id, reason in dispatcher_state_rejections(conn) if reason == "malformed_durable_state"}
     assert successor in rejections and forged in rejections
     claim = kb.claim_task(conn, successor, claimer="dispatcher:implementer")
-    assert claim is not None
-    with active("implementer"):
-        assert not kb.complete_task(
-            conn,
-            successor,
-            summary="receipt pointer was retargeted",
-            expected_run_id=claim.current_run_id,
-        )
+    assert claim is None
     print(json.dumps({"writer": "rejected", "barrier": 2, "completion": "rejected"}))
 ''',
     )
@@ -1273,3 +1297,167 @@ with kb.connect_closing(db) as conn:
         "tombstone": "legacy_receipt_missing_v2_provenance",
         "event": True,
     }
+
+
+def test_successor_writers_and_terminal_shortcut_are_fail_closed(tmp_path):
+    probe = _run_native(
+        tmp_path,
+        _COMMON
+        + r'''
+from hermes_cli.native_boundary import dispatcher_state_rejections
+
+with kb.connect_closing(db) as conn:
+    graph = make_graph(conn)
+    reject_leaf(conn, graph, "successor must remain native")
+    with active("orchestrator"):
+        consumed = kb.consume_standalone_review_handoffs(conn)
+    assert len(consumed) == 1
+    successor = consumed[0]["successor_task_id"]
+    assert kb.assign_task(conn, successor, "foreign") is False
+    try:
+        kb.set_branch_name(conn, successor, "foreign/retarget")
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("branch retarget was accepted")
+    try:
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (successor,))
+    except sqlite3.IntegrityError:
+        pass
+    else:
+        raise AssertionError("ordinary writer completed remediation successor")
+
+    # Simulate corruption below the ordinary-writer boundary.  The dispatcher
+    # barrier and dependency promotion must still fail closed.
+    with kb._review_native_mutation_authorized(conn):
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (successor,))
+    malformed = {
+        str(task_id)
+        for task_id, reason in dispatcher_state_rejections(conn)
+        if reason == "malformed_durable_state"
+    }
+    assert successor in malformed
+    kb.recompute_ready(conn)
+    assert kb.get_task(conn, graph["child"]).status == "todo"
+    dispatch = kb.dispatch_once(
+        conn, dry_run=True, max_spawn=10, reconcile_orphans=False
+    )
+    assert graph["child"] not in {item[0] for item in dispatch.spawned}
+    print(json.dumps({"successor": "rejected", "child": "gated"}))
+''',
+    )
+    assert probe == {"successor": "rejected", "child": "gated"}
+
+
+def test_review_claim_graph_body_and_gc_evidence_are_immutable(tmp_path):
+    probe = _run_native(
+        tmp_path,
+        _COMMON
+        + r'''
+with kb.connect_closing(db) as conn:
+    try:
+        conn.execute(
+            "INSERT INTO review_native_mutation_authorization(token) VALUES (1)"
+        )
+    except sqlite3.DatabaseError:
+        pass
+    else:
+        raise AssertionError("ordinary writer installed native mutation authorization")
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM review_native_mutation_authorization"
+    ).fetchone()["n"] == 0
+    graph = make_graph(conn)
+    try:
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (graph["leaf"],))
+    except sqlite3.IntegrityError:
+        pass
+    else:
+        raise AssertionError("claimed standalone review was directly completed")
+    try:
+        conn.execute(
+            "DELETE FROM task_links WHERE parent_id=? AND child_id=?",
+            (graph["leaf"], graph["child"]),
+        )
+    except sqlite3.IntegrityError:
+        pass
+    else:
+        raise AssertionError("claimed review frontier was detached")
+
+    with active("reviewer"):
+        assert kb.complete_task(
+            conn,
+            graph["leaf"],
+            summary="exact packet approved",
+            metadata={"review_outcome": "APPROVED", "candidate_commit": head},
+            expected_run_id=graph["review_run"],
+        )
+    with kb._review_native_mutation_authorized(conn):
+        conn.execute(
+            "UPDATE task_events SET created_at=1 WHERE task_id=?",
+            (graph["leaf"],),
+        )
+    kb.gc_events(conn, older_than_seconds=1)
+    durable_kinds = {
+        row["kind"]
+        for row in conn.execute(
+            "SELECT kind FROM task_events WHERE task_id=?", (graph["leaf"],)
+        ).fetchall()
+    }
+    assert "standalone_review_packet_claimed" in durable_kinds
+    assert "standalone_review_approved" in durable_kinds
+    for sql, params in (
+        ("UPDATE tasks SET title='laundered' WHERE id=?", (graph["leaf"],)),
+        ("UPDATE tasks SET status='ready' WHERE id=?", (graph["leaf"],)),
+    ):
+        try:
+            conn.execute(sql, params)
+        except sqlite3.IntegrityError:
+            pass
+        else:
+            raise AssertionError("retained approval evidence was bypassed")
+
+    same_card = kb.create_task(
+        conn,
+        title="same-card immutable packet",
+        body="review this exact body",
+        assignee="implementer",
+        created_by="orchestrator",
+        workspace_kind="dir",
+        workspace_path=str(repo),
+    )
+    implementation = kb.claim_task(conn, same_card, claimer="dispatcher:implementer")
+    assert implementation is not None
+    with active("implementer"):
+        assert kb.request_review(
+            conn,
+            same_card,
+            summary="review exact body",
+            metadata={"candidate_commit": head},
+            reviewer="reviewer",
+            expected_run_id=implementation.current_run_id,
+        )
+    review = kb.claim_review_task(conn, same_card, claimer="dispatcher:reviewer")
+    assert review is not None
+    try:
+        conn.execute(
+            "UPDATE tasks SET title='dashboard edit', body='tampered' WHERE id=?",
+            (same_card,),
+        )
+    except sqlite3.IntegrityError:
+        pass
+    else:
+        raise AssertionError("dashboard-equivalent edit bypassed review receipt")
+    with kb._review_native_mutation_authorized(conn):
+        conn.execute("UPDATE tasks SET body='tampered' WHERE id=?", (same_card,))
+    with active("reviewer"):
+        assert not kb.complete_task(
+            conn,
+            same_card,
+            summary="must reject changed body",
+            metadata={"candidate_commit": head},
+            expected_run_id=review.current_run_id,
+        )
+    print(json.dumps({"standalone": "durable", "same_card": "bound"}))
+''',
+    )
+    assert probe == {"standalone": "durable", "same_card": "bound"}

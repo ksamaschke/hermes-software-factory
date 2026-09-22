@@ -50,11 +50,24 @@ copy of the pinned Hermes runtime:
   Only the unchanged child frontier moves before exact graph readback, old-leaf
   archive, and receipt application.
 - SQLite-level guards protect claimed/terminal review task evidence, remediation
-  receipts, and frozen graph links from generic promote, schedule, unblock,
-  respecify, archive, delete, dashboard, and direct SQL writers. Only the scoped
-  native terminal/recovery transaction receives connection-local mutation
-  authority. Legacy pending receipts that lack current v2 provenance are
-  atomically tombstoned with a durable audit event instead of remaining pending.
+  successors and receipts, and frozen graph links from generic promote, schedule,
+  unblock, respecify, archive, delete, dashboard, and direct SQL writers. Native
+  authorization is an uncommitted transaction-local row guarded by the current
+  connection's SQLite authorizer; it is removed before commit and cannot become
+  a process-global bypass. Older runtimes can still perform ordinary compatible
+  writes after the schema upgrade because triggers no longer depend on a custom
+  connection-local SQL function. Additive columns are installed before indexes
+  and triggers that reference them, and function-backed trigger revisions are
+  replaced during migration. Legacy pending receipts that lack current v2
+  provenance are atomically tombstoned with a durable audit event instead of
+  remaining pending.
+- standalone and same-card claims persist immutable title/body and complete graph
+  receipts. Active and approved review evidence is excluded from event GC, direct
+  terminal shortcuts and graph detachment fail closed, and a malformed terminal
+  successor cannot satisfy or promote a dependent child. The production
+  heartbeat tool has no legacy renewal-first fallback: renewal and heartbeat
+  both require the exact positive run, claim lock, native profile, and live task
+  and run leases.
 - completion of a standalone leaf or remediation successor requires structured
   exact `APPROVED` metadata plus matching current reviewer run, native active
   profile, live lease and claim lock, prior terminal `review_requested`

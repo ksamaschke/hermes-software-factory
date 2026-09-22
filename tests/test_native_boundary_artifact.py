@@ -56,6 +56,7 @@ def test_static_manifest_and_patch_are_pinned():
     assert {entry["path"]: entry["sha256"] for entry in manifest["source_files"]} == {
         "hermes_cli/kanban_db.py": "9262365420d875736fbc90927b353cd854241ae85fb80ffda2e622789fc6ed9e",
         "hermes_cli/kanban_specify.py": "67bdf407fc4ce626677c8aae7ee3a2a0da893c9015ad56410e0de3704ed19f13",
+        "tools/kanban_tools.py": "bf5997e9ad1dc49d5c76afe4a1e81927c8c043951a2058ecffbb855f3a159b1d",
     }
     for entry in manifest["patches"]:
         assert builder._sha256(ARTIFACT / entry["path"]) == entry["sha256"]
@@ -2449,16 +2450,6 @@ def test_staged_dispatch_admits_canonical_review_rework_handoffs(tmp_path):
                 )
                 assert review is not None
 
-                parent_id = None
-                if promoted:
-                    parent_id = kb.create_task(
-                        conn,
-                        title="Open parent gate",
-                        assignee="default",
-                        created_by="fixture",
-                    )
-                    kb.link_tasks(conn, parent_id, task_id)
-
                 profile_root = Path(os.environ["HOME"]) / ".hermes" / "profiles"
                 os.environ["HERMES_HOME"] = str(profile_root / "reviewer")
                 assert kb.request_changes(
@@ -2468,6 +2459,15 @@ def test_staged_dispatch_admits_canonical_review_rework_handoffs(tmp_path):
                     expected_run_id=review.current_run_id,
                 )
                 os.environ["HERMES_HOME"] = str(profile_root / "default")
+                parent_id = None
+                if promoted:
+                    parent_id = kb.create_task(
+                        conn,
+                        title="Open parent gate",
+                        assignee="default",
+                        created_by="fixture",
+                    )
+                    kb.link_tasks(conn, parent_id, task_id)
                 if parent_id is not None:
                     parent_run = kb.claim_task(
                         conn, parent_id, claimer="fixture-parent:1"
@@ -2514,12 +2514,9 @@ def test_staged_dispatch_admits_canonical_review_rework_handoffs(tmp_path):
     )
     assert result.returncode == 0, result.stderr or result.stdout
     probe = json.loads(result.stdout)
-    assert probe["guards"] == {"False": None, "True": None}
-    assert sorted(probe["spawned"]) == sorted(probe["task_ids"])
-    assert all(
-        task_id not in {item[0] for item in probe["guarded"]}
-        for task_id in probe["task_ids"]
-    )
+    assert probe["guards"] == {"False": None, "True": "active_pr"}
+    assert probe["spawned"] == [probe["task_ids"][0]]
+    assert (probe["task_ids"][1], "active_pr") in [tuple(item) for item in probe["guarded"]]
 
 
 def test_staged_review_lane_requires_native_handoff_provenance(tmp_path):
@@ -4162,3 +4159,193 @@ def test_staged_ancestor_reopen_review_handoff_rejects_tampering(
     assert probe["authorized"] is False
     assert probe["guard"] is not None
     assert probe["spawned"] == []
+
+
+def test_staged_preflights_columns_before_indexes_and_triggers(tmp_path):
+    runtime = _staged_runtime()
+    tasks_db = tmp_path / "legacy-tasks-without-idempotency.db"
+    raw = sqlite3.connect(tasks_db)
+    raw.executescript(
+        """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY, title TEXT NOT NULL, body TEXT, assignee TEXT,
+            status TEXT NOT NULL, priority INTEGER DEFAULT 0, created_by TEXT,
+            created_at INTEGER NOT NULL, started_at INTEGER, completed_at INTEGER,
+            workspace_kind TEXT NOT NULL DEFAULT 'scratch', workspace_path TEXT,
+            branch_name TEXT, project_id TEXT, claim_lock TEXT, claim_expires INTEGER,
+            tenant TEXT, result TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            worker_pid INTEGER, last_failure_error TEXT, max_runtime_seconds INTEGER,
+            last_heartbeat_at INTEGER, current_run_id INTEGER, workflow_template_id TEXT,
+            current_step_key TEXT, skills TEXT, model_override TEXT, provider_override TEXT,
+            reasoning_effort TEXT, max_retries INTEGER, goal_mode INTEGER NOT NULL DEFAULT 0,
+            goal_max_turns INTEGER, session_id TEXT, block_kind TEXT,
+            block_recurrences INTEGER NOT NULL DEFAULT 0
+        );
+        """
+    )
+    raw.commit()
+    raw.close()
+
+    handoff_db = tmp_path / "legacy-handoff-without-successor.db"
+    raw = sqlite3.connect(handoff_db)
+    raw.executescript(
+        """
+        CREATE TABLE review_remediation_handoffs (
+            handoff_key TEXT PRIMARY KEY,
+            leaf_task_id TEXT NOT NULL UNIQUE,
+            review_run_id INTEGER NOT NULL,
+            reviewer_profile TEXT,
+            implementer_profile TEXT,
+            coordinator_profile TEXT,
+            implementation_task TEXT NOT NULL,
+            candidate_commit TEXT,
+            workspace_identity_json TEXT,
+            packet_sha256 TEXT NOT NULL,
+            finding_sha256 TEXT,
+            frontier_sha256 TEXT,
+            frontier_json TEXT NOT NULL,
+            reason TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            successor_body_sha256 TEXT,
+            tombstone_reason TEXT,
+            created_at INTEGER NOT NULL,
+            consumed_at INTEGER
+        );
+        """
+    )
+    raw.commit()
+    raw.close()
+
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            print(json.dumps({
+                "task_columns": [row["name"] for row in conn.execute("PRAGMA table_info(tasks)")],
+                "handoff_columns": [row["name"] for row in conn.execute(
+                    "PRAGMA table_info(review_remediation_handoffs)"
+                )],
+            }))
+        """
+    )
+    for db in (tasks_db, handoff_db):
+        result = subprocess.run(
+            [sys.executable, "-B", "-c", script],
+            cwd=runtime,
+            env=_private_environment(runtime, tmp_path, db=db),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr or result.stdout
+        probe = json.loads(result.stdout)
+        assert "idempotency_key" in probe["task_columns"]
+        assert "successor_task_id" in probe["handoff_columns"]
+
+    # A database initialized by the prior function-backed revision must replace
+    # those triggers before any old-runtime migration statement is prepared.
+    with sqlite3.connect(tasks_db) as conn:
+        conn.executescript(
+            """
+            DROP TRIGGER trg_review_terminal_status_immutable;
+            CREATE TRIGGER trg_review_terminal_status_immutable
+            BEFORE UPDATE ON tasks
+            WHEN review_native_mutation_authorized() = 0
+            BEGIN
+                SELECT RAISE(ABORT, 'legacy function-backed trigger');
+            END;
+            INSERT INTO tasks(id, title, status, created_at)
+            VALUES ('legacy-ordinary', 'legacy ordinary', 'ready', 1);
+            """
+        )
+    migrated = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=runtime,
+        env=_private_environment(runtime, tmp_path, db=tasks_db),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert migrated.returncode == 0, migrated.stderr or migrated.stdout
+    with sqlite3.connect(tasks_db) as conn:
+        conn.execute(
+            "UPDATE tasks SET status='blocked' WHERE id='legacy-ordinary'"
+        )
+        assert conn.execute(
+            "SELECT status FROM tasks WHERE id='legacy-ordinary'"
+        ).fetchone()[0] == "blocked"
+
+
+def test_staged_new_schema_keeps_old_runtime_ordinary_writes_compatible(tmp_path):
+    runtime = _staged_runtime()
+    old_runtime = Path(
+        os.environ.get(
+            "FACTORY_NATIVE_LEGACY_RUNTIME",
+            "/home/ksamaschke/.hermes/profiles/orchestrator/runtime-hotfix-20260906",
+        )
+    ).resolve()
+    if not old_runtime.is_dir():
+        pytest.skip("FACTORY_NATIVE_LEGACY_RUNTIME is not available")
+    db = tmp_path / "mixed-version.db"
+    task_file = tmp_path / "task-id.txt"
+    create_script = textwrap.dedent(
+        """
+        import os
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+        db = Path(os.environ["HERMES_KANBAN_DB"])
+        kb.init_db(db)
+        with kb.connect_closing(db) as conn:
+            task_id = kb.create_task(
+                conn, title="ordinary mixed-version task", assignee="default",
+                created_by="fixture",
+            )
+        Path(os.environ["TASK_ID_FILE"]).write_text(task_id, encoding="utf-8")
+        """
+    )
+    environment = _private_environment(
+        runtime, tmp_path, db=db, task_file=task_file
+    )
+    created = subprocess.run(
+        [sys.executable, "-B", "-c", create_script],
+        cwd=runtime,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert created.returncode == 0, created.stderr or created.stdout
+
+    old_environment = dict(environment)
+    old_environment["PYTHONPATH"] = str(old_runtime)
+    old_script = textwrap.dedent(
+        """
+        import os
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+        task_id = Path(os.environ["TASK_ID_FILE"]).read_text(encoding="utf-8")
+        with kb.connect_closing(Path(os.environ["HERMES_KANBAN_DB"])) as conn:
+            assert kb.block_task(conn, task_id, reason="ordinary legacy block")
+        """
+    )
+    blocked = subprocess.run(
+        [sys.executable, "-B", "-c", old_script],
+        cwd=old_runtime,
+        env=old_environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert blocked.returncode == 0, blocked.stderr or blocked.stdout
+
+    with sqlite3.connect(db) as conn:
+        status = conn.execute(
+            "SELECT status FROM tasks WHERE id=?",
+            (task_file.read_text(encoding="utf-8"),),
+        ).fetchone()[0]
+    assert status == "blocked"
