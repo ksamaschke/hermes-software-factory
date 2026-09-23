@@ -62,6 +62,26 @@ def test_static_manifest_and_patch_are_pinned():
         assert builder._sha256(ARTIFACT / entry["path"]) == entry["sha256"]
 
 
+def test_output_manifest_artifact_identity_is_content_bound(tmp_path, monkeypatch):
+    relocated = tmp_path / "relocated-artifact"
+    shutil.copytree(
+        ARTIFACT,
+        relocated,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+    )
+    monkeypatch.setattr(builder, "ROOT", relocated)
+    output_manifest = {
+        "artifact_root": "/different/commit-bound/export/path",
+        "artifact_tree": builder._artifact_tree(),
+    }
+
+    builder._verify_artifact_tree(output_manifest)
+
+    (relocated / "README.md").write_text("tampered\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="artifact tree"):
+        builder._verify_artifact_tree(output_manifest)
+
+
 def test_unsafe_relative_and_symlink_paths_fail_closed(tmp_path):
     for value in ("", ".", "../escape", "/absolute", "a/../b", "a//b"):
         with pytest.raises(ValueError, match="unsafe artifact path"):

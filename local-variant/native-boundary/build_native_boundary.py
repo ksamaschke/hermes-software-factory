@@ -21,7 +21,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 ARTIFACT_SCHEMA = "factory.native-boundary.v1"
-ARTIFACT_VERSION = "1.0.23"
+ARTIFACT_VERSION = "1.0.24"
 ROOT = Path(__file__).resolve().parent
 STATIC_MANIFEST = ROOT / "manifest.json"
 _PATCH_EXECUTABLE = Path("/usr/bin/patch")
@@ -510,8 +510,20 @@ def _expected_tree(
     return dict(sorted(expected.items()))
 
 
+def _artifact_tree() -> dict[str, str]:
+    """Authenticate the artifact by content rather than its checkout path."""
+    return _tree_files(ROOT, allow_excluded=True)
+
+
+def _verify_artifact_tree(output_manifest: dict[str, Any]) -> None:
+    recorded = output_manifest.get("artifact_tree")
+    if not isinstance(recorded, dict) or recorded != _artifact_tree():
+        raise ValueError("output manifest artifact tree does not match this artifact")
+
+
 def _verification_metadata() -> dict[str, bool]:
     return {
+        "artifact_tree_verified": True,
         "complete_tree_verified": True,
         "import_probe_isolated": True,
         "patches_applied": True,
@@ -570,6 +582,7 @@ def stage(
     for _entry in _walk_without_symlinks(source):
         pass
     observed_source = _check_pins(source, manifest)
+    artifact_tree = _artifact_tree()
     source_tree = _tree_files(source, allow_excluded=True)
     expected_patched = _expected_patched_tree(source, patches, targets)
     expected_tree = _expected_tree(source_tree, expected_patched)
@@ -599,6 +612,7 @@ def stage(
         "schema": ARTIFACT_SCHEMA,
         "artifact_version": ARTIFACT_VERSION,
         "artifact_root": str(ROOT.resolve()),
+        "artifact_tree": artifact_tree,
         "source_runtime": str(source),
         "source_files": observed_source,
         "source_tree": source_tree,
@@ -665,8 +679,7 @@ def verify(manifest_arg: str, source_arg: str | None = None) -> dict[str, Any]:
     }
     if output_manifest.get("source_files") != expected_source_pins:
         raise ValueError("output manifest source pins do not match the artifact")
-    if output_manifest.get("artifact_root") != str(ROOT.resolve()):
-        raise ValueError("output manifest artifact root is not this artifact")
+    _verify_artifact_tree(output_manifest)
     expected_patch_pins = {relative: _sha256(path) for path, relative in patches}
     if output_manifest.get("patches") != expected_patch_pins:
         raise ValueError("output manifest patch pins do not match the artifact")

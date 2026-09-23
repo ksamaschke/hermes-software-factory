@@ -254,10 +254,15 @@ rot after those files get committed, and how to route the repair.
 
 ## Native standalone-leaf lifecycle
 
+All immutable and fail-closed claims in this section are scoped to
+Hermes-managed SQLite connections. A process running as the board database's
+owning OS user or holding raw file write access is trusted; isolate hostile
+workers behind a broker or a distinct OS identity without database write access.
+
 A standalone leaf claimed from `source_status=ready` must never call
 `kanban_request_changes`. Exact `APPROVED` calls `kanban_complete` once with
 `review_outcome: APPROVED` and the exact `candidate_commit`; Native Boundary
-`1.0.19` requires an exact positive current run ID from the native active
+`1.0.24` requires an exact positive current run ID from the native active
 reviewer profile, re-reads the strict packet, immutable claim receipt, resolved
 worktree/Git-dir identity, repository, branch, base, candidate, and changed-path
 manifest before release. A missing/string/float/stale run ID, role collision,

@@ -19,7 +19,9 @@ user as trusted. Do not run an untrusted worker under that identity with raw
 filesystem access. A deployment that needs hostile-worker isolation must put
 the board behind a broker or a distinct operating-system identity that cannot
 open the database for writing; trigger and authorizer checks do not replace
-that isolation.
+that isolation. Every use below of “immutable”, “cannot”, “only”, or
+“fail-closed” is scoped to Hermes-managed connections unless an operating-system
+isolation boundary is stated explicitly.
 
 - repeated-blocker triage admission is rejected inside the existing native
   write transaction before any task fields are changed;
@@ -72,14 +74,14 @@ that isolation.
   Hermes-managed connections. Native authorization is an uncommitted
   transaction-local row guarded by that connection's SQLite authorizer; it is
   removed before commit and cannot become a process-global bypass inside the
-  managed-connection trust boundary. Older runtimes can still perform ordinary
-  compatible writes after the schema upgrade because triggers no longer depend
-  on a custom connection-local SQL function. Additive columns are installed
-  before indexes and triggers that reference them, and function-backed trigger
-  revisions are
-  replaced during migration. Legacy pending receipts that lack current v2
-  provenance are atomically tombstoned with a durable audit event instead of
-  remaining pending.
+  managed-connection trust boundary. Protected-schema triggers still call
+  `review_native_connection_authorized()`; an older runtime that does not
+  register that function fails closed, including for an otherwise ordinary
+  write touching the protected schema. Additive columns are installed before
+  indexes and triggers that reference them, and earlier function-backed trigger
+  revisions are replaced during migration. Legacy pending receipts that lack
+  current v2 provenance are atomically tombstoned with a durable audit event
+  instead of remaining pending.
 - standalone and same-card claims persist immutable title/body and complete graph
   receipts. Active and approved review evidence is excluded from event GC, direct
   terminal shortcuts and graph detachment fail closed, and a malformed terminal

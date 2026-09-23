@@ -61,7 +61,8 @@ implementation card. A standalone review leaf is claimed from
 current run ID, matching claim lock and live lease, active independent reviewer
 profile, clean immutable worktree, and structured outcome and candidate metadata.
 Exact `CHANGES_REQUESTED` blocks once with the native
-`STANDALONE_REVIEW_CHANGES_REQUESTED:` prefix. Native Boundary `1.0.19`
+`STANDALONE_REVIEW_CHANGES_REQUESTED:` prefix. Within Hermes-managed SQLite
+connections, Native Boundary `1.0.24`
 binds the strict owner/repository, complete task title/body, resolved worktree/
 Git-dir identity, branch, base/candidate, changed-path manifest, distinct roles,
 exact run and lease, finding, and complete direct-parent/child frontier into a
@@ -72,7 +73,11 @@ direct parent, enforces the immutable mandatory successor pointer/body/graph
 review gate, moves only the unchanged child frontier, archives the old leaf
 after exact readback, and marks the receipt applied. Generic board writers may
 not promote, schedule, unblock, respecify, archive, delete, or retarget that
-boundary; legacy receipts without v2 provenance are tombstoned. Missing, stale,
+boundary through managed connections. A process running as the board database's
+owning OS user or holding raw file write access is trusted and outside this
+SQLite boundary; hostile workers require a broker or distinct OS identity
+without database write access. Legacy receipts without v2 provenance are
+tombstoned. Missing, stale,
 expired, foreign, malformed, self-attested, changed-frontier, wrong-repository,
 wrong-head, dirty-worktree, body/pointer/graph-tampered, or unfenced evidence
 remains `REVIEW-INCOMPLETE`; never complete, release, redispatch, or manually

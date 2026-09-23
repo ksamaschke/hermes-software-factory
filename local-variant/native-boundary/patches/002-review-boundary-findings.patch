@@ -55,8 +55,8 @@
 +        "trg_review_link_update_immutable",
 +    }
 +)
- 
- 
+
+
  @contextlib.contextmanager
  def _review_native_mutation_authorized(
      conn: Optional[sqlite3.Connection] = None,
@@ -160,17 +160,17 @@
 +        raise
 +    finally:
 +        _REVIEW_DISPATCH_AUTH.reset(token)
- 
- 
+
+
  _IS_WINDOWS = sys.platform == "win32"
  KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
- 
+
 @@ -1616,10 +1748,46 @@
- 
+
  CREATE TABLE IF NOT EXISTS review_native_mutation_authorization (
      token INTEGER PRIMARY KEY CHECK (token = 1)
  );
- 
+
 +-- A capability is minted by the native claim transaction and is bound to one
 +-- review run. The authorizer prevents ordinary connections from minting,
 +-- changing, or deleting capabilities; insert triggers require both this row
@@ -241,7 +241,7 @@
  BEGIN
      SELECT RAISE(ABORT, 'native review task evidence is immutable');
  END;
- 
+
 @@ -1675,12 +1858,35 @@
                     'same_card_review_approved'
                 )
@@ -279,7 +279,7 @@
  BEGIN
      SELECT RAISE(ABORT, 'native review lifecycle state is immutable');
  END;
- 
+
 @@ -1708,10 +1914,52 @@
  ) AND NOT EXISTS (
      SELECT 1 FROM review_native_mutation_authorization WHERE token = 1
@@ -329,7 +329,7 @@
 +BEGIN
 +    SELECT RAISE(ABORT, 'native review handoff insert requires a native run capability');
  END;
- 
+
  CREATE TRIGGER IF NOT EXISTS trg_review_event_update_immutable
  BEFORE UPDATE ON task_events
  WHEN OLD.kind IN (
@@ -421,13 +421,13 @@
      ):
          return sqlite3.SQLITE_DENY
      return sqlite3.SQLITE_OK
- 
- 
+
+
 @@ -2776,24 +3073,86 @@
                      definition,
                  )
- 
- 
+
+
  def _replace_review_boundary_triggers(conn: sqlite3.Connection) -> None:
 -    """Replace earlier function-backed triggers before installing this schema."""
 +    """Replace review triggers only inside the trusted migration transaction."""
@@ -506,8 +506,8 @@
 +            "review schema migration integrity_check failed: "
 +            + (messages[0] if messages else "<no row>")
 +        )
- 
- 
+
+
  def connect(
      db_path: Optional[Path] = None,
      *,
@@ -618,8 +618,8 @@
 +    if cur.rowcount != 1:
 +        raise RuntimeError("native review run capability was not created")
 +    return nonce
- 
- 
+
+
  @contextlib.contextmanager
  def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
      """Context manager for an IMMEDIATE write transaction.
@@ -632,7 +632,7 @@
 +    expected_run_id: Optional[int] = None,
  ) -> Optional[int]:
      """Close the currently-active run for ``task_id`` and clear the pointer.
- 
+
      ``outcome`` is the semantic result (completed / blocked / crashed /
      timed_out / spawn_failed / gave_up / reclaimed). ``status`` is the
 @@ -4921,10 +5331,12 @@
@@ -699,7 +699,7 @@
          _append_event(
              conn,
 @@ -5964,27 +6393,32 @@
- 
+
      Returns True if a reclaim happened, False if the task isn't in a
      reclaimable state (not running, or doesn't exist).
      """
@@ -769,8 +769,8 @@
      if value is None or frozenset(value) != expected_keys:
          return None
      return value
- 
- 
+
+
 -def _repository_from_remote_url(value: str) -> Optional[str]:
 +def _repository_identity_from_remote_url(value: str) -> Optional[dict[str, str]]:
 +    """Return the complete authorized host + exact two-segment repo identity."""
@@ -898,15 +898,15 @@
 +        check=False,
 +        timeout=timeout,
 +    )
- 
- 
+
+
  def _review_workspace_identity(
      packet: Mapping[str, str],
  ) -> tuple[Optional[dict[str, Any]], Optional[str]]:
 @@ -7484,21 +8013,20 @@
      if not workspace.is_dir():
          return None, "target_worktree is not a directory"
- 
+
      def git_text(*arguments: str) -> Optional[str]:
          try:
 -            probe = subprocess.run(
@@ -927,7 +927,7 @@
 +            return _review_git_probe(workspace, *arguments, timeout=15).returncode == 0
 +        except (OSError, subprocess.TimeoutExpired):
 +            return False
- 
+
      root_text = git_text("rev-parse", "--show-toplevel")
      git_dir_text = git_text("rev-parse", "--git-dir")
      origin_url = git_text("config", "--get", "remote.origin.url")
@@ -1037,7 +1037,7 @@
          "scope_manifest_sha256": packet["scope_manifest_sha256"],
          "workspace_realpath": str(workspace),
 @@ -7627,10 +8156,12 @@
- 
+
  def _active_worker_run_rejection(
      conn: sqlite3.Connection,
      task_id: str,
@@ -1060,8 +1060,8 @@
      ):
          return "active worker identity or lease provenance is invalid"
      return None
- 
- 
+
+
 @@ -7973,17 +8504,12 @@
          return None
      git = Path("/usr/bin/git")
@@ -1121,7 +1121,7 @@
          return "review approval has no canonical candidate_commit"
 +    if _active_native_profile() != _canonical_assignee(str(task["assignee"] or "")):
 +        return "active native reviewer identity is invalid"
- 
+
      source_status = claim.get("source_status") or "ready"
      expected_reviewer: Optional[str] = None
      expected_candidate: Optional[str] = None
@@ -1144,7 +1144,7 @@
 @@ -9466,11 +10002,13 @@
      if fenced_run_id is None:
          return False, "an exact positive built-in expected_run_id is required"
- 
+
      now = int(time.time())
      with _review_native_mutation_authorized(), write_txn(conn):
 -        run_rejection = _active_worker_run_rejection(conn, task_id, fenced_run_id)
@@ -1159,8 +1159,8 @@
 @@ -10876,29 +11414,81 @@
          return p
      raise ValueError(f"unknown workspace_kind: {kind}")
- 
- 
+
+
  def set_workspace_path(
 -    conn: sqlite3.Connection, task_id: str, path: Path | str
 +    conn: sqlite3.Connection, task_id: str, path: Path | str,
@@ -1201,8 +1201,8 @@
 +        )
 +        if cur.rowcount != 1:
 +            raise RuntimeError("workspace transition lost the dispatcher claim")
- 
- 
+
+
  def set_branch_name(
 -    conn: sqlite3.Connection, task_id: str, branch_name: str
 +    conn: sqlite3.Connection, task_id: str, branch_name: str,
@@ -1247,8 +1247,8 @@
 +        )
 +        if cur.rowcount != 1:
 +            raise RuntimeError("branch transition lost the dispatcher claim")
- 
- 
+
+
  # ---------------------------------------------------------------------------
  def schedule_task(
      conn: sqlite3.Connection,
@@ -1256,8 +1256,8 @@
          release_claim=True,
          end_run=True,
      )
- 
- 
+
+
 -def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
 +def _set_worker_pid(
 +    conn: sqlite3.Connection, task_id: str, pid: int,
@@ -1267,7 +1267,7 @@
 +    expected_claim_expires: Optional[int] = None,
 +) -> None:
      """Record the spawned child's pid + emit a ``spawned`` event.
- 
+
 -    The event's payload carries the pid so a human reading ``hermes kanban
 -    tail`` can correlate log lines with OS-level traces without opening
 -    the drawer.
@@ -1331,11 +1331,11 @@
 +        _append_event(
 +            conn, task_id, "spawned", {"pid": pid_value}, run_id=expected_run_id
 +        )
- 
- 
+
+
  def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
      """Reset the unified consecutive-failures counter.
- 
+
 @@ -13543,13 +14171,24 @@
              )
              if auto:

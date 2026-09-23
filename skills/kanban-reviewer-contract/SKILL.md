@@ -272,10 +272,18 @@ task/run/events rather than task prose:
   before release. `CHANGES_REQUESTED` never calls `kanban_request_changes`:
   call `kanban_block` once with `kind=dependency` and a reason beginning exactly
   `STANDALONE_REVIEW_CHANGES_REQUESTED:`, followed by the bounded structured
-  findings. Native Boundary `1.0.19` terminally closes that exact run and
+  findings. Within Hermes-managed SQLite connections, Native Boundary `1.0.24`
+  terminally closes that exact run and
   writes one immutable remediation outbox receipt; the reviewer creates no
   product task. `REVIEW-INCOMPLETE` calls `kanban_block` once without the
   changes-requested prefix and remains gated for coordinator adjudication.
+
+All immutable and fail-closed claims in this standalone-leaf contract are
+scoped to Hermes-managed SQLite connections. A process running as the board
+database's owning OS user or holding raw file write access is trusted and can
+replace the file, drop triggers, or register lookalike functions. Isolate
+hostile workers behind a broker or a distinct OS identity without database
+write access.
 
 Never call `kanban_request_changes` for a standalone leaf. Never attempt a
 second terminal action after rejection. Do not manufacture the native prefix
