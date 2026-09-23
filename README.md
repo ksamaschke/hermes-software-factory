@@ -176,7 +176,7 @@ have been read back.
 The recovery add-on validates the durable packet before dispatch, keeps authored
 acceptance questions verbatim, creates at most eight lossless two-file successor
 leaves, and preserves an incomplete packet when that bound cannot cover the
-whole scope. Native Boundary artifact `1.0.24` also records a strict standalone
+whole scope. Native Boundary artifact `1.0.25` also records a strict standalone
 `CHANGES_REQUESTED` packet as a sticky `blocked/changes_requested`, exact-run,
 live-lease, active-profile-fenced SQLite outbox receipt. Within the
 Hermes-managed connection boundary, the packet binds the complete task

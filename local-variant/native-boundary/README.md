@@ -140,13 +140,17 @@ sufficient free space; do not stage under `/tmp` for the full runtime.
 SOURCE=/home/ksamaschke/.hermes/profiles/orchestrator/runtime-hotfix-20260906
 STAGE="$PWD/.native-boundary-stage/runtime"
 MANIFEST="$PWD/.native-boundary-stage/manifest.json"
+PYTHON=${FACTORY_PYTHON:-/opt/hermes-agent/venv/bin/python}
+test -x "$PYTHON"
 
-python3 -B local-variant/native-boundary/build_native_boundary.py stage \
+PYTHONDONTWRITEBYTECODE=1 "$PYTHON" -B \
+  local-variant/native-boundary/build_native_boundary.py stage \
   --source "$SOURCE" \
   --output "$STAGE" \
   --manifest-output "$MANIFEST"
 
-python3 -B local-variant/native-boundary/build_native_boundary.py verify \
+PYTHONDONTWRITEBYTECODE=1 "$PYTHON" -B \
+  local-variant/native-boundary/build_native_boundary.py verify \
   --manifest "$MANIFEST" \
   --source "$SOURCE"
 ```
@@ -174,6 +178,12 @@ virtualenv site-packages path for required dependencies, and requires
 `kanban_db`, `kanban_specify`, and `native_boundary` to resolve to their exact
 files under `STAGE`. Hosted package checks without `FACTORY_NATIVE_RUNTIME`
 are package evidence only; they are not native activation proof.
+The verifier deliberately uses the interpreter that launched it. Pin
+`FACTORY_PYTHON` to the same dependency-complete Hermes interpreter used by the
+gateway; an ambient `python3` with different site-packages is not reproducible
+artifact evidence. Keep `PYTHONDONTWRITEBYTECODE=1` on both verification and
+the activated gateway so the reviewed runtime tree does not acquire excluded
+`__pycache__` or `*.pyc` entries after activation.
 
 ## Native contract verification
 
@@ -231,11 +241,15 @@ STAGE=/absolute/path/to/.native-boundary-stage/runtime
 MANIFEST=/absolute/path/to/.native-boundary-stage/manifest.json
 SOURCE=/absolute/path/to/runtime-hotfix-source
 REVIEWED_DROPIN=/absolute/path/to/reviewed-10-runtime-hotfix.conf
+PYTHON=${FACTORY_PYTHON:-/opt/hermes-agent/venv/bin/python}
 
-python3 -B local-variant/native-boundary/build_native_boundary.py verify \
+test -x "$PYTHON"
+PYTHONDONTWRITEBYTECODE=1 "$PYTHON" -B \
+  local-variant/native-boundary/build_native_boundary.py verify \
   --manifest "$MANIFEST" --source "$SOURCE"
 test -r "$REVIEWED_DROPIN"
 grep -F "PYTHONPATH=$STAGE" "$REVIEWED_DROPIN"
+grep -F 'PYTHONDONTWRITEBYTECODE=1' "$REVIEWED_DROPIN"
 
 # Freeze admission before inspecting or stopping a KillMode=mixed service.
 MAIN_PID=$(systemctl --user show "$SERVICE" -p MainPID --value)

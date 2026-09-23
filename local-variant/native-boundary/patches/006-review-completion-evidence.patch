@@ -1,0 +1,97 @@
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -206,7 +206,11 @@
+ ) -> Optional[dict]:
+     """Preserve typed handoff identifiers; redact only free-form metadata."""
+     if metadata is None:
+-        return _stamp_worker_session_metadata(task_id, None)
++        # Preserve the legacy sentinel exactly. Injecting worker provenance here
++        # manufactures structured metadata that the native review boundary must
++        # reject for lacking candidate_commit. Run/session identity is already
++        # durably fenced by the task claim and expected_run_id.
++        return None
+     if _is_exact_remediation_review_metadata(metadata):
+         try:
+             json.dumps(metadata)
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -85,0 +86 @@
++import unicodedata
+@@ -9818,10 +9819,16 @@
+         ).fetchone()
+         is not None
+     )
++    review_requested_registered = conn.execute(
++        "SELECT 1 FROM task_events WHERE task_id = ? "
++        "AND kind = 'review_requested' LIMIT 1",
++        (task_id,),
++    ).fetchone() is not None
+     review_required = (
+         _review_body_field(body, "review_required_before_completion") == "true"
+         or remediation_handoff is not None
+         or same_card_registered
++        or review_requested_registered
+     )
+     standalone_declared = _review_body_field(body, "review_type") is not None
+     standalone_registered = conn.execute(
+@@ -9869,8 +9876,21 @@
+     if not isinstance(metadata, dict):
+         return "structured review completion metadata is required"
+     verdict_fields = {
+-        key for key in ("review_outcome", "overall_verdict", "verdict")
+-        if key in metadata
++        key
++        for key in metadata
++        if isinstance(key, str)
++        and (
++            (
++                normalized_key := "".join(
++                    character
++                    for character in unicodedata.normalize("NFKC", key).casefold()
++                    if character.isalnum()
++                )
++            )
++            == "reviewoutcome"
++            or normalized_key == "verdict"
++            or normalized_key.endswith("verdict")
++        )
+     }
+     if verdict_fields != {"review_outcome"} or (
+         type(metadata.get("review_outcome")) is not str
+--- a/tests/hermes_cli/test_kanban_review_lifecycle_complete.py
++++ b/tests/hermes_cli/test_kanban_review_lifecycle_complete.py
+@@ -570,16 +570,22 @@
+-def test_parked_review_approval_without_evidence_still_creates_audit_run(conn) -> None:
++def test_parked_review_approval_without_reviewer_run_fails_closed(conn) -> None:
++    candidate = "a" * 40
+     task_id = kb.create_task(conn, title="Manual approval", assignee="reviewer")
+     assert kb.request_review(conn, task_id, summary="implementation handoff")
+-    assert kb.complete_task(conn, task_id)
+-    completed_event = _event(kb.list_events(conn, task_id), "completed")
+-    assert completed_event.run_id is not None
++    assert not kb.complete_task(
++        conn,
++        task_id,
++        summary="must not approve without an active reviewer run",
++        metadata={
++            "review_outcome": "APPROVED",
++            "candidate_commit": candidate,
++        },
++    )
++    task = kb.get_task(conn, task_id)
++    assert task is not None
++    assert task.status == "review"
++    assert task.current_run_id is None
++    assert not any(event.kind == "completed" for event in kb.list_events(conn, task_id))
+     run = kb.latest_run(conn, task_id)
+     assert run is not None
+-    assert run.id == completed_event.run_id
+-    assert run.outcome == "completed"
+-    assert run.profile == "reviewer"
+-    assert run.summary == "Review approved without additional evidence."
+-    assert run.metadata == {
+-        "source_status": "review",
+-        "approval": "manual",
+-    }
++    assert run.outcome == "review_requested"
++    assert run.status == "review_requested"

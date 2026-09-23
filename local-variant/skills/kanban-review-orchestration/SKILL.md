@@ -262,7 +262,7 @@ workers behind a broker or a distinct OS identity without database write access.
 A standalone leaf claimed from `source_status=ready` must never call
 `kanban_request_changes`. Exact `APPROVED` calls `kanban_complete` once with
 `review_outcome: APPROVED` and the exact `candidate_commit`; Native Boundary
-`1.0.24` requires an exact positive current run ID from the native active
+`1.0.25` requires an exact positive current run ID from the native active
 reviewer profile, re-reads the strict packet, immutable claim receipt, resolved
 worktree/Git-dir identity, repository, branch, base, candidate, and changed-path
 manifest before release. A missing/string/float/stale run ID, role collision,

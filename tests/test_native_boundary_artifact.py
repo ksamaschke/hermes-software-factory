@@ -62,6 +62,13 @@ def test_static_manifest_and_patch_are_pinned():
         assert builder._sha256(ARTIFACT / entry["path"]) == entry["sha256"]
 
 
+def test_runbook_pins_runtime_interpreter_and_disables_bytecode_writes():
+    runbook = (ARTIFACT / "README.md").read_text(encoding="utf-8")
+    assert "FACTORY_PYTHON:-/opt/hermes-agent/venv/bin/python" in runbook
+    assert runbook.count("PYTHONDONTWRITEBYTECODE=1") >= 3
+    assert "grep -F 'PYTHONDONTWRITEBYTECODE=1'" in runbook
+
+
 def test_output_manifest_artifact_identity_is_content_bound(tmp_path, monkeypatch):
     relocated = tmp_path / "relocated-artifact"
     shutil.copytree(

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import json
 import os
 import sqlite3
 import subprocess
@@ -346,6 +347,126 @@ def test_request_review_force_requires_operator_capability_and_live_lease(kanban
     assert "expired" in str(reason).casefold() or "live" in str(reason).casefold()
 
 
+def test_structured_review_handoff_requires_canonical_candidate_commit(kanban_db):
+    module, conn, _ = kanban_db
+    task_id, claimed = _claim(module, conn, "structured review handoff")
+
+    for metadata in (
+        {},
+        {"pr_head_sha": "a" * 40},
+        {"candidate_commit": "not-a-commit"},
+        {"candidate_commit": int("1" * 40)},
+        {"candidate_commit": "a" * 40, "pr_head_sha": int("1" * 40)},
+        {
+            "candidate_commit": "a" * 40,
+            "post_verification_head": int("1" * 40),
+        },
+        {"candidate_commit": "a" * 40, "pr_head_sha": "b" * 40},
+        {
+            "candidate_commit": "a" * 40,
+            "post_verification_head": "b" * 40,
+        },
+    ):
+        ok, reason = module.request_review(
+            conn,
+            task_id,
+            summary="verified",
+            metadata=metadata,
+            reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+            with_reason=True,
+        )
+        assert not ok
+        assert "candidate_commit" in str(reason)
+        task = module.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running"
+        assert task.current_run_id == claimed.current_run_id
+
+    candidate = "A" * 40
+    ok, reason = module.request_review(
+        conn,
+        task_id,
+        summary="verified",
+        metadata={
+            "schema": "esg.handoff.v1",
+            "candidate_commit": candidate,
+            "pr_head_sha": candidate.lower(),
+            "post_verification_head": candidate.lower(),
+        },
+        reviewer="reviewer",
+        expected_run_id=claimed.current_run_id,
+        with_reason=True,
+    )
+    assert ok, reason
+
+    event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_requested' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    assert event is not None
+    payload = json.loads(event["payload"])
+    assert payload["metadata"]["candidate_commit"] == candidate.lower()
+    run = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id = ? AND task_id = ?",
+        (claimed.current_run_id, task_id),
+    ).fetchone()
+    assert run is not None
+    assert json.loads(run["metadata"])["candidate_commit"] == candidate.lower()
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"candidate_commit": int("1" * 40)},
+        {"candidate_commit": "a" * 40, "pr_head_sha": int("1" * 40)},
+        {
+            "candidate_commit": "a" * 40,
+            "post_verification_head": int("1" * 40),
+        },
+    ],
+)
+def test_public_review_request_rejects_non_string_candidate_identity(
+    kanban_db, monkeypatch, metadata
+):
+    module, conn, db_path = kanban_db
+    task_id, claimed = _claim(module, conn, "typed public review handoff")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+    monkeypatch.setenv("HERMES_SESSION_ID", "implementer-session")
+    sys.modules.pop("tools.kanban_tools", None)
+    tools = importlib.import_module("tools.kanban_tools")
+    monkeypatch.setattr(
+        tools,
+        "_connect",
+        lambda board=None: (module, module.connect(db_path)),
+    )
+
+    response = json.loads(
+        tools._handle_request_review(
+            {
+                "summary": "must reject non-string candidate identity",
+                "reviewer": "reviewer",
+                "metadata": metadata,
+            }
+        )
+    )
+    assert response.get("ok") is not True
+    assert "error" in response
+    task = module.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == claimed.current_run_id
+    run = module.latest_run(conn, task_id)
+    assert run is not None
+    assert run.status == "running"
+    assert run.outcome is None
+    assert not any(
+        event.kind == "review_requested" for event in module.list_events(conn, task_id)
+    )
+
+
 def test_ready_task_cannot_close_foreign_run(kanban_db):
     module, conn, _ = kanban_db
     task_a = module.create_task(conn, title="malformed ready", assignee="implementer")
@@ -490,6 +611,274 @@ def test_remediation_metadata_survives_tool_boundary_exactly(monkeypatch):
     assert (
         tools._prepare_request_review_metadata("task-remediation", metadata) == metadata
     )
+
+
+def test_none_review_metadata_survives_public_tool_boundary(
+    kanban_db, monkeypatch
+):
+    module, conn, db_path = kanban_db
+    task_id, claimed = _claim(module, conn, "legacy public review handoff")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+    monkeypatch.setenv("HERMES_SESSION_ID", "worker-session")
+    sys.modules.pop("tools.kanban_tools", None)
+    tools = importlib.import_module("tools.kanban_tools")
+    monkeypatch.setattr(
+        tools,
+        "_connect",
+        lambda board=None: (module, module.connect(db_path)),
+    )
+
+    response = json.loads(
+        tools._handle_request_review(
+            {
+                "summary": "legacy implementation handoff",
+                "reviewer": "reviewer",
+            }
+        )
+    )
+    assert response["ok"] is True
+    task = module.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "review"
+    run = module.latest_run(conn, task_id)
+    assert run is not None
+    assert run.outcome == "review_requested"
+    assert run.metadata is None
+    event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_requested' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    assert event is not None
+    assert json.loads(event["payload"])["metadata"] is None
+
+
+@pytest.mark.parametrize(
+    "alternate_key",
+    [
+        "overallVerdict",
+        "reviewOutcome",
+        "review-outcome",
+        "REVIEW_OUTCOME",
+        "review verdict",
+        "extra.verdict",
+        "ＴｅｒｍｉｎａｌＶｅｒｄｉｃｔ",
+    ],
+)
+def test_public_completion_rejects_normalized_verdict_aliases(
+    kanban_db, monkeypatch, alternate_key
+):
+    module, conn, db_path = kanban_db
+    candidate = "a" * 40
+    task_id, implementation = _claim(module, conn, "normalized verdict aliases")
+    assert module.request_review(
+        conn,
+        task_id,
+        summary="structured implementation handoff",
+        metadata={"candidate_commit": candidate},
+        reviewer="reviewer",
+        expected_run_id=implementation.current_run_id,
+    )
+    review = module.claim_review_task(
+        conn,
+        task_id,
+        claimer="reviewer:normalized-verdict-test",
+    )
+    assert review is not None
+    assert review.current_run_id is not None
+
+    monkeypatch.setattr(module, "_active_native_profile", lambda: "reviewer")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
+    monkeypatch.setenv("HERMES_SESSION_ID", "reviewer-session")
+    sys.modules.pop("tools.kanban_tools", None)
+    tools = importlib.import_module("tools.kanban_tools")
+    monkeypatch.setattr(
+        tools,
+        "_connect",
+        lambda board=None: (module, module.connect(db_path)),
+    )
+
+    response = json.loads(
+        tools._handle_complete(
+            {
+                "summary": "must reject every alternate verdict spelling",
+                "metadata": {
+                    "review_outcome": "APPROVED",
+                    "candidate_commit": candidate,
+                    alternate_key: "CHANGES_REQUESTED",
+                },
+            }
+        )
+    )
+    assert response.get("ok") is not True
+    assert "error" in response
+    task = module.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == review.current_run_id
+    run = module.latest_run(conn, task_id)
+    assert run is not None
+    assert run.status == "running"
+    assert run.outcome is None
+    assert not any(event.kind == "completed" for event in module.list_events(conn, task_id))
+
+
+@pytest.mark.parametrize(
+    ("identity_key", "identity_value"),
+    [
+        ("candidate_commit", int("1" * 40)),
+        ("pr_head_sha", int("1" * 40)),
+        ("post_verification_head", int("1" * 40)),
+    ],
+)
+def test_public_completion_rejects_non_string_candidate_identity(
+    kanban_db, monkeypatch, identity_key, identity_value
+):
+    module, conn, db_path = kanban_db
+    candidate = "a" * 40
+    task_id, implementation = _claim(module, conn, "typed review completion")
+    assert module.request_review(
+        conn,
+        task_id,
+        summary="structured implementation handoff",
+        metadata={"candidate_commit": candidate},
+        reviewer="reviewer",
+        expected_run_id=implementation.current_run_id,
+    )
+    review = module.claim_review_task(
+        conn,
+        task_id,
+        claimer="reviewer:typed-candidate-test",
+    )
+    assert review is not None
+    assert review.current_run_id is not None
+
+    monkeypatch.setattr(module, "_active_native_profile", lambda: "reviewer")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
+    monkeypatch.setenv("HERMES_SESSION_ID", "reviewer-session")
+    sys.modules.pop("tools.kanban_tools", None)
+    tools = importlib.import_module("tools.kanban_tools")
+    monkeypatch.setattr(
+        tools,
+        "_connect",
+        lambda board=None: (module, module.connect(db_path)),
+    )
+    metadata = {
+        "review_outcome": "APPROVED",
+        "candidate_commit": candidate,
+    }
+    metadata[identity_key] = identity_value
+
+    response = json.loads(
+        tools._handle_complete(
+            {
+                "summary": "must reject non-string candidate identity",
+                "metadata": metadata,
+            }
+        )
+    )
+    assert response.get("ok") is not True
+    assert "error" in response
+    task = module.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == review.current_run_id
+    run = module.latest_run(conn, task_id)
+    assert run is not None
+    assert run.status == "running"
+    assert run.outcome is None
+    assert not any(event.kind == "completed" for event in module.list_events(conn, task_id))
+
+
+def test_public_completion_accepts_matching_string_candidate_aliases(
+    kanban_db, monkeypatch
+):
+    module, conn, db_path = kanban_db
+    candidate = "a" * 40
+    task_id, implementation = _claim(module, conn, "canonical review completion")
+    assert module.request_review(
+        conn,
+        task_id,
+        summary="structured implementation handoff",
+        metadata={
+            "candidate_commit": candidate.upper(),
+            "pr_head_sha": candidate,
+            "post_verification_head": candidate,
+        },
+        reviewer="reviewer",
+        expected_run_id=implementation.current_run_id,
+    )
+    review = module.claim_review_task(
+        conn,
+        task_id,
+        claimer="reviewer:canonical-candidate-test",
+    )
+    assert review is not None
+    assert review.current_run_id is not None
+
+    monkeypatch.setattr(module, "_active_native_profile", lambda: "reviewer")
+    monkeypatch.setattr(module, "_review_workspace_head", lambda _path: candidate)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
+    monkeypatch.setenv("HERMES_SESSION_ID", "reviewer-session")
+    sys.modules.pop("tools.kanban_tools", None)
+    tools = importlib.import_module("tools.kanban_tools")
+    monkeypatch.setattr(
+        tools,
+        "_connect",
+        lambda board=None: (module, module.connect(db_path)),
+    )
+
+    response = json.loads(
+        tools._handle_complete(
+            {
+                "summary": "canonical candidate identity is approved",
+                "metadata": {
+                    "review_outcome": "APPROVED",
+                    "candidate_commit": candidate.upper(),
+                    "pr_head_sha": candidate,
+                    "post_verification_head": candidate.upper(),
+                },
+            }
+        )
+    )
+    assert response["ok"] is True
+    task = module.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "done"
+    run = module.latest_run(conn, task_id)
+    assert run is not None
+    assert run.status == "done"
+    assert run.outcome == "completed"
+
+
+def test_legacy_review_handoff_cannot_complete_without_reviewer_run(kanban_db):
+    module, conn, _ = kanban_db
+    task_id, claimed = _claim(module, conn, "legacy completion fence")
+    assert module.request_review(
+        conn,
+        task_id,
+        summary="legacy implementation handoff",
+        metadata=None,
+        reviewer=None,
+        expected_run_id=claimed.current_run_id,
+    )
+    assert not module.complete_task(
+        conn,
+        task_id,
+        summary="forged approval",
+        metadata={
+            "review_outcome": "APPROVED",
+            "candidate_commit": "a" * 40,
+        },
+    )
+    task = module.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "review"
+    assert task.current_run_id is None
 
 
 def test_ignored_untracked_content_is_not_a_clean_review_tree(kanban_db, tmp_path):

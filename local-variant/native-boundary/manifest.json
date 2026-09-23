@@ -1,6 +1,6 @@
 {
   "schema": "factory.native-boundary.v1",
-  "artifact_version": "1.0.24",
+  "artifact_version": "1.0.25",
   "description": "Fail-closed native Kanban boundary patch for a disposable Hermes runtime copy.",
   "source_files": [
     {
@@ -32,6 +32,18 @@
     {
       "path": "patches/004-review-lifecycle-followup.patch",
       "sha256": "f1ccf928bf6c665272f68f63e8334a5d00de168824016e7445e9e79871c2ffbe"
+    },
+    {
+      "path": "patches/005-review-handoff-contract.patch",
+      "sha256": "7c2461d0ee727fb4b37ff182c9d58fbbade7d1b72cac7a4b8a330fff80bc4c0a"
+    },
+    {
+      "path": "patches/006-review-completion-evidence.patch",
+      "sha256": "3b30c2eccd15a09d285ce273ca6e579cf1f97c8d63e4562f50ca86230b2fdf2b"
+    },
+    {
+      "path": "patches/007-review-candidate-type-contract.patch",
+      "sha256": "74e3ae9b4d79d7aa91623a992aceab3ec97e9fb034d08c41da6bda809dc257a7"
     }
   ],
   "patched_paths": [

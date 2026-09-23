@@ -252,10 +252,15 @@ task/run/events rather than task prose:
 
 - A **same-card review** has an exact `review_requested` handoff and a fresh
   reviewer run claimed from `source_status=review`. `APPROVED` uses
-  `kanban_complete`; `CHANGES_REQUESTED` uses `kanban_request_changes`, whose
-  native rework transition on the original task is the only implementation
-  lane. The orchestrator must not create a second implementer task for that
-  verdict. The implementer's earlier request-review run is not review evidence.
+  `kanban_complete` once with structured metadata containing exactly
+  `review_outcome: APPROVED` as the sole verdict field and the exact 40-hex
+  `candidate_commit` copied from the implementation handoff. Do not include
+  `verdict`, `overall_verdict`, `terminal_verdict`, `review_verdict`, or any
+  other `*_verdict` key;
+  `CHANGES_REQUESTED` uses `kanban_request_changes`, whose native rework
+  transition on the original task is the only implementation lane. The
+  orchestrator must not create a second implementer task for that verdict. The
+  implementer's earlier request-review run is not review evidence.
 - A **standalone review leaf** is a separate review card claimed from
   `source_status=ready` with no `review_requested` handoff. Its exact body
   schema names `review_type: read-only adversarial code review leaf`, direct
@@ -272,7 +277,7 @@ task/run/events rather than task prose:
   before release. `CHANGES_REQUESTED` never calls `kanban_request_changes`:
   call `kanban_block` once with `kind=dependency` and a reason beginning exactly
   `STANDALONE_REVIEW_CHANGES_REQUESTED:`, followed by the bounded structured
-  findings. Within Hermes-managed SQLite connections, Native Boundary `1.0.24`
+  findings. Within Hermes-managed SQLite connections, Native Boundary `1.0.25`
   terminally closes that exact run and
   writes one immutable remediation outbox receipt; the reviewer creates no
   product task. `REVIEW-INCOMPLETE` calls `kanban_block` once without the

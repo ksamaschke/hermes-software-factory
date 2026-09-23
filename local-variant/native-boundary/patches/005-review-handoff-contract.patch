@@ -1,0 +1,43 @@
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -10534,7 +10534,39 @@
+             if workspace_error is not None:
+                 return _ret(False, f"remediation workspace evidence is invalid: {workspace_error}")
+         else:
+-            metadata = redact_review_value(raw_metadata)
++            if raw_metadata is not None:
++                if not isinstance(raw_metadata, dict):
++                    return _ret(
++                        False,
++                        "structured review request metadata must be a mapping",
++                    )
++                candidate = str(
++                    raw_metadata.get("candidate_commit") or ""
++                ).strip().casefold()
++                if _REVIEW_COMMIT_RE.fullmatch(candidate) is None:
++                    return _ret(
++                        False,
++                        "structured review request metadata has no canonical candidate_commit",
++                    )
++                for alias in ("pr_head_sha", "post_verification_head"):
++                    if alias not in raw_metadata:
++                        continue
++                    alias_candidate = str(
++                        raw_metadata.get(alias) or ""
++                    ).strip().casefold()
++                    if (
++                        _REVIEW_COMMIT_RE.fullmatch(alias_candidate) is None
++                        or alias_candidate != candidate
++                    ):
++                        return _ret(
++                            False,
++                            f"structured review request {alias} conflicts with candidate_commit",
++                        )
++                metadata = redact_review_value(raw_metadata)
++                assert isinstance(metadata, dict)
++                metadata["candidate_commit"] = candidate
++            else:
++                metadata = None
+         assignee_sql = ""
+         update_params: list[Any] = []
+         if reviewer is not None:

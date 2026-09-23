@@ -62,7 +62,7 @@ current run ID, matching claim lock and live lease, active independent reviewer
 profile, clean immutable worktree, and structured outcome and candidate metadata.
 Exact `CHANGES_REQUESTED` blocks once with the native
 `STANDALONE_REVIEW_CHANGES_REQUESTED:` prefix. Within Hermes-managed SQLite
-connections, Native Boundary `1.0.24`
+connections, Native Boundary `1.0.25`
 binds the strict owner/repository, complete task title/body, resolved worktree/
 Git-dir identity, branch, base/candidate, changed-path manifest, distinct roles,
 exact run and lease, finding, and complete direct-parent/child frontier into a
