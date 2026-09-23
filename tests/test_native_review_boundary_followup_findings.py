@@ -17,7 +17,14 @@ from pathlib import Path
 
 import pytest
 
-_RUNTIME = Path(os.environ.get("FACTORY_NATIVE_RUNTIME", ""))
+_RUNTIME_SETTING = os.environ.get("FACTORY_NATIVE_RUNTIME")
+if not _RUNTIME_SETTING:
+    pytest.skip(
+        "set FACTORY_NATIVE_RUNTIME to the generated candidate",
+        allow_module_level=True,
+    )
+
+_RUNTIME = Path(_RUNTIME_SETTING)
 if not _RUNTIME.is_dir():
     pytest.skip(
         "set FACTORY_NATIVE_RUNTIME to the generated candidate",
