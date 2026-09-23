@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-
 from software_factory.control.policy import ExecutorKind, PolicyError, load_policy
 
 ROOT = Path(__file__).resolve().parents[2]

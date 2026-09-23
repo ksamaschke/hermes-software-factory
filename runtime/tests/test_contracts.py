@@ -7,7 +7,6 @@ from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
-
 from software_factory import (
     ImplementationOutcome,
     RepositoryIdentity,

@@ -6,7 +6,6 @@ from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
-
 from software_factory import (
     MAX_EVENT_ATTRIBUTE_KEY_LENGTH,
     MAX_EVENT_ATTRIBUTE_VALUE_LENGTH,
