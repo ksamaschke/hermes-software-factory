@@ -1,8 +1,27 @@
 # Factory native-boundary compatibility artifact
 
 This is the versioned `factory.native-boundary.v1` prerequisite for the
-Factory runtime. It repairs two native SQLite boundaries in a disposable copy
-of the pinned Hermes runtime:
+Factory runtime. It repairs native SQLite lifecycle boundaries in a disposable
+copy of the pinned Hermes runtime:
+
+## Security boundary
+
+The boundary is fail-closed for lifecycle callers and direct SQL executed
+through Hermes-managed SQLite connections. It is **not** a tamper-resistant
+boundary against another process running as the board database's owning Unix
+user, or against any principal with raw write access to the database file.
+Such a principal can replace the file, drop triggers, or register a lookalike
+SQLite function on its own connection; SQLite authorizers are connection-local
+and cannot authenticate an operating-system peer.
+
+The local Factory therefore treats every process running as the board-owning
+user as trusted. Do not run an untrusted worker under that identity with raw
+filesystem access. A deployment that needs hostile-worker isolation must put
+the board behind a broker or a distinct operating-system identity that cannot
+open the database for writing; trigger and authorizer checks do not replace
+that isolation. Every use below of “immutable”, “cannot”, “only”, or
+“fail-closed” is scoped to Hermes-managed connections unless an operating-system
+isolation boundary is stated explicitly.
 
 - repeated-blocker triage admission is rejected inside the existing native
   write transaction before any task fields are changed;
@@ -30,6 +49,55 @@ of the pinned Hermes runtime:
   implementation-run plus `review_requested` handoff; a bare `review` status
   is never authority. Reclaim evidence additionally enforces native
   cross-field termination, host-local, and heartbeat consistency.
+- a standalone review leaf claimed from `ready` can record
+  `CHANGES_REQUESTED` only from its exact positive current run, still-live lease,
+  matching claim lock, and native active reviewer profile. The claim and verdict
+  bind a strict immutable packet, complete task title/body digest, a completely
+  clean worktree including untracked files, resolved repository/worktree/Git-dir
+  identity, branch, base/candidate, changed-path manifest, three distinct roles,
+  finding, and complete direct-parent/child frontier. A heartbeat likewise
+  requires the exact current positive run, claim lock, and live lease; there is
+  no runless fallback. The same native transaction terminally closes that run as
+  the canonical sticky `blocked/changes_requested` pair and inserts one
+  graph-bound remediation outbox receipt. Recompute, dispatch, and claim paths
+  honor pending/applied/tombstoned receipts, so the rejected leaf cannot run
+  twice. Coordinator consumption is bound to the native active profile and
+  verified runtime contract, isolated per receipt, atomic, race-safe, and
+  idempotent. A full-digest reserved key creates or reuses one implementer
+  successor with every direct parent preserved; its mandatory pointer, immutable
+  body receipt, graph, and native review gate cannot be removed or retargeted.
+  Only the unchanged child frontier moves before exact graph readback, old-leaf
+  archive, and receipt application.
+- SQLite-level guards protect claimed/terminal review task evidence, remediation
+  successors and receipts, and frozen graph links from generic promote, schedule,
+  unblock, respecify, archive, delete, dashboard, and direct SQL executed through
+  Hermes-managed connections. Native authorization is an uncommitted
+  transaction-local row guarded by that connection's SQLite authorizer; it is
+  removed before commit and cannot become a process-global bypass inside the
+  managed-connection trust boundary. Protected-schema triggers still call
+  `review_native_connection_authorized()`; an older runtime that does not
+  register that function fails closed, including for an otherwise ordinary
+  write touching the protected schema. Additive columns are installed before
+  indexes and triggers that reference them, and earlier function-backed trigger
+  revisions are replaced during migration. Legacy pending receipts that lack
+  current v2 provenance are atomically tombstoned with a durable audit event
+  instead of remaining pending.
+- standalone and same-card claims persist immutable title/body and complete graph
+  receipts. Active and approved review evidence is excluded from event GC, direct
+  terminal shortcuts and graph detachment fail closed, and a malformed terminal
+  successor cannot satisfy or promote a dependent child. The production
+  heartbeat tool has no legacy renewal-first fallback: renewal and heartbeat
+  both require the exact positive run, claim lock, native profile, and live task
+  and run leases.
+- completion of a standalone leaf or remediation successor requires structured
+  exact `APPROVED` metadata plus matching current reviewer run, native active
+  profile, live lease and claim lock, prior terminal `review_requested`
+  implementation run, immutable packet/body/pointer receipt, clean worktree,
+  candidate, changed-path manifest, repository/worktree identity, and local HEAD.
+  Missing, boolean/string/float/stale/expired run IDs, role collisions,
+  non-approval, self-attestation, stale or foreign evidence, pointer/body/graph
+  tampering, and malformed provenance cannot complete the task or release
+  status-gated children.
 - before reclaim, orphan repair, promotion, or spawn, a durable-state barrier
   validates non-terminal task scalars, run/event/comment identifiers and
   timestamps, run state, JSON storage, transition schemas, counters, PIDs,

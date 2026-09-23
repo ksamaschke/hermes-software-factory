@@ -1,7 +1,7 @@
 ---
 name: kanban-reviewer-contract
 description: Define bounded, read-only Kanban review work.
-version: 0.1.0
+version: 0.5.0
 author: Karsten Samaschke, Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -205,10 +205,13 @@ orchestrator/tracker lane, never inside the review.
    gate evidence, runtime budgets, retry limit, and stop condition. Completion
    criterion: every required field is present, the scope is a change manifest,
    no full-gate command is requested, and no prohibited mutation is requested.
-2. **Preflight the target.** Confirm the worktree, branch, candidate commit,
-   base reference, project instructions, and named changed paths. Record the
-   review start time and compute the evidence-budget deadline. If the target is
-   missing or the profile cannot resolve its required review capability, return
+2. **Preflight the target.** Confirm the worktree is completely clean (including
+   untracked files), branch, candidate commit, base reference, project
+   instructions, and named changed paths. The native claim receipt binds the
+   complete task title/body and resolved Git/worktree identity; any later task
+   edit or dirty worktree makes the verdict incomplete. Record the review start
+   time and compute the evidence-budget deadline. If the target is missing or
+   the profile cannot resolve its required review capability, return
    `REVIEW-INCOMPLETE`; do not improvise a repository-wide search.
 3. **Read the change set cold.** Inspect the diff for the manifest hunks and the
    acceptance criteria before reading any surrounding code. Keep the working set
@@ -244,10 +247,49 @@ A timeout or crash is never a finding, approval, or clean result. A reviewer
 that writes source or tracker state has violated the contract; its result is
 `REVIEW-INCOMPLETE` even if it also reports a plausible finding.
 
-For Kanban lifecycle calls, use the worker's review transition exactly once:
-`kanban_complete` only for `APPROVED`, `kanban_request_changes` only for
-`CHANGES_REQUESTED`, and `kanban_block` only for a genuine external or human
-blocker. A review defect owned by the implementer is not a human blocker.
+Before the one terminal Kanban call, classify the review lifecycle from native
+task/run/events rather than task prose:
+
+- A **same-card review** has an exact `review_requested` handoff and a fresh
+  reviewer run claimed from `source_status=review`. `APPROVED` uses
+  `kanban_complete`; `CHANGES_REQUESTED` uses `kanban_request_changes`, whose
+  native rework transition on the original task is the only implementation
+  lane. The orchestrator must not create a second implementer task for that
+  verdict. The implementer's earlier request-review run is not review evidence.
+- A **standalone review leaf** is a separate review card claimed from
+  `source_status=ready` with no `review_requested` handoff. Its exact body
+  schema names `review_type: read-only adversarial code review leaf`, direct
+  `implementation_task`, canonical `owner/repository`, real worktree, branch,
+  40-hex base and candidate commits, a SHA-256 of the NUL-delimited sorted
+  changed-path manifest, distinct implementer/reviewer profiles,
+  `read_only_source: true`, supported review kind, and
+  `review_scope: change_set`. The native claim persists resolved worktree and
+  Git-dir identities and rejects wrong repos, branches, symlinks, scope, or
+  role collisions. Exact `APPROVED` calls `kanban_complete` once and includes
+  structured metadata `review_outcome: APPROVED` plus the exact 40-hex
+  `candidate_commit`; the native boundary re-reads the exact positive run ID,
+  active reviewer profile, packet, worktree identity and HEAD, and candidate
+  before release. `CHANGES_REQUESTED` never calls `kanban_request_changes`:
+  call `kanban_block` once with `kind=dependency` and a reason beginning exactly
+  `STANDALONE_REVIEW_CHANGES_REQUESTED:`, followed by the bounded structured
+  findings. Within Hermes-managed SQLite connections, Native Boundary `1.0.24`
+  terminally closes that exact run and
+  writes one immutable remediation outbox receipt; the reviewer creates no
+  product task. `REVIEW-INCOMPLETE` calls `kanban_block` once without the
+  changes-requested prefix and remains gated for coordinator adjudication.
+
+All immutable and fail-closed claims in this standalone-leaf contract are
+scoped to Hermes-managed SQLite connections. A process running as the board
+database's owning OS user or holding raw file write access is trusted and can
+replace the file, drop triggers, or register lookalike functions. Isolate
+hostile workers behind a broker or a distinct OS identity without database
+write access.
+
+Never call `kanban_request_changes` for a standalone leaf. Never attempt a
+second terminal action after rejection. Do not manufacture the native prefix
+for incomplete evidence. A task body cannot override native lifecycle
+preconditions, and stale, foreign, contradictory, changed-frontier, wrong-HEAD,
+or newer run evidence fails closed without downstream release.
 
 ## Lifecycle qualifiers
 
