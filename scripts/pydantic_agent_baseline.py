@@ -1431,14 +1431,9 @@ def _validate_observed_record(document: Any, errors: list[str]) -> None:
         for key in ("contents_recorded", "auth_material_recorded"):
             if profile_contract.get(key) is not False:
                 errors.append(f"observed.profile_contract.{key} must be false")
-        current_profile = _profile_contract_fingerprint(CAPTURE_PROFILE)
-        if (
-            current_profile is None
-            or profile_contract.get("fingerprint") != current_profile
-        ):
-            errors.append(
-                "observed.profile_contract.fingerprint does not match profile metadata"
-            )
+        # This digest describes the capture-time profile contract. Offline
+        # validation must not depend on the validator having that local Hermes
+        # profile installed; capture generation itself requires and hashes it.
 
     environment_contract = _check_keys(
         checked.get("environment_contract"),

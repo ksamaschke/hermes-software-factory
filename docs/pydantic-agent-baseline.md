@@ -112,7 +112,9 @@ this benchmark contract. The checked-in record binds to the capture executable
 source revision and source digest, factory base/head, profile/model, clean-before-
 capture state, environment-scrub contract, and a profile contract fingerprint
 covering only non-secret prompt/config metadata. The evidence fingerprint is a
-self-consistency digest, not an attestation.
+self-consistency digest, not an attestation. The profile fingerprint is
+capture-time provenance: offline validation checks its strict shape but does
+not require the validating machine to have the same local Hermes profile.
 
 Metric availability is fail-closed. A null metric has exactly one enum reason;
 a non-null metric has no reason; unknown reason keys and disagreement between

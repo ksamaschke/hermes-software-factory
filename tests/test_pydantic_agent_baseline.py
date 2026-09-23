@@ -401,6 +401,20 @@ def test_checked_in_observed_record_is_strictly_sanitized_and_fingerprinted():
     assert "failure" not in record["usage_evidence"]
 
 
+def test_observed_profile_fingerprint_is_capture_provenance(monkeypatch):
+    record = json.loads(OBSERVED_PATH.read_text(encoding="utf-8"))
+    monkeypatch.setattr(
+        baseline,
+        "_capture_source_sha256",
+        lambda: record["source_binding"]["source_sha256"],
+    )
+    monkeypatch.setattr(
+        baseline, "_profile_contract_fingerprint", lambda _profile: None
+    )
+
+    assert baseline.validate_observed_record(record) == []
+
+
 def test_observed_record_rejects_execution_and_usage_gate_failures():
     record = json.loads(OBSERVED_PATH.read_text(encoding="utf-8"))
     for path, value in (
