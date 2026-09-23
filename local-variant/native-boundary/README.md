@@ -4,6 +4,23 @@ This is the versioned `factory.native-boundary.v1` prerequisite for the
 Factory runtime. It repairs native SQLite lifecycle boundaries in a disposable
 copy of the pinned Hermes runtime:
 
+## Security boundary
+
+The boundary is fail-closed for lifecycle callers and direct SQL executed
+through Hermes-managed SQLite connections. It is **not** a tamper-resistant
+boundary against another process running as the board database's owning Unix
+user, or against any principal with raw write access to the database file.
+Such a principal can replace the file, drop triggers, or register a lookalike
+SQLite function on its own connection; SQLite authorizers are connection-local
+and cannot authenticate an operating-system peer.
+
+The local Factory therefore treats every process running as the board-owning
+user as trusted. Do not run an untrusted worker under that identity with raw
+filesystem access. A deployment that needs hostile-worker isolation must put
+the board behind a broker or a distinct operating-system identity that cannot
+open the database for writing; trigger and authorizer checks do not replace
+that isolation.
+
 - repeated-blocker triage admission is rejected inside the existing native
   write transaction before any task fields are changed;
 - a same-owner continuation is admitted only when the task has durable,
@@ -51,13 +68,15 @@ copy of the pinned Hermes runtime:
   archive, and receipt application.
 - SQLite-level guards protect claimed/terminal review task evidence, remediation
   successors and receipts, and frozen graph links from generic promote, schedule,
-  unblock, respecify, archive, delete, dashboard, and direct SQL writers. Native
-  authorization is an uncommitted transaction-local row guarded by the current
-  connection's SQLite authorizer; it is removed before commit and cannot become
-  a process-global bypass. Older runtimes can still perform ordinary compatible
-  writes after the schema upgrade because triggers no longer depend on a custom
-  connection-local SQL function. Additive columns are installed before indexes
-  and triggers that reference them, and function-backed trigger revisions are
+  unblock, respecify, archive, delete, dashboard, and direct SQL executed through
+  Hermes-managed connections. Native authorization is an uncommitted
+  transaction-local row guarded by that connection's SQLite authorizer; it is
+  removed before commit and cannot become a process-global bypass inside the
+  managed-connection trust boundary. Older runtimes can still perform ordinary
+  compatible writes after the schema upgrade because triggers no longer depend
+  on a custom connection-local SQL function. Additive columns are installed
+  before indexes and triggers that reference them, and function-backed trigger
+  revisions are
   replaced during migration. Legacy pending receipts that lack current v2
   provenance are atomically tombstoned with a durable audit event instead of
   remaining pending.

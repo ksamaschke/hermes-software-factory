@@ -198,8 +198,13 @@ hand internal repair coordination to the operator. Continue the bounded loop:
 3. The immutable successor receipt remains review-gated even if its body,
    idempotency key, graph links, or durable pointer is edited. Ordinary promote,
    schedule, unblock, respecify, archive, delete, dashboard, and direct SQL
-   writers cannot mutate a claimed or terminal native review boundary. Its exact
-   unexpired implementation run requests a distinct reviewer with only
+   executed through Hermes-managed connections cannot mutate a claimed or
+   terminal native review boundary. This is not an operating-system security
+   boundary: a process running as the board database's owning user is trusted
+   and can rewrite the SQLite file, drop triggers, or register lookalike SQL
+   functions. Isolate hostile workers behind a broker or a distinct identity
+   without raw database write access. Its exact unexpired implementation run
+   requests a distinct reviewer with only
    `candidate_commit`, `review_remediation_handoff_key`, and
    `scope_manifest_sha256`; the native boundary validates these against the
    current clean repository/worktree, branch, base, candidate, complete task
