@@ -8,21 +8,29 @@ before applying a lifecycle transition.
 
 from __future__ import annotations
 
+import math
+import re
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Literal, TypeAlias
+from urllib.parse import urlsplit
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
     HttpUrl,
+    StrictBool,
+    StrictFloat,
+    StrictInt,
+    StrictStr,
     field_validator,
     model_validator,
 )
 
 Identifier = Annotated[
-    str,
+    StrictStr,
     Field(
         min_length=1,
         max_length=256,
@@ -31,7 +39,7 @@ Identifier = Annotated[
     ),
 ]
 Revision = Annotated[
-    str,
+    StrictStr,
     Field(
         min_length=1,
         max_length=256,
@@ -39,27 +47,52 @@ Revision = Annotated[
         description="A commit, revision, or other immutable source reference.",
     ),
 ]
-NonEmptyText = Annotated[str, Field(min_length=1, max_length=16_384)]
-RelativePathValue = Annotated[str, Field(min_length=1, max_length=1_024)]
+NonEmptyText = Annotated[StrictStr, Field(min_length=1, max_length=16_384)]
+RelativePathValue = Annotated[StrictStr, Field(min_length=1, max_length=1_024)]
+EventScalar: TypeAlias = StrictStr | StrictInt | StrictFloat | StrictBool | None
+EventKey = Annotated[
+    StrictStr,
+    Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[^\s\x00]+$",
+    ),
+]
 
 
 class ContractModel(BaseModel):
-    """Base class used for strict wire contracts."""
+    """Base class used for strict, immutable wire contracts."""
 
     model_config = ConfigDict(
         extra="forbid",
+        frozen=True,
         str_strip_whitespace=True,
         validate_assignment=True,
     )
 
 
+def _as_tuple_input(value: object, field_name: str) -> tuple[object, ...]:
+    """Accept only real sequences for tuple-valued contract fields."""
+
+    if isinstance(value, (str, bytes, bytearray, Mapping)) or not isinstance(
+        value, Sequence
+    ):
+        raise ValueError(  # noqa: TRY004 - Pydantic v2 escapes TypeError from validators
+            f"{field_name} must be a sequence, not a scalar or mapping"
+        )
+    return tuple(value)
+
+
 def _validate_relative_path(value: str, field_name: str = "path") -> str:
     """Reject paths that could escape a bound workspace or be ambiguous."""
 
-    if "\x00" in value:
-        raise ValueError(f"{field_name} must not contain NUL")
+    if "\x00" in value or not value:
+        raise ValueError(f"{field_name} must be a non-empty relative path")
     normalized = value.replace("\\", "/")
-    if normalized.startswith(("/", "~/")):
+    if normalized.startswith(("/", "~")):
+        raise ValueError(f"{field_name} must be relative")
+    # This rejects drive-relative (``C:foo``) as well as drive-rooted paths.
+    if re.match(r"^[A-Za-z]:", normalized):
         raise ValueError(f"{field_name} must be relative")
     parts = normalized.split("/")
     if ".." in parts:
@@ -70,9 +103,17 @@ def _validate_relative_path(value: str, field_name: str = "path") -> str:
 
 
 def _validate_workspace_root(value: str) -> str:
+    """Require an absolute POSIX/Windows root without parent traversal."""
+
     if "\x00" in value or not value.strip():
         raise ValueError("workspace root must be a non-empty path without NUL")
     normalized = value.replace("\\", "/")
+    if value.startswith("\\") and not value.startswith("\\\\"):
+        raise ValueError("workspace root must be an absolute POSIX or Windows path")
+    is_posix_absolute = normalized.startswith("/")
+    is_windows_drive_absolute = bool(re.match(r"^[A-Za-z]:/", normalized))
+    if not (is_posix_absolute or is_windows_drive_absolute):
+        raise ValueError("workspace root must be an absolute POSIX or Windows path")
     if any(part == ".." for part in normalized.split("/")):
         raise ValueError("workspace root must not contain '..' segments")
     return value
@@ -84,10 +125,89 @@ def _validate_aware_datetime(value: datetime, field_name: str) -> datetime:
     return value
 
 
-def _unique(values: list[str], field_name: str) -> list[str]:
+def _unique(values: Sequence[str], field_name: str) -> Sequence[str]:
     if len(values) != len(set(values)):
         raise ValueError(f"{field_name} must not contain duplicates")
     return values
+
+
+def _validate_repository_url(value: HttpUrl | None) -> HttpUrl | None:
+    if value is None:
+        return None
+    text = str(value)
+    parsed = urlsplit(text)
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("repository URL must not contain userinfo")
+    if parsed.query or "?" in text:
+        raise ValueError("repository URL must not contain a query")
+    if parsed.fragment or "#" in text:
+        raise ValueError("repository URL must not contain a fragment")
+    return value
+
+
+_SECRET_EVENT_KEY_MARKERS = frozenset(
+    {
+        "accesskey",
+        "accesstoken",
+        "apikey",
+        "authorization",
+        "bearer",
+        "clientsecret",
+        "cookie",
+        "credential",
+        "credentials",
+        "password",
+        "passwd",
+        "privatekey",
+        "refreshtoken",
+        "secret",
+        "setcookie",
+        "token",
+    }
+)
+
+
+def _normalize_event_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.casefold())
+
+
+def _validate_event_key(value: str) -> str:
+    normalized = _normalize_event_key(value)
+    if not normalized:
+        raise ValueError("event attribute key must contain an alphanumeric character")
+    if any(marker in normalized for marker in _SECRET_EVENT_KEY_MARKERS):
+        raise ValueError("event attribute keys must not identify credential material")
+    return value
+
+
+def _looks_like_inline_credential(value: str) -> bool:
+    """Reject common credential encodings even when a safe-looking key is used."""
+
+    lower = value.casefold()
+    if "-----begin " in lower and " key-----" in lower:
+        return True
+    if re.search(r"\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{12,}", value, re.IGNORECASE):
+        return True
+    if re.search(
+        r"(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_-]{16,}|glpat-[A-Za-z0-9_-]{16,}|xox[baprs]-[A-Za-z0-9-]{12,})",
+        value,
+    ):
+        return True
+    if re.fullmatch(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", value):
+        return True
+    if re.search(
+        r"(?:^|[-_ ])(?:token|secret|password|credential)(?:$|[-_ ])",
+        value,
+        re.IGNORECASE,
+    ):
+        return True
+    return bool(
+        re.search(
+            r"(?:token|secret|password|api[ _-]?key|credential)\s*[:=]\s*\S+",
+            value,
+            re.IGNORECASE,
+        )
+    )
 
 
 class TaskRole(StrEnum):
@@ -116,12 +236,14 @@ class RepositoryIdentity(ContractModel):
     project: Identifier | None = None
     url: HttpUrl | None = None
 
+    _url_is_credential_free = field_validator("url")(_validate_repository_url)
+
 
 class WorkspaceIdentity(ContractModel):
     """A controller-bound workspace; agents receive this, not a database handle."""
 
     workspace_id: Identifier
-    root: str
+    root: StrictStr
     kind: Literal["git_worktree", "directory"] = "git_worktree"
 
     @field_validator("root")
@@ -145,8 +267,8 @@ class EvidenceRef(ContractModel):
 
     kind: EvidenceKind
     reference: Identifier
-    description: str | None = Field(default=None, max_length=2_048)
-    fingerprint: str | None = Field(default=None, min_length=1, max_length=256)
+    description: StrictStr | None = Field(default=None, max_length=2_048)
+    fingerprint: StrictStr | None = Field(default=None, min_length=1, max_length=256)
     revision: Revision | None = None
 
 
@@ -157,19 +279,25 @@ class AcceptanceCriterion(ContractModel):
 
 
 class CommandSpec(ContractModel):
-    """A controller-approved command description, not an arbitrary shell handle."""
+    """A controller-approved argv, executed by a caller with ``shell=False``."""
 
-    command: NonEmptyText
+    argv: tuple[NonEmptyText, ...] = Field(min_length=1)
     timeout_seconds: int = Field(default=120, ge=1, le=86_400)
     cwd: RelativePathValue | None = None
     network: Literal["denied", "bounded", "allowed"] = "denied"
 
-    @field_validator("command")
+    @field_validator("argv", mode="before")
     @classmethod
-    def command_is_single_line(cls, value: str) -> str:
-        if "\n" in value or "\r" in value:
-            raise ValueError("command must be a single-line command specification")
-        return value
+    def argv_is_a_sequence(cls, value: object) -> tuple[object, ...]:
+        return _as_tuple_input(value, "argv")
+
+    @field_validator("argv")
+    @classmethod
+    def argv_elements_are_non_empty(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        for element in values:
+            if "\x00" in element or "\n" in element or "\r" in element:
+                raise ValueError("argv elements must not contain NUL or newlines")
+        return values
 
     @field_validator("cwd")
     @classmethod
@@ -183,31 +311,38 @@ class Dependency(ContractModel):
 
 
 class TaskConstraints(ContractModel):
-    allowed_paths: list[RelativePathValue] = Field(default_factory=list)
-    protected_paths: list[RelativePathValue] = Field(default_factory=list)
-    dependencies: list[Dependency] = Field(default_factory=list)
+    allowed_paths: tuple[RelativePathValue, ...] = Field(default_factory=tuple)
+    protected_paths: tuple[RelativePathValue, ...] = Field(default_factory=tuple)
+    dependencies: tuple[Dependency, ...] = Field(default_factory=tuple)
     network: Literal["denied", "bounded", "allowed"] = "denied"
     max_changed_files: int | None = Field(default=None, ge=1)
 
+    @field_validator("allowed_paths", "protected_paths", mode="before")
+    @classmethod
+    def paths_are_sequences(cls, value: object, info) -> tuple[object, ...]:
+        return _as_tuple_input(value, info.field_name)
+
     @field_validator("allowed_paths", "protected_paths")
     @classmethod
-    def paths_are_relative(cls, values: list[str], info) -> list[str]:
-        field_name = info.field_name or "path"
-        return [_validate_relative_path(value, field_name) for value in values]
+    def paths_are_relative(cls, values: tuple[str, ...], info) -> tuple[str, ...]:
+        return tuple(
+            _validate_relative_path(value, info.field_name) for value in values
+        )
 
     @field_validator("dependencies", mode="before")
     @classmethod
-    def coerce_dependency_ids(cls, values):
-        if values is None:
-            return []
-        return [
-            {"task_id": value} if isinstance(value, str) else value for value in values
-        ]
+    def dependencies_are_sequence(cls, value: object) -> tuple[object, ...]:
+        values = _as_tuple_input(value, "dependencies")
+        return tuple(
+            {"task_id": item} if isinstance(item, str) else item for item in values
+        )
 
     @field_validator("dependencies")
     @classmethod
-    def dependencies_are_unique(cls, values: list[Dependency]) -> list[Dependency]:
-        _unique([value.task_id for value in values], "dependencies")
+    def dependencies_are_unique(
+        cls, values: tuple[Dependency, ...]
+    ) -> tuple[Dependency, ...]:
+        _unique(tuple(value.task_id for value in values), "dependencies")
         return values
 
 
@@ -222,11 +357,16 @@ class TaskEnvelope(ContractModel):
     base_revision: Revision
     candidate_revision: Revision | None = None
     objective: NonEmptyText
-    acceptance: list[AcceptanceCriterion] = Field(min_length=1)
+    acceptance: tuple[AcceptanceCriterion, ...] = Field(min_length=1)
     constraints: TaskConstraints = Field(default_factory=TaskConstraints)
-    allowed_commands: list[CommandSpec] = Field(default_factory=list)
-    evidence: list[EvidenceRef] = Field(default_factory=list)
+    allowed_commands: tuple[CommandSpec, ...] = Field(default_factory=tuple)
+    evidence: tuple[EvidenceRef, ...] = Field(default_factory=tuple)
     deadline: datetime
+
+    @field_validator("acceptance", "allowed_commands", "evidence", mode="before")
+    @classmethod
+    def nested_fields_are_sequences(cls, value: object, info) -> tuple[object, ...]:
+        return _as_tuple_input(value, info.field_name)
 
     @field_validator("deadline")
     @classmethod
@@ -236,9 +376,9 @@ class TaskEnvelope(ContractModel):
     @field_validator("acceptance")
     @classmethod
     def acceptance_ids_are_unique(
-        cls, values: list[AcceptanceCriterion]
-    ) -> list[AcceptanceCriterion]:
-        ids = [criterion.id for criterion in values if criterion.id is not None]
+        cls, values: tuple[AcceptanceCriterion, ...]
+    ) -> tuple[AcceptanceCriterion, ...]:
+        ids = tuple(criterion.id for criterion in values if criterion.id is not None)
         _unique(ids, "acceptance criterion ids")
         return values
 
@@ -274,24 +414,48 @@ class Blocker(ContractModel):
     blocking: bool = True
 
 
+class Failure(ContractModel):
+    code: Identifier
+    summary: NonEmptyText
+    owner: Identifier | None = None
+    retryable: bool = False
+
+
 class PlanTask(ContractModel):
     task_id: Identifier
     role: TaskRole
     objective: NonEmptyText
-    acceptance: list[AcceptanceCriterion] = Field(default_factory=list)
-    dependencies: list[Identifier] = Field(default_factory=list)
-    non_goals: list[NonEmptyText] = Field(default_factory=list)
+    acceptance: tuple[AcceptanceCriterion, ...] = Field(default_factory=tuple)
+    dependencies: tuple[Identifier, ...] = Field(default_factory=tuple)
+    non_goals: tuple[NonEmptyText, ...] = Field(default_factory=tuple)
+
+    @field_validator("acceptance", "dependencies", "non_goals", mode="before")
+    @classmethod
+    def plan_fields_are_sequences(cls, value: object, info) -> tuple[object, ...]:
+        return _as_tuple_input(value, info.field_name)
 
     @field_validator("dependencies")
     @classmethod
-    def plan_dependencies_are_unique(cls, values: list[str]) -> list[str]:
-        return _unique(values, "plan task dependencies")
+    def plan_dependencies_are_unique(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        _unique(values, "plan task dependencies")
+        return values
+
+    @model_validator(mode="after")
+    def task_does_not_depend_on_itself(self) -> PlanTask:
+        if self.task_id in self.dependencies:
+            raise ValueError("plan task dependency must not self-reference")
+        return self
 
 
 class DecisionRequest(ContractModel):
     key: Identifier
     question: NonEmptyText
-    options: list[NonEmptyText] = Field(default_factory=list)
+    options: tuple[NonEmptyText, ...] = Field(default_factory=tuple)
+
+    @field_validator("options", mode="before")
+    @classmethod
+    def options_are_sequence(cls, value: object) -> tuple[object, ...]:
+        return _as_tuple_input(value, "options")
 
 
 class PlanOutcome(ContractModel):
@@ -299,11 +463,52 @@ class PlanOutcome(ContractModel):
 
     status: Literal["planned", "ready", "needs_decision", "failed"]
     summary: NonEmptyText
-    tasks: list[PlanTask] = Field(default_factory=list)
-    decisions: list[DecisionRequest] = Field(default_factory=list)
-    assumptions: list[NonEmptyText] = Field(default_factory=list)
-    blockers: list[Blocker] = Field(default_factory=list)
+    tasks: tuple[PlanTask, ...] = Field(default_factory=tuple)
+    decisions: tuple[DecisionRequest, ...] = Field(default_factory=tuple)
+    assumptions: tuple[NonEmptyText, ...] = Field(default_factory=tuple)
+    blockers: tuple[Blocker, ...] = Field(default_factory=tuple)
     next_gate: NonEmptyText
+
+    @field_validator("tasks", "decisions", "assumptions", "blockers", mode="before")
+    @classmethod
+    def plan_outcome_fields_are_sequences(
+        cls, value: object, info
+    ) -> tuple[object, ...]:
+        return _as_tuple_input(value, info.field_name)
+
+    @model_validator(mode="after")
+    def dependency_graph_is_acyclic(self) -> PlanOutcome:
+        task_ids = tuple(task.task_id for task in self.tasks)
+        _unique(task_ids, "plan task ids")
+        known = set(task_ids)
+        graph: dict[str, tuple[str, ...]] = {}
+        for task in self.tasks:
+            for dependency in task.dependencies:
+                if dependency not in known:
+                    raise ValueError(
+                        f"plan task {task.task_id!r} references unknown dependency "
+                        f"{dependency!r}"
+                    )
+            graph[task.task_id] = task.dependencies
+
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(task_id: str, path: tuple[str, ...] = ()) -> None:
+            if task_id in visiting:
+                cycle = " -> ".join((*path, task_id))
+                raise ValueError(f"plan dependency cycle detected: {cycle}")
+            if task_id in visited:
+                return
+            visiting.add(task_id)
+            for dependency in graph[task_id]:
+                visit(dependency, (*path, task_id))
+            visiting.remove(task_id)
+            visited.add(task_id)
+
+        for task_id in graph:
+            visit(task_id)
+        return self
 
 
 class ChangedPath(ContractModel):
@@ -334,18 +539,30 @@ class ImplementationOutcome(ContractModel):
 
     status: Literal["candidate_ready", "needs_decision", "failed"]
     summary: NonEmptyText
-    changed_paths: list[RelativePathValue] = Field(default_factory=list)
+    changed_paths: tuple[RelativePathValue, ...] = Field(default_factory=tuple)
     candidate_revision: Revision | None = None
-    tests: list[TestEvidence] = Field(default_factory=list)
-    assumptions: list[NonEmptyText] = Field(default_factory=list)
-    blockers: list[Blocker] = Field(default_factory=list)
+    tests: tuple[TestEvidence, ...] = Field(default_factory=tuple)
+    assumptions: tuple[NonEmptyText, ...] = Field(default_factory=tuple)
+    blockers: tuple[Blocker, ...] = Field(default_factory=tuple)
     next_gate: NonEmptyText
+
+    @field_validator("changed_paths", "tests", "assumptions", "blockers", mode="before")
+    @classmethod
+    def implementation_fields_are_sequences(
+        cls, value: object, info
+    ) -> tuple[object, ...]:
+        return _as_tuple_input(value, info.field_name)
 
     @field_validator("changed_paths")
     @classmethod
-    def changed_paths_are_relative_and_unique(cls, values: list[str]) -> list[str]:
-        checked = [_validate_relative_path(value, "changed_paths") for value in values]
-        return _unique(checked, "changed_paths")
+    def changed_paths_are_relative_and_unique(
+        cls, values: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        checked = tuple(
+            _validate_relative_path(value, "changed_paths") for value in values
+        )
+        _unique(checked, "changed_paths")
+        return checked
 
     @model_validator(mode="after")
     def candidate_status_is_consistent(self) -> ImplementationOutcome:
@@ -375,22 +592,30 @@ class ReviewOutcome(ContractModel):
 
     verdict: Literal["APPROVED", "CHANGES_REQUESTED", "REVIEW_INCOMPLETE"]
     candidate_revision: Revision
-    reviewed_scope: list[ChangedPath] = Field(min_length=1)
-    findings: list[ReviewFinding] = Field(default_factory=list)
-    evidence: list[EvidenceRef] = Field(default_factory=list)
+    reviewed_scope: tuple[ChangedPath, ...] = Field(min_length=1)
+    findings: tuple[ReviewFinding, ...] = Field(default_factory=tuple)
+    evidence: tuple[EvidenceRef, ...] = Field(default_factory=tuple)
     mutation_detected: bool = False
 
     @field_validator("reviewed_scope", mode="before")
     @classmethod
-    def coerce_scope_paths(cls, values):
-        return [
-            value if isinstance(value, dict) else {"path": value} for value in values
-        ]
+    def scope_is_a_sequence(cls, value: object) -> tuple[object, ...]:
+        values = _as_tuple_input(value, "reviewed_scope")
+        return tuple(
+            item if isinstance(item, Mapping) else {"path": item} for item in values
+        )
+
+    @field_validator("findings", "evidence", mode="before")
+    @classmethod
+    def review_fields_are_sequences(cls, value: object, info) -> tuple[object, ...]:
+        return _as_tuple_input(value, info.field_name)
 
     @field_validator("reviewed_scope")
     @classmethod
-    def scope_paths_are_unique(cls, values: list[ChangedPath]) -> list[ChangedPath]:
-        _unique([value.path for value in values], "reviewed_scope")
+    def scope_paths_are_unique(
+        cls, values: tuple[ChangedPath, ...]
+    ) -> tuple[ChangedPath, ...]:
+        _unique(tuple(value.path for value in values), "reviewed_scope")
         return values
 
     @model_validator(mode="after")
@@ -400,18 +625,54 @@ class ReviewOutcome(ContractModel):
         return self
 
 
+class EventAttribute(ContractModel):
+    """One scalar event attribute; compound payloads are intentionally forbidden."""
+
+    key: EventKey
+    value: EventScalar
+
+    @field_validator("key")
+    @classmethod
+    def key_is_not_secret_bearing(cls, value: str) -> str:
+        return _validate_event_key(value)
+
+    @field_validator("value")
+    @classmethod
+    def value_is_safe_scalar(cls, value: EventScalar) -> EventScalar:
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("event attribute values must be JSON-safe finite scalars")
+        if isinstance(value, str) and _looks_like_inline_credential(value):
+            raise ValueError(
+                "event attributes must not contain inline credential material"
+            )
+        return value
+
+
 class FactoryEvent(ContractModel):
-    """An append-only, provider-neutral event attached to a run."""
+    """An append-only event with immutable typed scalar attributes."""
 
     event_type: Identifier
     run: RunIdentity
     occurred_at: datetime
-    data: dict[str, object] = Field(default_factory=dict)
+    attributes: tuple[EventAttribute, ...] = Field(default_factory=tuple)
+
+    @field_validator("attributes", mode="before")
+    @classmethod
+    def attributes_are_a_sequence(cls, value: object) -> tuple[object, ...]:
+        return _as_tuple_input(value, "attributes")
 
     @field_validator("occurred_at")
     @classmethod
     def event_time_is_aware(cls, value: datetime) -> datetime:
         return _validate_aware_datetime(value, "occurred_at")
+
+    @model_validator(mode="after")
+    def normalized_attribute_keys_are_unique(self) -> FactoryEvent:
+        keys = tuple(
+            _normalize_event_key(attribute.key) for attribute in self.attributes
+        )
+        _unique(keys, "event attribute keys")
+        return self
 
 
 class Lease(ContractModel):
@@ -429,8 +690,39 @@ class ClaimedRun(ContractModel):
     lease: Lease
     envelope: TaskEnvelope
 
+    @model_validator(mode="after")
+    def identities_agree(self) -> ClaimedRun:
+        identities = (self.run, self.lease.run)
+        if any(identity.task_id != self.run.task_id for identity in identities):
+            raise ValueError("claimed run task_id identities must agree")
+        if any(identity.run_id != self.run.run_id for identity in identities):
+            raise ValueError("claimed run run_id identities must agree")
+        if self.envelope.task_id != self.run.task_id:
+            raise ValueError("claimed run envelope task_id must agree with run")
+        if self.envelope.run_id != self.run.run_id:
+            raise ValueError("claimed run envelope run_id must agree with run")
+        return self
 
-ValidatedOutcome: TypeAlias = PlanOutcome | ImplementationOutcome | ReviewOutcome
+
+class BlockedOutcome(ContractModel):
+    """Explicit terminal representation for a policy/controller blocker."""
+
+    status: Literal["blocked"] = "blocked"
+    blocker: Blocker
+    next_gate: NonEmptyText
+
+
+class FailedOutcome(ContractModel):
+    """Explicit terminal representation for a failed run."""
+
+    status: Literal["failed"] = "failed"
+    failure: Failure
+    next_gate: NonEmptyText
+
+
+ValidatedOutcome: TypeAlias = (
+    PlanOutcome | ImplementationOutcome | ReviewOutcome | BlockedOutcome | FailedOutcome
+)
 
 
 class TaskState(ContractModel):
@@ -439,6 +731,36 @@ class TaskState(ContractModel):
     run: RunIdentity | None = None
     outcome: ValidatedOutcome | None = None
 
+    @model_validator(mode="after")
+    def lifecycle_fields_are_coherent(self) -> TaskState:
+        if self.run is not None and self.run.task_id != self.task_id:
+            raise ValueError("task state run.task_id must agree with task_id")
+        if self.state == "queued":
+            if self.run is not None or self.outcome is not None:
+                raise ValueError("queued task state must not include a run or outcome")
+            return self
+        if self.state in {"claimed", "running"}:
+            if self.run is None:
+                raise ValueError(f"{self.state} task state requires a run")
+            if self.outcome is not None:
+                raise ValueError(f"{self.state} task state must not include an outcome")
+            return self
+        if self.state == "completed":
+            if self.run is None or self.outcome is None:
+                raise ValueError("completed task state requires a run and outcome")
+            if isinstance(self.outcome, (BlockedOutcome, FailedOutcome)):
+                raise ValueError(
+                    "completed task state cannot carry a blocked or failed outcome"
+                )
+            return self
+        if self.run is None:
+            raise ValueError(f"{self.state} task state requires a run")
+        if self.state == "blocked" and not isinstance(self.outcome, BlockedOutcome):
+            raise ValueError("blocked task state requires an explicit BlockedOutcome")
+        if self.state == "failed" and not isinstance(self.outcome, FailedOutcome):
+            raise ValueError("failed task state requires an explicit FailedOutcome")
+        return self
+
 
 # Short aliases used by callers that treat these as the control-plane nouns.
 Evidence: TypeAlias = EvidenceRef
@@ -446,20 +768,29 @@ Plan: TypeAlias = PlanOutcome
 Implementation: TypeAlias = ImplementationOutcome
 Review: TypeAlias = ReviewOutcome
 Run: TypeAlias = RunIdentity
+BlockerOutcome: TypeAlias = BlockedOutcome
+FailureOutcome: TypeAlias = FailedOutcome
 
 __all__ = [
     "AcceptanceCriterion",
+    "BlockedOutcome",
     "Blocker",
+    "BlockerOutcome",
     "ChangedPath",
     "ClaimedRun",
     "CommandSpec",
     "ContractModel",
     "DecisionRequest",
     "Dependency",
+    "EventAttribute",
+    "EventScalar",
     "Evidence",
     "EvidenceKind",
     "EvidenceRef",
     "FactoryEvent",
+    "FailedOutcome",
+    "Failure",
+    "FailureOutcome",
     "Implementation",
     "ImplementationOutcome",
     "Lease",

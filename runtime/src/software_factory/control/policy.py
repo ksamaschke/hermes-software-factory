@@ -2,20 +2,26 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import math
+import re
+from collections.abc import Mapping, Sequence
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, TypeAlias
+from urllib.parse import urlsplit
 
 import yaml
 from pydantic import (
+    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
+    StrictStr,
     ValidationError,
     field_validator,
     model_validator,
 )
+from yaml.constructor import ConstructorError
 
 from ..api.contracts import Identifier, Revision
 
@@ -33,18 +39,103 @@ class ExecutorKind(StrEnum):
 class PolicyModel(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
+        frozen=True,
         str_strip_whitespace=True,
         validate_assignment=True,
     )
 
 
+def _as_tuple_input(value: object, field_name: str) -> tuple[object, ...]:
+    if isinstance(value, (str, bytes, bytearray, Mapping)) or not isinstance(
+        value, Sequence
+    ):
+        raise ValueError(  # noqa: TRY004 - Pydantic v2 escapes TypeError from validators
+            f"{field_name} must be a sequence, not a scalar or mapping"
+        )
+    return tuple(value)
+
+
+def _json_safe_value(value: object, path: str) -> object:
+    """Copy only JSON values, rejecting handles and provider objects."""
+
+    if value is None or type(value) in {bool, int, str}:
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError(f"{path} must contain finite JSON numbers")
+        return value
+    if isinstance(value, Mapping):
+        result: dict[str, object] = {}
+        for key, nested in value.items():
+            if type(key) is not str:
+                raise ValueError(f"{path} mapping keys must be strings")
+            result[key] = _json_safe_value(nested, f"{path}.{key}")
+        return result
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(item, f"{path}[]") for item in value]
+    raise ValueError(
+        f"{path} must contain only JSON-safe scalar, array, or mapping values"
+    )
+
+
+def _json_safe_mapping(value: object, field_name: str) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError(  # noqa: TRY004 - Pydantic v2 escapes TypeError from validators
+            f"{field_name} must be a JSON-safe mapping"
+        )
+    checked = _json_safe_value(value, field_name)
+    assert isinstance(checked, dict)
+    return checked
+
+
+_ALLOWED_CREDENTIAL_SCHEMES = frozenset(
+    {
+        "env",
+        "secret",
+        "secrets",
+        "vault",
+        "aws-secretsmanager",
+        "gcp-secretmanager",
+        "azure-keyvault",
+        "keyring",
+    }
+)
+
+
+def _validate_credential_reference(value: str) -> str:
+    if "\x00" in value or any(character.isspace() for character in value):
+        raise ValueError("credential references must not contain whitespace or NUL")
+    parsed = urlsplit(value)
+    scheme = parsed.scheme.casefold()
+    if scheme not in _ALLOWED_CREDENTIAL_SCHEMES or not re.match(
+        r"^[A-Za-z][A-Za-z0-9+.-]*://", value
+    ):
+        raise ValueError("credential reference must use an allowlisted explicit scheme")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("credential reference must not contain userinfo")
+    if parsed.query or "?" in value:
+        raise ValueError("credential reference must not contain a query")
+    if parsed.fragment or "#" in value:
+        raise ValueError("credential reference must not contain a fragment")
+    if not parsed.netloc and not parsed.path:
+        raise ValueError("credential reference must identify a secret-store reference")
+    return value
+
+
+CredentialReference: TypeAlias = Annotated[
+    StrictStr,
+    Field(min_length=1, max_length=1_024),
+    AfterValidator(_validate_credential_reference),
+]
+
+
 class AgentDefinition(PolicyModel):
     framework: Literal["pydantic_ai"] = "pydantic_ai"
-    prompt: str
+    prompt: StrictStr
     output_contract: Identifier
     static_prompt_token_target: int | None = Field(default=None, ge=1)
     visible_tool_limit: int | None = Field(default=None, ge=1)
-    capabilities: list[Identifier] = Field(default_factory=list)
+    capabilities: tuple[Identifier, ...] = Field(default_factory=tuple)
 
     @field_validator("prompt")
     @classmethod
@@ -55,9 +146,14 @@ class AgentDefinition(PolicyModel):
             raise ValueError("agent prompt must not contain ambiguous path segments")
         return value
 
+    @field_validator("capabilities", mode="before")
+    @classmethod
+    def capabilities_are_sequence(cls, value: object) -> tuple[object, ...]:
+        return _as_tuple_input(value, "capabilities")
+
     @field_validator("capabilities")
     @classmethod
-    def capabilities_are_unique(cls, values: list[str]) -> list[str]:
+    def capabilities_are_unique(cls, values: tuple[str, ...]) -> tuple[str, ...]:
         if len(values) != len(set(values)):
             raise ValueError("agent capabilities must not contain duplicates")
         return values
@@ -85,15 +181,20 @@ class ProviderKind(StrEnum):
 class ProviderDefinition(PolicyModel):
     kind: ProviderKind
     credential_source: Identifier | None = None
-    credential_reference: str | None = None
+    credential_reference: CredentialReference | None = None
     max_in_progress: int | None = Field(default=None, ge=1)
     refresh_lock: Literal["required", "optional", "disabled"] | None = None
     fallback_provider: Identifier | None = None
-    models: list[Revision] = Field(default_factory=list)
+    models: tuple[Revision, ...] = Field(default_factory=tuple)
+
+    @field_validator("models", mode="before")
+    @classmethod
+    def models_are_sequence(cls, value: object) -> tuple[object, ...]:
+        return _as_tuple_input(value, "models")
 
     @field_validator("models")
     @classmethod
-    def models_are_unique(cls, values: list[str]) -> list[str]:
+    def models_are_unique(cls, values: tuple[str, ...]) -> tuple[str, ...]:
         if len(values) != len(set(values)):
             raise ValueError("provider models must not contain duplicates")
         return values
@@ -145,27 +246,6 @@ class RoleRoute(PolicyModel):
         return self
 
 
-class CompatibilityPolicy(PolicyModel):
-    canary_only: bool = True
-    default_executor: ExecutorKind = ExecutorKind.HERMES_PROFILE
-    fallback_executors: dict[str, RoleRoute] = Field(default_factory=dict)
-    allow_backend_change_on_retry: Literal["explicit_policy_only"] = (
-        "explicit_policy_only"
-    )
-
-    @field_validator("fallback_executors")
-    @classmethod
-    def fallback_role_names_are_known(
-        cls, values: dict[str, RoleRoute]
-    ) -> dict[str, RoleRoute]:
-        unknown = sorted(set(values) - ROLE_KEYS)
-        if unknown:
-            raise ValueError(
-                f"unknown compatibility fallback role(s): {', '.join(unknown)}"
-            )
-        return values
-
-
 class HandlerDefinition(PolicyModel):
     """Optional declaration for a project-owned deterministic handler."""
 
@@ -198,29 +278,101 @@ BUILTIN_DETERMINISTIC_HANDLERS = frozenset(
 )
 
 
-class FactoryPolicy(BaseModel):
+class LegacySettings(PolicyModel):
+    """Typed preservation of the old ``profiles`` compatibility section."""
+
+    orchestrator: Identifier
+    planner: Identifier | None = None
+    implementer: Identifier
+    reviewer: Identifier | None = None
+    code_reviewer: Identifier
+    completion_verifier: Identifier | None = None
+    integration_operator: Identifier | None = None
+    qa_ui: Identifier | None = None
+    release_operator: Identifier | None = None
+    code_reviewer_model_default: Revision | None = None
+    code_reviewer_model_routine: Revision | None = None
+    implementer_vendor_family: Identifier | None = None
+    code_reviewer_vendor_family: Identifier | None = None
+
+
+class CompatibilityPolicy(PolicyModel):
+    canary_only: bool = True
+    default_executor: ExecutorKind = ExecutorKind.HERMES_PROFILE
+    fallback_executors: dict[str, RoleRoute] = Field(default_factory=dict)
+    allow_backend_change_on_retry: Literal["explicit_policy_only"] = (
+        "explicit_policy_only"
+    )
+    legacy_settings: LegacySettings | None = None
+
+    @field_validator("fallback_executors")
+    @classmethod
+    def fallback_role_names_are_known(
+        cls, values: dict[str, RoleRoute]
+    ) -> dict[str, RoleRoute]:
+        unknown = sorted(set(values) - ROLE_KEYS)
+        if unknown:
+            raise ValueError(
+                f"unknown compatibility fallback role(s): {', '.join(unknown)}"
+            )
+        return values
+
+
+class FactoryPolicy(PolicyModel):
     """Validated runtime policy with strict route references.
 
-    The architecture example contains additional operational sections (state,
-    workspace, review, credentials, and observability). They are intentionally
-    retained as opaque data here: this issue validates routing and compatibility
-    without pretending to implement the live dispatcher.
+    Architecture and legacy operational sections are explicitly declared as
+    opaque JSON-safe mappings. Their semantics belong to later control-plane
+    components, but unknown top-level sections are never silently accepted.
     """
-
-    model_config = ConfigDict(
-        extra="allow",
-        str_strip_whitespace=True,
-        validate_assignment=True,
-    )
 
     version: Literal[1] = 1
     runtime: dict[str, object] = Field(default_factory=dict)
     transport: dict[str, object] = Field(default_factory=dict)
+    state: dict[str, object] = Field(default_factory=dict)
+    workspace: dict[str, object] = Field(default_factory=dict)
+    review: dict[str, object] = Field(default_factory=dict)
+    credentials: dict[str, object] = Field(default_factory=dict)
+    observability: dict[str, object] = Field(default_factory=dict)
+    migration_gates: dict[str, object] = Field(default_factory=dict)
+    tracker: dict[str, object] = Field(default_factory=dict)
+    decision_authority: dict[str, object] = Field(default_factory=dict)
+    operator_bridge: dict[str, object] = Field(default_factory=dict)
+    kanban: dict[str, object] = Field(default_factory=dict)
+    verification: dict[str, object] = Field(default_factory=dict)
+    safety: dict[str, object] = Field(default_factory=dict)
+    delivery: dict[str, object] = Field(default_factory=dict)
+    deployment: dict[str, object] = Field(default_factory=dict)
+    notifications: dict[str, object] = Field(default_factory=dict)
     providers: dict[str, ProviderDefinition] = Field(default_factory=dict)
     agents: dict[str, AgentDefinition] = Field(default_factory=dict)
     handlers: dict[str, HandlerDefinition] = Field(default_factory=dict)
-    roles: dict[str, RoleRoute]
+    roles: dict[str, RoleRoute] = Field(min_length=1)
     compatibility: CompatibilityPolicy = Field(default_factory=CompatibilityPolicy)
+
+    @field_validator(
+        "runtime",
+        "transport",
+        "state",
+        "workspace",
+        "review",
+        "credentials",
+        "observability",
+        "migration_gates",
+        "tracker",
+        "decision_authority",
+        "operator_bridge",
+        "kanban",
+        "verification",
+        "safety",
+        "delivery",
+        "deployment",
+        "notifications",
+        mode="before",
+    )
+    @classmethod
+    def sections_are_json_safe(cls, value: object, info) -> dict[str, object]:
+        return _json_safe_mapping(value, info.field_name)
 
     @field_validator("providers", "agents", "handlers")
     @classmethod
@@ -244,13 +396,14 @@ class FactoryPolicy(BaseModel):
 
     @model_validator(mode="after")
     def all_routes_resolve(self) -> FactoryPolicy:
+        handlers = set(BUILTIN_DETERMINISTIC_HANDLERS) | set(self.handlers)
         for role, route in self.roles.items():
             _validate_route_references(
                 role,
                 route,
                 agents=self.agents,
                 providers=self.providers,
-                handlers=set(BUILTIN_DETERMINISTIC_HANDLERS) | set(self.handlers),
+                handlers=handlers,
             )
         for role, route in self.compatibility.fallback_executors.items():
             _validate_route_references(
@@ -258,17 +411,9 @@ class FactoryPolicy(BaseModel):
                 route,
                 agents=self.agents,
                 providers=self.providers,
-                handlers=set(BUILTIN_DETERMINISTIC_HANDLERS) | set(self.handlers),
+                handlers=handlers,
             )
-        for name, provider in self.providers.items():
-            if (
-                provider.fallback_provider is not None
-                and provider.fallback_provider not in self.providers
-            ):
-                raise ValueError(
-                    f"providers.{name}.fallback_provider references unknown provider "
-                    f"{provider.fallback_provider!r}"
-                )
+        _validate_provider_fallback_graph(self.providers)
         return self
 
 
@@ -293,7 +438,9 @@ def _validate_route_references(
         )
     if route.model is None:
         return
-    provider = providers[route.provider]  # route shape guarantees provider is present
+    if route.provider is None or route.provider not in providers:
+        return
+    provider = providers[route.provider]
     if provider.models and route.model not in provider.models:
         raise ValueError(
             f"{prefix}.model references an undeclared model {route.model!r} for "
@@ -322,12 +469,82 @@ def _validate_route_references(
         )
 
 
+def _validate_provider_fallback_graph(
+    providers: Mapping[str, ProviderDefinition],
+) -> None:
+    """Reject fallback self-links and cycles before routing can use them."""
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(provider_name: str, path: tuple[str, ...] = ()) -> None:
+        if provider_name in visiting:
+            cycle = " -> ".join((*path, provider_name))
+            raise ValueError(f"provider fallback cycle detected: {cycle}")
+        if provider_name in visited:
+            return
+        visiting.add(provider_name)
+        fallback = providers[provider_name].fallback_provider
+        if fallback is not None:
+            if fallback not in providers:
+                raise ValueError(
+                    f"providers.{provider_name}.fallback_provider references unknown provider "
+                    f"{fallback!r}"
+                )
+            visit(fallback, (*path, provider_name))
+        visiting.remove(provider_name)
+        visited.add(provider_name)
+
+    for provider_name in providers:
+        visit(provider_name)
+
+
 # Compatibility names used by callers that prefer generic policy terminology.
 ProjectPolicy = FactoryPolicy
 Policy = FactoryPolicy
 ExecutorRoute = RoleRoute
 AgentSpec = AgentDefinition
 ProviderSpec = ProviderDefinition
+
+
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    """Safe YAML loader that rejects duplicate mapping keys."""
+
+
+def _construct_unique_mapping(loader: _UniqueKeySafeLoader, node, deep: bool = False):
+    if not isinstance(node, yaml.MappingNode):
+        raise ConstructorError(None, None, "expected a mapping node", node.start_mark)
+    mapping: dict[object, object] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in mapping
+        except TypeError as exc:
+            raise ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                "mapping keys must be hashable",
+                key_node.start_mark,
+            ) from exc
+        if duplicate:
+            raise ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"found duplicate key {key!r}",
+                key_node.start_mark,
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_UniqueKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
+
+
+def _load_yaml(text: str) -> object:
+    return yaml.load(text, Loader=_UniqueKeySafeLoader)
 
 
 def _read_document(source: str | Path | Mapping[str, Any]) -> dict[str, Any]:
@@ -340,9 +557,9 @@ def _read_document(source: str | Path | Mapping[str, Any]) -> dict[str, Any]:
         )
         if looks_like_yaml:
             try:
-                document = yaml.safe_load(raw_source)
+                document = _load_yaml(raw_source)
             except yaml.YAMLError as exc:
-                raise PolicyError("policy text is not valid YAML") from exc
+                raise PolicyError(f"policy text is not valid YAML: {exc}") from exc
         else:
             path = Path(source)
             try:
@@ -353,47 +570,53 @@ def _read_document(source: str | Path | Mapping[str, Any]) -> dict[str, Any]:
                 ) from exc
             if exists:
                 try:
-                    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+                    document = _load_yaml(path.read_text(encoding="utf-8"))
                 except OSError as exc:
                     raise PolicyError(f"cannot read policy {path}: {exc}") from exc
                 except yaml.YAMLError as exc:
-                    raise PolicyError(f"policy {path} is not valid YAML") from exc
+                    raise PolicyError(
+                        f"policy {path} is not valid YAML: {exc}"
+                    ) from exc
             else:
                 try:
-                    document = yaml.safe_load(raw_source)
+                    document = _load_yaml(raw_source)
                 except yaml.YAMLError as exc:
                     raise PolicyError(
-                        f"policy path does not exist and text is invalid: {source}"
+                        f"policy path does not exist and text is invalid: {source}: {exc}"
                     ) from exc
     if not isinstance(document, dict):
         raise PolicyError("project policy must be a YAML mapping")
     return document
 
 
+_LEGACY_ROUTE_ROLES = (
+    "orchestrator",
+    "planner",
+    "implementer",
+    "reviewer",
+    "code_reviewer",
+    "completion_verifier",
+    "integration_operator",
+    "qa_ui",
+    "release_operator",
+)
+
+
 def _legacy_policy(document: Mapping[str, Any]) -> dict[str, Any]:
     profiles = document.get("profiles")
     if not isinstance(profiles, Mapping):
         raise PolicyError("legacy project policy requires a profiles mapping")
-    required = ("orchestrator", "implementer", "code_reviewer")
-    missing = [key for key in required if key not in profiles]
-    if missing:
-        raise PolicyError(
-            "legacy project policy is missing required profile(s): "
-            + ", ".join(missing)
-        )
+    try:
+        legacy_settings = LegacySettings.model_validate(profiles)
+    except ValidationError as exc:
+        raise PolicyError(f"invalid legacy profile settings: {exc}") from exc
 
     roles: dict[str, dict[str, str]] = {}
     fallbacks: dict[str, dict[str, str]] = {}
-    for role in ROLE_KEYS:
-        if role not in profiles or profiles[role] is None:
+    for role in _LEGACY_ROUTE_ROLES:
+        profile = getattr(legacy_settings, role)
+        if profile is None:
             continue
-        profile = profiles[role]
-        if (
-            not isinstance(profile, str)
-            or not profile.strip()
-            or any(character.isspace() for character in profile)
-        ):
-            raise PolicyError(f"profiles.{role} must be a non-empty profile name")
         route = {"executor": ExecutorKind.HERMES_PROFILE.value, "profile": profile}
         roles[role] = route
         fallbacks[role] = dict(route)
@@ -408,6 +631,7 @@ def _legacy_policy(document: Mapping[str, Any]) -> dict[str, Any]:
         "default_executor": ExecutorKind.HERMES_PROFILE.value,
         "fallback_executors": fallbacks,
         "allow_backend_change_on_retry": "explicit_policy_only",
+        "legacy_settings": legacy_settings.model_dump(mode="python"),
     }
     return mapped
 
@@ -445,10 +669,12 @@ __all__ = [
     "AgentDefinition",
     "AgentSpec",
     "CompatibilityPolicy",
+    "CredentialReference",
     "ExecutorKind",
     "ExecutorRoute",
     "FactoryPolicy",
     "HandlerDefinition",
+    "LegacySettings",
     "Policy",
     "PolicyError",
     "ProjectPolicy",
