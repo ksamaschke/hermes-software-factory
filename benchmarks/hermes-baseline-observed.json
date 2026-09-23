@@ -1,5 +1,5 @@
 {
-  "captured_at_utc": "2026-09-23T19:28:15Z",
+  "captured_at_utc": "2026-09-23T20:02:20Z",
   "command_contract": {
     "acknowledgement": "ack_local_hermes_persistence_required",
     "expected_response": "Hermes baseline OK.",
@@ -28,24 +28,24 @@
     "secret_environment_passed": false,
     "values_recorded": false
   },
-  "evidence_fingerprint": "sha256:250648fdbf52fcffbb31b8c7ef50fca74a1db4aa2d3d83483acfbb5f10c4ee67",
+  "evidence_fingerprint": "sha256:246ce416c3ed0584f0f23aa4cc9e09932cf8e64e8fe5a68747c621700fd5159e",
   "execution": {
     "cwd_non_git": true,
     "exit_code": 0,
     "measurement_helper": "fresh_helper_only_child_hermes",
-    "peak_rss_bytes": 232984576,
+    "peak_rss_bytes": 233938944,
     "response_contract_satisfied": true,
     "rss_scope": "max_child_rss_not_aggregate_process_tree",
     "stderr_recorded": false,
     "stdout_recorded": false,
     "timed_out": false,
-    "wall_time_ms": 5936.478
+    "wall_time_ms": 10204.671
   },
   "identity": {
-    "capture_source_revision": "7a69764896cb7ab64e51c8049228237a687906ae",
+    "capture_source_revision": "a337711c4da6c1a66e860e31641cbdd251ffbd75",
     "clean_before_capture": true,
     "factory_base_revision": "0c32430ab1243e060f21bab98c109e4f21d0a402",
-    "factory_head_revision": "7a69764896cb7ab64e51c8049228237a687906ae",
+    "factory_head_revision": "a337711c4da6c1a66e860e31641cbdd251ffbd75",
     "hermes_profile": "implementer",
     "hermes_source_revision": "044a77b3b6af4ce16138d42762f812a20b9f7a89",
     "hermes_version": "0.21.2",
@@ -65,10 +65,10 @@
     "cache_write_tokens": 0,
     "input_tokens": 21772,
     "model_calls": 1,
-    "output_tokens": 36,
-    "peak_rss_bytes": 232984576,
+    "output_tokens": 33,
+    "peak_rss_bytes": 233938944,
     "tool_calls": 0,
-    "wall_time_ms": 5936.478
+    "wall_time_ms": 10204.671
   },
   "profile_contract": {
     "auth_material_recorded": false,
@@ -90,9 +90,9 @@
   "record_type": "observed_hermes_baseline",
   "schema_version": 2,
   "source_binding": {
-    "capture_source_revision": "7a69764896cb7ab64e51c8049228237a687906ae",
+    "capture_source_revision": "a337711c4da6c1a66e860e31641cbdd251ffbd75",
     "fingerprint_scope": "capture_executable_source_bytes",
-    "source_sha256": "sha256:da5069d34bf680f7c8dbe2f08a935f8ff2fd6bf59fdc7d28e21153e41b178e07"
+    "source_sha256": "sha256:a1ca93edf5d27104823b7d644419918ad2e7b32ae32722ae2cd0bd8c5cdb0f03"
   },
   "usage_evidence": {
     "available_fields": [
