@@ -1,0 +1,116 @@
+{
+  "captured_at_utc": "2026-09-23T20:02:20Z",
+  "command_contract": {
+    "acknowledgement": "ack_local_hermes_persistence_required",
+    "expected_response": "Hermes baseline OK.",
+    "fixed_prompt": "Do not use tools. Reply with exactly: Hermes baseline OK.",
+    "mode": "bounded_one_shot",
+    "model": "openai-codex:gpt-5.6-luna",
+    "profile": "implementer",
+    "repository_access": "none",
+    "stderr": "not_captured",
+    "stdout": "captured_in_memory_then_discarded",
+    "timeout_seconds": 120,
+    "tool_override": "none",
+    "tools": "profile_default",
+    "usage_evidence": "sanitized_usage_file",
+    "working_directory": "fresh_temporary_non_git"
+  },
+  "environment_contract": {
+    "allowlist_categories": [
+      "HOME",
+      "PATH",
+      "LOCALE",
+      "TLS_PROXY"
+    ],
+    "control_plane_variables_removed": true,
+    "kanban_variables_removed": true,
+    "secret_environment_passed": false,
+    "values_recorded": false
+  },
+  "evidence_fingerprint": "sha256:246ce416c3ed0584f0f23aa4cc9e09932cf8e64e8fe5a68747c621700fd5159e",
+  "execution": {
+    "cwd_non_git": true,
+    "exit_code": 0,
+    "measurement_helper": "fresh_helper_only_child_hermes",
+    "peak_rss_bytes": 233938944,
+    "response_contract_satisfied": true,
+    "rss_scope": "max_child_rss_not_aggregate_process_tree",
+    "stderr_recorded": false,
+    "stdout_recorded": false,
+    "timed_out": false,
+    "wall_time_ms": 10204.671
+  },
+  "identity": {
+    "capture_source_revision": "a337711c4da6c1a66e860e31641cbdd251ffbd75",
+    "clean_before_capture": true,
+    "factory_base_revision": "0c32430ab1243e060f21bab98c109e4f21d0a402",
+    "factory_head_revision": "a337711c4da6c1a66e860e31641cbdd251ffbd75",
+    "hermes_profile": "implementer",
+    "hermes_source_revision": "044a77b3b6af4ce16138d42762f812a20b9f7a89",
+    "hermes_version": "0.21.2",
+    "qualified_model": "openai-codex:gpt-5.6-luna"
+  },
+  "local_side_effects": {
+    "credential_store_read": "expected",
+    "external_repository_mutations": "not_performed_by_contract",
+    "factory_task_mutations": "not_performed_by_contract",
+    "observed_record_write": "checked_in_record_only",
+    "profile_log_writes": "expected",
+    "profile_session_db_writes": "expected"
+  },
+  "metric_unavailable_reasons": {},
+  "metrics": {
+    "cache_read_tokens": 0,
+    "cache_write_tokens": 0,
+    "input_tokens": 21772,
+    "model_calls": 1,
+    "output_tokens": 33,
+    "peak_rss_bytes": 233938944,
+    "tool_calls": 0,
+    "wall_time_ms": 10204.671
+  },
+  "profile_contract": {
+    "auth_material_recorded": false,
+    "contents_recorded": false,
+    "fingerprint": "sha256:d482186815cc847d4e981ea43e94fe768b58a39cc4c17a962c20c3cc1d3fb76d",
+    "metadata_only": true
+  },
+  "provenance": {
+    "fingerprint_semantics": "self_consistency_digest_not_attestation",
+    "kind": "observed_benign_hermes_smoke",
+    "observed": true,
+    "raw_logs_recorded": false,
+    "raw_output_recorded": false,
+    "raw_prompts_recorded": false,
+    "redaction": "Response, stderr, raw usage failures, prompts beyond the fixed public phrase, environment values, credentials, session identifiers, and logs are not retained.",
+    "sanitized": true,
+    "synthetic": false
+  },
+  "record_type": "observed_hermes_baseline",
+  "schema_version": 2,
+  "source_binding": {
+    "capture_source_revision": "a337711c4da6c1a66e860e31641cbdd251ffbd75",
+    "fingerprint_scope": "capture_executable_source_bytes",
+    "source_sha256": "sha256:a1ca93edf5d27104823b7d644419918ad2e7b32ae32722ae2cd0bd8c5cdb0f03"
+  },
+  "usage_evidence": {
+    "available_fields": [
+      "api_calls",
+      "cache_read_tokens",
+      "cache_write_tokens",
+      "input_tokens",
+      "output_tokens"
+    ],
+    "completed": true,
+    "failed": false,
+    "model": "gpt-5.6-luna",
+    "prompts_recorded": false,
+    "provider": "openai-codex",
+    "raw_logs_recorded": false,
+    "read": true,
+    "session_identifier_recorded": false,
+    "source": "Hermes one-shot --usage-file",
+    "unavailable_reasons": {}
+  }
+}

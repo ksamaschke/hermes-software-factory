@@ -1,0 +1,738 @@
+{
+  "schema_version": 3,
+  "corpus_id": "pydantic-agent-factory-migration-v1",
+  "baseline": {
+    "hermes_profile": "implementer",
+    "model": "openai-codex:gpt-5.6-luna",
+    "runtime_revision": "0c32430ab1243e060f21bab98c109e4f21d0a402"
+  },
+  "provenance": {
+    "kind": "synthetic_test_vectors",
+    "synthetic": true,
+    "observed": false,
+    "observed_production_data": false,
+    "redaction": "Synthetic vectors only; no observed task data or arbitrary text is retained."
+  },
+  "replay": {
+    "deterministic": true,
+    "network": false,
+    "writes_files": false,
+    "mutates_factory_tasks": false,
+    "accesses_external_repositories": false,
+    "requires_credentials": false
+  },
+  "fixtures": [
+    {
+      "id": "fixture-implementation-success",
+      "scenario": "implementation_success",
+      "role": "implementer",
+      "synthetic": true,
+      "replay_safe": true,
+      "task": {
+        "task_id": "fixture-implementation-success",
+        "repository": {
+          "kind": "synthetic_fixture",
+          "name": "repo-implementation-success"
+        },
+        "workspace": {
+          "kind": "ephemeral_fixture",
+          "name": "workspace-implementation-success"
+        },
+        "external_task_id": null,
+        "scenario_code": "implementation_success"
+      },
+      "events": [
+        {
+          "kind": "model_call",
+          "provider": "openai_codex",
+          "model": "gpt-5.6-luna",
+          "attempt": 1,
+          "latency_ms": 500
+        },
+        {
+          "kind": "tool_call",
+          "name": "workspace_read",
+          "latency_ms": 35
+        },
+        {
+          "kind": "tool_call",
+          "name": "test_runner",
+          "latency_ms": 45
+        }
+      ],
+      "transitions": [
+        {
+          "from": "queued",
+          "to": "running",
+          "reason": "dispatch_started"
+        },
+        {
+          "from": "running",
+          "to": "done",
+          "reason": "tests_passed"
+        }
+      ],
+      "metrics": {
+        "prompt_size_chars": 2400,
+        "prompt_size_tokens": 600,
+        "model_calls": 1,
+        "model_requests": 1,
+        "tool_calls": 2,
+        "input_tokens": 700,
+        "output_tokens": 120,
+        "cache_read_tokens": 150,
+        "cache_tokens": 150,
+        "queue_wait_ms": 35,
+        "startup_ms": 180,
+        "first_model_request_ms": 715,
+        "model_latency_ms": 500,
+        "tool_latency_ms": 80,
+        "retry_latency_ms": 0,
+        "lifecycle_latency_ms": 0,
+        "event_latency_ms": 580,
+        "total_latency_ms": 795,
+        "peak_rss_bytes": 83886080,
+        "retry_count": 0,
+        "timeout_events": 0,
+        "cancellation_events": 0
+      },
+      "durable_outcome": {
+        "status": "candidate_ready",
+        "terminal": true,
+        "task_state": "done",
+        "reason": "tests_passed",
+        "outcome_code": "implementation_success"
+      }
+    },
+    {
+      "id": "fixture-test-failure",
+      "scenario": "test_failure",
+      "role": "implementer",
+      "synthetic": true,
+      "replay_safe": true,
+      "task": {
+        "task_id": "fixture-test-failure",
+        "repository": {
+          "kind": "synthetic_fixture",
+          "name": "repo-test-failure"
+        },
+        "workspace": {
+          "kind": "ephemeral_fixture",
+          "name": "workspace-test-failure"
+        },
+        "external_task_id": null,
+        "scenario_code": "test_failure"
+      },
+      "events": [
+        {
+          "kind": "model_call",
+          "provider": "openai_codex",
+          "model": "gpt-5.6-luna",
+          "attempt": 1,
+          "latency_ms": 550
+        },
+        {
+          "kind": "tool_call",
+          "name": "workspace_read",
+          "latency_ms": 40
+        },
+        {
+          "kind": "tool_call",
+          "name": "workspace_patch",
+          "latency_ms": 50
+        },
+        {
+          "kind": "tool_call",
+          "name": "test_runner",
+          "latency_ms": 40
+        }
+      ],
+      "transitions": [
+        {
+          "from": "queued",
+          "to": "running",
+          "reason": "dispatch_started"
+        },
+        {
+          "from": "running",
+          "to": "blocked",
+          "reason": "test_failure"
+        }
+      ],
+      "metrics": {
+        "prompt_size_chars": 2600,
+        "prompt_size_tokens": 650,
+        "model_calls": 1,
+        "model_requests": 1,
+        "tool_calls": 3,
+        "input_tokens": 760,
+        "output_tokens": 80,
+        "cache_read_tokens": 120,
+        "cache_tokens": 120,
+        "queue_wait_ms": 42,
+        "startup_ms": 180,
+        "first_model_request_ms": 772,
+        "model_latency_ms": 550,
+        "tool_latency_ms": 130,
+        "retry_latency_ms": 0,
+        "lifecycle_latency_ms": 0,
+        "event_latency_ms": 680,
+        "total_latency_ms": 902,
+        "peak_rss_bytes": 87031808,
+        "retry_count": 0,
+        "timeout_events": 0,
+        "cancellation_events": 0
+      },
+      "durable_outcome": {
+        "status": "failed",
+        "terminal": true,
+        "task_state": "blocked",
+        "reason": "test_failure",
+        "outcome_code": "test_failure"
+      }
+    },
+    {
+      "id": "fixture-provider-retry",
+      "scenario": "provider_retry",
+      "role": "implementer",
+      "synthetic": true,
+      "replay_safe": true,
+      "task": {
+        "task_id": "fixture-provider-retry",
+        "repository": {
+          "kind": "synthetic_fixture",
+          "name": "repo-provider-retry"
+        },
+        "workspace": {
+          "kind": "ephemeral_fixture",
+          "name": "workspace-provider-retry"
+        },
+        "external_task_id": null,
+        "scenario_code": "provider_retry"
+      },
+      "events": [
+        {
+          "kind": "model_call",
+          "provider": "openai_codex",
+          "model": "gpt-5.6-luna",
+          "attempt": 1,
+          "latency_ms": 260
+        },
+        {
+          "kind": "provider_retry",
+          "reason": "synthetic_rate_limit",
+          "latency_ms": 15
+        },
+        {
+          "kind": "model_call",
+          "provider": "openai_codex",
+          "model": "gpt-5.6-luna",
+          "attempt": 2,
+          "latency_ms": 640
+        },
+        {
+          "kind": "tool_call",
+          "name": "workspace_read",
+          "latency_ms": 35
+        },
+        {
+          "kind": "tool_call",
+          "name": "test_runner",
+          "latency_ms": 45
+        }
+      ],
+      "transitions": [
+        {
+          "from": "queued",
+          "to": "running",
+          "reason": "dispatch_started"
+        },
+        {
+          "from": "running",
+          "to": "done",
+          "reason": "provider_retry_recovered"
+        }
+      ],
+      "metrics": {
+        "prompt_size_chars": 2450,
+        "prompt_size_tokens": 612,
+        "model_calls": 2,
+        "model_requests": 2,
+        "tool_calls": 2,
+        "input_tokens": 1200,
+        "output_tokens": 180,
+        "cache_read_tokens": 500,
+        "cache_tokens": 500,
+        "queue_wait_ms": 50,
+        "startup_ms": 185,
+        "first_model_request_ms": 495,
+        "model_latency_ms": 900,
+        "tool_latency_ms": 80,
+        "retry_latency_ms": 15,
+        "lifecycle_latency_ms": 0,
+        "event_latency_ms": 995,
+        "total_latency_ms": 1230,
+        "peak_rss_bytes": 90177536,
+        "retry_count": 1,
+        "timeout_events": 0,
+        "cancellation_events": 0
+      },
+      "durable_outcome": {
+        "status": "candidate_ready",
+        "terminal": true,
+        "task_state": "done",
+        "reason": "provider_retry_recovered",
+        "outcome_code": "provider_retry"
+      }
+    },
+    {
+      "id": "fixture-timeout",
+      "scenario": "timeout",
+      "role": "implementer",
+      "synthetic": true,
+      "replay_safe": true,
+      "task": {
+        "task_id": "fixture-timeout",
+        "repository": {
+          "kind": "synthetic_fixture",
+          "name": "repo-timeout"
+        },
+        "workspace": {
+          "kind": "ephemeral_fixture",
+          "name": "workspace-timeout"
+        },
+        "external_task_id": null,
+        "scenario_code": "timeout"
+      },
+      "events": [
+        {
+          "kind": "model_call",
+          "provider": "openai_codex",
+          "model": "gpt-5.6-luna",
+          "attempt": 1,
+          "latency_ms": 700
+        },
+        {
+          "kind": "tool_call",
+          "name": "workspace_read",
+          "latency_ms": 35
+        },
+        {
+          "kind": "timeout",
+          "reason": "deadline_exceeded",
+          "latency_ms": 10
+        }
+      ],
+      "transitions": [
+        {
+          "from": "queued",
+          "to": "running",
+          "reason": "dispatch_started"
+        },
+        {
+          "from": "running",
+          "to": "timed_out",
+          "reason": "deadline_exceeded"
+        }
+      ],
+      "metrics": {
+        "prompt_size_chars": 2200,
+        "prompt_size_tokens": 550,
+        "model_calls": 1,
+        "model_requests": 1,
+        "tool_calls": 1,
+        "input_tokens": 500,
+        "output_tokens": 20,
+        "cache_read_tokens": 100,
+        "cache_tokens": 100,
+        "queue_wait_ms": 45,
+        "startup_ms": 175,
+        "first_model_request_ms": 920,
+        "model_latency_ms": 700,
+        "tool_latency_ms": 35,
+        "retry_latency_ms": 0,
+        "lifecycle_latency_ms": 10,
+        "event_latency_ms": 745,
+        "total_latency_ms": 965,
+        "peak_rss_bytes": 85983232,
+        "retry_count": 0,
+        "timeout_events": 1,
+        "cancellation_events": 0
+      },
+      "durable_outcome": {
+        "status": "timed_out",
+        "terminal": true,
+        "task_state": "timed_out",
+        "reason": "deadline_exceeded",
+        "outcome_code": "timeout"
+      }
+    },
+    {
+      "id": "fixture-cancellation",
+      "scenario": "cancellation",
+      "role": "implementer",
+      "synthetic": true,
+      "replay_safe": true,
+      "task": {
+        "task_id": "fixture-cancellation",
+        "repository": {
+          "kind": "synthetic_fixture",
+          "name": "repo-cancellation"
+        },
+        "workspace": {
+          "kind": "ephemeral_fixture",
+          "name": "workspace-cancellation"
+        },
+        "external_task_id": null,
+        "scenario_code": "cancellation"
+      },
+      "events": [
+        {
+          "kind": "model_call",
+          "provider": "openai_codex",
+          "model": "gpt-5.6-luna",
+          "attempt": 1,
+          "latency_ms": 400
+        },
+        {
+          "kind": "tool_call",
+          "name": "workspace_read",
+          "latency_ms": 20
+        },
+        {
+          "kind": "cancellation_requested",
+          "reason": "operator_requested",
+          "latency_ms": 12
+        }
+      ],
+      "transitions": [
+        {
+          "from": "queued",
+          "to": "running",
+          "reason": "dispatch_started"
+        },
+        {
+          "from": "running",
+          "to": "cancelled",
+          "reason": "operator_requested"
+        }
+      ],
+      "metrics": {
+        "prompt_size_chars": 2100,
+        "prompt_size_tokens": 525,
+        "model_calls": 1,
+        "model_requests": 1,
+        "tool_calls": 1,
+        "input_tokens": 450,
+        "output_tokens": 16,
+        "cache_read_tokens": 80,
+        "cache_tokens": 80,
+        "queue_wait_ms": 40,
+        "startup_ms": 170,
+        "first_model_request_ms": 610,
+        "model_latency_ms": 400,
+        "tool_latency_ms": 20,
+        "retry_latency_ms": 0,
+        "lifecycle_latency_ms": 12,
+        "event_latency_ms": 432,
+        "total_latency_ms": 642,
+        "peak_rss_bytes": 84869120,
+        "retry_count": 0,
+        "timeout_events": 0,
+        "cancellation_events": 1
+      },
+      "durable_outcome": {
+        "status": "cancelled",
+        "terminal": true,
+        "task_state": "cancelled",
+        "reason": "operator_requested",
+        "outcome_code": "cancellation"
+      }
+    },
+    {
+      "id": "fixture-review-approval",
+      "scenario": "review_approval",
+      "role": "code_reviewer",
+      "synthetic": true,
+      "replay_safe": true,
+      "task": {
+        "task_id": "fixture-review-approval",
+        "repository": {
+          "kind": "synthetic_fixture",
+          "name": "repo-review-approval"
+        },
+        "workspace": {
+          "kind": "ephemeral_fixture",
+          "name": "workspace-review-approval"
+        },
+        "external_task_id": null,
+        "scenario_code": "review_approval"
+      },
+      "events": [
+        {
+          "kind": "model_call",
+          "provider": "independent_review_provider",
+          "model": "gpt-5.6-luna",
+          "attempt": 1,
+          "latency_ms": 460
+        },
+        {
+          "kind": "tool_call",
+          "name": "review_packet_read",
+          "latency_ms": 30
+        },
+        {
+          "kind": "tool_call",
+          "name": "gate_evidence_read",
+          "latency_ms": 30
+        }
+      ],
+      "transitions": [
+        {
+          "from": "queued",
+          "to": "reviewing",
+          "reason": "dispatch_started"
+        },
+        {
+          "from": "reviewing",
+          "to": "review_approved",
+          "reason": "review_passed"
+        }
+      ],
+      "metrics": {
+        "prompt_size_chars": 1900,
+        "prompt_size_tokens": 475,
+        "model_calls": 1,
+        "model_requests": 1,
+        "tool_calls": 2,
+        "input_tokens": 520,
+        "output_tokens": 90,
+        "cache_read_tokens": 120,
+        "cache_tokens": 120,
+        "queue_wait_ms": 30,
+        "startup_ms": 160,
+        "first_model_request_ms": 650,
+        "model_latency_ms": 460,
+        "tool_latency_ms": 60,
+        "retry_latency_ms": 0,
+        "lifecycle_latency_ms": 0,
+        "event_latency_ms": 520,
+        "total_latency_ms": 710,
+        "peak_rss_bytes": 81788928,
+        "retry_count": 0,
+        "timeout_events": 0,
+        "cancellation_events": 0
+      },
+      "durable_outcome": {
+        "status": "APPROVED",
+        "terminal": true,
+        "task_state": "review_approved",
+        "reason": "review_passed",
+        "outcome_code": "review_approval"
+      },
+      "review_evidence": {
+        "packet_state": "immutable",
+        "evidence_state": "complete",
+        "mutation_detected": false,
+        "checks": [
+          {
+            "name": "review_packet_read",
+            "status": "passed"
+          },
+          {
+            "name": "gate_evidence_read",
+            "status": "passed"
+          }
+        ],
+        "findings": 0
+      }
+    },
+    {
+      "id": "fixture-review-changes-requested",
+      "scenario": "review_changes_requested",
+      "role": "code_reviewer",
+      "synthetic": true,
+      "replay_safe": true,
+      "task": {
+        "task_id": "fixture-review-changes-requested",
+        "repository": {
+          "kind": "synthetic_fixture",
+          "name": "repo-review-changes-requested"
+        },
+        "workspace": {
+          "kind": "ephemeral_fixture",
+          "name": "workspace-review-changes-requested"
+        },
+        "external_task_id": null,
+        "scenario_code": "review_changes_requested"
+      },
+      "events": [
+        {
+          "kind": "model_call",
+          "provider": "independent_review_provider",
+          "model": "gpt-5.6-luna",
+          "attempt": 1,
+          "latency_ms": 500
+        },
+        {
+          "kind": "tool_call",
+          "name": "review_packet_read",
+          "latency_ms": 35
+        },
+        {
+          "kind": "tool_call",
+          "name": "exact_diff_read",
+          "latency_ms": 35
+        }
+      ],
+      "transitions": [
+        {
+          "from": "queued",
+          "to": "reviewing",
+          "reason": "dispatch_started"
+        },
+        {
+          "from": "reviewing",
+          "to": "rework_required",
+          "reason": "review_finding"
+        }
+      ],
+      "metrics": {
+        "prompt_size_chars": 2000,
+        "prompt_size_tokens": 500,
+        "model_calls": 1,
+        "model_requests": 1,
+        "tool_calls": 2,
+        "input_tokens": 560,
+        "output_tokens": 110,
+        "cache_read_tokens": 140,
+        "cache_tokens": 140,
+        "queue_wait_ms": 32,
+        "startup_ms": 160,
+        "first_model_request_ms": 692,
+        "model_latency_ms": 500,
+        "tool_latency_ms": 70,
+        "retry_latency_ms": 0,
+        "lifecycle_latency_ms": 0,
+        "event_latency_ms": 570,
+        "total_latency_ms": 762,
+        "peak_rss_bytes": 82903040,
+        "retry_count": 0,
+        "timeout_events": 0,
+        "cancellation_events": 0
+      },
+      "durable_outcome": {
+        "status": "CHANGES_REQUESTED",
+        "terminal": true,
+        "task_state": "rework_required",
+        "reason": "review_finding",
+        "outcome_code": "review_changes_requested"
+      },
+      "review_evidence": {
+        "packet_state": "immutable",
+        "evidence_state": "complete",
+        "mutation_detected": false,
+        "checks": [
+          {
+            "name": "review_packet_read",
+            "status": "passed"
+          },
+          {
+            "name": "exact_diff_read",
+            "status": "passed"
+          }
+        ],
+        "findings": 1
+      }
+    },
+    {
+      "id": "fixture-review-incomplete",
+      "scenario": "review_incomplete",
+      "role": "code_reviewer",
+      "synthetic": true,
+      "replay_safe": true,
+      "task": {
+        "task_id": "fixture-review-incomplete",
+        "repository": {
+          "kind": "synthetic_fixture",
+          "name": "repo-review-incomplete"
+        },
+        "workspace": {
+          "kind": "ephemeral_fixture",
+          "name": "workspace-review-incomplete"
+        },
+        "external_task_id": null,
+        "scenario_code": "review_incomplete"
+      },
+      "events": [
+        {
+          "kind": "model_call",
+          "provider": "independent_review_provider",
+          "model": "gpt-5.6-luna",
+          "attempt": 1,
+          "latency_ms": 580
+        },
+        {
+          "kind": "tool_call",
+          "name": "review_packet_read",
+          "latency_ms": 30
+        }
+      ],
+      "transitions": [
+        {
+          "from": "queued",
+          "to": "reviewing",
+          "reason": "dispatch_started"
+        },
+        {
+          "from": "reviewing",
+          "to": "blocked",
+          "reason": "insufficient_review_evidence"
+        }
+      ],
+      "metrics": {
+        "prompt_size_chars": 1800,
+        "prompt_size_tokens": 450,
+        "model_calls": 1,
+        "model_requests": 1,
+        "tool_calls": 1,
+        "input_tokens": 430,
+        "output_tokens": 30,
+        "cache_read_tokens": 90,
+        "cache_tokens": 90,
+        "queue_wait_ms": 38,
+        "startup_ms": 165,
+        "first_model_request_ms": 783,
+        "model_latency_ms": 580,
+        "tool_latency_ms": 30,
+        "retry_latency_ms": 0,
+        "lifecycle_latency_ms": 0,
+        "event_latency_ms": 610,
+        "total_latency_ms": 813,
+        "peak_rss_bytes": 80609280,
+        "retry_count": 0,
+        "timeout_events": 0,
+        "cancellation_events": 0
+      },
+      "durable_outcome": {
+        "status": "REVIEW_INCOMPLETE",
+        "terminal": true,
+        "task_state": "blocked",
+        "reason": "insufficient_review_evidence",
+        "outcome_code": "review_incomplete"
+      },
+      "review_evidence": {
+        "packet_state": "immutable",
+        "evidence_state": "incomplete",
+        "mutation_detected": false,
+        "checks": [
+          {
+            "name": "review_packet_read",
+            "status": "passed"
+          }
+        ],
+        "findings": 0
+      }
+    }
+  ]
+}
