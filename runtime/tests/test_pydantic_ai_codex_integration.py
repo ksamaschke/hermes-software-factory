@@ -1,14 +1,16 @@
 """Optional exact-version PydanticAI integration regressions.
 
-The module is skipped in the default runtime environment.  The focused proof is
-run with ``uv run --no-project --with pydantic-ai==2.48.0`` and uses only
-synthetic credentials plus an in-memory HTTP transport.
+The module is skipped in the default runtime environment.  From ``runtime/``,
+the focused proof runs with ``uv run --extra pydantic-ai --with pytest>=8
+pytest tests/test_pydantic_ai_codex_integration.py -q`` and uses only synthetic
+credentials plus an in-memory HTTP transport.
 """
 
 from __future__ import annotations
 
 import asyncio
 import multiprocessing as mp
+from functools import wraps
 from pathlib import Path
 
 import pytest
@@ -35,13 +37,23 @@ def _credentials(generation: str) -> OpenAICodexCredentials:
     )
 
 
+def _asyncio_test(test):
+    """Run an async regression without an undeclared pytest plugin."""
+
+    @wraps(test)
+    def wrapper(*args, **kwargs):
+        return asyncio.run(test(*args, **kwargs))
+
+    return wrapper
+
+
 def test_guarded_class_is_the_pinned_real_provider():
     provider_class = get_pydantic_ai_codex_provider_class()
     assert issubclass(provider_class, pydantic_codex.OpenAICodexProvider)
     assert getattr(pydantic_ai, "__version__", "2.48.0") == "2.48.0"
 
 
-@pytest.mark.asyncio
+@_asyncio_test
 async def test_real_provider_path_uses_atomic_source_refresh_and_mock_transport(
     tmp_path: Path,
 ):
@@ -82,7 +94,7 @@ async def test_real_provider_path_uses_atomic_source_refresh_and_mock_transport(
         await client.aclose()
 
 
-@pytest.mark.asyncio
+@_asyncio_test
 async def test_actual_pydantic_ai_http_path_refreshes_once_and_retries_without_network(
     tmp_path: Path,
 ):
@@ -137,7 +149,7 @@ async def test_actual_pydantic_ai_http_path_refreshes_once_and_retries_without_n
         await client.aclose()
 
 
-@pytest.mark.asyncio
+@_asyncio_test
 async def test_pressure_wraps_actual_pydantic_ai_refresh_path(tmp_path: Path):
     source_one = OpenAICodexCredentialSource(tmp_path / "one.json")
     source_two = OpenAICodexCredentialSource(tmp_path / "two.json")
