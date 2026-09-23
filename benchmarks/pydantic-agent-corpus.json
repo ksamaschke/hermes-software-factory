@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "corpus_id": "pydantic-agent-factory-migration-v1",
   "baseline": {
     "hermes_profile": "implementer",
@@ -11,7 +11,7 @@
     "synthetic": true,
     "observed": false,
     "observed_production_data": false,
-    "redaction": "Synthetic test vectors only; no observed task data, prompts, credentials, repository paths, or repository contents are stored."
+    "redaction": "Synthetic vectors only; no observed task data or arbitrary text is retained."
   },
   "replay": {
     "deterministic": true,
@@ -30,7 +30,6 @@
       "replay_safe": true,
       "task": {
         "task_id": "fixture-implementation-success",
-        "objective": "produce a tested candidate for a small typed change",
         "repository": {
           "kind": "synthetic_fixture",
           "name": "repo-implementation-success"
@@ -39,7 +38,8 @@
           "kind": "ephemeral_fixture",
           "name": "workspace-implementation-success"
         },
-        "external_task_id": null
+        "external_task_id": null,
+        "scenario_code": "implementation_success"
       },
       "events": [
         {
@@ -101,7 +101,7 @@
         "terminal": true,
         "task_state": "done",
         "reason": "tests_passed",
-        "summary": "Synthetic test vector: produce a tested candidate for a small typed change"
+        "outcome_code": "implementation_success"
       }
     },
     {
@@ -112,7 +112,6 @@
       "replay_safe": true,
       "task": {
         "task_id": "fixture-test-failure",
-        "objective": "produce a candidate whose required test gate reports a failure",
         "repository": {
           "kind": "synthetic_fixture",
           "name": "repo-test-failure"
@@ -121,7 +120,8 @@
           "kind": "ephemeral_fixture",
           "name": "workspace-test-failure"
         },
-        "external_task_id": null
+        "external_task_id": null,
+        "scenario_code": "test_failure"
       },
       "events": [
         {
@@ -188,7 +188,7 @@
         "terminal": true,
         "task_state": "blocked",
         "reason": "test_failure",
-        "summary": "Synthetic test vector: produce a candidate whose required test gate reports a failure"
+        "outcome_code": "test_failure"
       }
     },
     {
@@ -199,7 +199,6 @@
       "replay_safe": true,
       "task": {
         "task_id": "fixture-provider-retry",
-        "objective": "recover from one provider retry and produce a tested candidate",
         "repository": {
           "kind": "synthetic_fixture",
           "name": "repo-provider-retry"
@@ -208,7 +207,8 @@
           "kind": "ephemeral_fixture",
           "name": "workspace-provider-retry"
         },
-        "external_task_id": null
+        "external_task_id": null,
+        "scenario_code": "provider_retry"
       },
       "events": [
         {
@@ -282,7 +282,7 @@
         "terminal": true,
         "task_state": "done",
         "reason": "provider_retry_recovered",
-        "summary": "Synthetic test vector: recover from one provider retry and produce a tested candidate"
+        "outcome_code": "provider_retry"
       }
     },
     {
@@ -293,7 +293,6 @@
       "replay_safe": true,
       "task": {
         "task_id": "fixture-timeout",
-        "objective": "exercise a bounded run that reaches its deadline before completion",
         "repository": {
           "kind": "synthetic_fixture",
           "name": "repo-timeout"
@@ -302,7 +301,8 @@
           "kind": "ephemeral_fixture",
           "name": "workspace-timeout"
         },
-        "external_task_id": null
+        "external_task_id": null,
+        "scenario_code": "timeout"
       },
       "events": [
         {
@@ -364,7 +364,7 @@
         "terminal": true,
         "task_state": "timed_out",
         "reason": "deadline_exceeded",
-        "summary": "Synthetic test vector: exercise a bounded run that reaches its deadline before completion"
+        "outcome_code": "timeout"
       }
     },
     {
@@ -375,7 +375,6 @@
       "replay_safe": true,
       "task": {
         "task_id": "fixture-cancellation",
-        "objective": "exercise an explicit cancellation before a candidate is finalized",
         "repository": {
           "kind": "synthetic_fixture",
           "name": "repo-cancellation"
@@ -384,7 +383,8 @@
           "kind": "ephemeral_fixture",
           "name": "workspace-cancellation"
         },
-        "external_task_id": null
+        "external_task_id": null,
+        "scenario_code": "cancellation"
       },
       "events": [
         {
@@ -446,7 +446,7 @@
         "terminal": true,
         "task_state": "cancelled",
         "reason": "operator_requested",
-        "summary": "Synthetic test vector: exercise an explicit cancellation before a candidate is finalized"
+        "outcome_code": "cancellation"
       }
     },
     {
@@ -457,7 +457,6 @@
       "replay_safe": true,
       "task": {
         "task_id": "fixture-review-approval",
-        "objective": "review an immutable candidate packet and approve it when all evidence passes",
         "repository": {
           "kind": "synthetic_fixture",
           "name": "repo-review-approval"
@@ -466,7 +465,8 @@
           "kind": "ephemeral_fixture",
           "name": "workspace-review-approval"
         },
-        "external_task_id": null
+        "external_task_id": null,
+        "scenario_code": "review_approval"
       },
       "events": [
         {
@@ -528,7 +528,7 @@
         "terminal": true,
         "task_state": "review_approved",
         "reason": "review_passed",
-        "summary": "Synthetic test vector: review an immutable candidate packet and approve it when all evidence passes"
+        "outcome_code": "review_approval"
       },
       "review_evidence": {
         "packet_state": "immutable",
@@ -555,7 +555,6 @@
       "replay_safe": true,
       "task": {
         "task_id": "fixture-review-changes-requested",
-        "objective": "review an immutable candidate packet and request a bounded correction",
         "repository": {
           "kind": "synthetic_fixture",
           "name": "repo-review-changes-requested"
@@ -564,7 +563,8 @@
           "kind": "ephemeral_fixture",
           "name": "workspace-review-changes-requested"
         },
-        "external_task_id": null
+        "external_task_id": null,
+        "scenario_code": "review_changes_requested"
       },
       "events": [
         {
@@ -626,7 +626,7 @@
         "terminal": true,
         "task_state": "rework_required",
         "reason": "review_finding",
-        "summary": "Synthetic test vector: review an immutable candidate packet and request a bounded correction"
+        "outcome_code": "review_changes_requested"
       },
       "review_evidence": {
         "packet_state": "immutable",
@@ -653,7 +653,6 @@
       "replay_safe": true,
       "task": {
         "task_id": "fixture-review-incomplete",
-        "objective": "exercise a review that cannot produce a trustworthy terminal verdict",
         "repository": {
           "kind": "synthetic_fixture",
           "name": "repo-review-incomplete"
@@ -662,7 +661,8 @@
           "kind": "ephemeral_fixture",
           "name": "workspace-review-incomplete"
         },
-        "external_task_id": null
+        "external_task_id": null,
+        "scenario_code": "review_incomplete"
       },
       "events": [
         {
@@ -719,7 +719,7 @@
         "terminal": true,
         "task_state": "blocked",
         "reason": "insufficient_review_evidence",
-        "summary": "Synthetic test vector: exercise a review that cannot produce a trustworthy terminal verdict"
+        "outcome_code": "review_incomplete"
       },
       "review_evidence": {
         "packet_state": "immutable",

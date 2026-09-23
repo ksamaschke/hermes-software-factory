@@ -23,7 +23,7 @@ def _corpus() -> dict:
     return json.loads(CORPUS_PATH.read_text(encoding="utf-8"))
 
 
-def _errors(document: dict) -> list[str]:
+def _errors(document: object) -> list[str]:
     return baseline.validate_corpus(document)
 
 
@@ -43,6 +43,14 @@ def test_checked_in_corpus_is_explicitly_synthetic_and_complete():
     } == baseline.REQUIRED_SCENARIO_SET
     assert all(fixture["synthetic"] for fixture in document["fixtures"])
     assert all(fixture["replay_safe"] for fixture in document["fixtures"])
+    assert all(
+        fixture["task"]["scenario_code"] == fixture["scenario"]
+        for fixture in document["fixtures"]
+    )
+    assert all(
+        fixture["durable_outcome"]["outcome_code"] == fixture["scenario"]
+        for fixture in document["fixtures"]
+    )
 
 
 def test_every_fixture_has_event_derived_counts_latencies_and_terminal_transition():
@@ -144,15 +152,17 @@ def test_validator_normalizes_secret_key_variants(secret_key):
     assert any("forbidden secret-like field" in error for error in errors)
 
 
-def test_validator_rejects_credential_values_and_arbitrary_uri_schemes():
+def test_validator_rejects_opaque_scenario_codes_and_credential_values():
     document = _corpus()
-    document["fixtures"][0]["task"]["objective"] = "custom+scheme:opaque-value"
-    document["fixtures"][1]["task"]["objective"] = "Bearer redacted-value"
+    document["fixtures"][0]["task"]["scenario_code"] = "custom+scheme:opaque-value"
+    document["fixtures"][1]["durable_outcome"]["outcome_code"] = "Bearer redacted-value"
 
     errors = _errors(document)
 
     assert any("arbitrary URI scheme" in error for error in errors)
     assert any("credential-like value" in error for error in errors)
+    assert any("scenario_code" in error for error in errors)
+    assert any("outcome_code" in error for error in errors)
 
 
 @pytest.mark.parametrize(
@@ -165,7 +175,9 @@ def test_validator_rejects_credential_values_and_arbitrary_uri_schemes():
         lambda d: d["fixtures"][0]["task"]["workspace"].update(
             {"name": "~/.credentials"}
         ),
-        lambda d: d["fixtures"][0]["task"].update({"objective": "read ../parent data"}),
+        lambda d: d["fixtures"][0]["task"].update(
+            {"scenario_code": "read ../parent data"}
+        ),
     ],
 )
 def test_validator_rejects_live_ids_external_repositories_and_paths(mutate):
@@ -178,7 +190,14 @@ def test_validator_rejects_live_ids_external_repositories_and_paths(mutate):
     assert any(
         any(
             marker in error
-            for marker in ("fixture id", "live-looking", "external", "path", "tied")
+            for marker in (
+                "fixture id",
+                "live-looking",
+                "external",
+                "path",
+                "tied",
+                "scenario",
+            )
         )
         for error in errors
     )
@@ -255,6 +274,43 @@ def test_review_evidence_is_required_and_incomplete_is_distinct():
     assert any("evidence_state must be incomplete" in error for error in errors)
 
 
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda d: d["fixtures"][0]["events"][0].update({"kind": ["model_call"]}),
+        lambda d: d["fixtures"][0]["events"][0].update({"latency_ms": "500"}),
+        lambda d: d["fixtures"][0]["task"].update({"repository": ["bad"]}),
+        lambda d: d["fixtures"][0].update({"events": {"bad": True}}),
+        lambda d: d["fixtures"][0].update({"metrics": ["bad"]}),
+        lambda d: d["fixtures"][5]["review_evidence"].update({"checks": {"bad": True}}),
+        lambda d: d.update({"fixtures": {"bad": True}}),
+        lambda d: d.update({"baseline": ["bad"]}),
+    ],
+)
+def test_malformed_json_values_return_deterministic_errors_without_type_errors(mutate):
+    first = _corpus()
+    second = copy.deepcopy(first)
+    mutate(first)
+    mutate(second)
+
+    first_errors = _errors(first)
+    second_errors = _errors(second)
+
+    assert first_errors
+    assert first_errors == second_errors
+
+
+def test_replay_malformed_values_fail_with_corpus_error_not_type_error():
+    document = _corpus()
+    document["fixtures"][0]["events"][0]["kind"] = ["model_call"]
+
+    with pytest.raises(baseline.CorpusValidationError) as raised:
+        baseline.replay_corpus(document)
+
+    assert raised.value.errors
+    assert all(isinstance(error, str) for error in raised.value.errors)
+
+
 def test_cli_validate_and_replay_are_side_effect_free(tmp_path):
     validate = subprocess.run(
         [sys.executable, str(SCRIPT_PATH), "validate", str(CORPUS_PATH)],
@@ -281,18 +337,144 @@ def test_cli_validate_and_replay_are_side_effect_free(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
-def test_checked_in_observed_record_is_sanitized_and_fingerprinted():
+def test_capture_requires_local_persistence_ack_and_has_no_overrides():
+    parser = baseline._parser()
+    args = parser.parse_args(["capture", "--output", "record.json"])
+    assert args.ack_local_hermes_persistence is False
+    assert not hasattr(args, "profile")
+    assert not hasattr(args, "model")
+    assert baseline.CAPTURE_PROFILE == "implementer"
+    assert baseline.CAPTURE_MODEL == "openai-codex:gpt-5.6-luna"
+
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT_PATH), "capture", "--output", "record.json"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 1
+    assert "--ack-local-hermes-persistence" in result.stderr
+
+
+def test_capture_source_does_not_use_unsafe_or_reduced_mode_flags():
+    source = SCRIPT_PATH.read_text(encoding="utf-8")
+    assert "--ignore-rules" not in source
+    assert "--safe-mode" not in source
+    assert "--toolsets" not in source
+    assert "--in" not in source
+
+
+def test_checked_in_observed_record_is_strictly_sanitized_and_fingerprinted():
     record = json.loads(OBSERVED_PATH.read_text(encoding="utf-8"))
 
     assert baseline.validate_observed_record(record) == []
     assert record["provenance"]["observed"] is True
     assert record["provenance"]["synthetic"] is False
-    assert record["provenance"]["raw_logs_recorded"] is False
+    assert record["local_side_effects"]["profile_session_db_writes"] == "expected"
+    assert record["local_side_effects"]["profile_log_writes"] == "expected"
     assert record["command_contract"]["fixed_prompt"] == baseline.CAPTURE_PROMPT
     assert record["identity"]["hermes_profile"] == "implementer"
     assert record["identity"]["qualified_model"] == baseline.CAPTURE_MODEL
-    assert '"session_id"' not in json.dumps(record)
-    assert "credential_path" not in json.dumps(record)
+    assert record["identity"]["clean_before_capture"] is True
+    serialized = json.dumps(record)
+    assert '"session_id"' not in serialized
+    assert "credential_path" not in serialized
+    assert "failure" not in record["usage_evidence"]
+
+
+def test_observed_record_rejects_execution_and_usage_gate_failures():
+    record = json.loads(OBSERVED_PATH.read_text(encoding="utf-8"))
+    for path, value in (
+        (("execution", "exit_code"), 1),
+        (("execution", "timed_out"), True),
+        (("execution", "response_contract_satisfied"), False),
+        (("usage_evidence", "completed"), False),
+        (("usage_evidence", "failed"), True),
+        (("usage_evidence", "provider"), "other"),
+    ):
+        candidate = copy.deepcopy(record)
+        candidate[path[0]][path[1]] = value
+        candidate["evidence_fingerprint"] = baseline._evidence_fingerprint(candidate)
+        assert baseline.validate_observed_record(candidate)
+
+
+def test_observed_metric_availability_is_fail_closed_and_nested_consistent():
+    record = json.loads(OBSERVED_PATH.read_text(encoding="utf-8"))
+    assert set(record["metric_unavailable_reasons"]) == {
+        key for key, value in record["metrics"].items() if value is None
+    }
+    assert all(
+        value in baseline.UNAVAILABLE_REASON_CODES
+        for value in record["metric_unavailable_reasons"].values()
+    )
+
+    candidate = copy.deepcopy(record)
+    candidate["metrics"]["input_tokens"] = 1
+    candidate["evidence_fingerprint"] = baseline._evidence_fingerprint(candidate)
+    errors = baseline.validate_observed_record(candidate)
+    assert any("exactly cover null metrics" in error for error in errors)
+
+    candidate = copy.deepcopy(record)
+    candidate["usage_evidence"]["unavailable_reasons"]["input_tokens"] = (
+        "measurement_unavailable"
+    )
+    candidate["evidence_fingerprint"] = baseline._evidence_fingerprint(candidate)
+    errors = baseline.validate_observed_record(candidate)
+    assert any("availability reasons disagree" in error for error in errors)
+
+    candidate = copy.deepcopy(record)
+    candidate["metrics"]["input_tokens"] = 1
+    candidate["metric_unavailable_reasons"].pop("input_tokens", None)
+    candidate["usage_evidence"]["unavailable_reasons"]["input_tokens"] = (
+        "usage_field_absent"
+    )
+    candidate["evidence_fingerprint"] = baseline._evidence_fingerprint(candidate)
+    errors = baseline.validate_observed_record(candidate)
+    assert any("availability reasons disagree" in error for error in errors)
+
+
+def test_sanitized_usage_treats_explicit_null_counts_as_unavailable():
+    usage = baseline._sanitized_usage(
+        {
+            "completed": True,
+            "failed": False,
+            "provider": baseline.CAPTURE_PROVIDER,
+            "model": baseline.CAPTURE_BARE_MODEL,
+            "api_calls": 1,
+            "input_tokens": None,
+            "output_tokens": None,
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+        }
+    )
+
+    assert usage == {
+        "completed": True,
+        "failed": False,
+        "route_matches": True,
+        "api_calls": 1,
+        "values": {"api_calls": 1},
+    }
+
+
+def test_scrubbed_environment_excludes_hermes_and_dispatch_control_plane(monkeypatch):
+    monkeypatch.setenv("HOME", "/tmp/hermes-home")
+    monkeypatch.setenv("PATH", "/tmp/bin")
+    monkeypatch.setenv("HERMES_HOME", "/tmp/secret-profile")
+    monkeypatch.setenv("HERMES_SESSION_ID", "opaque-session")
+    monkeypatch.setenv("HERMES_KANBAN_TASK_ID", "opaque-task")
+    monkeypatch.setenv("DISPATCHER_RUN_ID", "opaque-run")
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.example.invalid:8080")
+
+    scrubbed = baseline._scrubbed_environment()
+
+    assert scrubbed["HOME"] == "/tmp/hermes-home"
+    assert scrubbed["PATH"] == "/tmp/bin"
+    assert "HERMES_HOME" not in scrubbed
+    assert "HERMES_SESSION_ID" not in scrubbed
+    assert "HERMES_KANBAN_TASK_ID" not in scrubbed
+    assert "DISPATCHER_RUN_ID" not in scrubbed
 
 
 def test_baseline_report_cites_architecture_sample_and_separates_observation():
@@ -308,6 +490,9 @@ def test_baseline_report_cites_architecture_sample_and_separates_observation():
         "capture",
         "input_tokens",
         "cache_read_tokens",
+        "ack-local-hermes-persistence",
+        "SessionDB",
+        "not a distribution",
     ):
         assert required_text in report
     assert "issue-provided smoke samples" not in report

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Validate, replay, and explicitly capture the Pydantic-agent baseline.
 
-``validate`` and ``replay`` only read a checked-in synthetic corpus.  They are
-standard-library-only, deterministic, and side-effect free.  ``capture`` is a
-separate opt-in operation: it runs one bounded, benign Hermes one-shot with an
-empty toolset in a temporary non-repository directory and writes a sanitized
-observed record.  It never stores the response, prompts other than the fixed
-benign phrase, environment values, credential paths, or raw logs.
+``validate`` and ``replay`` consume only the checked-in synthetic corpus.  They
+are deterministic, standard-library-only operations and never contact Hermes,
+Git, a provider, a Factory task, or an external repository.  ``capture`` is a
+separate, explicitly acknowledged operation.  It measures one real Hermes
+implementer-profile one-shot and writes only a sanitized observation after all
+fail-closed gates pass.
 """
 
 from __future__ import annotations
@@ -27,15 +27,24 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
-SCHEMA_VERSION = 2
-OBSERVED_SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
+OBSERVED_SCHEMA_VERSION = 2
 CORPUS_ID = "pydantic-agent-factory-migration-v1"
+BASE_REVISION = "0c32430ab1243e060f21bab98c109e4f21d0a402"
+
+# These are deliberately constants.  The capture CLI does not expose profile or
+# model overrides: changing either would make the checked-in baseline a
+# different experiment.
 CAPTURE_PROFILE = "implementer"
 CAPTURE_MODEL = "openai-codex:gpt-5.6-luna"
-CAPTURE_PROMPT = "Reply with exactly: Hermes baseline OK."
-CAPTURE_TOOLSET = "bot_room"
+CAPTURE_PROVIDER = "openai-codex"
+CAPTURE_BARE_MODEL = "gpt-5.6-luna"
+CAPTURE_PROMPT = "Do not use tools. Reply with exactly: Hermes baseline OK."
+CAPTURE_RESPONSE = "Hermes baseline OK."
 CAPTURE_TIMEOUT_SECONDS = 120
+CAPTURE_HELPER_GRACE_SECONDS = 10
 
 REQUIRED_SCENARIOS = (
     "implementation_success",
@@ -60,6 +69,19 @@ EXPECTED_ROLES = {
     "review_approval": "code_reviewer",
     "review_changes_requested": "code_reviewer",
     "review_incomplete": "code_reviewer",
+}
+EXPECTED_MODEL_EVENT_ROUTES = {
+    "implementation_success": ("openai_codex", "gpt-5.6-luna"),
+    "test_failure": ("openai_codex", "gpt-5.6-luna"),
+    "provider_retry": ("openai_codex", "gpt-5.6-luna"),
+    "timeout": ("openai_codex", "gpt-5.6-luna"),
+    "cancellation": ("openai_codex", "gpt-5.6-luna"),
+    "review_approval": ("independent_review_provider", "gpt-5.6-luna"),
+    "review_changes_requested": (
+        "independent_review_provider",
+        "gpt-5.6-luna",
+    ),
+    "review_incomplete": ("independent_review_provider", "gpt-5.6-luna"),
 }
 EXPECTED_OUTCOMES = {
     "implementation_success": ("candidate_ready", "done", "tests_passed"),
@@ -147,6 +169,11 @@ EXPECTED_TOOL_NAMES = {
     "review_changes_requested": ("review_packet_read", "exact_diff_read"),
     "review_incomplete": ("review_packet_read",),
 }
+EXPECTED_RETRY_REASONS = {"provider_retry": "synthetic_rate_limit"}
+EXPECTED_LIFECYCLE_REASONS = {
+    "timeout": "deadline_exceeded",
+    "cancellation": "operator_requested",
+}
 
 INTEGER_METRICS = frozenset(
     {
@@ -193,25 +220,30 @@ REPLAY_SUM_METRICS = (
     "cancellation_events",
 )
 
-# Normalize separators and case before checking.  This catches apiKey,
-# api_key, API-KEY, access_token, and authorization without rejecting normal
-# metric names such as input_tokens.
+# Normalize separators and case before checking.  The synthetic corpus has no
+# arbitrary text fields, but this recursive guard remains defense in depth for
+# future schema edits and for observed-record redaction.
 SECRET_KEY_NAMES = frozenset(
     {
         "apikey",
         "accesstoken",
         "authorization",
         "auth",
+        "authpath",
         "bearer",
         "clientsecret",
         "cookie",
         "credential",
         "credentials",
+        "environment",
+        "env",
         "password",
         "privatekey",
-        "refresh token",
         "refreshtoken",
         "secret",
+        "session",
+        "sessionid",
+        "sessionidentifier",
         "sessiontoken",
         "token",
         "url",
@@ -234,15 +266,102 @@ QUALIFIED_MODEL_RE = re.compile(r"^[a-z][a-z0-9_-]*:[a-z0-9][a-z0-9._-]*$")
 IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 FIXTURE_ID_RE = re.compile(r"^fixture-[a-z0-9]+(?:-[a-z0-9]+)*$")
 REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
+SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$")
+TIMESTAMP_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
 LIVE_LOOKING_ID_RE = re.compile(
     r"(?i)(?:^|[-_ ])(?:prod(?:uction)?|live|task|issue|run|pr|kanban)(?:[-_ ]?\d+|$)"
 )
 PATH_PARENT_RE = re.compile(r"(?:^|[\s/\\])\.\.?(?:[/\\]|$)")
 ABSOLUTE_PATH_RE = re.compile(r"^(?:[/\\]|~[/\\]|[A-Za-z]:[/\\])")
 
+OBSERVED_METRIC_KEYS = (
+    "model_calls",
+    "tool_calls",
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "wall_time_ms",
+    "peak_rss_bytes",
+)
+OBSERVED_INTEGER_METRICS = frozenset(
+    {
+        "model_calls",
+        "tool_calls",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "peak_rss_bytes",
+    }
+)
+USAGE_METRIC_TO_FIELD = {
+    "model_calls": "api_calls",
+    "input_tokens": "input_tokens",
+    "output_tokens": "output_tokens",
+    "cache_read_tokens": "cache_read_tokens",
+    "cache_write_tokens": "cache_write_tokens",
+}
+USAGE_FIELDS = frozenset(
+    {
+        "api_calls",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+    }
+)
+UNAVAILABLE_REASON_CODES = frozenset(
+    {"usage_field_absent", "usage_file_unreadable", "measurement_unavailable"}
+)
+
+PROFILE_CONTRACT_FILES = (
+    "SOUL.md",
+    "CAPABILITIES.md",
+    "profile.yaml",
+    "config.yaml",
+)
+NON_SECRET_PROFILE_PROMPTS = frozenset({"SOUL.md", "CAPABILITIES.md"})
+ALLOWED_ENV_NAMES = frozenset(
+    {
+        "HOME",
+        "PATH",
+        "LANG",
+        "LANGUAGE",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LC_MESSAGES",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    }
+)
+PROXY_ENV_NAMES = frozenset(
+    {
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    }
+)
+
 
 class CorpusValidationError(ValueError):
-    """Raised when a corpus or observed record cannot be safely consumed."""
+    """Raised when a corpus cannot be safely consumed."""
 
     def __init__(self, errors: Sequence[str]):
         self.errors = tuple(errors)
@@ -250,7 +369,7 @@ class CorpusValidationError(ValueError):
 
 
 class CaptureError(RuntimeError):
-    """Raised when the opt-in observed capture cannot produce a record."""
+    """Raised when the opt-in observed capture cannot pass its gates."""
 
 
 def _is_mapping(value: Any) -> bool:
@@ -285,13 +404,23 @@ def _check_keys(
     if not _is_mapping(value):
         errors.append(f"{path} must be an object")
         return None
-    for key in value:
+    try:
+        keys = list(value)
+    except (TypeError, ValueError, AttributeError):
+        errors.append(f"{path} contains malformed fields")
+        return None
+    for key in keys:
         if not isinstance(key, str):
             errors.append(f"{path} contains a non-string field name")
             continue
         if key not in allowed:
             errors.append(f"{path}.{key} is an unknown field")
-    for key in sorted(required - set(value)):
+    try:
+        present = set(keys)
+    except (TypeError, ValueError, AttributeError):
+        errors.append(f"{path} contains malformed fields")
+        return None
+    for key in sorted(required - present):
         errors.append(f"{path}.{key} is required")
     return value
 
@@ -321,6 +450,13 @@ def _check_revision(value: Any, path: str, errors: list[str]) -> bool:
     return True
 
 
+def _check_sha256(value: Any, path: str, errors: list[str]) -> bool:
+    if not isinstance(value, str) or not SHA256_RE.fullmatch(value):
+        errors.append(f"{path} must be a sha256 fingerprint")
+        return False
+    return True
+
+
 def _check_safe_string(value: Any, path: str, errors: list[str]) -> None:
     if not isinstance(value, str):
         return
@@ -334,22 +470,19 @@ def _check_safe_string(value: Any, path: str, errors: list[str]) -> None:
         errors.append(f"{path} contains an external repository or URL reference")
     if ABSOLUTE_PATH_RE.match(value) or PATH_PARENT_RE.search(value):
         errors.append(f"{path} contains an absolute, home, or parent path")
-    # The corpus permits exactly one qualified model spelling.  Any other
-    # scheme-like value is rejected rather than treated as harmless text.
     if URI_SCHEME_RE.match(value) and not (
-        (
-            normalized_path.endswith(
-                (
-                    ".baseline.model",
-                    ".identity.qualified_model",
-                    ".evidence_fingerprint",
-                )
+        normalized_path.endswith(
+            (
+                ".baseline.model",
+                ".identity.qualified_model",
+                ".command_contract.model",
+                ".evidence_fingerprint",
+                ".source_sha256",
+                ".profile_contract_fingerprint",
+                ".profile_contract.fingerprint",
             )
         )
-        and (
-            QUALIFIED_MODEL_RE.fullmatch(value)
-            or re.fullmatch(r"sha256:[0-9a-f]{64}", value)
-        )
+        and (QUALIFIED_MODEL_RE.fullmatch(value) or SHA256_RE.fullmatch(value))
     ):
         errors.append(f"{path} contains an arbitrary URI scheme")
     if LIVE_LOOKING_ID_RE.search(value):
@@ -358,7 +491,12 @@ def _check_safe_string(value: Any, path: str, errors: list[str]) -> None:
 
 def _check_forbidden_values(value: Any, path: str, errors: list[str]) -> None:
     if isinstance(value, Mapping):
-        for key, child in value.items():
+        try:
+            items = list(value.items())
+        except (TypeError, ValueError, AttributeError):
+            errors.append(f"{path} contains malformed fields")
+            return
+        for key, child in items:
             key_text = str(key)
             normalized = _normalized_key(key_text)
             if normalized in SECRET_KEY_NAMES:
@@ -371,51 +509,54 @@ def _check_forbidden_values(value: Any, path: str, errors: list[str]) -> None:
         _check_safe_string(value, path, errors)
 
 
+def _event_spec(kind: str | None) -> tuple[frozenset[str], frozenset[str]]:
+    common = {"kind", "latency_ms"}
+    if kind == "model_call":
+        return frozenset({*common, "provider", "model", "attempt"}), frozenset(
+            {*common, "provider", "model", "attempt"}
+        )
+    if kind == "tool_call":
+        return frozenset({*common, "name"}), frozenset({*common, "name"})
+    if kind in {"provider_retry", "timeout", "cancellation_requested"}:
+        return frozenset({*common, "reason"}), frozenset({*common, "reason"})
+    return frozenset(common), frozenset(common)
+
+
 def _check_event(event: Any, path: str, errors: list[str]) -> tuple[str, int]:
     if not _is_mapping(event):
         errors.append(f"{path} must be an object")
         return "", 0
-    kind = event.get("kind")
-    common = {"kind", "latency_ms"}
-    if kind == "model_call":
-        allowed = frozenset({*common, "provider", "model", "attempt"})
-        required = frozenset({*allowed})
-    elif kind == "tool_call":
-        allowed = frozenset({*common, "name"})
-        required = frozenset({*allowed})
-    elif kind == "provider_retry" or kind in {"timeout", "cancellation_requested"}:
-        allowed = frozenset({*common, "reason"})
-        required = frozenset({*allowed})
-    else:
+    kind_value = event.get("kind")
+    kind = kind_value if isinstance(kind_value, str) else None
+    if kind not in {
+        "model_call",
+        "tool_call",
+        "provider_retry",
+        "timeout",
+        "cancellation_requested",
+    }:
         errors.append(f"{path}.kind is unsupported")
-        allowed = frozenset(common)
-        required = frozenset(common)
+    allowed, required = _event_spec(kind)
     checked = _check_keys(
         event, allowed=allowed, required=required, path=path, errors=errors
     )
     if checked is None:
-        return str(kind or ""), 0
+        return kind or "", 0
     latency = checked.get("latency_ms")
     if not _is_nonnegative_number(latency):
         errors.append(f"{path}.latency_ms must be non-negative")
     if kind == "model_call":
         _check_identifier(checked.get("provider"), f"{path}.provider", errors)
         _check_nonempty_string(checked.get("model"), f"{path}.model", errors)
-        if not _is_nonnegative_int(checked.get("attempt")) or checked["attempt"] < 1:
+        attempt = checked.get("attempt")
+        if not _is_nonnegative_int(attempt) or attempt < 1:
             errors.append(f"{path}.attempt must be a positive integer")
     elif kind == "tool_call":
         _check_identifier(checked.get("name"), f"{path}.name", errors)
     elif kind in {"provider_retry", "timeout", "cancellation_requested"}:
         _check_identifier(checked.get("reason"), f"{path}.reason", errors)
-    latency_value = (
-        int(latency)
-        if isinstance(latency, (int, float))
-        and not isinstance(latency, bool)
-        and math.isfinite(float(latency))
-        and latency >= 0
-        else 0
-    )
-    return str(kind or ""), latency_value
+    latency_value = int(latency) if _is_nonnegative_number(latency) else 0
+    return kind or "", latency_value
 
 
 def _check_review_evidence(
@@ -458,20 +599,13 @@ def _check_review_evidence(
     if checked.get("mutation_detected") is not False:
         errors.append(f"{path}.mutation_detected must be false")
     findings = checked.get("findings")
-    findings_int = (
-        findings
-        if isinstance(findings, int)
-        and not isinstance(findings, bool)
-        and findings >= 0
-        else None
-    )
-    if findings_int is None:
+    if not _is_nonnegative_int(findings):
         errors.append(f"{path}.findings must be a non-negative integer")
-    elif scenario == "review_approval" and findings_int != 0:
+    elif scenario == "review_approval" and findings != 0:
         errors.append(f"{path}.findings must be zero for review_approval")
-    elif scenario == "review_changes_requested" and findings_int < 1:
+    elif scenario == "review_changes_requested" and findings < 1:
         errors.append(f"{path}.findings must be positive for review_changes_requested")
-    elif scenario == "review_incomplete" and findings_int != 0:
+    elif scenario == "review_incomplete" and findings != 0:
         errors.append(f"{path}.findings must be zero for review_incomplete")
 
     checks = checked.get("checks")
@@ -519,6 +653,11 @@ def _check_review_evidence(
             )
 
 
+def _safe_event_latency(event: Mapping[str, Any]) -> float | int:
+    value = event.get("latency_ms")
+    return value if _is_nonnegative_number(value) else 0
+
+
 def _check_metrics(
     metrics: Any,
     events: Sequence[Mapping[str, Any]],
@@ -537,9 +676,9 @@ def _check_metrics(
         return
     for key in REQUIRED_METRICS & set(checked):
         valid = (
-            _is_nonnegative_int(checked[key])
+            _is_nonnegative_int(checked.get(key))
             if key in INTEGER_METRICS
-            else _is_nonnegative_number(checked[key])
+            else _is_nonnegative_number(checked.get(key))
         )
         if not valid:
             errors.append(f"{path}.{key} must be non-negative")
@@ -551,16 +690,12 @@ def _check_metrics(
     cancellation_events = [
         event for event in events if event.get("kind") == "cancellation_requested"
     ]
-    event_latency = sum(
-        event.get("latency_ms", 0)
-        for event in events
-        if _is_nonnegative_number(event.get("latency_ms"))
-    )
-    model_latency = sum(event.get("latency_ms", 0) for event in model_events)
-    tool_latency = sum(event.get("latency_ms", 0) for event in tool_events)
-    retry_latency = sum(event.get("latency_ms", 0) for event in retry_events)
+    event_latency = sum(_safe_event_latency(event) for event in events)
+    model_latency = sum(_safe_event_latency(event) for event in model_events)
+    tool_latency = sum(_safe_event_latency(event) for event in tool_events)
+    retry_latency = sum(_safe_event_latency(event) for event in retry_events)
     lifecycle_latency = sum(
-        event.get("latency_ms", 0) for event in (*timeout_events, *cancellation_events)
+        _safe_event_latency(event) for event in (*timeout_events, *cancellation_events)
     )
     expected_pairs = (
         ("model_calls", len(model_events)),
@@ -596,11 +731,11 @@ def _check_metrics(
         + checked["event_latency_ms"]
     ):
         errors.append(f"{path}.total_latency_ms does not match queue/startup/events")
-    if model_events and _is_nonnegative_number(model_events[0].get("latency_ms")):
+    if model_events:
         expected_first = (
             checked.get("queue_wait_ms", 0)
             + checked.get("startup_ms", 0)
-            + model_events[0]["latency_ms"]
+            + _safe_event_latency(model_events[0])
         )
         if checked.get("first_model_request_ms") != expected_first:
             errors.append(
@@ -617,10 +752,7 @@ def _check_metrics(
         errors.append(f"{path}.lifecycle_latency_ms must include the causal event")
 
 
-def validate_corpus(document: Any) -> list[str]:
-    """Return deterministic errors for the strict synthetic corpus schema."""
-
-    errors: list[str] = []
+def _validate_corpus(document: Any, errors: list[str]) -> None:
     checked_document = _check_keys(
         document,
         allowed=frozenset(
@@ -647,7 +779,7 @@ def validate_corpus(document: Any) -> list[str]:
         errors=errors,
     )
     if checked_document is None:
-        return errors
+        return
     if checked_document.get("schema_version") != SCHEMA_VERSION:
         errors.append(f"corpus.schema_version must be {SCHEMA_VERSION}")
     if checked_document.get("corpus_id") != CORPUS_ID:
@@ -661,12 +793,10 @@ def validate_corpus(document: Any) -> list[str]:
         errors=errors,
     )
     if baseline is not None:
-        _check_identifier(
-            baseline.get("hermes_profile"), "corpus.baseline.hermes_profile", errors
-        )
-        model = baseline.get("model")
-        if not isinstance(model, str) or not QUALIFIED_MODEL_RE.fullmatch(model):
-            errors.append("corpus.baseline.model must be a qualified model")
+        if baseline.get("hermes_profile") != CAPTURE_PROFILE:
+            errors.append("corpus.baseline.hermes_profile must be implementer")
+        if baseline.get("model") != CAPTURE_MODEL:
+            errors.append(f"corpus.baseline.model must be {CAPTURE_MODEL}")
         _check_revision(
             baseline.get("runtime_revision"), "corpus.baseline.runtime_revision", errors
         )
@@ -691,9 +821,12 @@ def validate_corpus(document: Any) -> list[str]:
             errors.append("corpus.provenance.observed must be false")
         if provenance.get("observed_production_data") is not False:
             errors.append("corpus.provenance.observed_production_data must be false")
-        _check_nonempty_string(
-            provenance.get("redaction"), "corpus.provenance.redaction", errors
-        )
+        if provenance.get("redaction") != (
+            "Synthetic vectors only; no observed task data or arbitrary text is retained."
+        ):
+            errors.append(
+                "corpus.provenance.redaction is not the fixed synthetic literal"
+            )
 
     replay = _check_keys(
         checked_document.get("replay"),
@@ -808,10 +941,22 @@ def validate_corpus(document: Any) -> list[str]:
         task = _check_keys(
             checked_fixture.get("task"),
             allowed=frozenset(
-                {"task_id", "objective", "repository", "workspace", "external_task_id"}
+                {
+                    "task_id",
+                    "scenario_code",
+                    "repository",
+                    "workspace",
+                    "external_task_id",
+                }
             ),
             required=frozenset(
-                {"task_id", "objective", "repository", "workspace", "external_task_id"}
+                {
+                    "task_id",
+                    "scenario_code",
+                    "repository",
+                    "workspace",
+                    "external_task_id",
+                }
             ),
             path=f"{prefix}.task",
             errors=errors,
@@ -819,9 +964,8 @@ def validate_corpus(document: Any) -> list[str]:
         if task is not None:
             if task.get("task_id") != fixture_id:
                 errors.append(f"{prefix}.task.task_id must equal the fixture id")
-            _check_nonempty_string(
-                task.get("objective"), f"{prefix}.task.objective", errors
-            )
+            if task.get("scenario_code") != scenario:
+                errors.append(f"{prefix}.task.scenario_code must equal the scenario")
             suffix = (
                 fixture_id.removeprefix("fixture-")
                 if isinstance(fixture_id, str)
@@ -876,6 +1020,28 @@ def validate_corpus(document: Any) -> list[str]:
         if isinstance(scenario, str) and scenario in EXPECTED_EVENT_KINDS:
             if tuple(event_kinds) != EXPECTED_EVENT_KINDS[scenario]:
                 errors.append(f"{prefix}.events are not causal for {scenario}")
+            expected_provider, expected_model = EXPECTED_MODEL_EVENT_ROUTES[scenario]
+            for event_index, event in enumerate(event_rows):
+                event_path = f"{prefix}.events[{event_index}]"
+                if event.get("kind") == "model_call":
+                    if event.get("provider") != expected_provider:
+                        errors.append(
+                            f"{event_path}.provider is not the fixed scenario provider"
+                        )
+                    if event.get("model") != expected_model:
+                        errors.append(
+                            f"{event_path}.model is not the fixed scenario model"
+                        )
+                elif event.get("kind") == "provider_retry":
+                    if event.get("reason") != EXPECTED_RETRY_REASONS["provider_retry"]:
+                        errors.append(
+                            f"{event_path}.reason is not the fixed retry code"
+                        )
+                elif event.get("kind") in {"timeout", "cancellation_requested"}:
+                    if event.get("reason") != EXPECTED_LIFECYCLE_REASONS[scenario]:
+                        errors.append(
+                            f"{event_path}.reason is not the fixed lifecycle code"
+                        )
             tool_names = tuple(
                 event.get("name")
                 for event in event_rows
@@ -937,7 +1103,7 @@ def validate_corpus(document: Any) -> list[str]:
         _check_metrics(
             checked_fixture.get("metrics"),
             event_rows,
-            str(scenario),
+            scenario if isinstance(scenario, str) else "",
             f"{prefix}.metrics",
             errors,
         )
@@ -945,10 +1111,10 @@ def validate_corpus(document: Any) -> list[str]:
         outcome = _check_keys(
             checked_fixture.get("durable_outcome"),
             allowed=frozenset(
-                {"status", "terminal", "task_state", "reason", "summary"}
+                {"status", "terminal", "task_state", "reason", "outcome_code"}
             ),
             required=frozenset(
-                {"status", "terminal", "task_state", "reason", "summary"}
+                {"status", "terminal", "task_state", "reason", "outcome_code"}
             ),
             path=f"{prefix}.durable_outcome",
             errors=errors,
@@ -975,16 +1141,9 @@ def validate_corpus(document: Any) -> list[str]:
                 errors.append(
                     f"{prefix}.durable_outcome.reason must be {expected_reason}"
                 )
-            summary = outcome.get("summary")
-            if not _check_nonempty_string(
-                summary, f"{prefix}.durable_outcome.summary", errors
-            ):
-                pass
-            elif isinstance(summary, str) and not summary.startswith(
-                "Synthetic test vector:"
-            ):
+            if outcome.get("outcome_code") != scenario:
                 errors.append(
-                    f"{prefix}.durable_outcome.summary must be labeled synthetic"
+                    f"{prefix}.durable_outcome.outcome_code must equal the scenario"
                 )
 
         if scenario in REVIEW_SCENARIOS:
@@ -1009,6 +1168,16 @@ def validate_corpus(document: Any) -> list[str]:
         f"missing required scenario: {scenario}" for scenario in missing_scenarios
     )
     _check_forbidden_values(document, "corpus", errors)
+
+
+def validate_corpus(document: Any) -> list[str]:
+    """Return deterministic errors and never raise for malformed JSON values."""
+
+    errors: list[str] = []
+    try:
+        _validate_corpus(document, errors)
+    except (TypeError, KeyError, IndexError, AttributeError, ValueError):
+        errors.append("corpus contains malformed JSON values")
     return errors
 
 
@@ -1024,10 +1193,7 @@ def _evidence_fingerprint(record: Mapping[str, Any]) -> str:
     return "sha256:" + hashlib.sha256(_canonical_json(payload)).hexdigest()
 
 
-def validate_observed_record(document: Any) -> list[str]:
-    """Validate the sanitized observed-record contract and its fingerprint."""
-
-    errors: list[str] = []
+def _validate_observed_record(document: Any, errors: list[str]) -> None:
     checked = _check_keys(
         document,
         allowed=frozenset(
@@ -1036,7 +1202,11 @@ def validate_observed_record(document: Any) -> list[str]:
                 "record_type",
                 "provenance",
                 "identity",
+                "source_binding",
+                "profile_contract",
+                "environment_contract",
                 "command_contract",
+                "local_side_effects",
                 "captured_at_utc",
                 "execution",
                 "usage_evidence",
@@ -1051,7 +1221,11 @@ def validate_observed_record(document: Any) -> list[str]:
                 "record_type",
                 "provenance",
                 "identity",
+                "source_binding",
+                "profile_contract",
+                "environment_contract",
                 "command_contract",
+                "local_side_effects",
                 "captured_at_utc",
                 "execution",
                 "usage_evidence",
@@ -1064,11 +1238,14 @@ def validate_observed_record(document: Any) -> list[str]:
         errors=errors,
     )
     if checked is None:
-        return errors
+        return
     if checked.get("schema_version") != OBSERVED_SCHEMA_VERSION:
-        errors.append("observed.schema_version is unsupported")
+        errors.append(f"observed.schema_version must be {OBSERVED_SCHEMA_VERSION}")
     if checked.get("record_type") != "observed_hermes_baseline":
         errors.append("observed.record_type is unsupported")
+    captured_at = checked.get("captured_at_utc")
+    if not isinstance(captured_at, str) or not TIMESTAMP_RE.fullmatch(captured_at):
+        errors.append("observed.captured_at_utc must be a UTC timestamp")
 
     provenance = _check_keys(
         checked.get("provenance"),
@@ -1080,6 +1257,8 @@ def validate_observed_record(document: Any) -> list[str]:
                 "sanitized",
                 "raw_prompts_recorded",
                 "raw_logs_recorded",
+                "raw_output_recorded",
+                "fingerprint_semantics",
                 "redaction",
             }
         ),
@@ -1091,6 +1270,8 @@ def validate_observed_record(document: Any) -> list[str]:
                 "sanitized",
                 "raw_prompts_recorded",
                 "raw_logs_recorded",
+                "raw_output_recorded",
+                "fingerprint_semantics",
                 "redaction",
             }
         ),
@@ -1100,15 +1281,26 @@ def validate_observed_record(document: Any) -> list[str]:
     if provenance is not None:
         if provenance.get("kind") != "observed_benign_hermes_smoke":
             errors.append("observed.provenance.kind is unsupported")
-        for key in ("synthetic", "raw_prompts_recorded", "raw_logs_recorded"):
+        for key in (
+            "synthetic",
+            "raw_prompts_recorded",
+            "raw_logs_recorded",
+            "raw_output_recorded",
+        ):
             if provenance.get(key) is not False:
                 errors.append(f"observed.provenance.{key} must be false")
         for key in ("observed", "sanitized"):
             if provenance.get(key) is not True:
                 errors.append(f"observed.provenance.{key} must be true")
-        _check_nonempty_string(
-            provenance.get("redaction"), "observed.provenance.redaction", errors
-        )
+        if (
+            provenance.get("fingerprint_semantics")
+            != "self_consistency_digest_not_attestation"
+        ):
+            errors.append("observed.provenance.fingerprint_semantics is unsupported")
+        if provenance.get("redaction") != (
+            "Response, stderr, raw usage failures, prompts beyond the fixed public phrase, environment values, credentials, session identifiers, and logs are not retained."
+        ):
+            errors.append("observed.provenance.redaction is not the fixed literal")
 
     identity = _check_keys(
         checked.get("identity"),
@@ -1118,7 +1310,10 @@ def validate_observed_record(document: Any) -> list[str]:
                 "qualified_model",
                 "hermes_version",
                 "hermes_source_revision",
-                "factory_runtime_revision",
+                "capture_source_revision",
+                "factory_base_revision",
+                "factory_head_revision",
+                "clean_before_capture",
             }
         ),
         required=frozenset(
@@ -1127,61 +1322,200 @@ def validate_observed_record(document: Any) -> list[str]:
                 "qualified_model",
                 "hermes_version",
                 "hermes_source_revision",
-                "factory_runtime_revision",
+                "capture_source_revision",
+                "factory_base_revision",
+                "factory_head_revision",
+                "clean_before_capture",
             }
         ),
         path="observed.identity",
         errors=errors,
     )
     if identity is not None:
-        _check_identifier(
-            identity.get("hermes_profile"), "observed.identity.hermes_profile", errors
-        )
-        if not isinstance(
-            identity.get("qualified_model"), str
-        ) or not QUALIFIED_MODEL_RE.fullmatch(identity.get("qualified_model", "")):
-            errors.append("observed.identity.qualified_model must be qualified")
+        if identity.get("hermes_profile") != CAPTURE_PROFILE:
+            errors.append("observed.identity.hermes_profile must be implementer")
+        if identity.get("qualified_model") != CAPTURE_MODEL:
+            errors.append(f"observed.identity.qualified_model must be {CAPTURE_MODEL}")
+        version = identity.get("hermes_version")
+        if not isinstance(version, str) or not VERSION_RE.fullmatch(version):
+            errors.append("observed.identity.hermes_version must be a version")
         for key in (
-            "hermes_version",
             "hermes_source_revision",
-            "factory_runtime_revision",
+            "capture_source_revision",
+            "factory_base_revision",
+            "factory_head_revision",
         ):
-            value = identity.get(key)
-            if value is not None and not isinstance(value, str):
-                errors.append(f"observed.identity.{key} must be a string or null")
-        for key in ("hermes_source_revision", "factory_runtime_revision"):
-            value = identity.get(key)
-            if value is not None and not REVISION_RE.fullmatch(value):
-                errors.append(
-                    f"observed.identity.{key} must be a full hexadecimal revision or null"
-                )
+            _check_revision(identity.get(key), f"observed.identity.{key}", errors)
+        if identity.get("factory_base_revision") != BASE_REVISION:
+            errors.append(
+                "observed.identity.factory_base_revision does not match the admitted base"
+            )
+        if identity.get("factory_head_revision") != identity.get(
+            "capture_source_revision"
+        ):
+            errors.append(
+                "observed identity head and capture source revision must agree"
+            )
+        if identity.get("clean_before_capture") is not True:
+            errors.append("observed.identity.clean_before_capture must be true")
+
+    source_binding = _check_keys(
+        checked.get("source_binding"),
+        allowed=frozenset(
+            {"capture_source_revision", "source_sha256", "fingerprint_scope"}
+        ),
+        required=frozenset(
+            {"capture_source_revision", "source_sha256", "fingerprint_scope"}
+        ),
+        path="observed.source_binding",
+        errors=errors,
+    )
+    if source_binding is not None:
+        _check_revision(
+            source_binding.get("capture_source_revision"),
+            "observed.source_binding.capture_source_revision",
+            errors,
+        )
+        _check_sha256(
+            source_binding.get("source_sha256"),
+            "observed.source_binding.source_sha256",
+            errors,
+        )
+        if source_binding.get("fingerprint_scope") != "capture_executable_source_bytes":
+            errors.append("observed.source_binding.fingerprint_scope is unsupported")
+        if identity is not None and source_binding.get(
+            "capture_source_revision"
+        ) != identity.get("capture_source_revision"):
+            errors.append(
+                "observed.source_binding.capture_source_revision does not match identity"
+            )
+        current_source = _capture_source_sha256()
+        if (
+            current_source is None
+            or source_binding.get("source_sha256") != current_source
+        ):
+            errors.append(
+                "observed.source_binding.source_sha256 does not match capture source"
+            )
+
+    profile_contract = _check_keys(
+        checked.get("profile_contract"),
+        allowed=frozenset(
+            {
+                "fingerprint",
+                "metadata_only",
+                "contents_recorded",
+                "auth_material_recorded",
+            }
+        ),
+        required=frozenset(
+            {
+                "fingerprint",
+                "metadata_only",
+                "contents_recorded",
+                "auth_material_recorded",
+            }
+        ),
+        path="observed.profile_contract",
+        errors=errors,
+    )
+    if profile_contract is not None:
+        _check_sha256(
+            profile_contract.get("fingerprint"),
+            "observed.profile_contract.fingerprint",
+            errors,
+        )
+        for key in ("metadata_only",):
+            if profile_contract.get(key) is not True:
+                errors.append(f"observed.profile_contract.{key} must be true")
+        for key in ("contents_recorded", "auth_material_recorded"):
+            if profile_contract.get(key) is not False:
+                errors.append(f"observed.profile_contract.{key} must be false")
+        current_profile = _profile_contract_fingerprint(CAPTURE_PROFILE)
+        if (
+            current_profile is None
+            or profile_contract.get("fingerprint") != current_profile
+        ):
+            errors.append(
+                "observed.profile_contract.fingerprint does not match profile metadata"
+            )
+
+    environment_contract = _check_keys(
+        checked.get("environment_contract"),
+        allowed=frozenset(
+            {
+                "allowlist_categories",
+                "control_plane_variables_removed",
+                "kanban_variables_removed",
+                "secret_environment_passed",
+                "values_recorded",
+            }
+        ),
+        required=frozenset(
+            {
+                "allowlist_categories",
+                "control_plane_variables_removed",
+                "kanban_variables_removed",
+                "secret_environment_passed",
+                "values_recorded",
+            }
+        ),
+        path="observed.environment_contract",
+        errors=errors,
+    )
+    if environment_contract is not None:
+        if environment_contract.get("allowlist_categories") != [
+            "HOME",
+            "PATH",
+            "LOCALE",
+            "TLS_PROXY",
+        ]:
+            errors.append(
+                "observed.environment_contract.allowlist_categories is unsupported"
+            )
+        for key in ("control_plane_variables_removed", "kanban_variables_removed"):
+            if environment_contract.get(key) is not True:
+                errors.append(f"observed.environment_contract.{key} must be true")
+        for key in ("secret_environment_passed", "values_recorded"):
+            if environment_contract.get(key) is not False:
+                errors.append(f"observed.environment_contract.{key} must be false")
 
     command = _check_keys(
         checked.get("command_contract"),
         allowed=frozenset(
             {
                 "mode",
+                "profile",
+                "model",
                 "fixed_prompt",
-                "toolsets",
-                "tools_allowed",
+                "expected_response",
+                "tools",
+                "tool_override",
                 "repository_access",
                 "working_directory",
                 "timeout_seconds",
-                "stdout_stderr",
+                "stdout",
+                "stderr",
                 "usage_evidence",
+                "acknowledgement",
             }
         ),
         required=frozenset(
             {
                 "mode",
+                "profile",
+                "model",
                 "fixed_prompt",
-                "toolsets",
-                "tools_allowed",
+                "expected_response",
+                "tools",
+                "tool_override",
                 "repository_access",
                 "working_directory",
                 "timeout_seconds",
-                "stdout_stderr",
+                "stdout",
+                "stderr",
                 "usage_evidence",
+                "acknowledgement",
             }
         ),
         path="observed.command_contract",
@@ -1190,14 +1524,19 @@ def validate_observed_record(document: Any) -> list[str]:
     if command is not None:
         expected_command = {
             "mode": "bounded_one_shot",
+            "profile": CAPTURE_PROFILE,
+            "model": CAPTURE_MODEL,
             "fixed_prompt": CAPTURE_PROMPT,
-            "toolsets": [CAPTURE_TOOLSET],
-            "tools_allowed": False,
+            "expected_response": CAPTURE_RESPONSE,
+            "tools": "profile_default",
+            "tool_override": "none",
             "repository_access": "none",
-            "working_directory": "temporary_directory",
+            "working_directory": "fresh_temporary_non_git",
             "timeout_seconds": CAPTURE_TIMEOUT_SECONDS,
-            "stdout_stderr": "discarded",
+            "stdout": "captured_in_memory_then_discarded",
+            "stderr": "not_captured",
             "usage_evidence": "sanitized_usage_file",
+            "acknowledgement": "ack_local_hermes_persistence_required",
         }
         for key, expected in expected_command.items():
             if command.get(key) != expected:
@@ -1205,49 +1544,103 @@ def validate_observed_record(document: Any) -> list[str]:
                     f"observed.command_contract.{key} does not match capture contract"
                 )
 
+    side_effects = _check_keys(
+        checked.get("local_side_effects"),
+        allowed=frozenset(
+            {
+                "credential_store_read",
+                "profile_session_db_writes",
+                "profile_log_writes",
+                "factory_task_mutations",
+                "external_repository_mutations",
+                "observed_record_write",
+            }
+        ),
+        required=frozenset(
+            {
+                "credential_store_read",
+                "profile_session_db_writes",
+                "profile_log_writes",
+                "factory_task_mutations",
+                "external_repository_mutations",
+                "observed_record_write",
+            }
+        ),
+        path="observed.local_side_effects",
+        errors=errors,
+    )
+    if side_effects is not None:
+        expected_side_effects = {
+            "credential_store_read": "expected",
+            "profile_session_db_writes": "expected",
+            "profile_log_writes": "expected",
+            "factory_task_mutations": "not_performed_by_contract",
+            "external_repository_mutations": "not_performed_by_contract",
+            "observed_record_write": "checked_in_record_only",
+        }
+        for key, expected in expected_side_effects.items():
+            if side_effects.get(key) != expected:
+                errors.append(f"observed.local_side_effects.{key} is not truthful")
+
     execution = _check_keys(
         checked.get("execution"),
         allowed=frozenset(
             {
                 "exit_code",
                 "timed_out",
+                "response_contract_satisfied",
                 "wall_time_ms",
                 "peak_rss_bytes",
-                "response_recorded",
-                "raw_output_recorded",
+                "rss_scope",
+                "measurement_helper",
+                "stdout_recorded",
+                "stderr_recorded",
+                "cwd_non_git",
             }
         ),
         required=frozenset(
             {
                 "exit_code",
                 "timed_out",
+                "response_contract_satisfied",
                 "wall_time_ms",
                 "peak_rss_bytes",
-                "response_recorded",
-                "raw_output_recorded",
+                "rss_scope",
+                "measurement_helper",
+                "stdout_recorded",
+                "stderr_recorded",
+                "cwd_non_git",
             }
         ),
         path="observed.execution",
         errors=errors,
     )
     if execution is not None:
-        if execution.get("exit_code") is not None and not isinstance(
-            execution.get("exit_code"), int
-        ):
-            errors.append("observed.execution.exit_code must be an integer or null")
-        if not _is_nonnegative_number(execution.get("wall_time_ms")):
-            errors.append("observed.execution.wall_time_ms must be non-negative")
-        if execution.get("peak_rss_bytes") is not None and not _is_nonnegative_int(
-            execution.get("peak_rss_bytes")
-        ):
-            errors.append(
-                "observed.execution.peak_rss_bytes must be an integer or null"
-            )
+        if execution.get("exit_code") != 0:
+            errors.append("observed.execution.exit_code must be zero")
+        if execution.get("timed_out") is not False:
+            errors.append("observed.execution.timed_out must be false")
+        if execution.get("response_contract_satisfied") is not True:
+            errors.append("observed.execution.response_contract_satisfied must be true")
         if (
-            execution.get("response_recorded") is not False
-            or execution.get("raw_output_recorded") is not False
+            not _is_nonnegative_number(execution.get("wall_time_ms"))
+            or execution.get("wall_time_ms") <= 0
         ):
-            errors.append("observed execution must not record response or raw output")
+            errors.append("observed.execution.wall_time_ms must be positive")
+        if (
+            not _is_nonnegative_int(execution.get("peak_rss_bytes"))
+            or execution.get("peak_rss_bytes") <= 0
+        ):
+            errors.append("observed.execution.peak_rss_bytes must be positive")
+        if execution.get("rss_scope") != "max_child_rss_not_aggregate_process_tree":
+            errors.append("observed.execution.rss_scope is unsupported")
+        if execution.get("measurement_helper") != "fresh_helper_only_child_hermes":
+            errors.append("observed.execution.measurement_helper is unsupported")
+        for key in ("stdout_recorded", "stderr_recorded"):
+            if execution.get(key) is not False:
+                errors.append(f"observed.execution.{key} must be false")
+        if execution.get("cwd_non_git") is not True:
+            errors.append("observed.execution.cwd_non_git must be true")
 
     usage = _check_keys(
         checked.get("usage_evidence"),
@@ -1255,8 +1648,12 @@ def validate_observed_record(document: Any) -> list[str]:
             {
                 "source",
                 "read",
+                "provider",
+                "model",
                 "available_fields",
                 "unavailable_reasons",
+                "completed",
+                "failed",
                 "session_identifier_recorded",
                 "raw_logs_recorded",
                 "prompts_recorded",
@@ -1266,8 +1663,12 @@ def validate_observed_record(document: Any) -> list[str]:
             {
                 "source",
                 "read",
+                "provider",
+                "model",
                 "available_fields",
                 "unavailable_reasons",
+                "completed",
+                "failed",
                 "session_identifier_recorded",
                 "raw_logs_recorded",
                 "prompts_recorded",
@@ -1276,46 +1677,46 @@ def validate_observed_record(document: Any) -> list[str]:
         path="observed.usage_evidence",
         errors=errors,
     )
+    usage_unavailable: Mapping[str, Any] = {}
     if usage is not None:
-        _check_nonempty_string(
-            usage.get("source"), "observed.usage_evidence.source", errors
-        )
+        if usage.get("source") != "Hermes one-shot --usage-file":
+            errors.append("observed.usage_evidence.source is unsupported")
+        if usage.get("read") is not True:
+            errors.append("observed.usage_evidence.read must be true")
+        if usage.get("provider") != CAPTURE_PROVIDER:
+            errors.append("observed.usage_evidence.provider does not match Codex route")
+        if usage.get("model") != CAPTURE_BARE_MODEL:
+            errors.append("observed.usage_evidence.model does not match Codex route")
+        if usage.get("completed") is not True:
+            errors.append("observed.usage_evidence.completed must be true")
+        if usage.get("failed") is not False:
+            errors.append("observed.usage_evidence.failed must be false")
         available_fields = usage.get("available_fields")
-        allowed_usage_fields = frozenset(
-            {
-                "api_calls",
-                "input_tokens",
-                "output_tokens",
-                "cache_read_tokens",
-                "cache_write_tokens",
-            }
-        )
         if not isinstance(available_fields, list) or any(
-            not isinstance(field, str) or field not in allowed_usage_fields
-            for field in (
-                available_fields if isinstance(available_fields, list) else []
-            )
+            not isinstance(field, str) or field not in USAGE_FIELDS
+            for field in available_fields
         ):
             errors.append(
-                "observed.usage_evidence.available_fields must be a string array"
+                "observed.usage_evidence.available_fields must be a usage-field array"
             )
+            available_fields = []
         elif len(available_fields) != len(set(available_fields)):
             errors.append("observed.usage_evidence.available_fields must be unique")
-        unavailable_usage = usage.get("unavailable_reasons")
-        if not isinstance(unavailable_usage, Mapping):
+        usage_unavailable_value = usage.get("unavailable_reasons")
+        if not isinstance(usage_unavailable_value, Mapping):
             errors.append(
                 "observed.usage_evidence.unavailable_reasons must be an object"
             )
         else:
-            allowed_unavailable = frozenset({*allowed_usage_fields, "process"})
-            for key, value in unavailable_usage.items():
-                if key not in allowed_unavailable:
+            usage_unavailable = usage_unavailable_value
+            for key, value in usage_unavailable.items():
+                if key not in USAGE_FIELDS - {"api_calls"}:
                     errors.append(
                         f"observed.usage_evidence.unavailable_reasons.{key} is unknown"
                     )
-                if not isinstance(value, str) or not value.strip():
+                if value not in UNAVAILABLE_REASON_CODES:
                     errors.append(
-                        f"observed.usage_evidence.unavailable_reasons.{key} must be non-empty text"
+                        f"observed.usage_evidence.unavailable_reasons.{key} is not an enum code"
                     )
         for key in (
             "session_identifier_recorded",
@@ -1327,76 +1728,90 @@ def validate_observed_record(document: Any) -> list[str]:
 
     metrics = _check_keys(
         checked.get("metrics"),
-        allowed=frozenset(
-            {
-                "model_calls",
-                "tool_calls",
-                "input_tokens",
-                "output_tokens",
-                "cache_read_tokens",
-                "cache_write_tokens",
-            }
-        ),
-        required=frozenset(
-            {
-                "model_calls",
-                "tool_calls",
-                "input_tokens",
-                "output_tokens",
-                "cache_read_tokens",
-                "cache_write_tokens",
-            }
-        ),
+        allowed=frozenset(OBSERVED_METRIC_KEYS),
+        required=frozenset(OBSERVED_METRIC_KEYS),
         path="observed.metrics",
         errors=errors,
     )
+    null_metrics: set[str] = set()
     if metrics is not None:
-        for key, value in metrics.items():
-            if value is not None and not _is_nonnegative_int(value):
+        for key in OBSERVED_METRIC_KEYS:
+            value = metrics.get(key)
+            if value is None:
+                null_metrics.add(key)
+            elif key in OBSERVED_INTEGER_METRICS and not _is_nonnegative_int(value):
                 errors.append(
                     f"observed.metrics.{key} must be a non-negative integer or null"
                 )
-        if metrics.get("tool_calls") != 0:
+            elif key == "wall_time_ms" and not _is_nonnegative_number(value):
+                errors.append(
+                    "observed.metrics.wall_time_ms must be a non-negative number or null"
+                )
+        if metrics.get("model_calls") != 1:
             errors.append(
-                "observed.metrics.tool_calls must be zero for the empty toolset"
+                "observed.metrics.model_calls must equal one usage-file api call"
             )
+        if metrics.get("tool_calls") != 0:
+            errors.append("observed.metrics.tool_calls must be zero")
+        if execution is not None:
+            if metrics.get("wall_time_ms") != execution.get("wall_time_ms"):
+                errors.append("observed.metrics.wall_time_ms must match execution")
+            if metrics.get("peak_rss_bytes") != execution.get("peak_rss_bytes"):
+                errors.append("observed.metrics.peak_rss_bytes must match execution")
+
     reasons = checked.get("metric_unavailable_reasons")
     if not isinstance(reasons, Mapping):
         errors.append("observed.metric_unavailable_reasons must be an object")
-    else:
-        allowed_reason_keys = frozenset(
-            {
-                "model_calls",
-                "tool_calls",
-                "input_tokens",
-                "output_tokens",
-                "cache_read_tokens",
-                "cache_write_tokens",
-                "hermes_version",
-                "hermes_source_revision",
-                "factory_runtime_revision",
-                "peak_rss_bytes",
-                "process",
-            }
+        reasons = {}
+    reason_keys = set(reasons)
+    unknown_reason_keys = reason_keys - set(OBSERVED_METRIC_KEYS)
+    for key in sorted(unknown_reason_keys):
+        errors.append(f"observed.metric_unavailable_reasons.{key} is unknown")
+    if reason_keys != null_metrics:
+        errors.append(
+            "observed.metric_unavailable_reasons must exactly cover null metrics"
         )
-        for key, value in reasons.items():
-            if key not in allowed_reason_keys:
-                errors.append(f"observed.metric_unavailable_reasons.{key} is unknown")
-            if not isinstance(value, str) or not value.strip():
-                errors.append(
-                    f"observed.metric_unavailable_reasons.{key} must contain text"
-                )
+    for key in sorted(reason_keys & set(OBSERVED_METRIC_KEYS)):
+        if reasons.get(key) not in UNAVAILABLE_REASON_CODES:
+            errors.append(
+                f"observed.metric_unavailable_reasons.{key} is not an enum code"
+            )
+    expected_nested = {
+        field: reasons[metric]
+        for metric, field in USAGE_METRIC_TO_FIELD.items()
+        if metric in null_metrics and field != "api_calls"
+    }
+    if dict(usage_unavailable) != expected_nested:
+        errors.append("nested and top-level metric availability reasons disagree")
+    if usage is not None:
+        available_fields = usage.get("available_fields")
+        if isinstance(available_fields, list):
+            expected_available = {
+                field
+                for metric, field in USAGE_METRIC_TO_FIELD.items()
+                if metric not in null_metrics
+            }
+            if set(available_fields) != expected_available:
+                errors.append("usage available_fields do not match non-null metrics")
 
     fingerprint = checked.get("evidence_fingerprint")
-    if not isinstance(fingerprint, str) or not re.fullmatch(
-        r"sha256:[0-9a-f]{64}", fingerprint
-    ):
+    if not isinstance(fingerprint, str) or not SHA256_RE.fullmatch(fingerprint):
         errors.append("observed.evidence_fingerprint must be a sha256 fingerprint")
     elif fingerprint != _evidence_fingerprint(checked):
         errors.append(
             "observed.evidence_fingerprint does not match the sanitized record"
         )
     _check_forbidden_values(document, "observed", errors)
+
+
+def validate_observed_record(document: Any) -> list[str]:
+    """Return strict observed-record errors without raising on malformed values."""
+
+    errors: list[str] = []
+    try:
+        _validate_observed_record(document, errors)
+    except (TypeError, KeyError, IndexError, AttributeError, ValueError):
+        errors.append("observed record contains malformed JSON values")
     return errors
 
 
@@ -1413,6 +1828,8 @@ def load_corpus(path: str | Path) -> dict[str, Any]:
     errors = validate_corpus(document)
     if errors:
         raise CorpusValidationError(errors)
+    if not isinstance(document, dict):
+        raise CorpusValidationError(("corpus must be an object",))
     return document
 
 
@@ -1423,37 +1840,45 @@ def replay_corpus(source: Mapping[str, Any] | str | Path) -> dict[str, Any]:
     errors = validate_corpus(document)
     if errors:
         raise CorpusValidationError(errors)
-    fixtures = document["fixtures"]
-    outcomes = Counter(fixture["durable_outcome"]["status"] for fixture in fixtures)
-    totals = {
-        key: sum(fixture["metrics"][key] for fixture in fixtures)
-        for key in REPLAY_SUM_METRICS
-    }
-    return {
-        "corpus_id": document["corpus_id"],
-        "schema_version": document["schema_version"],
-        "provenance": {
-            "kind": "synthetic_test_vectors",
+    if not isinstance(document, Mapping):
+        raise CorpusValidationError(("corpus must be an object",))
+    fixtures = document.get("fixtures")
+    if not isinstance(fixtures, list):
+        raise CorpusValidationError(("corpus.fixtures must be an array",))
+    try:
+        outcomes = Counter(fixture["durable_outcome"]["status"] for fixture in fixtures)
+        totals = {
+            key: sum(fixture["metrics"][key] for fixture in fixtures)
+            for key in REPLAY_SUM_METRICS
+        }
+        result = {
+            "corpus_id": document["corpus_id"],
+            "schema_version": document["schema_version"],
+            "provenance": {
+                "kind": "synthetic_test_vectors",
+                "synthetic": True,
+                "observed": False,
+                "metrics_are_measurements": False,
+            },
             "synthetic": True,
             "observed": False,
-            "metrics_are_measurements": False,
-        },
-        "synthetic": True,
-        "observed": False,
-        "deterministic": True,
-        "side_effects": False,
-        "fixtures_replayed": len(fixtures),
-        "fixture_ids": [fixture["id"] for fixture in fixtures],
-        "scenario_ids": sorted(fixture["scenario"] for fixture in fixtures),
-        "outcome_counts": dict(sorted(outcomes.items())),
-        "totals": totals,
-        "max_peak_rss_bytes": max(
-            fixture["metrics"]["peak_rss_bytes"] for fixture in fixtures
-        ),
-        "all_terminal": all(
-            fixture["durable_outcome"]["terminal"] for fixture in fixtures
-        ),
-    }
+            "deterministic": True,
+            "side_effects": False,
+            "fixtures_replayed": len(fixtures),
+            "fixture_ids": [fixture["id"] for fixture in fixtures],
+            "scenario_ids": sorted(fixture["scenario"] for fixture in fixtures),
+            "outcome_counts": dict(sorted(outcomes.items())),
+            "totals": totals,
+            "max_peak_rss_bytes": max(
+                fixture["metrics"]["peak_rss_bytes"] for fixture in fixtures
+            ),
+            "all_terminal": all(
+                fixture["durable_outcome"]["terminal"] for fixture in fixtures
+            ),
+        }
+    except (TypeError, KeyError, IndexError, AttributeError, ValueError) as exc:
+        raise CorpusValidationError(("corpus contains malformed JSON values",)) from exc
+    return result
 
 
 def _read_revision(cwd: Path) -> str | None:
@@ -1472,6 +1897,21 @@ def _read_revision(cwd: Path) -> str | None:
     return revision if REVISION_RE.fullmatch(revision) else None
 
 
+def _git_worktree_is_clean(cwd: Path) -> bool:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(cwd), "status", "--porcelain", "--untracked-files=all"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0 and result.stdout == ""
+
+
 def _hermes_identity(executable: str) -> tuple[str | None, str | None]:
     """Read only version/revision identity; never persist the install path."""
 
@@ -1488,15 +1928,100 @@ def _hermes_identity(executable: str) -> tuple[str | None, str | None]:
         return None, None
     output = result.stdout
     version_match = re.search(r"Hermes Agent v([^\s·]+)", output)
-    upstream_match = re.search(r"upstream\s+([0-9a-f]{7,40})", output)
     version = version_match.group(1) if version_match else None
     revision = None
     install_match = re.search(r"^Install directory:\s*(\S+)\s*$", output, re.MULTILINE)
     if install_match:
         revision = _read_revision(Path(install_match.group(1)))
-    if revision is None and upstream_match and len(upstream_match.group(1)) == 40:
-        revision = upstream_match.group(1)
     return version, revision
+
+
+def _sha256_file(path: Path) -> str | None:
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(65536), b""):
+                digest.update(chunk)
+    except (OSError, ValueError):
+        return None
+    return "sha256:" + digest.hexdigest()
+
+
+def _config_key_metadata(path: Path) -> list[str]:
+    """Return key/indent metadata only; never include config values."""
+
+    keys: list[str] = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.lstrip()
+            if not stripped or stripped.startswith("#") or ":" not in stripped:
+                continue
+            key = stripped.split(":", 1)[0].strip()
+            if re.fullmatch(r"[A-Za-z0-9_.-]+", key):
+                keys.append(f"{len(line) - len(stripped)}:{key}")
+    except (OSError, UnicodeError):
+        return []
+    return keys
+
+
+def _profile_contract_fingerprint(profile: str) -> str | None:
+    """Hash stable, non-secret profile contract metadata without storing contents."""
+
+    home = os.environ.get("HOME")
+    if not isinstance(home, str) or not home:
+        return None
+    root = Path(home) / ".hermes" / "profiles" / profile
+    metadata: dict[str, Any] = {"profile": profile, "files": []}
+    for relative in PROFILE_CONTRACT_FILES:
+        path = root / relative
+        item: dict[str, Any] = {"path": relative, "present": path.is_file()}
+        if path.is_file():
+            try:
+                item["size"] = path.stat().st_size
+            except OSError:
+                item["size"] = None
+            if relative in NON_SECRET_PROFILE_PROMPTS:
+                item["sha256"] = _sha256_file(path)
+            elif relative == "config.yaml":
+                item["key_metadata"] = _config_key_metadata(path)
+        metadata["files"].append(item)
+    try:
+        encoded = json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    except (TypeError, ValueError):
+        return None
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _capture_source_sha256() -> str | None:
+    return _sha256_file(Path(__file__).resolve())
+
+
+def _proxy_value_is_non_secret(value: str) -> bool:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    return parsed.username is None and parsed.password is None
+
+
+def _scrubbed_environment() -> dict[str, str]:
+    """Build the narrow environment allowlist used by the real Hermes child."""
+
+    scrubbed: dict[str, str] = {}
+    for key, value in os.environ.items():
+        if key not in ALLOWED_ENV_NAMES and not key.startswith("LC_"):
+            continue
+        if key in PROXY_ENV_NAMES and not _proxy_value_is_non_secret(value):
+            continue
+        scrubbed[key] = value
+    return scrubbed
+
+
+def _usage_int(candidate: Mapping[str, Any], key: str) -> int | None:
+    value = candidate.get(key)
+    return value if _is_nonnegative_int(value) else None
 
 
 def _children_peak_rss_bytes() -> int | None:
@@ -1508,23 +2033,204 @@ def _children_peak_rss_bytes() -> int | None:
         return None
     if not _is_nonnegative_number(value) or value <= 0:
         return None
-    # Linux reports KiB; macOS reports bytes.  The observed environment is
-    # Linux, but retaining the platform branch keeps the command repeatable.
+    # Linux reports KiB; macOS reports bytes.  The record states that this is
+    # max direct-child RSS, not aggregate process-tree RSS.
     return int(value * 1024) if sys.platform.startswith("linux") else int(value)
 
 
-def _safe_usage_value(usage: Mapping[str, Any], key: str) -> int | None:
-    value = usage.get(key)
-    return value if _is_nonnegative_int(value) else None
+def _kill_process_group(process: subprocess.Popen[Any]) -> None:
+    if os.name == "posix":
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            return
+        except OSError:
+            pass
+    try:
+        process.kill()
+    except OSError:
+        pass
 
 
-def _capture_record(profile: str, model: str) -> dict[str, Any]:
-    if not _check_nonempty_string(
-        profile, "profile", []
-    ) or not IDENTIFIER_RE.fullmatch(profile):
-        raise CaptureError("profile must be a safe identifier")
-    if not isinstance(model, str) or not QUALIFIED_MODEL_RE.fullmatch(model):
-        raise CaptureError("model must be a qualified model")
+def _sanitized_usage(candidate: Any) -> dict[str, Any] | None:
+    """Extract only typed, non-secret usage evidence from Hermes' report."""
+
+    if not isinstance(candidate, Mapping):
+        return None
+    completed = candidate.get("completed")
+    failed = candidate.get("failed")
+    provider = candidate.get("provider")
+    model = candidate.get("model")
+    api_calls = candidate.get("api_calls")
+    if (
+        not isinstance(completed, bool)
+        or not isinstance(failed, bool)
+        or not isinstance(provider, str)
+        or not isinstance(model, str)
+        or not _is_nonnegative_int(api_calls)
+    ):
+        return None
+    values: dict[str, int] = {"api_calls": api_calls}
+    for field in USAGE_FIELDS - {"api_calls"}:
+        if field in candidate:
+            value = candidate.get(field)
+            if value is None:
+                continue
+            if not _is_nonnegative_int(value):
+                return None
+            values[field] = value
+    return {
+        "completed": completed,
+        "failed": failed,
+        "route_matches": provider == CAPTURE_PROVIDER and model == CAPTURE_BARE_MODEL,
+        "api_calls": api_calls,
+        "values": values,
+    }
+
+
+def _measurement_helper(usage_path: Path, workspace: Path) -> dict[str, Any]:
+    """Run exactly one measured Hermes child and emit only sanitized metadata."""
+
+    result: dict[str, Any] = {
+        "exit_code": None,
+        "timed_out": False,
+        "response_exact": False,
+        "usage_read": False,
+        "usage_contract": None,
+        "peak_rss_bytes": None,
+        "helper_error": None,
+    }
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        before_rss = _children_peak_rss_bytes()
+        process = subprocess.Popen(
+            [
+                "hermes",
+                "--profile",
+                CAPTURE_PROFILE,
+                "-z",
+                CAPTURE_PROMPT,
+                "--usage-file",
+                str(usage_path),
+                "-m",
+                CAPTURE_MODEL,
+            ],
+            cwd=workspace,
+            env=os.environ.copy(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=False,
+        )
+        try:
+            stdout, _ = process.communicate(timeout=CAPTURE_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            result["timed_out"] = True
+            _kill_process_group(process)
+            stdout, _ = process.communicate()
+        result["exit_code"] = process.returncode
+        # Hermes oneshot writes the final response followed by one newline.  No
+        # trim or normalization is allowed: this is an exact response gate.
+        result["response_exact"] = stdout == (CAPTURE_RESPONSE + "\n").encode("utf-8")
+        if usage_path.is_file():
+            result["usage_read"] = True
+            try:
+                candidate = json.loads(usage_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                candidate = None
+            result["usage_contract"] = _sanitized_usage(candidate)
+        after_rss = _children_peak_rss_bytes()
+        if after_rss is not None and (before_rss is None or after_rss > before_rss):
+            result["peak_rss_bytes"] = after_rss
+    except (OSError, subprocess.SubprocessError):
+        result["helper_error"] = "process_unavailable"
+    except (TypeError, ValueError, UnicodeError):
+        result["helper_error"] = "measurement_invalid"
+    return result
+
+
+def _measurement_helper_main(argv: Sequence[str]) -> int:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--usage-path", required=True, type=Path)
+    parser.add_argument("--workspace", required=True, type=Path)
+    args = parser.parse_args(list(argv))
+    try:
+        result = _measurement_helper(args.usage_path, args.workspace)
+        sys.stdout.write(json.dumps(result, sort_keys=True, separators=(",", ":")))
+        sys.stdout.flush()
+        return 0
+    except (
+        OSError,
+        TypeError,
+        ValueError,
+        UnicodeError,
+        RuntimeError,
+        KeyError,
+        IndexError,
+        AttributeError,
+    ):
+        # Never expose an exception, usage failure string, environment, or
+        # session identifier through the helper boundary.
+        sys.stdout.write(json.dumps({"helper_error": "measurement_invalid"}))
+        sys.stdout.flush()
+        return 0
+
+
+def _run_measurement_helper(
+    usage_path: Path, workspace: Path, environment: Mapping[str, str]
+) -> dict[str, Any] | None:
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "_measure-hermes",
+        "--usage-path",
+        str(usage_path),
+        "--workspace",
+        str(workspace),
+    ]
+    helper: subprocess.Popen[Any] | None = None
+    try:
+        helper = subprocess.Popen(
+            command,
+            cwd=workspace,
+            env=dict(environment),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            start_new_session=(os.name == "posix"),
+        )
+        try:
+            stdout, _ = helper.communicate(
+                timeout=CAPTURE_TIMEOUT_SECONDS + CAPTURE_HELPER_GRACE_SECONDS
+            )
+        except subprocess.TimeoutExpired:
+            _kill_process_group(helper)
+            stdout, _ = helper.communicate()
+        if helper.returncode != 0:
+            return None
+    except (OSError, subprocess.SubprocessError):
+        if helper is not None:
+            _kill_process_group(helper)
+        return None
+    try:
+        result = json.loads(stdout)
+    except (TypeError, UnicodeError, json.JSONDecodeError):
+        return None
+    return result if isinstance(result, dict) else None
+
+
+def _capture_record() -> dict[str, Any]:
+    repository = Path(__file__).resolve().parents[1]
+    if not _git_worktree_is_clean(repository):
+        raise CaptureError("capture requires a clean factory worktree")
+    factory_head = _read_revision(repository)
+    hermes_version, hermes_source_revision = _hermes_identity("hermes")
+    source_sha256 = _capture_source_sha256()
+    profile_fingerprint = _profile_contract_fingerprint(CAPTURE_PROFILE)
+    if not factory_head or not hermes_version or not hermes_source_revision:
+        raise CaptureError("capture identity probes were incomplete")
+    if not source_sha256 or not profile_fingerprint:
+        raise CaptureError("capture source or profile fingerprint was unavailable")
 
     started_at = (
         datetime.now(timezone.utc)
@@ -1532,143 +2238,67 @@ def _capture_record(profile: str, model: str) -> dict[str, Any]:
         .isoformat()
         .replace("+00:00", "Z")
     )
-    hermes_version, hermes_source_revision = _hermes_identity("hermes")
-    factory_revision = _read_revision(Path(__file__).resolve().parents[1])
-    usage_data: Mapping[str, Any] = {}
-    return_code: int | None = None
-    timed_out = False
-    usage_read = False
-    launch_reason: str | None = None
-    start = time.perf_counter()
-    rss_before = _children_peak_rss_bytes()
+    environment = _scrubbed_environment()
+    started = time.perf_counter()
     with tempfile.TemporaryDirectory(prefix="pydantic-baseline-") as temp_root:
         root = Path(temp_root)
         workspace = root / "workspace"
         workspace.mkdir()
         usage_path = root / "usage.json"
-        command = [
-            "hermes",
-            "--profile",
-            profile,
-            "--ignore-rules",
-            "-z",
-            CAPTURE_PROMPT,
-            "--usage-file",
-            str(usage_path),
-            "-m",
-            model,
-            "-t",
-            CAPTURE_TOOLSET,
-            "--in",
-            str(workspace),
-        ]
-        process: subprocess.Popen[bytes] | None = None
-        try:
-            process = subprocess.Popen(
-                command,
-                cwd=workspace,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=(os.name == "posix"),
-            )
-            try:
-                process.communicate(timeout=CAPTURE_TIMEOUT_SECONDS)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                if os.name == "posix":
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except OSError:
-                        process.kill()
-                else:
-                    process.kill()
-                process.communicate()
-            return_code = process.returncode
-        except (OSError, subprocess.SubprocessError) as exc:
-            launch_reason = f"Hermes process unavailable ({type(exc).__name__})."
-        finished = time.perf_counter()
-        if usage_path.exists():
-            try:
-                candidate = json.loads(usage_path.read_text(encoding="utf-8"))
-                if isinstance(candidate, Mapping):
-                    usage_data = candidate
-                    usage_read = True
-            except (OSError, json.JSONDecodeError):
-                usage_read = False
+        if (workspace / ".git").exists():
+            raise CaptureError("capture workspace was not non-git")
+        helper_result = _run_measurement_helper(usage_path, workspace, environment)
+    wall_time_ms = round((time.perf_counter() - started) * 1000, 3)
 
-    wall_time_ms = round((finished - start) * 1000, 3)
-    rss_after = _children_peak_rss_bytes()
-    peak_rss_bytes = (
-        rss_after
-        if rss_after is not None and (rss_before is None or rss_after > rss_before)
-        else None
+    if not isinstance(helper_result, Mapping):
+        raise CaptureError("capture measurement helper did not return evidence")
+    usage_contract = helper_result.get("usage_contract")
+    gates = (
+        helper_result.get("exit_code") == 0,
+        helper_result.get("timed_out") is False,
+        helper_result.get("response_exact") is True,
+        helper_result.get("usage_read") is True,
+        isinstance(usage_contract, Mapping),
+        usage_contract.get("completed") is True
+        if isinstance(usage_contract, Mapping)
+        else False,
+        usage_contract.get("failed") is False
+        if isinstance(usage_contract, Mapping)
+        else False,
+        usage_contract.get("route_matches") is True
+        if isinstance(usage_contract, Mapping)
+        else False,
+        usage_contract.get("api_calls") == 1
+        if isinstance(usage_contract, Mapping)
+        else False,
+        _is_nonnegative_int(helper_result.get("peak_rss_bytes"))
+        and helper_result.get("peak_rss_bytes") > 0,
     )
-    metric_keys = (
-        "model_calls",
-        "input_tokens",
-        "output_tokens",
-        "cache_read_tokens",
-        "cache_write_tokens",
-    )
-    metrics = {
-        "model_calls": _safe_usage_value(usage_data, "api_calls"),
+    if not all(gates):
+        raise CaptureError("capture failed a required Hermes evidence gate")
+
+    values = usage_contract["values"]
+    metrics: dict[str, Any] = {
+        "model_calls": values["api_calls"],
+        # One exact response from one provider call is the evidence basis for
+        # zero tool roundtrips.  The full profile-default tools remain enabled.
         "tool_calls": 0,
-        "input_tokens": _safe_usage_value(usage_data, "input_tokens"),
-        "output_tokens": _safe_usage_value(usage_data, "output_tokens"),
-        "cache_read_tokens": _safe_usage_value(usage_data, "cache_read_tokens"),
-        "cache_write_tokens": _safe_usage_value(usage_data, "cache_write_tokens"),
+        "input_tokens": values.get("input_tokens"),
+        "output_tokens": values.get("output_tokens"),
+        "cache_read_tokens": values.get("cache_read_tokens"),
+        "cache_write_tokens": values.get("cache_write_tokens"),
+        "wall_time_ms": wall_time_ms,
+        "peak_rss_bytes": helper_result["peak_rss_bytes"],
     }
-    unavailable_reasons: dict[str, str] = {}
-    usage_reason = (
-        "The sanitized Hermes --usage-file was not produced or was unreadable."
-        if not usage_read
-        else "Hermes --usage-file did not supply this metric."
-    )
-    for key in metric_keys:
-        if metrics[key] is None:
-            unavailable_reasons[key] = usage_reason
-    unavailable_reasons["tool_calls"] = (
-        (
-            "The capture supplied an empty built-in toolset, so tool calls were not permitted."
-        )
-        if metrics["tool_calls"] == 0
-        else ""
-    )
-    if hermes_version is None:
-        unavailable_reasons["hermes_version"] = (
-            "Hermes --version did not expose a parseable version."
-        )
-    if hermes_source_revision is None:
-        unavailable_reasons["hermes_source_revision"] = (
-            "The Hermes installation did not expose a full source revision."
-        )
-    if factory_revision is None:
-        unavailable_reasons["factory_runtime_revision"] = (
-            "The factory worktree revision was not readable."
-        )
-    if peak_rss_bytes is None:
-        unavailable_reasons["peak_rss_bytes"] = (
-            "The platform did not provide an isolated child-process peak RSS measurement."
-        )
-    if launch_reason:
-        unavailable_reasons["process"] = launch_reason
-    if timed_out:
-        unavailable_reasons["process"] = (
-            "The bounded Hermes process exceeded the capture timeout."
-        )
-
+    unavailable_reasons = {
+        metric: "usage_field_absent"
+        for metric, field in USAGE_METRIC_TO_FIELD.items()
+        if metrics[metric] is None and field != "api_calls"
+    }
     available_fields = sorted(
-        key
-        for key in (
-            "api_calls",
-            "input_tokens",
-            "output_tokens",
-            "cache_read_tokens",
-            "cache_write_tokens",
-        )
-        if _safe_usage_value(usage_data, key) is not None
+        field for field in USAGE_FIELDS if field in values and field != "api_calls"
     )
+    available_fields.insert(0, "api_calls")
     record: dict[str, Any] = {
         "schema_version": OBSERVED_SCHEMA_VERSION,
         "record_type": "observed_hermes_baseline",
@@ -1679,47 +2309,90 @@ def _capture_record(profile: str, model: str) -> dict[str, Any]:
             "sanitized": True,
             "raw_prompts_recorded": False,
             "raw_logs_recorded": False,
+            "raw_output_recorded": False,
+            "fingerprint_semantics": "self_consistency_digest_not_attestation",
             "redaction": (
-                "Only bounded process measurements and selected usage counters are retained; "
-                "the response, raw prompts, environment, credential paths, session identifiers, and logs are discarded."
+                "Response, stderr, raw usage failures, prompts beyond the fixed public phrase, environment values, credentials, session identifiers, and logs are not retained."
             ),
         },
         "identity": {
-            "hermes_profile": profile,
-            "qualified_model": model,
+            "hermes_profile": CAPTURE_PROFILE,
+            "qualified_model": CAPTURE_MODEL,
             "hermes_version": hermes_version,
             "hermes_source_revision": hermes_source_revision,
-            "factory_runtime_revision": factory_revision,
+            "capture_source_revision": factory_head,
+            "factory_base_revision": BASE_REVISION,
+            "factory_head_revision": factory_head,
+            "clean_before_capture": True,
+        },
+        "source_binding": {
+            "capture_source_revision": factory_head,
+            "source_sha256": source_sha256,
+            "fingerprint_scope": "capture_executable_source_bytes",
+        },
+        "profile_contract": {
+            "fingerprint": profile_fingerprint,
+            "metadata_only": True,
+            "contents_recorded": False,
+            "auth_material_recorded": False,
+        },
+        "environment_contract": {
+            "allowlist_categories": ["HOME", "PATH", "LOCALE", "TLS_PROXY"],
+            "control_plane_variables_removed": True,
+            "kanban_variables_removed": True,
+            "secret_environment_passed": False,
+            "values_recorded": False,
         },
         "command_contract": {
             "mode": "bounded_one_shot",
+            "profile": CAPTURE_PROFILE,
+            "model": CAPTURE_MODEL,
             "fixed_prompt": CAPTURE_PROMPT,
-            "toolsets": [CAPTURE_TOOLSET],
-            "tools_allowed": False,
+            "expected_response": CAPTURE_RESPONSE,
+            "tools": "profile_default",
+            "tool_override": "none",
             "repository_access": "none",
-            "working_directory": "temporary_directory",
+            "working_directory": "fresh_temporary_non_git",
             "timeout_seconds": CAPTURE_TIMEOUT_SECONDS,
-            "stdout_stderr": "discarded",
+            "stdout": "captured_in_memory_then_discarded",
+            "stderr": "not_captured",
             "usage_evidence": "sanitized_usage_file",
+            "acknowledgement": "ack_local_hermes_persistence_required",
+        },
+        "local_side_effects": {
+            "credential_store_read": "expected",
+            "profile_session_db_writes": "expected",
+            "profile_log_writes": "expected",
+            "factory_task_mutations": "not_performed_by_contract",
+            "external_repository_mutations": "not_performed_by_contract",
+            "observed_record_write": "checked_in_record_only",
         },
         "captured_at_utc": started_at,
         "execution": {
-            "exit_code": return_code,
-            "timed_out": timed_out,
+            "exit_code": helper_result["exit_code"],
+            "timed_out": helper_result["timed_out"],
+            "response_contract_satisfied": helper_result["response_exact"],
             "wall_time_ms": wall_time_ms,
-            "peak_rss_bytes": peak_rss_bytes,
-            "response_recorded": False,
-            "raw_output_recorded": False,
+            "peak_rss_bytes": helper_result["peak_rss_bytes"],
+            "rss_scope": "max_child_rss_not_aggregate_process_tree",
+            "measurement_helper": "fresh_helper_only_child_hermes",
+            "stdout_recorded": False,
+            "stderr_recorded": False,
+            "cwd_non_git": True,
         },
         "usage_evidence": {
             "source": "Hermes one-shot --usage-file",
-            "read": usage_read,
+            "read": True,
+            "provider": CAPTURE_PROVIDER,
+            "model": CAPTURE_BARE_MODEL,
             "available_fields": available_fields,
             "unavailable_reasons": {
-                key: value
-                for key, value in unavailable_reasons.items()
-                if key in metric_keys or key in {"process"}
+                field: unavailable_reasons[metric]
+                for metric, field in USAGE_METRIC_TO_FIELD.items()
+                if metric in unavailable_reasons
             },
+            "completed": True,
+            "failed": False,
             "session_identifier_recorded": False,
             "raw_logs_recorded": False,
             "prompts_recorded": False,
@@ -1735,18 +2408,33 @@ def _capture_record(profile: str, model: str) -> dict[str, Any]:
 
 
 def capture_baseline(
-    output: str | Path, *, profile: str = CAPTURE_PROFILE, model: str = CAPTURE_MODEL
+    output: str | Path, *, ack_local_hermes_persistence: bool = False
 ) -> dict[str, Any]:
-    """Run the opt-in bounded smoke and write only its sanitized evidence."""
+    """Run the fixed real-profile capture and atomically write sanitized evidence."""
 
-    record = _capture_record(profile, model)
+    if not ack_local_hermes_persistence:
+        raise CaptureError("capture requires --ack-local-hermes-persistence")
+    record = _capture_record()
     output_path = Path(output)
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(
-            json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=output_path.parent,
+            prefix=f".{output_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            json.dump(record, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.replace(temporary_path, output_path)
     except OSError as exc:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except (UnboundLocalError, OSError):
+            pass
         raise CaptureError("could not write the sanitized observed record") from exc
     return record
 
@@ -1754,6 +2442,9 @@ def capture_baseline(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+    internal = subparsers.add_parser("_measure-hermes", help=argparse.SUPPRESS)
+    internal.add_argument("--usage-path", required=True, type=Path)
+    internal.add_argument("--workspace", required=True, type=Path)
     for command, help_text in (
         ("validate", "validate the strict synthetic corpus without replaying it"),
         ("replay", "validate and print a deterministic synthetic replay summary"),
@@ -1762,20 +2453,28 @@ def _parser() -> argparse.ArgumentParser:
         command_parser.add_argument("corpus", type=Path)
     capture = subparsers.add_parser(
         "capture",
-        help="opt-in: run one benign Hermes smoke and write sanitized observed evidence",
+        help="opt-in: run the fixed real Hermes implementer smoke and write sanitized evidence",
     )
     capture.add_argument("--output", required=True, type=Path)
-    capture.add_argument("--profile", default=CAPTURE_PROFILE)
-    capture.add_argument("--model", default=CAPTURE_MODEL)
+    capture.add_argument(
+        "--ack-local-hermes-persistence",
+        action="store_true",
+        help="acknowledge expected profile credential-store, SessionDB, and log writes",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.command == "_measure-hermes":
+        return _measurement_helper_main(
+            ("--usage-path", str(args.usage_path), "--workspace", str(args.workspace))
+        )
     if args.command == "capture":
         try:
             record = capture_baseline(
-                args.output, profile=args.profile, model=args.model
+                args.output,
+                ack_local_hermes_persistence=args.ack_local_hermes_persistence,
             )
         except CaptureError as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -1810,7 +2509,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         summary = replay_corpus(corpus)
-    except CorpusValidationError as exc:  # Defensive: load_corpus already validated.
+    except CorpusValidationError as exc:
         for error in exc.errors:
             print(f"error: {error}", file=sys.stderr)
         return 1

@@ -297,14 +297,17 @@ non-repository directory and records only sanitized measurements:
 
 ```bash
 python3 scripts/pydantic_agent_baseline.py capture \
-  --profile implementer \
-  --model openai-codex:gpt-5.6-luna \
+  --ack-local-hermes-persistence \
   --output benchmarks/hermes-baseline-observed.json
 ```
 
+Capture is fixed to the real `implementer` profile and
+`openai-codex:gpt-5.6-luna`; profile/model overrides are not accepted. The
+acknowledgement is required because Hermes reads its profile-bound credential
+store and is expected to write local profile SessionDB/session state and logs.
 See [`docs/pydantic-agent-baseline.md`](docs/pydantic-agent-baseline.md) for the
-exact identities, evidence fingerprint, unavailable-metric reasons, and the
-architecture smoke sample citation.
+exact identities, source/profile/evidence fingerprints, unavailable-metric
+reasons, and the architecture smoke sample citation.
 
 ## Monitoring
 
