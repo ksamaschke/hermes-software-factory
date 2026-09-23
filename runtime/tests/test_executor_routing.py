@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 
 import pytest
-
 from software_factory.api.contracts import FailedOutcome, Failure, TaskState
 from software_factory.control.policy import FactoryPolicy, PolicyError, load_policy
 from software_factory.execution import (
