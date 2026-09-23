@@ -278,6 +278,23 @@ The example policy demonstrates one GitOps/Argo arrangement without baking any u
 The required distinction between implementation, review, integration, merge, and
 deployment is documented in [`docs/factory-delivery-lifecycle.md`](docs/factory-delivery-lifecycle.md).
 
+## Pydantic-agent migration baseline
+
+The Phase 0 baseline is a checked-in, synthetic corpus that covers implementation
+and review outcomes without reading or mutating live Factory state:
+
+```bash
+python3 scripts/pydantic_agent_baseline.py \
+  validate benchmarks/pydantic-agent-corpus.json
+python3 scripts/pydantic_agent_baseline.py \
+  replay benchmarks/pydantic-agent-corpus.json
+```
+
+The validator and replay summary are standard-library-only and side-effect free.
+See [`docs/pydantic-agent-baseline.md`](docs/pydantic-agent-baseline.md) for the
+exact Hermes profile/model/runtime revision and the explicit distinction between
+synthetic fixtures and directional smoke evidence.
+
 ## Monitoring
 
 Typical board commands:
@@ -316,8 +333,10 @@ scripts/kanban_factory_recovery.py              deterministic recovery add-on
 scripts/kanban_review_successor_recovery.py     review packet guard and recursive successor bridge
 scripts/kanban_review_successor_recovery_cron.py installed no-agent wrapper
 scripts/forgejo_delivery_controller.py          bounded read-only Forgejo delivery observer
+scripts/pydantic_agent_baseline.py               synthetic corpus validator and replay summary
 examples/project-policy.yaml                    adaptable tracker policy template
 examples/forgejo-delivery-overlay.json           anonymized observer overlay template
+benchmarks/pydantic-agent-corpus.json             sanitized Phase 0 benchmark fixtures
 docs/profile-roles.md                            reusable profile role model
 docs/reviewer-role-contract.md                   project-agnostic reviewer boundary
 docs/profile-environment-contract.md             profile/worktree environment preflight
@@ -325,6 +344,7 @@ docs/tracker-kanban-reconciliation.md            project-agnostic source adapter
 docs/policy-resolution.md                        project-specific adaptation guide
 docs/reviewer-reliability.md                     bounded review and failure recovery
 docs/factory-delivery-lifecycle.md               implementation-to-deployment state contract
+docs/pydantic-agent-baseline.md                  reproducible Hermes baseline report
 docs/tracker-adapters.md                         multi-provider tracker adapter guidance
 tests/test_skill_frontmatter.py                 lightweight package validation
 ```

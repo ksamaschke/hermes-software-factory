@@ -1,0 +1,546 @@
+{
+  "schema_version": 1,
+  "corpus_id": "pydantic-agent-factory-migration-v1",
+  "baseline": {
+    "hermes_profile": "implementer",
+    "model": "openai-codex:gpt-5.6-luna",
+    "runtime_revision": "0c32430ab1243e060f21bab98c109e4f21d0a402"
+  },
+  "provenance": {
+    "kind": "synthetic",
+    "observed_production_data": false,
+    "redaction": "No prompts, credentials, live task identifiers, repository paths, or repository contents are stored."
+  },
+  "replay": {
+    "deterministic": true,
+    "network": false,
+    "writes_files": false,
+    "mutates_factory_tasks": false,
+    "accesses_external_repositories": false,
+    "requires_credentials": false
+  },
+  "fixtures": [
+    {
+      "id": "fixture-implementation-success",
+      "scenario": "implementation_success",
+      "role": "implementer",
+      "synthetic": true,
+      "replay_safe": true,
+      "task": {
+        "task_id": "fixture-implementation-success",
+        "objective": "Produce a tested candidate for a small typed change.",
+        "repository": {
+          "kind": "synthetic_fixture",
+          "name": "repo-implementation-success"
+        },
+        "workspace": {
+          "kind": "ephemeral_fixture",
+          "name": "workspace-implementation-success"
+        },
+        "external_task_id": null
+      },
+      "events": [
+        {
+          "kind": "model_call",
+          "provider": "openai_codex",
+          "model": "gpt-5.6-luna",
+          "attempt": 1,
+          "latency_ms": 500
+        },
+        {
+          "kind": "tool_call",
+          "name": "workspace_read",
+          "latency_ms": 35
+        },
+        {
+          "kind": "tool_call",
+          "name": "test_runner",
+          "latency_ms": 45
+        }
+      ],
+      "metrics": {
+        "prompt_size_chars": 2400,
+        "prompt_size_tokens": 600,
+        "model_calls": 1,
+        "model_requests": 1,
+        "tool_calls": 2,
+        "input_tokens": 700,
+        "output_tokens": 120,
+        "cache_read_tokens": 150,
+        "cache_tokens": 150,
+        "queue_wait_ms": 35,
+        "startup_ms": 180,
+        "first_model_request_ms": 250,
+        "model_latency_ms": 500,
+        "tool_latency_ms": 80,
+        "total_latency_ms": 1050,
+        "peak_rss_bytes": 83886080,
+        "retry_count": 0
+      },
+      "durable_outcome": {
+        "status": "candidate_ready",
+        "terminal": true,
+        "task_state": "done",
+        "reason": "tests_passed",
+        "summary": "Synthetic fixture: candidate is ready after the deterministic test gate."
+      }
+    },
+    {
+      "id": "fixture-test-failure",
+      "scenario": "test_failure",
+      "role": "implementer",
+      "synthetic": true,
+      "replay_safe": true,
+      "task": {
+        "task_id": "fixture-test-failure",
+        "objective": "Produce a candidate whose required test gate reports a failure.",
+        "repository": {
+          "kind": "synthetic_fixture",
+          "name": "repo-test-failure"
+        },
+        "workspace": {
+          "kind": "ephemeral_fixture",
+          "name": "workspace-test-failure"
+        },
+        "external_task_id": null
+      },
+      "events": [
+        {
+          "kind": "model_call",
+          "provider": "openai_codex",
+          "model": "gpt-5.6-luna",
+          "attempt": 1,
+          "latency_ms": 550
+        },
+        {
+          "kind": "tool_call",
+          "name": "workspace_read",
+          "latency_ms": 40
+        },
+        {
+          "kind": "tool_call",
+          "name": "workspace_patch",
+          "latency_ms": 50
+        },
+        {
+          "kind": "tool_call",
+          "name": "test_runner",
+          "latency_ms": 40
+        }
+      ],
+      "metrics": {
+        "prompt_size_chars": 2600,
+        "prompt_size_tokens": 650,
+        "model_calls": 1,
+        "model_requests": 1,
+        "tool_calls": 3,
+        "input_tokens": 760,
+        "output_tokens": 80,
+        "cache_read_tokens": 120,
+        "cache_tokens": 120,
+        "queue_wait_ms": 42,
+        "startup_ms": 180,
+        "first_model_request_ms": 265,
+        "model_latency_ms": 550,
+        "tool_latency_ms": 130,
+        "total_latency_ms": 1250,
+        "peak_rss_bytes": 87031808,
+        "retry_count": 0
+      },
+      "durable_outcome": {
+        "status": "failed",
+        "terminal": true,
+        "task_state": "blocked",
+        "reason": "test_failure",
+        "summary": "Synthetic fixture: the required test gate failed and the candidate is not ready."
+      }
+    },
+    {
+      "id": "fixture-provider-retry",
+      "scenario": "provider_retry",
+      "role": "implementer",
+      "synthetic": true,
+      "replay_safe": true,
+      "task": {
+        "task_id": "fixture-provider-retry",
+        "objective": "Recover from one provider retry and produce a tested candidate.",
+        "repository": {
+          "kind": "synthetic_fixture",
+          "name": "repo-provider-retry"
+        },
+        "workspace": {
+          "kind": "ephemeral_fixture",
+          "name": "workspace-provider-retry"
+        },
+        "external_task_id": null
+      },
+      "events": [
+        {
+          "kind": "model_call",
+          "provider": "openai_codex",
+          "model": "gpt-5.6-luna",
+          "attempt": 1,
+          "latency_ms": 260
+        },
+        {
+          "kind": "provider_retry",
+          "reason": "synthetic_rate_limit",
+          "latency_ms": 15
+        },
+        {
+          "kind": "model_call",
+          "provider": "openai_codex",
+          "model": "gpt-5.6-luna",
+          "attempt": 2,
+          "latency_ms": 640
+        },
+        {
+          "kind": "tool_call",
+          "name": "workspace_read",
+          "latency_ms": 35
+        },
+        {
+          "kind": "tool_call",
+          "name": "test_runner",
+          "latency_ms": 45
+        }
+      ],
+      "metrics": {
+        "prompt_size_chars": 2450,
+        "prompt_size_tokens": 612,
+        "model_calls": 2,
+        "model_requests": 2,
+        "tool_calls": 2,
+        "input_tokens": 1200,
+        "output_tokens": 180,
+        "cache_read_tokens": 500,
+        "cache_tokens": 500,
+        "queue_wait_ms": 50,
+        "startup_ms": 185,
+        "first_model_request_ms": 300,
+        "model_latency_ms": 900,
+        "tool_latency_ms": 80,
+        "total_latency_ms": 1540,
+        "peak_rss_bytes": 90177536,
+        "retry_count": 1
+      },
+      "durable_outcome": {
+        "status": "candidate_ready",
+        "terminal": true,
+        "task_state": "done",
+        "reason": "provider_retry_recovered",
+        "summary": "Synthetic fixture: one provider retry was recovered before the test gate passed."
+      }
+    },
+    {
+      "id": "fixture-timeout",
+      "scenario": "timeout",
+      "role": "implementer",
+      "synthetic": true,
+      "replay_safe": true,
+      "task": {
+        "task_id": "fixture-timeout",
+        "objective": "Exercise a bounded run that reaches its deadline before completion.",
+        "repository": {
+          "kind": "synthetic_fixture",
+          "name": "repo-timeout"
+        },
+        "workspace": {
+          "kind": "ephemeral_fixture",
+          "name": "workspace-timeout"
+        },
+        "external_task_id": null
+      },
+      "events": [
+        {
+          "kind": "model_call",
+          "provider": "openai_codex",
+          "model": "gpt-5.6-luna",
+          "attempt": 1,
+          "latency_ms": 700
+        },
+        {
+          "kind": "tool_call",
+          "name": "workspace_read",
+          "latency_ms": 35
+        }
+      ],
+      "metrics": {
+        "prompt_size_chars": 2200,
+        "prompt_size_tokens": 550,
+        "model_calls": 1,
+        "model_requests": 1,
+        "tool_calls": 1,
+        "input_tokens": 500,
+        "output_tokens": 20,
+        "cache_read_tokens": 100,
+        "cache_tokens": 100,
+        "queue_wait_ms": 45,
+        "startup_ms": 175,
+        "first_model_request_ms": 280,
+        "model_latency_ms": 700,
+        "tool_latency_ms": 35,
+        "total_latency_ms": 980,
+        "peak_rss_bytes": 85983232,
+        "retry_count": 0
+      },
+      "durable_outcome": {
+        "status": "timed_out",
+        "terminal": true,
+        "task_state": "blocked",
+        "reason": "deadline_exceeded",
+        "summary": "Synthetic fixture: the run reached its deadline and retained a durable timeout outcome."
+      }
+    },
+    {
+      "id": "fixture-cancellation",
+      "scenario": "cancellation",
+      "role": "implementer",
+      "synthetic": true,
+      "replay_safe": true,
+      "task": {
+        "task_id": "fixture-cancellation",
+        "objective": "Exercise an explicit cancellation before a candidate is finalized.",
+        "repository": {
+          "kind": "synthetic_fixture",
+          "name": "repo-cancellation"
+        },
+        "workspace": {
+          "kind": "ephemeral_fixture",
+          "name": "workspace-cancellation"
+        },
+        "external_task_id": null
+      },
+      "events": [
+        {
+          "kind": "model_call",
+          "provider": "openai_codex",
+          "model": "gpt-5.6-luna",
+          "attempt": 1,
+          "latency_ms": 400
+        },
+        {
+          "kind": "tool_call",
+          "name": "workspace_read",
+          "latency_ms": 20
+        }
+      ],
+      "metrics": {
+        "prompt_size_chars": 2100,
+        "prompt_size_tokens": 525,
+        "model_calls": 1,
+        "model_requests": 1,
+        "tool_calls": 1,
+        "input_tokens": 450,
+        "output_tokens": 16,
+        "cache_read_tokens": 80,
+        "cache_tokens": 80,
+        "queue_wait_ms": 40,
+        "startup_ms": 170,
+        "first_model_request_ms": 260,
+        "model_latency_ms": 400,
+        "tool_latency_ms": 20,
+        "total_latency_ms": 700,
+        "peak_rss_bytes": 84869120,
+        "retry_count": 0
+      },
+      "durable_outcome": {
+        "status": "cancelled",
+        "terminal": true,
+        "task_state": "cancelled",
+        "reason": "operator_requested",
+        "summary": "Synthetic fixture: cancellation was acknowledged and no candidate was promoted."
+      }
+    },
+    {
+      "id": "fixture-review-approval",
+      "scenario": "review_approval",
+      "role": "code_reviewer",
+      "synthetic": true,
+      "replay_safe": true,
+      "task": {
+        "task_id": "fixture-review-approval",
+        "objective": "Review an immutable candidate packet and approve it when all evidence passes.",
+        "repository": {
+          "kind": "synthetic_fixture",
+          "name": "repo-review-approval"
+        },
+        "workspace": {
+          "kind": "ephemeral_fixture",
+          "name": "workspace-review-approval"
+        },
+        "external_task_id": null
+      },
+      "events": [
+        {
+          "kind": "model_call",
+          "provider": "independent_review_provider",
+          "model": "review-model-v1",
+          "attempt": 1,
+          "latency_ms": 460
+        },
+        {
+          "kind": "tool_call",
+          "name": "review_packet_read",
+          "latency_ms": 30
+        },
+        {
+          "kind": "tool_call",
+          "name": "gate_evidence_read",
+          "latency_ms": 30
+        }
+      ],
+      "metrics": {
+        "prompt_size_chars": 1900,
+        "prompt_size_tokens": 475,
+        "model_calls": 1,
+        "model_requests": 1,
+        "tool_calls": 2,
+        "input_tokens": 520,
+        "output_tokens": 90,
+        "cache_read_tokens": 120,
+        "cache_tokens": 120,
+        "queue_wait_ms": 30,
+        "startup_ms": 160,
+        "first_model_request_ms": 230,
+        "model_latency_ms": 460,
+        "tool_latency_ms": 60,
+        "total_latency_ms": 850,
+        "peak_rss_bytes": 81788928,
+        "retry_count": 0
+      },
+      "durable_outcome": {
+        "status": "APPROVED",
+        "terminal": true,
+        "task_state": "review_approved",
+        "reason": "review_passed",
+        "summary": "Synthetic fixture: the immutable review packet passed and was approved."
+      }
+    },
+    {
+      "id": "fixture-review-changes-requested",
+      "scenario": "review_changes_requested",
+      "role": "code_reviewer",
+      "synthetic": true,
+      "replay_safe": true,
+      "task": {
+        "task_id": "fixture-review-changes-requested",
+        "objective": "Review an immutable candidate packet and request a bounded correction.",
+        "repository": {
+          "kind": "synthetic_fixture",
+          "name": "repo-review-changes-requested"
+        },
+        "workspace": {
+          "kind": "ephemeral_fixture",
+          "name": "workspace-review-changes-requested"
+        },
+        "external_task_id": null
+      },
+      "events": [
+        {
+          "kind": "model_call",
+          "provider": "independent_review_provider",
+          "model": "review-model-v1",
+          "attempt": 1,
+          "latency_ms": 500
+        },
+        {
+          "kind": "tool_call",
+          "name": "review_packet_read",
+          "latency_ms": 35
+        },
+        {
+          "kind": "tool_call",
+          "name": "exact_diff_read",
+          "latency_ms": 35
+        }
+      ],
+      "metrics": {
+        "prompt_size_chars": 2000,
+        "prompt_size_tokens": 500,
+        "model_calls": 1,
+        "model_requests": 1,
+        "tool_calls": 2,
+        "input_tokens": 560,
+        "output_tokens": 110,
+        "cache_read_tokens": 140,
+        "cache_tokens": 140,
+        "queue_wait_ms": 32,
+        "startup_ms": 160,
+        "first_model_request_ms": 240,
+        "model_latency_ms": 500,
+        "tool_latency_ms": 70,
+        "total_latency_ms": 910,
+        "peak_rss_bytes": 82903040,
+        "retry_count": 0
+      },
+      "durable_outcome": {
+        "status": "CHANGES_REQUESTED",
+        "terminal": true,
+        "task_state": "rework_required",
+        "reason": "review_finding",
+        "summary": "Synthetic fixture: review found a bounded issue and requested changes before approval."
+      }
+    },
+    {
+      "id": "fixture-review-incomplete",
+      "scenario": "review_incomplete",
+      "role": "code_reviewer",
+      "synthetic": true,
+      "replay_safe": true,
+      "task": {
+        "task_id": "fixture-review-incomplete",
+        "objective": "Exercise a review that cannot produce a trustworthy terminal verdict.",
+        "repository": {
+          "kind": "synthetic_fixture",
+          "name": "repo-review-incomplete"
+        },
+        "workspace": {
+          "kind": "ephemeral_fixture",
+          "name": "workspace-review-incomplete"
+        },
+        "external_task_id": null
+      },
+      "events": [
+        {
+          "kind": "model_call",
+          "provider": "independent_review_provider",
+          "model": "review-model-v1",
+          "attempt": 1,
+          "latency_ms": 580
+        },
+        {
+          "kind": "tool_call",
+          "name": "review_packet_read",
+          "latency_ms": 30
+        }
+      ],
+      "metrics": {
+        "prompt_size_chars": 1800,
+        "prompt_size_tokens": 450,
+        "model_calls": 1,
+        "model_requests": 1,
+        "tool_calls": 1,
+        "input_tokens": 430,
+        "output_tokens": 30,
+        "cache_read_tokens": 90,
+        "cache_tokens": 90,
+        "queue_wait_ms": 38,
+        "startup_ms": 165,
+        "first_model_request_ms": 250,
+        "model_latency_ms": 580,
+        "tool_latency_ms": 30,
+        "total_latency_ms": 820,
+        "peak_rss_bytes": 80609280,
+        "retry_count": 0
+      },
+      "durable_outcome": {
+        "status": "REVIEW_INCOMPLETE",
+        "terminal": true,
+        "task_state": "blocked",
+        "reason": "insufficient_review_evidence",
+        "summary": "Synthetic fixture: review evidence was incomplete, so the controller stayed fail-closed."
+      }
+    }
+  ]
+}
