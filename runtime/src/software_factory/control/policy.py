@@ -413,6 +413,86 @@ ROLE_KEYS = frozenset(
     }
 )
 
+
+class CanaryRule(PolicyModel):
+    """One exact task/role pair admitted to a Pydantic route."""
+
+    task_id: Identifier
+    role: Identifier
+
+    @field_validator("task_id")
+    @classmethod
+    def task_id_is_exact(cls, value: str) -> str:
+        if any(marker in value for marker in ("*", "?", "[", "]")):
+            raise ValueError("canary task_id must be an exact identifier")
+        return value
+
+    @field_validator("role")
+    @classmethod
+    def role_is_known(cls, value: str) -> str:
+        if value not in ROLE_KEYS:
+            raise ValueError(f"unknown canary role: {value!r}")
+        return value
+
+
+class RetryCompatibilityRule(PolicyModel):
+    """An explicit executor-kind change allowed on a retry.
+
+    The rule is only a policy gate. The routing boundary still compares the
+    complete prior and proposed selections, including their concrete
+    identities, before it can allow a backend change.
+    """
+
+    from_executor: ExecutorKind
+    to_executor: ExecutorKind
+    from_id: Identifier | None = None
+    to_id: Identifier | None = None
+    role: Identifier | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_executor_aliases(cls, value: object) -> object:
+        if not isinstance(value, Mapping):
+            return value
+        data = dict(value)
+        aliases = {
+            "source_executor": "from_executor",
+            "source_kind": "from_executor",
+            "from_kind": "from_executor",
+            "target_executor": "to_executor",
+            "target_kind": "to_executor",
+            "to_kind": "to_executor",
+            "source_id": "from_id",
+            "from_executor_id": "from_id",
+            "target_id": "to_id",
+            "to_executor_id": "to_id",
+        }
+        for alias, canonical in aliases.items():
+            if alias not in data:
+                continue
+            if canonical in data:
+                raise ValueError(
+                    f"retry compatibility rule defines both {alias!r} and {canonical!r}"
+                )
+            data[canonical] = data.pop(alias)
+        return data
+
+    @field_validator("role")
+    @classmethod
+    def role_is_known(cls, value: str | None) -> str | None:
+        if value is not None and value not in ROLE_KEYS:
+            raise ValueError(f"unknown retry compatibility role: {value!r}")
+        return value
+
+    @model_validator(mode="after")
+    def concrete_ids_are_paired(self) -> RetryCompatibilityRule:
+        if (self.from_id is None) != (self.to_id is None):
+            raise ValueError(
+                "retry compatibility from_id and to_id must be provided together"
+            )
+        return self
+
+
 # These are the deterministic lifecycle handlers named by the architecture
 # example. Project-owned additions must be declared under ``handlers``.
 BUILTIN_DETERMINISTIC_HANDLERS = frozenset(
@@ -448,10 +528,100 @@ class CompatibilityPolicy(PolicyModel):
     fallback_executors: Mapping[str, RoleRoute] = Field(
         default_factory=dict, validate_default=True
     )
-    allow_backend_change_on_retry: Literal["explicit_policy_only"] = (
+    allow_backend_change_on_retry: Literal["explicit_policy_only"] | StrictBool = (
         "explicit_policy_only"
     )
+    canary_rules: tuple[CanaryRule, ...] = Field(default_factory=tuple)
+    retry_compatibility: tuple[RetryCompatibilityRule, ...] = Field(
+        default_factory=tuple
+    )
     legacy_settings: LegacySettings | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_routing_aliases(cls, value: object) -> object:
+        """Accept descriptive aliases, but reject ambiguous policy sources."""
+
+        if not isinstance(value, Mapping):
+            return value
+        data = dict(value)
+
+        canary_aliases = (
+            "canary",
+            "canary_tasks",
+            "canary_routes",
+            "canary_allowlist",
+        )
+        present_canary = [
+            name for name in ("canary_rules", *canary_aliases) if name in data
+        ]
+        if len(present_canary) > 1:
+            raise ValueError(
+                "compatibility canary policy must use exactly one of "
+                "canary_rules, canary, canary_tasks, or canary_routes"
+            )
+        if present_canary and any(
+            name in data for name in ("canary_task_ids", "canary_roles")
+        ):
+            raise ValueError("canary rule forms must not be combined")
+        if present_canary and present_canary[0] != "canary_rules":
+            data["canary_rules"] = data.pop(present_canary[0])
+        if isinstance(data.get("canary_rules"), Mapping):
+            canary_mapping = data["canary_rules"]
+            if "admitted" in canary_mapping and len(canary_mapping) == 1:
+                data["canary_rules"] = canary_mapping["admitted"]
+
+        for alias, canonical in (
+            ("admitted_task_ids", "canary_task_ids"),
+            ("admitted_roles", "canary_roles"),
+        ):
+            if alias not in data:
+                continue
+            if canonical in data:
+                raise ValueError(
+                    f"canary policy defines both {alias!r} and {canonical!r}"
+                )
+            data[canonical] = data.pop(alias)
+        has_task_ids = "canary_task_ids" in data
+        has_roles = "canary_roles" in data
+        if has_task_ids != has_roles:
+            raise ValueError("canary_task_ids and canary_roles must be paired")
+        if has_task_ids:
+            if "canary_rules" in data:
+                raise ValueError("canary rule forms must not be combined")
+            task_ids = _as_tuple_input(data.pop("canary_task_ids"), "canary_task_ids")
+            roles = _as_tuple_input(data.pop("canary_roles"), "canary_roles")
+            if len(task_ids) != len(roles):
+                if len(task_ids) == 1:
+                    task_ids = task_ids * len(roles)
+                elif len(roles) == 1:
+                    roles = roles * len(task_ids)
+                else:
+                    raise ValueError(
+                        "canary_task_ids and canary_roles must have equal lengths "
+                        "or one must contain exactly one value"
+                    )
+            data["canary_rules"] = tuple(
+                {"task_id": task_id, "role": role}
+                for task_id, role in zip(task_ids, roles, strict=True)
+            )
+
+        retry_aliases = (
+            "retry_backend_compatibility",
+            "backend_change_compatibility",
+            "backend_change_rules",
+            "retry_backend_rules",
+        )
+        present_retry = [
+            name for name in ("retry_compatibility", *retry_aliases) if name in data
+        ]
+        if len(present_retry) > 1:
+            raise ValueError(
+                "compatibility retry policy must use exactly one retry rule field"
+            )
+        if present_retry and present_retry[0] != "retry_compatibility":
+            data["retry_compatibility"] = data.pop(present_retry[0])
+        return data
 
     @field_validator("fallback_executors")
     @classmethod
@@ -465,6 +635,94 @@ class CompatibilityPolicy(PolicyModel):
             )
         return values
 
+    @field_validator("fallback_executors")
+    @classmethod
+    def fallback_routes_are_hermes_profiles(
+        cls, values: Mapping[str, RoleRoute]
+    ) -> Mapping[str, RoleRoute]:
+        invalid = sorted(
+            role
+            for role, route in values.items()
+            if route.executor is not ExecutorKind.HERMES_PROFILE
+        )
+        if invalid:
+            raise ValueError(
+                "compatibility fallback routes must use hermes_profile: "
+                + ", ".join(invalid)
+            )
+        return values
+
+    @field_validator("canary_rules", mode="before")
+    @classmethod
+    def canary_rules_are_explicit(
+        cls, value: object
+    ) -> tuple[Mapping[str, object], ...]:
+        if value is None:
+            return ()
+        if isinstance(value, Mapping):
+            if "task_id" in value or "role" in value:
+                raw_rules: tuple[object, ...] = (value,)
+            else:
+                raw_rules = tuple(
+                    {"task_id": task_id, "role": role}
+                    for task_id, role in value.items()
+                )
+        else:
+            raw_rules = _as_tuple_input(value, "canary_rules")
+
+        expanded: list[Mapping[str, object]] = []
+        for raw_rule in raw_rules:
+            if not isinstance(raw_rule, Mapping):
+                raise ValueError("canary rules must be mappings")  # noqa: TRY004
+            if "task_ids" in raw_rule or "roles" in raw_rule:
+                if "task_id" in raw_rule or "role" in raw_rule:
+                    raise ValueError(
+                        "canary rules must use singular or plural fields, not both"
+                    )
+                task_ids = _as_tuple_input(raw_rule.get("task_ids", ()), "task_ids")
+                roles = _as_tuple_input(raw_rule.get("roles", ()), "roles")
+                if not task_ids or not roles:
+                    raise ValueError("plural canary rules require task_ids and roles")
+                for task_id in task_ids:
+                    for role in roles:
+                        expanded.append({"task_id": task_id, "role": role})
+                continue
+            expanded.append(dict(raw_rule))
+        return tuple(expanded)
+
+    @field_validator("retry_compatibility", mode="before")
+    @classmethod
+    def retry_rules_are_a_sequence(cls, value: object) -> tuple[object, ...]:
+        if value is None:
+            return ()
+        if isinstance(value, Mapping):
+            return (value,)
+        return _as_tuple_input(value, "retry_compatibility")
+
+    @model_validator(mode="after")
+    def routing_rules_are_unambiguous(self) -> CompatibilityPolicy:
+        seen_task_ids: set[str] = set()
+        for rule in self.canary_rules:
+            if rule.task_id in seen_task_ids:
+                raise ValueError(
+                    f"overlapping canary rule for exact task_id {rule.task_id!r}"
+                )
+            seen_task_ids.add(rule.task_id)
+
+        seen_retry_rules: set[tuple[object, ...]] = set()
+        for rule in self.retry_compatibility:
+            key = (
+                rule.from_executor,
+                rule.to_executor,
+                rule.from_id,
+                rule.to_id,
+                rule.role,
+            )
+            if key in seen_retry_rules:
+                raise ValueError("duplicate retry compatibility rule")
+            seen_retry_rules.add(key)
+        return self
+
     @model_validator(mode="after")
     def mapping_fields_are_immutable(self) -> CompatibilityPolicy:
         object.__setattr__(
@@ -477,6 +735,24 @@ class CompatibilityPolicy(PolicyModel):
     @field_serializer("fallback_executors")
     def serialize_fallback_executors(self, value: Mapping[str, RoleRoute], info):
         return _policy_dump_value(value, info.mode)
+
+    @property
+    def canary(self) -> tuple[CanaryRule, ...]:
+        """Compatibility alias for callers using the short policy name."""
+
+        return self.canary_rules
+
+    @property
+    def canary_task_ids(self) -> tuple[str, ...]:
+        return tuple(rule.task_id for rule in self.canary_rules)
+
+    @property
+    def canary_roles(self) -> tuple[str, ...]:
+        return tuple(rule.role for rule in self.canary_rules)
+
+    @property
+    def retry_backend_compatibility(self) -> tuple[RetryCompatibilityRule, ...]:
+        return self.retry_compatibility
 
 
 class FactoryPolicy(PolicyModel):
@@ -605,6 +881,15 @@ class FactoryPolicy(PolicyModel):
                 providers=self.providers,
                 handlers=handlers,
             )
+        if self.compatibility.canary_rules and not self.compatibility.canary_only:
+            raise ValueError("canary rules require compatibility.canary_only=true")
+        for rule in self.compatibility.canary_rules:
+            if rule.role not in self.roles:
+                raise ValueError(f"canary rule references unknown role {rule.role!r}")
+            if self.roles[rule.role].executor is not ExecutorKind.PYDANTIC_AGENT:
+                raise ValueError(
+                    f"canary rule role {rule.role!r} does not select a pydantic_agent route"
+                )
         _validate_provider_fallback_graph(self.providers)
         return self
 
@@ -904,6 +1189,7 @@ __all__ = [
     "SUPPORTED_OUTCOME_CONTRACTS",
     "AgentDefinition",
     "AgentSpec",
+    "CanaryRule",
     "CompatibilityPolicy",
     "CredentialReference",
     "ExecutorKind",
@@ -919,6 +1205,7 @@ __all__ = [
     "ProviderDefinition",
     "ProviderKind",
     "ProviderSpec",
+    "RetryCompatibilityRule",
     "RoleRoute",
     "load_policy",
     "load_project_policy",
