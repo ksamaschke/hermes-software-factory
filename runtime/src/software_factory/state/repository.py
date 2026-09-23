@@ -20,6 +20,15 @@ AppendEventOperation = Callable[[RunIdentity, FactoryEvent], None]
 FinishOperation = Callable[[RunIdentity, ValidatedOutcome], TaskState]
 
 
+def _wrap_operation(operation: Callable[..., object]) -> Callable[..., object]:
+    """Adapt a trusted operation without storing its bound-method descriptor."""
+
+    def invoke(*args: object, **kwargs: object) -> object:
+        return operation(*args, **kwargs)
+
+    return invoke
+
+
 @runtime_checkable
 class TaskRepository(Protocol):
     """Narrow task-store boundary; implementations remain outside agent code.
@@ -50,9 +59,13 @@ class TaskRepository(Protocol):
 class TaskRepositoryFacade:
     """Agent-facing capability object built from exactly four operations.
 
-    The facade stores only private callable references. It deliberately accepts
-    no backend, connection, transaction, or database object and offers no method
-    other than the four operations in :class:`TaskRepository`.
+    This is an API/capability-narrowing boundary, not a Python sandbox. The
+    constructor receives trusted operation capabilities and keeps only wrapper
+    functions, so a readable facade slot never exposes a bound method's
+    ``__self__`` backend. Slots are write-protected after construction, and the
+    facade accepts no backend, connection, transaction, or database object. The
+    supplied operations still retain whatever authority their owner granted;
+    callers must not pass an over-privileged callable.
     """
 
     __slots__ = ("_append_event", "_claim", "_finish", "_heartbeat")
@@ -67,10 +80,16 @@ class TaskRepositoryFacade:
         operations = (claim, heartbeat, append_event, finish)
         if not all(callable(operation) for operation in operations):
             raise TypeError("all repository facade operations must be callable")
-        self._claim = claim
-        self._heartbeat = heartbeat
-        self._append_event = append_event
-        self._finish = finish
+        object.__setattr__(self, "_claim", _wrap_operation(claim))
+        object.__setattr__(self, "_heartbeat", _wrap_operation(heartbeat))
+        object.__setattr__(self, "_append_event", _wrap_operation(append_event))
+        object.__setattr__(self, "_finish", _wrap_operation(finish))
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError(f"{type(self).__name__} operation bindings are immutable")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError(f"{type(self).__name__} operation bindings are immutable")
 
     def claim(self, task_id: str, executor_id: str) -> ClaimedRun:
         return self._claim(task_id, executor_id)
@@ -79,6 +98,8 @@ class TaskRepositoryFacade:
         return self._heartbeat(run)
 
     def append_event(self, run: RunIdentity, event: FactoryEvent) -> None:
+        if isinstance(event, FactoryEvent) and event.run != run:
+            raise ValueError("factory event run identity must exactly match append run")
         self._append_event(run, event)
 
     def finish(self, run: RunIdentity, outcome: ValidatedOutcome) -> TaskState:

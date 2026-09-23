@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
+
 from software_factory import (
     ImplementationOutcome,
     RepositoryIdentity,
@@ -36,7 +37,7 @@ def make_envelope(**overrides) -> TaskEnvelope:
         "acceptance": [
             {"id": "contracts", "description": "Contracts validate and serialize"}
         ],
-        "deadline": datetime(2026, 9, 23, 12, 0, tzinfo=timezone.utc),
+        "deadline": datetime(2026, 9, 23, 12, 0, tzinfo=UTC),
     }
     values.update(overrides)
     return TaskEnvelope.model_validate(values)

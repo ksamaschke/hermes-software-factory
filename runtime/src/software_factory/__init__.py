@@ -1,6 +1,11 @@
 """Typed, provider-neutral control-plane contracts for the factory runtime."""
 
 from .api.contracts import (
+    MAX_EVENT_ATTRIBUTE_KEY_LENGTH,
+    MAX_EVENT_ATTRIBUTE_VALUE_LENGTH,
+    MAX_EVIDENCE_DESCRIPTION_LENGTH,
+    MAX_FACTORY_EVENT_ATTRIBUTES,
+    MAX_IDENTIFIER_LENGTH,
     AcceptanceCriterion,
     BlockedOutcome,
     Blocker,
@@ -41,6 +46,7 @@ from .api.contracts import (
     WorkspaceIdentity,
 )
 from .control.policy import (
+    SUPPORTED_OUTCOME_CONTRACTS,
     AgentDefinition,
     AgentSpec,
     CompatibilityPolicy,
@@ -51,6 +57,7 @@ from .control.policy import (
     HandlerDefinition,
     ImmutableMapping,
     LegacySettings,
+    OutputContractName,
     Policy,
     PolicyError,
     ProjectPolicy,
@@ -71,6 +78,12 @@ from .state.repository import (
 )
 
 __all__ = [
+    "MAX_EVENT_ATTRIBUTE_KEY_LENGTH",
+    "MAX_EVENT_ATTRIBUTE_VALUE_LENGTH",
+    "MAX_EVIDENCE_DESCRIPTION_LENGTH",
+    "MAX_FACTORY_EVENT_ATTRIBUTES",
+    "MAX_IDENTIFIER_LENGTH",
+    "SUPPORTED_OUTCOME_CONTRACTS",
     "AcceptanceCriterion",
     "AgentCapabilityFacade",
     "AgentDefinition",
@@ -106,6 +119,7 @@ __all__ = [
     "ImplementationOutcome",
     "Lease",
     "LegacySettings",
+    "OutputContractName",
     "Plan",
     "PlanOutcome",
     "PlanTask",

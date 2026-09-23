@@ -13,7 +13,7 @@ import re
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated, Literal, TypeAlias
+from typing import Annotated, Literal, Self, TypeAlias
 from urllib.parse import urlsplit
 
 from pydantic import (
@@ -29,11 +29,17 @@ from pydantic import (
     model_validator,
 )
 
+MAX_IDENTIFIER_LENGTH = 256
+MAX_EVENT_ATTRIBUTE_KEY_LENGTH = 128
+MAX_EVENT_ATTRIBUTE_VALUE_LENGTH = 4_096
+MAX_FACTORY_EVENT_ATTRIBUTES = 64
+MAX_EVIDENCE_DESCRIPTION_LENGTH = 2_048
+
 Identifier = Annotated[
     StrictStr,
     Field(
         min_length=1,
-        max_length=256,
+        max_length=MAX_IDENTIFIER_LENGTH,
         pattern=r"^[^\s\x00]+$",
         description="A non-empty stable control-plane identifier.",
     ),
@@ -49,12 +55,13 @@ Revision = Annotated[
 ]
 NonEmptyText = Annotated[StrictStr, Field(min_length=1, max_length=16_384)]
 RelativePathValue = Annotated[StrictStr, Field(min_length=1, max_length=1_024)]
-EventScalar: TypeAlias = StrictStr | StrictInt | StrictFloat | StrictBool | None
+EventString = Annotated[StrictStr, Field(max_length=MAX_EVENT_ATTRIBUTE_VALUE_LENGTH)]
+EventScalar: TypeAlias = EventString | StrictInt | StrictFloat | StrictBool | None
 EventKey = Annotated[
     StrictStr,
     Field(
         min_length=1,
-        max_length=128,
+        max_length=MAX_EVENT_ATTRIBUTE_KEY_LENGTH,
         pattern=r"^[^\s\x00]+$",
     ),
 ]
@@ -69,6 +76,36 @@ class ContractModel(BaseModel):
         str_strip_whitespace=True,
         validate_assignment=True,
     )
+
+    def validated_copy(
+        self,
+        *,
+        update: Mapping[str, object] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        """Return a defensive, freshly validated copy of this contract.
+
+        Pydantic's default ``model_copy(update=...)`` intentionally skips
+        validation.  Runtime callers must use this validated behavior instead;
+        the override below keeps the familiar API from creating an unvalidated
+        frozen object.
+        """
+
+        del deep  # validation creates a fresh object graph regardless of this hint
+        values = self.model_dump(mode="python")
+        if update:
+            values.update(dict(update))
+        return type(self).model_validate(values)
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, object] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        """Return only a validated copy; never bypass contract validators."""
+
+        return self.validated_copy(update=update, deep=deep)
 
 
 def _as_tuple_input(value: object, field_name: str) -> tuple[object, ...]:
@@ -103,20 +140,41 @@ def _validate_relative_path(value: str, field_name: str = "path") -> str:
 
 
 def _validate_workspace_root(value: str) -> str:
-    """Require an absolute POSIX/Windows root without parent traversal."""
+    """Require and canonically represent an absolute workspace root.
+
+    This is lexical canonicalization only.  It removes separator aliases and
+    dot segments but cannot resolve filesystem symlinks; a controller must still
+    bind the resulting root to the real workspace before authorization checks.
+    """
 
     if "\x00" in value or not value.strip():
         raise ValueError("workspace root must be a non-empty path without NUL")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError("workspace root must not contain control characters")
     normalized = value.replace("\\", "/")
     if value.startswith("\\") and not value.startswith("\\\\"):
         raise ValueError("workspace root must be an absolute POSIX or Windows path")
-    is_posix_absolute = normalized.startswith("/")
-    is_windows_drive_absolute = bool(re.match(r"^[A-Za-z]:/", normalized))
-    if not (is_posix_absolute or is_windows_drive_absolute):
+
+    def canonical_parts(parts: list[str]) -> list[str]:
+        if any(part in {".", ".."} for part in parts):
+            raise ValueError("workspace root must not contain '.' or '..' segments")
+        return [part for part in parts if part]
+
+    if normalized.startswith("//"):
+        parts = canonical_parts(normalized[2:].split("/"))
+        if len(parts) < 2:
+            raise ValueError("UNC workspace root must include a server and share")
+        return "//" + "/".join(parts)
+    if normalized.startswith("/"):
+        parts = canonical_parts(normalized[1:].split("/"))
+        return "/" if not parts else "/" + "/".join(parts)
+
+    drive_match = re.match(r"^([A-Za-z]):/(.*)$", normalized)
+    if drive_match is None:
         raise ValueError("workspace root must be an absolute POSIX or Windows path")
-    if any(part == ".." for part in normalized.split("/")):
-        raise ValueError("workspace root must not contain '..' segments")
-    return value
+    parts = canonical_parts(drive_match.group(2).split("/"))
+    suffix = "/".join(parts)
+    return f"{drive_match.group(1).upper()}:/" + suffix
 
 
 def _validate_aware_datetime(value: datetime, field_name: str) -> datetime:
@@ -181,7 +239,12 @@ def _validate_event_key(value: str) -> str:
 
 
 def _looks_like_inline_credential(value: str) -> bool:
-    """Reject common credential encodings even when a safe-looking key is used."""
+    """Reject common credential encodings even when a safe-looking key is used.
+
+    This is a conservative exclusion list, not a proof that arbitrary text is
+    secret-free.  Unknown encodings remain the responsibility of the caller and
+    must not be treated as safe merely because they evade these checks.
+    """
 
     lower = value.casefold()
     if "-----begin " in lower and " key-----" in lower:
@@ -193,6 +256,12 @@ def _looks_like_inline_credential(value: str) -> bool:
         value,
     ):
         return True
+    if re.search(r"(?:AKIA|ASIA)[0-9A-Z]{16}", value):
+        return True
+    if re.search(r"(?:github_pat|npm_|pypi-)[A-Za-z0-9_-]{16,}", value):
+        return True
+    if re.search(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}", value):
+        return True
     if re.fullmatch(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", value):
         return True
     if re.search(
@@ -203,11 +272,77 @@ def _looks_like_inline_credential(value: str) -> bool:
         return True
     return bool(
         re.search(
-            r"(?:token|secret|password|api[ _-]?key|credential)\s*[:=]\s*\S+",
+            r"(?:authorization|cookie|token|secret|password|api[ _-]?key|credential)\s*[:=]\s*\S+",
+            value,
+            re.IGNORECASE,
+        )
+        or re.search(
+            r"(?:^|[?&\s])(?:access[_-]?token|client[_-]?secret|refresh[_-]?token|private[_-]?key)=[^\s&]+",
             value,
             re.IGNORECASE,
         )
     )
+
+
+_SAFE_DIGEST_OR_UUID = re.compile(
+    r"^(?:[0-9a-f]{7,128}|(?:md5|sha(?:1|224|256|384|512)):[0-9a-f]{7,128}|"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$",
+    re.IGNORECASE,
+)
+
+
+def _shannon_entropy(value: str) -> float:
+    frequencies = {character: value.count(character) for character in set(value)}
+    length = len(value)
+    return -sum(
+        (count / length) * math.log2(count / length) for count in frequencies.values()
+    )
+
+
+def _contains_high_entropy_token(value: str) -> bool:
+    """Reject opaque high-entropy tokens unless shaped as durable fingerprints."""
+
+    for token in re.findall(r"[A-Za-z0-9+/=_-]{20,}", value):
+        if _SAFE_DIGEST_OR_UUID.fullmatch(token):
+            continue
+        if len(set(token)) >= 8 and _shannon_entropy(token) >= 4.0:
+            return True
+    return False
+
+
+def _validate_secret_free_text(value: str, field_name: str) -> str:
+    """Apply bounded, fail-closed checks to text crossing an evidence boundary."""
+
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError(f"{field_name} must not contain control characters")
+    if _looks_like_inline_credential(value) or _contains_high_entropy_token(value):
+        raise ValueError(f"{field_name} must not contain credential-like material")
+    return value
+
+
+_CREDENTIAL_REFERENCE_SCHEMES = frozenset(
+    {
+        "env",
+        "secret",
+        "secrets",
+        "vault",
+        "aws-secretsmanager",
+        "gcp-secretmanager",
+        "azure-keyvault",
+    }
+)
+
+
+def _validate_evidence_reference(value: str) -> str:
+    value = _validate_secret_free_text(value, "evidence reference")
+    parsed = urlsplit(value)
+    if parsed.scheme.casefold() in _CREDENTIAL_REFERENCE_SCHEMES:
+        raise ValueError("evidence references must not point to credential stores")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("evidence references must not contain userinfo")
+    if parsed.query or "?" in value or parsed.fragment or "#" in value:
+        raise ValueError("evidence references must not contain query or fragment data")
+    return value
 
 
 class TaskRole(StrEnum):
@@ -243,7 +378,7 @@ class WorkspaceIdentity(ContractModel):
     """A controller-bound workspace; agents receive this, not a database handle."""
 
     workspace_id: Identifier
-    root: StrictStr
+    root: StrictStr = Field(min_length=1, max_length=4_096)
     kind: Literal["git_worktree", "directory"] = "git_worktree"
 
     @field_validator("root")
@@ -258,7 +393,7 @@ class RunIdentity(ContractModel):
     task_id: Identifier
     run_id: Identifier
     executor_id: Identifier | None = None
-    attempt: int = Field(default=1, ge=1)
+    attempt: StrictInt = Field(default=1, ge=1)
     lease_id: Identifier | None = None
 
 
@@ -267,22 +402,47 @@ class EvidenceRef(ContractModel):
 
     kind: EvidenceKind
     reference: Identifier
-    description: StrictStr | None = Field(default=None, max_length=2_048)
+    description: StrictStr | None = Field(
+        default=None, max_length=MAX_EVIDENCE_DESCRIPTION_LENGTH
+    )
     fingerprint: StrictStr | None = Field(default=None, min_length=1, max_length=256)
     revision: Revision | None = None
+
+    @field_validator("reference")
+    @classmethod
+    def reference_is_credential_free(cls, value: str) -> str:
+        return _validate_evidence_reference(value)
+
+    @field_validator("description")
+    @classmethod
+    def description_is_credential_free(cls, value: str | None) -> str | None:
+        return (
+            None
+            if value is None
+            else _validate_secret_free_text(value, "evidence description")
+        )
+
+    @field_validator("fingerprint")
+    @classmethod
+    def fingerprint_is_credential_free(cls, value: str | None) -> str | None:
+        return (
+            None
+            if value is None
+            else _validate_secret_free_text(value, "evidence fingerprint")
+        )
 
 
 class AcceptanceCriterion(ContractModel):
     id: Identifier | None = None
     description: NonEmptyText
-    required: bool = True
+    required: StrictBool = True
 
 
 class CommandSpec(ContractModel):
     """A controller-approved argv, executed by a caller with ``shell=False``."""
 
     argv: tuple[NonEmptyText, ...] = Field(min_length=1)
-    timeout_seconds: int = Field(default=120, ge=1, le=86_400)
+    timeout_seconds: StrictInt = Field(default=120, ge=1, le=86_400)
     cwd: RelativePathValue | None = None
     network: Literal["denied", "bounded", "allowed"] = "denied"
 
@@ -315,7 +475,7 @@ class TaskConstraints(ContractModel):
     protected_paths: tuple[RelativePathValue, ...] = Field(default_factory=tuple)
     dependencies: tuple[Dependency, ...] = Field(default_factory=tuple)
     network: Literal["denied", "bounded", "allowed"] = "denied"
-    max_changed_files: int | None = Field(default=None, ge=1)
+    max_changed_files: StrictInt | None = Field(default=None, ge=1)
 
     @field_validator("allowed_paths", "protected_paths", mode="before")
     @classmethod
@@ -387,12 +547,12 @@ class TestEvidence(ContractModel):
     """Deterministic test evidence recorded by a runner and read back by a controller."""
 
     command: NonEmptyText
-    exit_code: int = Field(ge=0)
+    exit_code: StrictInt = Field(ge=0)
     status: Literal["passed", "failed", "skipped", "blocked"] = "passed"
     run_ref: Identifier | None = None
     revision: Revision | None = None
-    duration_seconds: float | None = Field(default=None, ge=0)
-    passed: bool | None = None
+    duration_seconds: StrictFloat | None = Field(default=None, ge=0)
+    passed: StrictBool | None = None
 
     @model_validator(mode="after")
     def status_matches_exit_code(self) -> TestEvidence:
@@ -411,14 +571,14 @@ class Blocker(ContractModel):
     code: Identifier
     summary: NonEmptyText
     owner: Identifier | None = None
-    blocking: bool = True
+    blocking: StrictBool = True
 
 
 class Failure(ContractModel):
     code: Identifier
     summary: NonEmptyText
     owner: Identifier | None = None
-    retryable: bool = False
+    retryable: StrictBool = False
 
 
 class PlanTask(ContractModel):
@@ -515,8 +675,8 @@ class ChangedPath(ContractModel):
     path: RelativePathValue
     status: Literal["added", "modified", "deleted", "renamed"] = "modified"
     old_path: RelativePathValue | None = None
-    additions: int = Field(default=0, ge=0)
-    deletions: int = Field(default=0, ge=0)
+    additions: StrictInt = Field(default=0, ge=0)
+    deletions: StrictInt = Field(default=0, ge=0)
 
     @field_validator("path", "old_path")
     @classmethod
@@ -578,8 +738,8 @@ class ReviewFinding(ContractModel):
     severity: Literal["info", "warning", "error", "blocker"]
     summary: NonEmptyText
     path: RelativePathValue | None = None
-    line: int | None = Field(default=None, ge=1)
-    resolved: bool = False
+    line: StrictInt | None = Field(default=None, ge=1)
+    resolved: StrictBool = False
 
     @field_validator("path")
     @classmethod
@@ -595,7 +755,7 @@ class ReviewOutcome(ContractModel):
     reviewed_scope: tuple[ChangedPath, ...] = Field(min_length=1)
     findings: tuple[ReviewFinding, ...] = Field(default_factory=tuple)
     evidence: tuple[EvidenceRef, ...] = Field(default_factory=tuple)
-    mutation_detected: bool = False
+    mutation_detected: StrictBool = False
 
     @field_validator("reviewed_scope", mode="before")
     @classmethod
@@ -645,6 +805,10 @@ class EventAttribute(ContractModel):
             raise ValueError(
                 "event attributes must not contain inline credential material"
             )
+        if isinstance(value, str) and _contains_high_entropy_token(value):
+            raise ValueError(
+                "event attributes must not contain opaque high-entropy material"
+            )
         return value
 
 
@@ -654,7 +818,9 @@ class FactoryEvent(ContractModel):
     event_type: Identifier
     run: RunIdentity
     occurred_at: datetime
-    attributes: tuple[EventAttribute, ...] = Field(default_factory=tuple)
+    attributes: tuple[EventAttribute, ...] = Field(
+        default_factory=tuple, max_length=MAX_FACTORY_EVENT_ATTRIBUTES
+    )
 
     @field_validator("attributes", mode="before")
     @classmethod
@@ -692,11 +858,23 @@ class ClaimedRun(ContractModel):
 
     @model_validator(mode="after")
     def identities_agree(self) -> ClaimedRun:
-        identities = (self.run, self.lease.run)
-        if any(identity.task_id != self.run.task_id for identity in identities):
-            raise ValueError("claimed run task_id identities must agree")
-        if any(identity.run_id != self.run.run_id for identity in identities):
-            raise ValueError("claimed run run_id identities must agree")
+        ownership_fields = (
+            "task_id",
+            "run_id",
+            "executor_id",
+            "attempt",
+            "lease_id",
+        )
+        mismatched_fields = tuple(
+            field_name
+            for field_name in ownership_fields
+            if getattr(self.lease.run, field_name) != getattr(self.run, field_name)
+        )
+        if mismatched_fields:
+            raise ValueError(
+                "claimed run lease identity must exactly match run for: "
+                + ", ".join(mismatched_fields)
+            )
         if self.envelope.task_id != self.run.task_id:
             raise ValueError("claimed run envelope task_id must agree with run")
         if self.envelope.run_id != self.run.run_id:
@@ -725,6 +903,16 @@ ValidatedOutcome: TypeAlias = (
 )
 
 
+def _is_successful_completion_outcome(outcome: ValidatedOutcome) -> bool:
+    if isinstance(outcome, PlanOutcome):
+        return outcome.status in {"planned", "ready"}
+    if isinstance(outcome, ImplementationOutcome):
+        return outcome.status == "candidate_ready"
+    if isinstance(outcome, ReviewOutcome):
+        return outcome.verdict == "APPROVED"
+    return False
+
+
 class TaskState(ContractModel):
     task_id: Identifier
     state: Literal["queued", "claimed", "running", "completed", "blocked", "failed"]
@@ -748,9 +936,10 @@ class TaskState(ContractModel):
         if self.state == "completed":
             if self.run is None or self.outcome is None:
                 raise ValueError("completed task state requires a run and outcome")
-            if isinstance(self.outcome, (BlockedOutcome, FailedOutcome)):
+            if not _is_successful_completion_outcome(self.outcome):
                 raise ValueError(
-                    "completed task state cannot carry a blocked or failed outcome"
+                    "completed task state requires a successful plan, implementation, "
+                    "or approved review outcome"
                 )
             return self
         if self.run is None:
@@ -772,6 +961,11 @@ BlockerOutcome: TypeAlias = BlockedOutcome
 FailureOutcome: TypeAlias = FailedOutcome
 
 __all__ = [
+    "MAX_EVENT_ATTRIBUTE_KEY_LENGTH",
+    "MAX_EVENT_ATTRIBUTE_VALUE_LENGTH",
+    "MAX_EVIDENCE_DESCRIPTION_LENGTH",
+    "MAX_FACTORY_EVENT_ATTRIBUTES",
+    "MAX_IDENTIFIER_LENGTH",
     "AcceptanceCriterion",
     "BlockedOutcome",
     "Blocker",
@@ -784,6 +978,7 @@ __all__ = [
     "Dependency",
     "EventAttribute",
     "EventScalar",
+    "EventString",
     "Evidence",
     "EvidenceKind",
     "EvidenceRef",

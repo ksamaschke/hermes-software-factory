@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
+
 from software_factory import (
     BlockedOutcome,
     ClaimedRun,
@@ -32,8 +33,6 @@ from software_factory import (
 )
 from software_factory.agents.contracts import TaskEnvelope as AgentTaskEnvelope
 from software_factory.control.policy import PolicyError, ProviderDefinition
-
-UTC = timezone.utc
 
 
 def envelope(

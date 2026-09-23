@@ -8,7 +8,7 @@ from collections.abc import Mapping, Sequence
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Annotated, Any, Generic, Literal, TypeAlias, TypeVar
+from typing import Annotated, Any, Generic, Literal, Self, TypeAlias, TypeVar
 from urllib.parse import urlsplit
 
 import yaml
@@ -17,6 +17,8 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
+    StrictInt,
     StrictStr,
     ValidationError,
     field_serializer,
@@ -104,6 +106,30 @@ class PolicyModel(BaseModel):
         validate_assignment=True,
     )
 
+    def validated_copy(
+        self,
+        *,
+        update: Mapping[str, object] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        """Return a defensive copy after re-running the complete policy model."""
+
+        del deep  # validation creates a fresh object graph regardless of this hint
+        values = self.model_dump(mode="python")
+        if update:
+            values.update(dict(update))
+        return type(self).model_validate(values)
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, object] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        """Return only a validated copy; never bypass policy validators."""
+
+        return self.validated_copy(update=update, deep=deep)
+
 
 def _as_tuple_input(value: object, field_name: str) -> tuple[object, ...]:
     if isinstance(value, (str, bytes, bytearray, Mapping)) or not isinstance(
@@ -188,13 +214,30 @@ CredentialReference: TypeAlias = Annotated[
     AfterValidator(_validate_credential_reference),
 ]
 
+SUPPORTED_OUTCOME_CONTRACTS = frozenset(
+    {
+        "PlanOutcome",
+        "ImplementationOutcome",
+        "ReviewOutcome",
+        "BlockedOutcome",
+        "FailedOutcome",
+    }
+)
+OutputContractName: TypeAlias = Literal[
+    "PlanOutcome",
+    "ImplementationOutcome",
+    "ReviewOutcome",
+    "BlockedOutcome",
+    "FailedOutcome",
+]
+
 
 class AgentDefinition(PolicyModel):
     framework: Literal["pydantic_ai"] = "pydantic_ai"
     prompt: StrictStr
-    output_contract: Identifier
-    static_prompt_token_target: int | None = Field(default=None, ge=1)
-    visible_tool_limit: int | None = Field(default=None, ge=1)
+    output_contract: OutputContractName
+    static_prompt_token_target: StrictInt | None = Field(default=None, ge=1)
+    visible_tool_limit: StrictInt | None = Field(default=None, ge=1)
     capabilities: tuple[Identifier, ...] = Field(default_factory=tuple)
 
     @field_validator("prompt")
@@ -238,11 +281,46 @@ class ProviderKind(StrEnum):
     CUSTOM = "custom"
 
 
+_PROVIDER_MODEL_PREFIXES: dict[ProviderKind, str | None] = {
+    ProviderKind.OPENAI_CODEX: "openai-codex",
+    ProviderKind.OPENAI: "openai",
+    ProviderKind.ANTHROPIC: "anthropic",
+    ProviderKind.GEMINI: "gemini",
+    ProviderKind.GOOGLE: "google",
+    ProviderKind.OLLAMA: "ollama",
+    ProviderKind.MISTRAL: "mistral",
+    ProviderKind.XAI: "xai",
+    ProviderKind.OPENROUTER: "openrouter",
+    ProviderKind.AZURE_OPENAI: "azure-openai",
+    ProviderKind.VERTEX_AI: "vertex-ai",
+    ProviderKind.BEDROCK: "bedrock",
+    ProviderKind.LOCAL: "local",
+    ProviderKind.CUSTOM: None,
+}
+
+
+def _validate_model_family(kind: ProviderKind, model: str, field_name: str) -> str:
+    if ":" not in model:
+        raise ValueError(
+            f"{field_name} must use a provider-qualified model route such as "
+            "openai-codex:model-id"
+        )
+    model_provider, _, model_id = model.partition(":")
+    if not model_id:
+        raise ValueError(f"{field_name} must include a non-empty model id")
+    expected_prefix = _PROVIDER_MODEL_PREFIXES[kind]
+    if expected_prefix is not None and model_provider != expected_prefix:
+        raise ValueError(
+            f"{field_name} route {model!r} does not belong to provider kind {kind.value!r}"
+        )
+    return model
+
+
 class ProviderDefinition(PolicyModel):
     kind: ProviderKind
     credential_source: Identifier | None = None
     credential_reference: CredentialReference | None = None
-    max_in_progress: int | None = Field(default=None, ge=1)
+    max_in_progress: StrictInt | None = Field(default=None, ge=1)
     refresh_lock: Literal["required", "optional", "disabled"] | None = None
     fallback_provider: Identifier | None = None
     models: tuple[Revision, ...] = Field(default_factory=tuple)
@@ -259,6 +337,12 @@ class ProviderDefinition(PolicyModel):
             raise ValueError("provider models must not contain duplicates")
         return values
 
+    @model_validator(mode="after")
+    def models_belong_to_provider(self) -> ProviderDefinition:
+        for model in self.models:
+            _validate_model_family(self.kind, model, "provider.models")
+        return self
+
 
 class RoleRoute(PolicyModel):
     """One logical role's explicitly selected execution backend."""
@@ -270,9 +354,9 @@ class RoleRoute(PolicyModel):
     model: Revision | None = None
     handler: Identifier | None = None
     vendor_family: Identifier | None = None
-    max_in_progress: int | None = Field(default=None, ge=1)
-    max_runtime_seconds: int | None = Field(default=None, ge=1)
-    read_only_source: bool | None = None
+    max_in_progress: StrictInt | None = Field(default=None, ge=1)
+    max_runtime_seconds: StrictInt | None = Field(default=None, ge=1)
+    read_only_source: StrictBool | None = None
 
     @model_validator(mode="after")
     def route_shape_is_strict(self) -> RoleRoute:
@@ -357,7 +441,7 @@ class LegacySettings(PolicyModel):
 
 
 class CompatibilityPolicy(PolicyModel):
-    canary_only: bool = True
+    canary_only: StrictBool = True
     default_executor: ExecutorKind = ExecutorKind.HERMES_PROFILE
     fallback_executors: Mapping[str, RoleRoute] = Field(
         default_factory=dict, validate_default=True
@@ -401,7 +485,7 @@ class FactoryPolicy(PolicyModel):
     components, but unknown top-level sections are never silently accepted.
     """
 
-    version: Literal[1] = 1
+    version: StrictInt = 1
     runtime: Mapping[str, object] = Field(default_factory=dict, validate_default=True)
     transport: Mapping[str, object] = Field(default_factory=dict, validate_default=True)
     state: Mapping[str, object] = Field(default_factory=dict, validate_default=True)
@@ -470,6 +554,13 @@ class FactoryPolicy(PolicyModel):
     @classmethod
     def sections_are_json_safe(cls, value: object, info) -> dict[str, object]:
         return _json_safe_mapping(value, info.field_name)
+
+    @field_validator("version")
+    @classmethod
+    def version_is_supported(cls, value: int) -> int:
+        if value != 1:
+            raise ValueError("policy version must be 1")
+        return value
 
     @field_validator("providers", "agents", "handlers")
     @classmethod
@@ -583,6 +674,13 @@ def _validate_route_references(
     prefix = f"roles.{role}"
     if route.agent is not None and route.agent not in agents:
         raise ValueError(f"{prefix}.agent references unknown agent {route.agent!r}")
+    if route.agent is not None:
+        output_contract = agents[route.agent].output_contract
+        if output_contract not in SUPPORTED_OUTCOME_CONTRACTS:
+            raise ValueError(
+                f"{prefix}.agent references unsupported output contract "
+                f"{output_contract!r}"
+            )
     if route.provider is not None and route.provider not in providers:
         raise ValueError(
             f"{prefix}.provider references unknown provider {route.provider!r}"
@@ -601,27 +699,7 @@ def _validate_route_references(
             f"{prefix}.model references an undeclared model {route.model!r} for "
             f"provider {route.provider!r}"
         )
-    if ":" not in route.model:
-        raise ValueError(
-            f"{prefix}.model must use a provider-qualified model route such as "
-            "openai-codex:model-id"
-        )
-    model_provider, _, model_id = route.model.partition(":")
-    if not model_id:
-        raise ValueError(f"{prefix}.model must include a non-empty model id")
-    expected_prefix = {
-        "openai_codex": "openai-codex",
-        "openai": "openai",
-        "anthropic": "anthropic",
-        "gemini": "gemini",
-        "google": "google",
-        "ollama": "ollama",
-    }.get(provider.kind.value)
-    if expected_prefix is not None and model_provider != expected_prefix:
-        raise ValueError(
-            f"{prefix}.model route {route.model!r} does not belong to provider "
-            f"{route.provider!r}"
-        )
+    _validate_model_family(provider.kind, route.model, f"{prefix}.model")
 
 
 def _validate_provider_fallback_graph(
@@ -821,6 +899,7 @@ def load_project_policy(source: str | Path | Mapping[str, Any]) -> FactoryPolicy
 
 __all__ = [
     "BUILTIN_DETERMINISTIC_HANDLERS",
+    "SUPPORTED_OUTCOME_CONTRACTS",
     "AgentDefinition",
     "AgentSpec",
     "CompatibilityPolicy",
@@ -831,6 +910,7 @@ __all__ = [
     "HandlerDefinition",
     "ImmutableMapping",
     "LegacySettings",
+    "OutputContractName",
     "Policy",
     "PolicyError",
     "ProjectPolicy",
