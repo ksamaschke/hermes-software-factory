@@ -428,7 +428,7 @@ def test_observed_metric_availability_is_fail_closed_and_nested_consistent():
     )
 
     candidate = copy.deepcopy(record)
-    candidate["metrics"]["input_tokens"] = 1
+    candidate["metrics"]["input_tokens"] = None
     candidate["evidence_fingerprint"] = baseline._evidence_fingerprint(candidate)
     errors = baseline.validate_observed_record(candidate)
     assert any("exactly cover null metrics" in error for error in errors)
@@ -442,10 +442,10 @@ def test_observed_metric_availability_is_fail_closed_and_nested_consistent():
     assert any("availability reasons disagree" in error for error in errors)
 
     candidate = copy.deepcopy(record)
-    candidate["metrics"]["input_tokens"] = 1
-    candidate["metric_unavailable_reasons"].pop("input_tokens", None)
+    candidate["metrics"]["input_tokens"] = None
+    candidate["metric_unavailable_reasons"]["input_tokens"] = "usage_field_absent"
     candidate["usage_evidence"]["unavailable_reasons"]["input_tokens"] = (
-        "usage_field_absent"
+        "measurement_unavailable"
     )
     candidate["evidence_fingerprint"] = baseline._evidence_fingerprint(candidate)
     errors = baseline.validate_observed_record(candidate)

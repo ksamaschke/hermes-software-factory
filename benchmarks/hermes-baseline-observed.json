@@ -1,74 +1,116 @@
 {
-  "captured_at_utc": "2026-09-23T18:00:32Z",
+  "captured_at_utc": "2026-09-23T19:28:15Z",
   "command_contract": {
-    "fixed_prompt": "Reply with exactly: Hermes baseline OK.",
+    "acknowledgement": "ack_local_hermes_persistence_required",
+    "expected_response": "Hermes baseline OK.",
+    "fixed_prompt": "Do not use tools. Reply with exactly: Hermes baseline OK.",
     "mode": "bounded_one_shot",
+    "model": "openai-codex:gpt-5.6-luna",
+    "profile": "implementer",
     "repository_access": "none",
-    "stdout_stderr": "discarded",
+    "stderr": "not_captured",
+    "stdout": "captured_in_memory_then_discarded",
     "timeout_seconds": 120,
-    "tools_allowed": false,
-    "toolsets": [
-      "bot_room"
-    ],
+    "tool_override": "none",
+    "tools": "profile_default",
     "usage_evidence": "sanitized_usage_file",
-    "working_directory": "temporary_directory"
+    "working_directory": "fresh_temporary_non_git"
   },
-  "evidence_fingerprint": "sha256:57d039e2997c785437667ed38dcd26070784d107c41f1bcbc8ebb132a0e47a80",
+  "environment_contract": {
+    "allowlist_categories": [
+      "HOME",
+      "PATH",
+      "LOCALE",
+      "TLS_PROXY"
+    ],
+    "control_plane_variables_removed": true,
+    "kanban_variables_removed": true,
+    "secret_environment_passed": false,
+    "values_recorded": false
+  },
+  "evidence_fingerprint": "sha256:250648fdbf52fcffbb31b8c7ef50fca74a1db4aa2d3d83483acfbb5f10c4ee67",
   "execution": {
+    "cwd_non_git": true,
     "exit_code": 0,
-    "peak_rss_bytes": 170717184,
-    "raw_output_recorded": false,
-    "response_recorded": false,
+    "measurement_helper": "fresh_helper_only_child_hermes",
+    "peak_rss_bytes": 232984576,
+    "response_contract_satisfied": true,
+    "rss_scope": "max_child_rss_not_aggregate_process_tree",
+    "stderr_recorded": false,
+    "stdout_recorded": false,
     "timed_out": false,
-    "wall_time_ms": 3019.588
+    "wall_time_ms": 5936.478
   },
   "identity": {
-    "factory_runtime_revision": "f6f68269bee26dbb33c49b21c01db871a901804e",
+    "capture_source_revision": "7a69764896cb7ab64e51c8049228237a687906ae",
+    "clean_before_capture": true,
+    "factory_base_revision": "0c32430ab1243e060f21bab98c109e4f21d0a402",
+    "factory_head_revision": "7a69764896cb7ab64e51c8049228237a687906ae",
     "hermes_profile": "implementer",
     "hermes_source_revision": "044a77b3b6af4ce16138d42762f812a20b9f7a89",
     "hermes_version": "0.21.2",
     "qualified_model": "openai-codex:gpt-5.6-luna"
   },
-  "metric_unavailable_reasons": {
-    "cache_read_tokens": "Hermes --usage-file did not supply this metric.",
-    "cache_write_tokens": "Hermes --usage-file did not supply this metric.",
-    "input_tokens": "Hermes --usage-file did not supply this metric.",
-    "output_tokens": "Hermes --usage-file did not supply this metric.",
-    "tool_calls": "The capture supplied an empty built-in toolset, so tool calls were not permitted."
+  "local_side_effects": {
+    "credential_store_read": "expected",
+    "external_repository_mutations": "not_performed_by_contract",
+    "factory_task_mutations": "not_performed_by_contract",
+    "observed_record_write": "checked_in_record_only",
+    "profile_log_writes": "expected",
+    "profile_session_db_writes": "expected"
   },
+  "metric_unavailable_reasons": {},
   "metrics": {
-    "cache_read_tokens": null,
-    "cache_write_tokens": null,
-    "input_tokens": null,
+    "cache_read_tokens": 0,
+    "cache_write_tokens": 0,
+    "input_tokens": 21772,
     "model_calls": 1,
-    "output_tokens": null,
-    "tool_calls": 0
+    "output_tokens": 36,
+    "peak_rss_bytes": 232984576,
+    "tool_calls": 0,
+    "wall_time_ms": 5936.478
+  },
+  "profile_contract": {
+    "auth_material_recorded": false,
+    "contents_recorded": false,
+    "fingerprint": "sha256:d482186815cc847d4e981ea43e94fe768b58a39cc4c17a962c20c3cc1d3fb76d",
+    "metadata_only": true
   },
   "provenance": {
+    "fingerprint_semantics": "self_consistency_digest_not_attestation",
     "kind": "observed_benign_hermes_smoke",
     "observed": true,
     "raw_logs_recorded": false,
+    "raw_output_recorded": false,
     "raw_prompts_recorded": false,
-    "redaction": "Only bounded process measurements and selected usage counters are retained; the response, raw prompts, environment, credential paths, session identifiers, and logs are discarded.",
+    "redaction": "Response, stderr, raw usage failures, prompts beyond the fixed public phrase, environment values, credentials, session identifiers, and logs are not retained.",
     "sanitized": true,
     "synthetic": false
   },
   "record_type": "observed_hermes_baseline",
-  "schema_version": 1,
+  "schema_version": 2,
+  "source_binding": {
+    "capture_source_revision": "7a69764896cb7ab64e51c8049228237a687906ae",
+    "fingerprint_scope": "capture_executable_source_bytes",
+    "source_sha256": "sha256:da5069d34bf680f7c8dbe2f08a935f8ff2fd6bf59fdc7d28e21153e41b178e07"
+  },
   "usage_evidence": {
     "available_fields": [
-      "api_calls"
+      "api_calls",
+      "cache_read_tokens",
+      "cache_write_tokens",
+      "input_tokens",
+      "output_tokens"
     ],
+    "completed": true,
+    "failed": false,
+    "model": "gpt-5.6-luna",
     "prompts_recorded": false,
+    "provider": "openai-codex",
     "raw_logs_recorded": false,
     "read": true,
     "session_identifier_recorded": false,
     "source": "Hermes one-shot --usage-file",
-    "unavailable_reasons": {
-      "cache_read_tokens": "Hermes --usage-file did not supply this metric.",
-      "cache_write_tokens": "Hermes --usage-file did not supply this metric.",
-      "input_tokens": "Hermes --usage-file did not supply this metric.",
-      "output_tokens": "Hermes --usage-file did not supply this metric."
-    }
+    "unavailable_reasons": {}
   }
 }
