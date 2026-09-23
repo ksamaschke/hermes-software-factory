@@ -81,6 +81,16 @@ The broader runtime, profile-routing, decomposer, and explicit-profile
 contract is documented in
 [`docs/kanban-factory-runtime.md`](docs/kanban-factory-runtime.md).
 
+A proposed next-generation runtime keeps one small Hermes orchestrator profile
+as the messaging, architecture, and decision bridge while moving planning,
+implementation, and review to narrow typed PydanticAI agents behind a
+deterministic factory control plane.
+The architecture, executor boundary, migration sequence, performance gates,
+and rollback model are documented in
+[`docs/pydantic-agent-factory-architecture.md`](docs/pydantic-agent-factory-architecture.md),
+with a non-secret policy example in
+[`examples/pydantic-agent-runtime.yaml`](examples/pydantic-agent-runtime.yaml).
+
 ## Tracker adapters
 
 The workflow supports multiple code and issue trackers through declared

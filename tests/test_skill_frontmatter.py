@@ -33,6 +33,8 @@ PUBLIC_TEXT_FILES = [
     ROOT / "docs" / "profile-environment-contract.md",
     ROOT / "docs" / "tracker-kanban-reconciliation.md",
     ROOT / "docs" / "kanban-factory-runtime.md",
+    ROOT / "docs" / "pydantic-agent-factory-architecture.md",
+    ROOT / "examples" / "pydantic-agent-runtime.yaml",
     ROOT / "LICENSE",
     ROOT / "tests" / "test_skill_frontmatter.py",
     ROOT / "requirements-dev.txt",

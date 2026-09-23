@@ -1,0 +1,195 @@
+# Proposed runtime policy for the Pydantic-agent factory architecture.
+# This file contains no credentials and is not an activation manifest.
+version: 1
+
+runtime:
+  control_plane: factory
+  state_backend: hermes_kanban_compat
+  dispatcher_owner: single_factory_dispatcher
+  transport_profile: factory-orchestrator
+  tool_transport: mcp_stdio
+  event_outbox: enabled
+
+transport:
+  hermes_profile: factory-orchestrator
+  # The profile receives only the named factory tools. It must not receive
+  # repository, shell, direct Kanban, deployment, or worker-management tools.
+  tools:
+    - factory_submit
+    - factory_status
+    - factory_evidence
+    - factory_decisions
+    - factory_record_decision
+    - factory_cancel
+    - factory_retry
+    - factory_explain
+
+providers:
+  codex_subscription:
+    kind: openai_codex
+    credential_source: application_owned
+    credential_reference: null # secret-store reference, never token material
+    max_in_progress: 2
+    refresh_lock: required
+    fallback_provider: null
+
+agents:
+  planner-v1:
+    framework: pydantic_ai
+    prompt: runtime/prompts/planner-v1.md
+    output_contract: PlanOutcome
+    static_prompt_token_target: 2500
+    visible_tool_limit: 8
+    capabilities:
+      - project_policy_read
+      - source_item_read
+      - repository_tree_read
+      - repository_search_read
+      - repository_file_read
+
+  implementer-v1:
+    framework: pydantic_ai
+    prompt: runtime/prompts/implementer-v1.md
+    output_contract: ImplementationOutcome
+    static_prompt_token_target: 2500
+    visible_tool_limit: 12
+    capabilities:
+      - workspace_file_read
+      - workspace_search
+      - workspace_patch
+      - workspace_write
+      - workspace_delete
+      - git_status_read
+      - git_diff_read
+      - allowlisted_test_runner
+
+  reviewer-v1:
+    framework: pydantic_ai
+    prompt: runtime/prompts/reviewer-v1.md
+    output_contract: ReviewOutcome
+    static_prompt_token_target: 2500
+    visible_tool_limit: 8
+    capabilities:
+      - immutable_review_packet_read
+      - workspace_file_read_only
+      - exact_diff_read
+      - gate_evidence_read
+      - allowlisted_targeted_check
+      - scratch_evidence_write
+
+roles:
+  planner:
+    executor: pydantic_agent
+    agent: planner-v1
+    model: openai-codex:gpt-5.6-luna
+    provider: codex_subscription
+    max_in_progress: 1
+    max_runtime_seconds: 600
+
+  implementer:
+    executor: pydantic_agent
+    agent: implementer-v1
+    model: openai-codex:gpt-5.6-luna
+    provider: codex_subscription
+    vendor_family: openai
+    max_in_progress: 1
+    max_runtime_seconds: 3600
+
+  code_reviewer:
+    executor: pydantic_agent
+    agent: reviewer-v1
+    # Project overlay must provide an independently approved route.
+    model: null
+    provider: null
+    vendor_family: null
+    max_in_progress: 1
+    max_runtime_seconds: 1800
+    read_only_source: true
+
+  completion_verifier:
+    executor: deterministic
+    handler: completion-verifier-v1
+
+  integration_operator:
+    executor: deterministic
+    handler: source-integration-v1
+
+  release_operator:
+    executor: deterministic
+    handler: release-v1
+
+compatibility:
+  canary_only: true
+  default_executor: hermes_profile
+  fallback_executors:
+    implementer:
+      executor: hermes_profile
+      profile: implementer
+    code_reviewer:
+      executor: hermes_profile
+      profile: reviewer
+  # A backend change always creates a new run. Never switch an active run.
+  allow_backend_change_on_retry: explicit_policy_only
+
+state:
+  claim_lock_required: true
+  lease_required: true
+  heartbeat_required: true
+  immutable_run_events: true
+  readback_after_mutation: true
+  agent_database_access: forbidden
+
+workspace:
+  kind: git_worktree
+  unique_per_task: true
+  root_binding_required: true
+  protected_paths: []
+  dirty_cleanup: quarantine
+  shell:
+    background_processes: forbidden
+    listeners: forbidden
+    containers: forbidden
+    commands: project_policy_allowlist
+    command_timeout_seconds: 120
+
+review:
+  independent_vendor_family: required
+  exact_candidate_required: true
+  exact_scope_required: true
+  max_changed_files_per_leaf: 5
+  acceptance_questions_per_leaf: 1
+  source_mutation_check: before_and_after
+  mutation_result: REVIEW_INCOMPLETE
+
+credentials:
+  task_envelopes: forbidden
+  prompts: forbidden
+  events: forbidden
+  logs: forbidden
+  telemetry: forbidden
+  artifacts: forbidden
+
+observability:
+  opentelemetry: true
+  capture_http_bodies: false
+  record:
+    - queue_wait_ms
+    - startup_ms
+    - first_model_request_ms
+    - model_latency_ms
+    - tool_latency_ms
+    - total_latency_ms
+    - model_requests
+    - input_tokens
+    - output_tokens
+    - cache_tokens
+    - peak_rss_bytes
+    - retry_count
+    - terminal_outcome
+
+migration_gates:
+  static_prompt_reduction_percent: 80
+  peak_rss_reduction_percent: 50
+  generic_orientation_model_calls: 0
+  lifecycle_correctness_regression_allowed: false
+  review_quality_regression_allowed: false
