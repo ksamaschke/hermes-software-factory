@@ -1,0 +1,74 @@
+{
+  "captured_at_utc": "2026-09-23T18:00:32Z",
+  "command_contract": {
+    "fixed_prompt": "Reply with exactly: Hermes baseline OK.",
+    "mode": "bounded_one_shot",
+    "repository_access": "none",
+    "stdout_stderr": "discarded",
+    "timeout_seconds": 120,
+    "tools_allowed": false,
+    "toolsets": [
+      "bot_room"
+    ],
+    "usage_evidence": "sanitized_usage_file",
+    "working_directory": "temporary_directory"
+  },
+  "evidence_fingerprint": "sha256:57d039e2997c785437667ed38dcd26070784d107c41f1bcbc8ebb132a0e47a80",
+  "execution": {
+    "exit_code": 0,
+    "peak_rss_bytes": 170717184,
+    "raw_output_recorded": false,
+    "response_recorded": false,
+    "timed_out": false,
+    "wall_time_ms": 3019.588
+  },
+  "identity": {
+    "factory_runtime_revision": "f6f68269bee26dbb33c49b21c01db871a901804e",
+    "hermes_profile": "implementer",
+    "hermes_source_revision": "044a77b3b6af4ce16138d42762f812a20b9f7a89",
+    "hermes_version": "0.21.2",
+    "qualified_model": "openai-codex:gpt-5.6-luna"
+  },
+  "metric_unavailable_reasons": {
+    "cache_read_tokens": "Hermes --usage-file did not supply this metric.",
+    "cache_write_tokens": "Hermes --usage-file did not supply this metric.",
+    "input_tokens": "Hermes --usage-file did not supply this metric.",
+    "output_tokens": "Hermes --usage-file did not supply this metric.",
+    "tool_calls": "The capture supplied an empty built-in toolset, so tool calls were not permitted."
+  },
+  "metrics": {
+    "cache_read_tokens": null,
+    "cache_write_tokens": null,
+    "input_tokens": null,
+    "model_calls": 1,
+    "output_tokens": null,
+    "tool_calls": 0
+  },
+  "provenance": {
+    "kind": "observed_benign_hermes_smoke",
+    "observed": true,
+    "raw_logs_recorded": false,
+    "raw_prompts_recorded": false,
+    "redaction": "Only bounded process measurements and selected usage counters are retained; the response, raw prompts, environment, credential paths, session identifiers, and logs are discarded.",
+    "sanitized": true,
+    "synthetic": false
+  },
+  "record_type": "observed_hermes_baseline",
+  "schema_version": 1,
+  "usage_evidence": {
+    "available_fields": [
+      "api_calls"
+    ],
+    "prompts_recorded": false,
+    "raw_logs_recorded": false,
+    "read": true,
+    "session_identifier_recorded": false,
+    "source": "Hermes one-shot --usage-file",
+    "unavailable_reasons": {
+      "cache_read_tokens": "Hermes --usage-file did not supply this metric.",
+      "cache_write_tokens": "Hermes --usage-file did not supply this metric.",
+      "input_tokens": "Hermes --usage-file did not supply this metric.",
+      "output_tokens": "Hermes --usage-file did not supply this metric."
+    }
+  }
+}

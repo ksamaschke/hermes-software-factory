@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "corpus_id": "pydantic-agent-factory-migration-v1",
   "baseline": {
     "hermes_profile": "implementer",
@@ -7,9 +7,11 @@
     "runtime_revision": "0c32430ab1243e060f21bab98c109e4f21d0a402"
   },
   "provenance": {
-    "kind": "synthetic",
+    "kind": "synthetic_test_vectors",
+    "synthetic": true,
+    "observed": false,
     "observed_production_data": false,
-    "redaction": "No prompts, credentials, live task identifiers, repository paths, or repository contents are stored."
+    "redaction": "Synthetic test vectors only; no observed task data, prompts, credentials, repository paths, or repository contents are stored."
   },
   "replay": {
     "deterministic": true,
@@ -28,7 +30,7 @@
       "replay_safe": true,
       "task": {
         "task_id": "fixture-implementation-success",
-        "objective": "Produce a tested candidate for a small typed change.",
+        "objective": "produce a tested candidate for a small typed change",
         "repository": {
           "kind": "synthetic_fixture",
           "name": "repo-implementation-success"
@@ -58,6 +60,18 @@
           "latency_ms": 45
         }
       ],
+      "transitions": [
+        {
+          "from": "queued",
+          "to": "running",
+          "reason": "dispatch_started"
+        },
+        {
+          "from": "running",
+          "to": "done",
+          "reason": "tests_passed"
+        }
+      ],
       "metrics": {
         "prompt_size_chars": 2400,
         "prompt_size_tokens": 600,
@@ -70,19 +84,24 @@
         "cache_tokens": 150,
         "queue_wait_ms": 35,
         "startup_ms": 180,
-        "first_model_request_ms": 250,
+        "first_model_request_ms": 715,
         "model_latency_ms": 500,
         "tool_latency_ms": 80,
-        "total_latency_ms": 1050,
+        "retry_latency_ms": 0,
+        "lifecycle_latency_ms": 0,
+        "event_latency_ms": 580,
+        "total_latency_ms": 795,
         "peak_rss_bytes": 83886080,
-        "retry_count": 0
+        "retry_count": 0,
+        "timeout_events": 0,
+        "cancellation_events": 0
       },
       "durable_outcome": {
         "status": "candidate_ready",
         "terminal": true,
         "task_state": "done",
         "reason": "tests_passed",
-        "summary": "Synthetic fixture: candidate is ready after the deterministic test gate."
+        "summary": "Synthetic test vector: produce a tested candidate for a small typed change"
       }
     },
     {
@@ -93,7 +112,7 @@
       "replay_safe": true,
       "task": {
         "task_id": "fixture-test-failure",
-        "objective": "Produce a candidate whose required test gate reports a failure.",
+        "objective": "produce a candidate whose required test gate reports a failure",
         "repository": {
           "kind": "synthetic_fixture",
           "name": "repo-test-failure"
@@ -128,6 +147,18 @@
           "latency_ms": 40
         }
       ],
+      "transitions": [
+        {
+          "from": "queued",
+          "to": "running",
+          "reason": "dispatch_started"
+        },
+        {
+          "from": "running",
+          "to": "blocked",
+          "reason": "test_failure"
+        }
+      ],
       "metrics": {
         "prompt_size_chars": 2600,
         "prompt_size_tokens": 650,
@@ -140,19 +171,24 @@
         "cache_tokens": 120,
         "queue_wait_ms": 42,
         "startup_ms": 180,
-        "first_model_request_ms": 265,
+        "first_model_request_ms": 772,
         "model_latency_ms": 550,
         "tool_latency_ms": 130,
-        "total_latency_ms": 1250,
+        "retry_latency_ms": 0,
+        "lifecycle_latency_ms": 0,
+        "event_latency_ms": 680,
+        "total_latency_ms": 902,
         "peak_rss_bytes": 87031808,
-        "retry_count": 0
+        "retry_count": 0,
+        "timeout_events": 0,
+        "cancellation_events": 0
       },
       "durable_outcome": {
         "status": "failed",
         "terminal": true,
         "task_state": "blocked",
         "reason": "test_failure",
-        "summary": "Synthetic fixture: the required test gate failed and the candidate is not ready."
+        "summary": "Synthetic test vector: produce a candidate whose required test gate reports a failure"
       }
     },
     {
@@ -163,7 +199,7 @@
       "replay_safe": true,
       "task": {
         "task_id": "fixture-provider-retry",
-        "objective": "Recover from one provider retry and produce a tested candidate.",
+        "objective": "recover from one provider retry and produce a tested candidate",
         "repository": {
           "kind": "synthetic_fixture",
           "name": "repo-provider-retry"
@@ -205,6 +241,18 @@
           "latency_ms": 45
         }
       ],
+      "transitions": [
+        {
+          "from": "queued",
+          "to": "running",
+          "reason": "dispatch_started"
+        },
+        {
+          "from": "running",
+          "to": "done",
+          "reason": "provider_retry_recovered"
+        }
+      ],
       "metrics": {
         "prompt_size_chars": 2450,
         "prompt_size_tokens": 612,
@@ -217,19 +265,24 @@
         "cache_tokens": 500,
         "queue_wait_ms": 50,
         "startup_ms": 185,
-        "first_model_request_ms": 300,
+        "first_model_request_ms": 495,
         "model_latency_ms": 900,
         "tool_latency_ms": 80,
-        "total_latency_ms": 1540,
+        "retry_latency_ms": 15,
+        "lifecycle_latency_ms": 0,
+        "event_latency_ms": 995,
+        "total_latency_ms": 1230,
         "peak_rss_bytes": 90177536,
-        "retry_count": 1
+        "retry_count": 1,
+        "timeout_events": 0,
+        "cancellation_events": 0
       },
       "durable_outcome": {
         "status": "candidate_ready",
         "terminal": true,
         "task_state": "done",
         "reason": "provider_retry_recovered",
-        "summary": "Synthetic fixture: one provider retry was recovered before the test gate passed."
+        "summary": "Synthetic test vector: recover from one provider retry and produce a tested candidate"
       }
     },
     {
@@ -240,7 +293,7 @@
       "replay_safe": true,
       "task": {
         "task_id": "fixture-timeout",
-        "objective": "Exercise a bounded run that reaches its deadline before completion.",
+        "objective": "exercise a bounded run that reaches its deadline before completion",
         "repository": {
           "kind": "synthetic_fixture",
           "name": "repo-timeout"
@@ -263,6 +316,23 @@
           "kind": "tool_call",
           "name": "workspace_read",
           "latency_ms": 35
+        },
+        {
+          "kind": "timeout",
+          "reason": "deadline_exceeded",
+          "latency_ms": 10
+        }
+      ],
+      "transitions": [
+        {
+          "from": "queued",
+          "to": "running",
+          "reason": "dispatch_started"
+        },
+        {
+          "from": "running",
+          "to": "timed_out",
+          "reason": "deadline_exceeded"
         }
       ],
       "metrics": {
@@ -277,19 +347,24 @@
         "cache_tokens": 100,
         "queue_wait_ms": 45,
         "startup_ms": 175,
-        "first_model_request_ms": 280,
+        "first_model_request_ms": 920,
         "model_latency_ms": 700,
         "tool_latency_ms": 35,
-        "total_latency_ms": 980,
+        "retry_latency_ms": 0,
+        "lifecycle_latency_ms": 10,
+        "event_latency_ms": 745,
+        "total_latency_ms": 965,
         "peak_rss_bytes": 85983232,
-        "retry_count": 0
+        "retry_count": 0,
+        "timeout_events": 1,
+        "cancellation_events": 0
       },
       "durable_outcome": {
         "status": "timed_out",
         "terminal": true,
-        "task_state": "blocked",
+        "task_state": "timed_out",
         "reason": "deadline_exceeded",
-        "summary": "Synthetic fixture: the run reached its deadline and retained a durable timeout outcome."
+        "summary": "Synthetic test vector: exercise a bounded run that reaches its deadline before completion"
       }
     },
     {
@@ -300,7 +375,7 @@
       "replay_safe": true,
       "task": {
         "task_id": "fixture-cancellation",
-        "objective": "Exercise an explicit cancellation before a candidate is finalized.",
+        "objective": "exercise an explicit cancellation before a candidate is finalized",
         "repository": {
           "kind": "synthetic_fixture",
           "name": "repo-cancellation"
@@ -323,6 +398,23 @@
           "kind": "tool_call",
           "name": "workspace_read",
           "latency_ms": 20
+        },
+        {
+          "kind": "cancellation_requested",
+          "reason": "operator_requested",
+          "latency_ms": 12
+        }
+      ],
+      "transitions": [
+        {
+          "from": "queued",
+          "to": "running",
+          "reason": "dispatch_started"
+        },
+        {
+          "from": "running",
+          "to": "cancelled",
+          "reason": "operator_requested"
         }
       ],
       "metrics": {
@@ -337,19 +429,24 @@
         "cache_tokens": 80,
         "queue_wait_ms": 40,
         "startup_ms": 170,
-        "first_model_request_ms": 260,
+        "first_model_request_ms": 610,
         "model_latency_ms": 400,
         "tool_latency_ms": 20,
-        "total_latency_ms": 700,
+        "retry_latency_ms": 0,
+        "lifecycle_latency_ms": 12,
+        "event_latency_ms": 432,
+        "total_latency_ms": 642,
         "peak_rss_bytes": 84869120,
-        "retry_count": 0
+        "retry_count": 0,
+        "timeout_events": 0,
+        "cancellation_events": 1
       },
       "durable_outcome": {
         "status": "cancelled",
         "terminal": true,
         "task_state": "cancelled",
         "reason": "operator_requested",
-        "summary": "Synthetic fixture: cancellation was acknowledged and no candidate was promoted."
+        "summary": "Synthetic test vector: exercise an explicit cancellation before a candidate is finalized"
       }
     },
     {
@@ -360,7 +457,7 @@
       "replay_safe": true,
       "task": {
         "task_id": "fixture-review-approval",
-        "objective": "Review an immutable candidate packet and approve it when all evidence passes.",
+        "objective": "review an immutable candidate packet and approve it when all evidence passes",
         "repository": {
           "kind": "synthetic_fixture",
           "name": "repo-review-approval"
@@ -375,7 +472,7 @@
         {
           "kind": "model_call",
           "provider": "independent_review_provider",
-          "model": "review-model-v1",
+          "model": "gpt-5.6-luna",
           "attempt": 1,
           "latency_ms": 460
         },
@@ -390,6 +487,18 @@
           "latency_ms": 30
         }
       ],
+      "transitions": [
+        {
+          "from": "queued",
+          "to": "reviewing",
+          "reason": "dispatch_started"
+        },
+        {
+          "from": "reviewing",
+          "to": "review_approved",
+          "reason": "review_passed"
+        }
+      ],
       "metrics": {
         "prompt_size_chars": 1900,
         "prompt_size_tokens": 475,
@@ -402,19 +511,40 @@
         "cache_tokens": 120,
         "queue_wait_ms": 30,
         "startup_ms": 160,
-        "first_model_request_ms": 230,
+        "first_model_request_ms": 650,
         "model_latency_ms": 460,
         "tool_latency_ms": 60,
-        "total_latency_ms": 850,
+        "retry_latency_ms": 0,
+        "lifecycle_latency_ms": 0,
+        "event_latency_ms": 520,
+        "total_latency_ms": 710,
         "peak_rss_bytes": 81788928,
-        "retry_count": 0
+        "retry_count": 0,
+        "timeout_events": 0,
+        "cancellation_events": 0
       },
       "durable_outcome": {
         "status": "APPROVED",
         "terminal": true,
         "task_state": "review_approved",
         "reason": "review_passed",
-        "summary": "Synthetic fixture: the immutable review packet passed and was approved."
+        "summary": "Synthetic test vector: review an immutable candidate packet and approve it when all evidence passes"
+      },
+      "review_evidence": {
+        "packet_state": "immutable",
+        "evidence_state": "complete",
+        "mutation_detected": false,
+        "checks": [
+          {
+            "name": "review_packet_read",
+            "status": "passed"
+          },
+          {
+            "name": "gate_evidence_read",
+            "status": "passed"
+          }
+        ],
+        "findings": 0
       }
     },
     {
@@ -425,7 +555,7 @@
       "replay_safe": true,
       "task": {
         "task_id": "fixture-review-changes-requested",
-        "objective": "Review an immutable candidate packet and request a bounded correction.",
+        "objective": "review an immutable candidate packet and request a bounded correction",
         "repository": {
           "kind": "synthetic_fixture",
           "name": "repo-review-changes-requested"
@@ -440,7 +570,7 @@
         {
           "kind": "model_call",
           "provider": "independent_review_provider",
-          "model": "review-model-v1",
+          "model": "gpt-5.6-luna",
           "attempt": 1,
           "latency_ms": 500
         },
@@ -455,6 +585,18 @@
           "latency_ms": 35
         }
       ],
+      "transitions": [
+        {
+          "from": "queued",
+          "to": "reviewing",
+          "reason": "dispatch_started"
+        },
+        {
+          "from": "reviewing",
+          "to": "rework_required",
+          "reason": "review_finding"
+        }
+      ],
       "metrics": {
         "prompt_size_chars": 2000,
         "prompt_size_tokens": 500,
@@ -467,19 +609,40 @@
         "cache_tokens": 140,
         "queue_wait_ms": 32,
         "startup_ms": 160,
-        "first_model_request_ms": 240,
+        "first_model_request_ms": 692,
         "model_latency_ms": 500,
         "tool_latency_ms": 70,
-        "total_latency_ms": 910,
+        "retry_latency_ms": 0,
+        "lifecycle_latency_ms": 0,
+        "event_latency_ms": 570,
+        "total_latency_ms": 762,
         "peak_rss_bytes": 82903040,
-        "retry_count": 0
+        "retry_count": 0,
+        "timeout_events": 0,
+        "cancellation_events": 0
       },
       "durable_outcome": {
         "status": "CHANGES_REQUESTED",
         "terminal": true,
         "task_state": "rework_required",
         "reason": "review_finding",
-        "summary": "Synthetic fixture: review found a bounded issue and requested changes before approval."
+        "summary": "Synthetic test vector: review an immutable candidate packet and request a bounded correction"
+      },
+      "review_evidence": {
+        "packet_state": "immutable",
+        "evidence_state": "complete",
+        "mutation_detected": false,
+        "checks": [
+          {
+            "name": "review_packet_read",
+            "status": "passed"
+          },
+          {
+            "name": "exact_diff_read",
+            "status": "passed"
+          }
+        ],
+        "findings": 1
       }
     },
     {
@@ -490,7 +653,7 @@
       "replay_safe": true,
       "task": {
         "task_id": "fixture-review-incomplete",
-        "objective": "Exercise a review that cannot produce a trustworthy terminal verdict.",
+        "objective": "exercise a review that cannot produce a trustworthy terminal verdict",
         "repository": {
           "kind": "synthetic_fixture",
           "name": "repo-review-incomplete"
@@ -505,7 +668,7 @@
         {
           "kind": "model_call",
           "provider": "independent_review_provider",
-          "model": "review-model-v1",
+          "model": "gpt-5.6-luna",
           "attempt": 1,
           "latency_ms": 580
         },
@@ -513,6 +676,18 @@
           "kind": "tool_call",
           "name": "review_packet_read",
           "latency_ms": 30
+        }
+      ],
+      "transitions": [
+        {
+          "from": "queued",
+          "to": "reviewing",
+          "reason": "dispatch_started"
+        },
+        {
+          "from": "reviewing",
+          "to": "blocked",
+          "reason": "insufficient_review_evidence"
         }
       ],
       "metrics": {
@@ -527,19 +702,36 @@
         "cache_tokens": 90,
         "queue_wait_ms": 38,
         "startup_ms": 165,
-        "first_model_request_ms": 250,
+        "first_model_request_ms": 783,
         "model_latency_ms": 580,
         "tool_latency_ms": 30,
-        "total_latency_ms": 820,
+        "retry_latency_ms": 0,
+        "lifecycle_latency_ms": 0,
+        "event_latency_ms": 610,
+        "total_latency_ms": 813,
         "peak_rss_bytes": 80609280,
-        "retry_count": 0
+        "retry_count": 0,
+        "timeout_events": 0,
+        "cancellation_events": 0
       },
       "durable_outcome": {
         "status": "REVIEW_INCOMPLETE",
         "terminal": true,
         "task_state": "blocked",
         "reason": "insufficient_review_evidence",
-        "summary": "Synthetic fixture: review evidence was incomplete, so the controller stayed fail-closed."
+        "summary": "Synthetic test vector: exercise a review that cannot produce a trustworthy terminal verdict"
+      },
+      "review_evidence": {
+        "packet_state": "immutable",
+        "evidence_state": "incomplete",
+        "mutation_detected": false,
+        "checks": [
+          {
+            "name": "review_packet_read",
+            "status": "passed"
+          }
+        ],
+        "findings": 0
       }
     }
   ]

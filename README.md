@@ -280,8 +280,9 @@ deployment is documented in [`docs/factory-delivery-lifecycle.md`](docs/factory-
 
 ## Pydantic-agent migration baseline
 
-The Phase 0 baseline is a checked-in, synthetic corpus that covers implementation
-and review outcomes without reading or mutating live Factory state:
+The Phase 0 comparison keeps eight checked-in **synthetic test vectors** separate
+from one observed, sanitized Hermes implementer smoke record. The synthetic
+corpus never reads or mutates live Factory state:
 
 ```bash
 python3 scripts/pydantic_agent_baseline.py \
@@ -291,9 +292,19 @@ python3 scripts/pydantic_agent_baseline.py \
 ```
 
 The validator and replay summary are standard-library-only and side-effect free.
+Capture is a separate explicit operation that runs no tools in a temporary,
+non-repository directory and records only sanitized measurements:
+
+```bash
+python3 scripts/pydantic_agent_baseline.py capture \
+  --profile implementer \
+  --model openai-codex:gpt-5.6-luna \
+  --output benchmarks/hermes-baseline-observed.json
+```
+
 See [`docs/pydantic-agent-baseline.md`](docs/pydantic-agent-baseline.md) for the
-exact Hermes profile/model/runtime revision and the explicit distinction between
-synthetic fixtures and directional smoke evidence.
+exact identities, evidence fingerprint, unavailable-metric reasons, and the
+architecture smoke sample citation.
 
 ## Monitoring
 
@@ -337,6 +348,7 @@ scripts/pydantic_agent_baseline.py               synthetic corpus validator and 
 examples/project-policy.yaml                    adaptable tracker policy template
 examples/forgejo-delivery-overlay.json           anonymized observer overlay template
 benchmarks/pydantic-agent-corpus.json             sanitized Phase 0 benchmark fixtures
+benchmarks/hermes-baseline-observed.json         sanitized observed Hermes smoke evidence
 docs/profile-roles.md                            reusable profile role model
 docs/reviewer-role-contract.md                   project-agnostic reviewer boundary
 docs/profile-environment-contract.md             profile/worktree environment preflight
