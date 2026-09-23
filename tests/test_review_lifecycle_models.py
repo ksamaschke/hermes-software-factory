@@ -394,6 +394,18 @@ with kb.connect_closing(db) as conn:
         "review_remediation_handoff_key": receipt["handoff_key"],
         "scope_manifest_sha256": remediation_scope,
     }
+    original_redact_review_value = kb.redact_review_value
+
+    def redactor_that_masks_opaque_handoff(value):
+        if isinstance(value, str) and value == receipt["handoff_key"]:
+            return "***"
+        if isinstance(value, dict):
+            return {
+                key: redactor_that_masks_opaque_handoff(item)
+                for key, item in value.items()
+            }
+        return original_redact_review_value(value)
+    kb.redact_review_value = redactor_that_masks_opaque_handoff
     with active("implementer"):
         assert not kb.complete_task(
             conn,
