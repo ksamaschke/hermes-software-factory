@@ -230,6 +230,8 @@ def _normalize_event_key(value: str) -> str:
 
 
 def _validate_event_key(value: str) -> str:
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError("event attribute keys must not contain control characters")
     normalized = _normalize_event_key(value)
     if not normalized:
         raise ValueError("event attribute key must contain an alphanumeric character")
@@ -668,6 +670,15 @@ class PlanOutcome(ContractModel):
 
         for task_id in graph:
             visit(task_id)
+        if self.status in {"planned", "ready"}:
+            if self.decisions:
+                raise ValueError(
+                    "successful plan outcomes must not contain pending decisions"
+                )
+            if any(blocker.blocking for blocker in self.blockers):
+                raise ValueError(
+                    "successful plan outcomes must not contain blocking blockers"
+                )
         return self
 
 
@@ -728,6 +739,12 @@ class ImplementationOutcome(ContractModel):
     def candidate_status_is_consistent(self) -> ImplementationOutcome:
         if self.status == "candidate_ready" and self.candidate_revision is None:
             raise ValueError("candidate_ready requires candidate_revision")
+        if self.status == "candidate_ready" and any(
+            blocker.blocking for blocker in self.blockers
+        ):
+            raise ValueError(
+                "candidate_ready outcomes must not contain blocking blockers"
+            )
         if self.status == "failed" and self.candidate_revision is not None:
             raise ValueError("failed outcomes must not publish candidate_revision")
         return self
@@ -782,6 +799,13 @@ class ReviewOutcome(ContractModel):
     def mutation_requires_incomplete_review(self) -> ReviewOutcome:
         if self.mutation_detected and self.verdict != "REVIEW_INCOMPLETE":
             raise ValueError("a source mutation must produce REVIEW_INCOMPLETE")
+        if self.verdict == "APPROVED" and any(
+            not finding.resolved and finding.severity in {"error", "blocker"}
+            for finding in self.findings
+        ):
+            raise ValueError(
+                "APPROVED reviews must not contain unresolved error or blocker findings"
+            )
         return self
 
 
@@ -801,15 +825,11 @@ class EventAttribute(ContractModel):
     def value_is_safe_scalar(cls, value: EventScalar) -> EventScalar:
         if isinstance(value, float) and not math.isfinite(value):
             raise ValueError("event attribute values must be JSON-safe finite scalars")
-        if isinstance(value, str) and _looks_like_inline_credential(value):
-            raise ValueError(
-                "event attributes must not contain inline credential material"
-            )
-        if isinstance(value, str) and _contains_high_entropy_token(value):
-            raise ValueError(
-                "event attributes must not contain opaque high-entropy material"
-            )
-        return value
+        return (
+            _validate_secret_free_text(value, "event attribute value")
+            if isinstance(value, str)
+            else value
+        )
 
 
 class FactoryEvent(ContractModel):
@@ -905,11 +925,20 @@ ValidatedOutcome: TypeAlias = (
 
 def _is_successful_completion_outcome(outcome: ValidatedOutcome) -> bool:
     if isinstance(outcome, PlanOutcome):
-        return outcome.status in {"planned", "ready"}
+        return (
+            outcome.status in {"planned", "ready"}
+            and not outcome.decisions
+            and not any(blocker.blocking for blocker in outcome.blockers)
+        )
     if isinstance(outcome, ImplementationOutcome):
-        return outcome.status == "candidate_ready"
+        return outcome.status == "candidate_ready" and not any(
+            blocker.blocking for blocker in outcome.blockers
+        )
     if isinstance(outcome, ReviewOutcome):
-        return outcome.verdict == "APPROVED"
+        return outcome.verdict == "APPROVED" and not any(
+            not finding.resolved and finding.severity in {"error", "blocker"}
+            for finding in outcome.findings
+        )
     return False
 
 

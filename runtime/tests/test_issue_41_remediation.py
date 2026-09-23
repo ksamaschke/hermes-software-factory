@@ -12,6 +12,7 @@ from software_factory import (
     MAX_FACTORY_EVENT_ATTRIBUTES,
     AcceptanceCriterion,
     BlockedOutcome,
+    ChangedPath,
     ClaimedRun,
     EventAttribute,
     EvidenceRef,
@@ -21,6 +22,7 @@ from software_factory import (
     ImplementationOutcome,
     Lease,
     PlanOutcome,
+    ReviewFinding,
     ReviewOutcome,
     RoleRoute,
     RunIdentity,
@@ -187,6 +189,110 @@ def test_completed_state_accepts_only_successful_outcomes(outcome: object):
         )
 
 
+def test_successful_outcomes_reject_contradictory_nested_payloads():
+    with pytest.raises(ValidationError, match="pending decisions"):
+        PlanOutcome.model_validate(
+            {
+                "status": "ready",
+                "summary": "not actually ready",
+                "decisions": [{"key": "scope", "question": "Which scope?"}],
+                "next_gate": "run",
+            }
+        )
+    with pytest.raises(ValidationError, match="blocking blockers"):
+        PlanOutcome.model_validate(
+            {
+                "status": "planned",
+                "summary": "blocked plan",
+                "blockers": [{"code": "dependency", "summary": "dependency missing"}],
+                "next_gate": "run",
+            }
+        )
+    with pytest.raises(ValidationError, match="blocking blockers"):
+        ImplementationOutcome.model_validate(
+            {
+                "status": "candidate_ready",
+                "summary": "blocked candidate",
+                "candidate_revision": "candidate-41",
+                "blockers": [{"code": "tests", "summary": "tests are blocked"}],
+                "next_gate": "review",
+            }
+        )
+    with pytest.raises(ValidationError, match="unresolved"):
+        ReviewOutcome.model_validate(
+            {
+                "verdict": "APPROVED",
+                "candidate_revision": "candidate-41",
+                "reviewed_scope": ["runtime/src/software_factory/api/contracts.py"],
+                "findings": [
+                    {
+                        "finding_id": "blocking-41",
+                        "severity": "blocker",
+                        "summary": "still unresolved",
+                    }
+                ],
+            }
+        )
+
+    ImplementationOutcome.model_validate(
+        {
+            "status": "candidate_ready",
+            "summary": "candidate with a nonblocking note",
+            "candidate_revision": "candidate-41",
+            "blockers": [
+                {
+                    "code": "follow-up",
+                    "summary": "nonblocking follow-up",
+                    "blocking": False,
+                }
+            ],
+            "next_gate": "review",
+        }
+    )
+    ReviewOutcome.model_validate(
+        {
+            "verdict": "APPROVED",
+            "candidate_revision": "candidate-41",
+            "reviewed_scope": ["runtime/src/software_factory/api/contracts.py"],
+            "findings": [
+                {
+                    "finding_id": "resolved-41",
+                    "severity": "blocker",
+                    "summary": "resolved before approval",
+                    "resolved": True,
+                }
+            ],
+        }
+    )
+
+
+def test_completed_state_rechecks_nested_success_semantics():
+    bypassed_outcome = ReviewOutcome.model_construct(
+        verdict="APPROVED",
+        candidate_revision="candidate-41",
+        reviewed_scope=(
+            ChangedPath(path="runtime/src/software_factory/api/contracts.py"),
+        ),
+        findings=(
+            ReviewFinding(
+                finding_id="blocking-41",
+                severity="blocker",
+                summary="unresolved after construction",
+            ),
+        ),
+        evidence=(),
+        mutation_detected=False,
+    )
+
+    with pytest.raises(ValidationError, match="unresolved error or blocker"):
+        TaskState(
+            task_id="task-41",
+            state="completed",
+            run=RunIdentity(task_id="task-41", run_id="run-41"),
+            outcome=bypassed_outcome,
+        )
+
+
 @pytest.mark.parametrize(
     "factory",
     [
@@ -278,6 +384,8 @@ def test_every_known_provider_family_accepts_only_its_model_prefix(
 
 def test_custom_provider_preserves_provider_neutral_model_forms():
     load_policy(policy_document(kind="custom", model="vendor:model-41"))
+    with pytest.raises(PolicyError, match="provider prefix"):
+        load_policy(policy_document(kind="custom", model=":model-41"))
 
 
 def test_agent_output_contract_is_a_closed_routing_allowlist():
@@ -312,6 +420,14 @@ def test_event_resource_caps_are_explicit_and_enforced():
             occurred_at=datetime(2026, 9, 23, 12, 0, tzinfo=UTC),
             attributes=[*attributes, {"key": "one-too-many", "value": 1}],
         )
+
+
+@pytest.mark.parametrize("control", ["\x01", "\x1f", "\x7f"])
+def test_event_attributes_reject_control_characters(control: str):
+    with pytest.raises(ValidationError, match="control characters"):
+        EventAttribute(key=f"status{control}", value="safe")
+    with pytest.raises(ValidationError, match="control characters"):
+        EventAttribute(key="status", value=f"unsafe{control}value")
 
 
 def test_event_and_evidence_text_use_conservative_credential_exclusions():

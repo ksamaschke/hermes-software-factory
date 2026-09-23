@@ -306,6 +306,8 @@ def _validate_model_family(kind: ProviderKind, model: str, field_name: str) -> s
             "openai-codex:model-id"
         )
     model_provider, _, model_id = model.partition(":")
+    if not model_provider:
+        raise ValueError(f"{field_name} must include a non-empty provider prefix")
     if not model_id:
         raise ValueError(f"{field_name} must include a non-empty model id")
     expected_prefix = _PROVIDER_MODEL_PREFIXES[kind]
