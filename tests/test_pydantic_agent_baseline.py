@@ -357,6 +357,24 @@ def test_capture_requires_local_persistence_ack_and_has_no_overrides():
     assert "--ack-local-hermes-persistence" in result.stderr
 
 
+def test_capture_command_binds_provider_and_bare_model_explicitly():
+    usage_path = Path("usage.json")
+
+    assert baseline._hermes_capture_command(usage_path) == [
+        "hermes",
+        "--profile",
+        "implementer",
+        "-z",
+        baseline.CAPTURE_PROMPT,
+        "--usage-file",
+        "usage.json",
+        "--provider",
+        "openai-codex",
+        "-m",
+        "gpt-5.6-luna",
+    ]
+
+
 def test_capture_source_does_not_use_unsafe_or_reduced_mode_flags():
     source = SCRIPT_PATH.read_text(encoding="utf-8")
     assert "--ignore-rules" not in source

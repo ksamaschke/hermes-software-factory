@@ -2087,6 +2087,24 @@ def _sanitized_usage(candidate: Any) -> dict[str, Any] | None:
     }
 
 
+def _hermes_capture_command(usage_path: Path) -> list[str]:
+    """Return the fixed provider/model route used by the observed capture."""
+
+    return [
+        "hermes",
+        "--profile",
+        CAPTURE_PROFILE,
+        "-z",
+        CAPTURE_PROMPT,
+        "--usage-file",
+        str(usage_path),
+        "--provider",
+        CAPTURE_PROVIDER,
+        "-m",
+        CAPTURE_BARE_MODEL,
+    ]
+
+
 def _measurement_helper(usage_path: Path, workspace: Path) -> dict[str, Any]:
     """Run exactly one measured Hermes child and emit only sanitized metadata."""
 
@@ -2103,17 +2121,7 @@ def _measurement_helper(usage_path: Path, workspace: Path) -> dict[str, Any]:
     try:
         before_rss = _children_peak_rss_bytes()
         process = subprocess.Popen(
-            [
-                "hermes",
-                "--profile",
-                CAPTURE_PROFILE,
-                "-z",
-                CAPTURE_PROMPT,
-                "--usage-file",
-                str(usage_path),
-                "-m",
-                CAPTURE_MODEL,
-            ],
+            _hermes_capture_command(usage_path),
             cwd=workspace,
             env=os.environ.copy(),
             stdin=subprocess.DEVNULL,
