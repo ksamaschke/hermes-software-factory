@@ -50,6 +50,39 @@ Report the decision, durable action, progress, non-progress, why, boundary,
 owner, evidence, and next gate. Treat evidence as verification of the action,
 not as a reason to return routine decisions to the operator.
 
+## Review lifecycle models
+
+Distinguish native same-card review from a separate review leaf before routing
+any verdict. A same-card review is claimed from `source_status=review` after a
+durable `review_requested` handoff; its native `kanban_request_changes`
+transition is the sole rework lane and must not be duplicated by a new
+implementation card. A standalone review leaf is claimed from
+`source_status=ready`; exact `APPROVED` completes once with an exact positive
+current run ID, matching claim lock and live lease, active independent reviewer
+profile, clean immutable worktree, and structured outcome and candidate metadata.
+Exact `CHANGES_REQUESTED` blocks once with the native
+`STANDALONE_REVIEW_CHANGES_REQUESTED:` prefix. Within Hermes-managed SQLite
+connections, Native Boundary `1.0.24`
+binds the strict owner/repository, complete task title/body, resolved worktree/
+Git-dir identity, branch, base/candidate, changed-path manifest, distinct roles,
+exact run and lease, finding, and complete direct-parent/child frontier into a
+sticky terminal outbox receipt. The scheduled recovery path verifies the active
+runtime contract and native coordinator profile, consumes each receipt
+independently, uses a full-digest permanent idempotency key, preserves every
+direct parent, enforces the immutable mandatory successor pointer/body/graph
+review gate, moves only the unchanged child frontier, archives the old leaf
+after exact readback, and marks the receipt applied. Generic board writers may
+not promote, schedule, unblock, respecify, archive, delete, or retarget that
+boundary through managed connections. A process running as the board database's
+owning OS user or holding raw file write access is trusted and outside this
+SQLite boundary; hostile workers require a broker or distinct OS identity
+without database write access. Legacy receipts without v2 provenance are
+tombstoned. Missing, stale,
+expired, foreign, malformed, self-attested, changed-frontier, wrong-repository,
+wrong-head, dirty-worktree, body/pointer/graph-tampered, or unfenced evidence
+remains `REVIEW-INCOMPLETE`; never complete, release, redispatch, or manually
+duplicate the native path.
+
 ## Boundaries
 
 - Do not implement source changes personally when an implementer owns them.

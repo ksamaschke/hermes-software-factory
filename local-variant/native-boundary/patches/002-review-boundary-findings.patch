@@ -1,0 +1,1428 @@
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -80,10 +80,11 @@
+ import secrets
+ import shutil
+ import sqlite3
+ import subprocess
+ import sys
++from urllib.parse import unquote, urlsplit
+ import threading
+ import logging
+ import time
+ from contextvars import ContextVar, Token
+ from dataclasses import dataclass, field
+@@ -168,10 +169,47 @@
+     "review_remediation_create_authorized", default=False
+ )
+ _REVIEW_NATIVE_MUTATION_AUTH: contextvars.ContextVar[bool] = contextvars.ContextVar(
+     "review_native_mutation_authorized", default=False
+ )
++_REVIEW_SCHEMA_MIGRATION_AUTH: contextvars.ContextVar[bool] = contextvars.ContextVar(
++    "review_schema_migration_authorized", default=False
++)
++_REVIEW_DISPATCH_AUTH: contextvars.ContextVar[Optional[dict[str, Any]]] = contextvars.ContextVar(
++    "review_dispatch_transition_authorized", default=None
++)
++
++_REVIEW_NATIVE_MUTATION_AUTH_TABLE = "review_native_mutation_authorization"
++_REVIEW_RUN_CAPABILITY_TABLE = "review_native_run_capabilities"
++_REVIEW_DISPATCH_AUTH_TABLE = "review_native_dispatch_authorization"
++_REVIEW_SCHEMA_MIGRATION_TABLE = "review_native_schema_migration_authorization"
++_REVIEW_AUTHORIZED_REMOTE_HOSTS = frozenset({"github.com"})
++_REVIEW_PROTECTED_SCHEMA_TABLES = frozenset(
++    {
++        _REVIEW_NATIVE_MUTATION_AUTH_TABLE,
++        _REVIEW_RUN_CAPABILITY_TABLE,
++        _REVIEW_DISPATCH_AUTH_TABLE,
++        _REVIEW_SCHEMA_MIGRATION_TABLE,
++        "review_remediation_handoffs",
++    }
++)
++_REVIEW_PROTECTED_TRIGGER_NAMES = frozenset(
++    {
++        "trg_review_claim_body_immutable",
++        "trg_review_terminal_status_immutable",
++        "trg_review_task_delete_immutable",
++        "trg_review_event_insert_authorized",
++        "trg_review_event_update_immutable",
++        "trg_review_event_delete_immutable",
++        "trg_review_handoff_insert_authorized",
++        "trg_review_handoff_update_immutable",
++        "trg_review_handoff_delete_immutable",
++        "trg_review_link_insert_immutable",
++        "trg_review_link_delete_immutable",
++        "trg_review_link_update_immutable",
++    }
++)
+
+
+ @contextlib.contextmanager
+ def _review_native_mutation_authorized(
+     conn: Optional[sqlite3.Connection] = None,
+@@ -209,10 +247,104 @@
+             except sqlite3.OperationalError:
+                 pass
+         raise
+     finally:
+         _REVIEW_NATIVE_MUTATION_AUTH.reset(token)
++
++
++@contextlib.contextmanager
++def _review_schema_migration_authorized():
++    """Authorize only the trusted, atomic review-schema migration."""
++    token = _REVIEW_SCHEMA_MIGRATION_AUTH.set(True)
++    try:
++        yield
++    finally:
++        _REVIEW_SCHEMA_MIGRATION_AUTH.reset(token)
++
++
++@contextlib.contextmanager
++def _review_dispatch_transition(
++    conn: sqlite3.Connection,
++    *,
++    task_id: str,
++    run_id: int,
++    claim_lock: str,
++    claim_expires: int,
++    field: str,
++    value: str,
++):
++    """Authorize one exact post-claim dispatcher field transition.
++
++    The authorization row is created, consumed, and deleted inside the same
++    transaction as the one allowed task update. It is not the broad native
++    review-mutation bypass: the row names the exact task, run, lease, field,
++    and value that the dispatcher is allowed to persist.
++    """
++    if (
++        type(run_id) is not int
++        or run_id <= 0
++        or type(claim_expires) is not int
++        or claim_expires <= 0
++        or not isinstance(claim_lock, str)
++        or not claim_lock
++        or field not in {"workspace_path", "branch_name", "worker_pid"}
++    ):
++        raise RuntimeError("dispatcher transition requires an exact live claim")
++    if conn.in_transaction:
++        raise RuntimeError("dispatcher transition must own its write transaction")
++    token = _REVIEW_DISPATCH_AUTH.set(
++        {
++            "task_id": str(task_id),
++            "run_id": run_id,
++            "claim_lock": claim_lock,
++            "claim_expires": claim_expires,
++            "field": field,
++            "value": str(value),
++        }
++    )
++    started = False
++    try:
++        _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
++        started = True
++        live = conn.execute(
++            "SELECT status, current_run_id, claim_lock, claim_expires "
++            "FROM tasks WHERE id = ?",
++            (task_id,),
++        ).fetchone()
++        if (
++            live is None
++            or live["status"] != "running"
++            or live["current_run_id"] != run_id
++            or live["claim_lock"] != claim_lock
++            or live["claim_expires"] != claim_expires
++        ):
++            raise RuntimeError("dispatcher claim changed before post-claim transition")
++        conn.execute(
++            "INSERT INTO review_native_dispatch_authorization "
++            "(task_id, run_id, claim_lock, claim_expires, field, value) "
++            "VALUES (?, ?, ?, ?, ?, ?)",
++            (task_id, run_id, claim_lock, claim_expires, field, str(value)),
++        )
++        yield
++        removed = conn.execute(
++            "DELETE FROM review_native_dispatch_authorization "
++            "WHERE task_id = ? AND run_id = ? AND claim_lock = ? "
++            "AND claim_expires = ? AND field = ? AND value = ?",
++            (task_id, run_id, claim_lock, claim_expires, field, str(value)),
++        )
++        if removed.rowcount != 1:
++            raise RuntimeError("dispatcher transition authorization was not consumed")
++        _execute_boundary_with_retry(conn, "COMMIT")
++    except Exception:
++        if started and conn.in_transaction:
++            try:
++                conn.execute("ROLLBACK")
++            except sqlite3.OperationalError:
++                pass
++        raise
++    finally:
++        _REVIEW_DISPATCH_AUTH.reset(token)
+
+
+ _IS_WINDOWS = sys.platform == "win32"
+ KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
+
+@@ -1616,10 +1748,46 @@
+
+ CREATE TABLE IF NOT EXISTS review_native_mutation_authorization (
+     token INTEGER PRIMARY KEY CHECK (token = 1)
+ );
+
++-- A capability is minted by the native claim transaction and is bound to one
++-- review run. The authorizer prevents ordinary connections from minting,
++-- changing, or deleting capabilities; insert triggers require both this row
++-- and the transaction-local native authorization row.
++CREATE TABLE IF NOT EXISTS review_native_run_capabilities (
++    task_id       TEXT NOT NULL,
++    run_id        INTEGER NOT NULL,
++    claim_lock    TEXT NOT NULL,
++    claim_expires INTEGER NOT NULL,
++    nonce         TEXT NOT NULL,
++    source_status TEXT NOT NULL,
++    created_at    INTEGER NOT NULL,
++    PRIMARY KEY (task_id, run_id),
++    UNIQUE (nonce)
++);
++
++-- Dispatcher-only post-claim updates (workspace, branch, and PID). Rows are
++-- created and consumed within one transaction and cannot authorize a different
++-- task, run, lease, field, or value.
++CREATE TABLE IF NOT EXISTS review_native_dispatch_authorization (
++    task_id       TEXT NOT NULL,
++    run_id        INTEGER NOT NULL,
++    claim_lock    TEXT NOT NULL,
++    claim_expires INTEGER NOT NULL,
++    field         TEXT NOT NULL,
++    value         TEXT NOT NULL,
++    PRIMARY KEY (task_id, run_id, field)
++);
++
++-- This marker exists only inside the trusted migration transaction. It lets
++-- migration cleanup record a tombstone for a legacy receipt without turning
++-- the native-created run capability gate into a permanent bypass.
++CREATE TABLE IF NOT EXISTS review_native_schema_migration_authorization (
++    token INTEGER PRIMARY KEY CHECK (token = 1)
++);
++
+ -- Native review evidence is immutable from ordinary board writers.
+ -- Authorization is an uncommitted row installed and removed by one native
+ -- write transaction. SQLite's single-writer lock and isolation make it visible
+ -- only to that writer; old runtimes can still mutate ordinary tasks while
+ -- protected evidence remains fail-closed.
+@@ -1644,12 +1812,27 @@
+     OR EXISTS (
+         SELECT 1 FROM review_remediation_handoffs h
+          WHERE h.leaf_task_id = OLD.id OR h.successor_task_id = OLD.id
+     )
+     OR OLD.idempotency_key GLOB 'review-remediation:v2:*'
+-) AND NOT EXISTS (
+-    SELECT 1 FROM review_native_mutation_authorization WHERE token = 1
++) AND NOT (
++    EXISTS (
++        SELECT 1 FROM review_native_mutation_authorization WHERE token = 1
++    )
++    OR EXISTS (
++        SELECT 1 FROM review_native_dispatch_authorization d
++         WHERE d.task_id = OLD.id
++           AND d.run_id = OLD.current_run_id
++           AND d.claim_lock = OLD.claim_lock
++           AND d.claim_expires = OLD.claim_expires
++           AND d.field = 'workspace_path'
++           AND d.value = NEW.workspace_path
++           AND OLD.title IS NEW.title
++           AND OLD.body IS NEW.body
++           AND OLD.created_by IS NEW.created_by
++           AND OLD.idempotency_key IS NEW.idempotency_key
++    )
+ )
+ BEGIN
+     SELECT RAISE(ABORT, 'native review task evidence is immutable');
+ END;
+
+@@ -1675,12 +1858,35 @@
+                    'same_card_review_approved'
+                )
+                OR (e.kind = 'same_card_review_claimed' AND e.run_id = OLD.current_run_id)
+            )
+     )
+-) AND NOT EXISTS (
+-    SELECT 1 FROM review_native_mutation_authorization WHERE token = 1
++) AND NOT (
++    EXISTS (
++        SELECT 1 FROM review_native_mutation_authorization WHERE token = 1
++    )
++    OR EXISTS (
++        SELECT 1 FROM review_native_dispatch_authorization d
++         WHERE d.task_id = OLD.id
++           AND d.run_id = OLD.current_run_id
++           AND d.claim_lock = OLD.claim_lock
++           AND d.claim_expires = OLD.claim_expires
++           AND (
++               (d.field = 'worker_pid'
++                AND d.value = CAST(NEW.worker_pid AS TEXT)
++                AND OLD.branch_name IS NEW.branch_name)
++               OR
++               (d.field = 'branch_name'
++                AND d.value = NEW.branch_name
++                AND OLD.worker_pid IS NEW.worker_pid)
++           )
++           AND OLD.status IS NEW.status
++           AND OLD.assignee IS NEW.assignee
++           AND OLD.current_run_id IS NEW.current_run_id
++           AND OLD.claim_lock IS NEW.claim_lock
++           AND OLD.claim_expires IS NEW.claim_expires
++    )
+ )
+ BEGIN
+     SELECT RAISE(ABORT, 'native review lifecycle state is immutable');
+ END;
+
+@@ -1708,10 +1914,52 @@
+ ) AND NOT EXISTS (
+     SELECT 1 FROM review_native_mutation_authorization WHERE token = 1
+ )
+ BEGIN
+     SELECT RAISE(ABORT, 'native review task cannot be deleted');
++END;
++
++CREATE TRIGGER IF NOT EXISTS trg_review_event_insert_authorized
++BEFORE INSERT ON task_events
++WHEN NEW.kind IN (
++    'standalone_review_packet_claimed',
++    'standalone_review_changes_requested',
++    'standalone_review_incomplete',
++    'standalone_review_approved',
++    'standalone_review_handoff_tombstoned',
++    'same_card_review_claimed',
++    'same_card_review_changes_requested',
++    'same_card_review_approved'
++) AND NOT EXISTS (
++    SELECT 1 FROM review_native_schema_migration_authorization WHERE token = 1
++) AND (
++    NOT EXISTS (
++        SELECT 1 FROM review_native_mutation_authorization WHERE token = 1
++    )
++    OR NEW.run_id IS NULL
++    OR NOT EXISTS (
++        SELECT 1 FROM review_native_run_capabilities c
++         WHERE c.task_id = NEW.task_id AND c.run_id = NEW.run_id
++    )
++)
++BEGIN
++    SELECT RAISE(ABORT, 'native review evidence insert requires a native run capability');
++END;
++
++CREATE TRIGGER IF NOT EXISTS trg_review_handoff_insert_authorized
++BEFORE INSERT ON review_remediation_handoffs
++WHEN (
++    NOT EXISTS (
++        SELECT 1 FROM review_native_mutation_authorization WHERE token = 1
++    )
++    OR NOT EXISTS (
++        SELECT 1 FROM review_native_run_capabilities c
++         WHERE c.task_id = NEW.leaf_task_id AND c.run_id = NEW.review_run_id
++    )
++)
++BEGIN
++    SELECT RAISE(ABORT, 'native review handoff insert requires a native run capability');
+ END;
+
+ CREATE TRIGGER IF NOT EXISTS trg_review_event_update_immutable
+ BEFORE UPDATE ON task_events
+ WHEN OLD.kind IN (
+@@ -1931,29 +2179,78 @@
+     arg1: Optional[str],
+     arg2: Optional[str],
+     database: Optional[str],
+     source: Optional[str],
+ ) -> int:
+-    protected_table = "review_native_mutation_authorization"
++    """Keep review evidence and its trigger DDL behind native boundaries.
++
++    SQLite authorizer callbacks run before triggers, so ordinary app-equivalent
++    connections cannot manufacture the transaction-local authorization rows or
++    create/drop a protective trigger. Schema migration is a separate capability
++    from ordinary native mutations and is held only while an atomic migration is
++    read back and integrity-checked.
++    """
++    schema_actions = {
++        getattr(sqlite3, "SQLITE_CREATE_TRIGGER", -1),
++        getattr(sqlite3, "SQLITE_DROP_TRIGGER", -1),
++        getattr(sqlite3, "SQLITE_CREATE_TABLE", -1),
++        getattr(sqlite3, "SQLITE_DROP_TABLE", -1),
++        getattr(sqlite3, "SQLITE_ALTER_TABLE", -1),
++        getattr(sqlite3, "SQLITE_CREATE_INDEX", -1),
++        getattr(sqlite3, "SQLITE_DROP_INDEX", -1),
++    }
++    if action in {
++        getattr(sqlite3, "SQLITE_CREATE_TRIGGER", -1),
++        getattr(sqlite3, "SQLITE_DROP_TRIGGER", -1),
++    }:
++        return (
++            sqlite3.SQLITE_OK
++            if _REVIEW_SCHEMA_MIGRATION_AUTH.get()
++            else sqlite3.SQLITE_DENY
++        )
++
++    if action in schema_actions:
++        if action == getattr(sqlite3, "SQLITE_ALTER_TABLE", -1):
++            targets = {str(arg2 or "")}
++        elif action == getattr(sqlite3, "SQLITE_CREATE_INDEX", -1):
++            targets = {str(arg1 or ""), str(arg2 or "")}
++        else:
++            targets = {str(arg1 or "")}
++        protected = any(
++            target in _REVIEW_PROTECTED_SCHEMA_TABLES
++            or target.startswith("review_native_")
++            or target.startswith("idx_review_")
++            for target in targets
++        )
++        if protected and not _REVIEW_SCHEMA_MIGRATION_AUTH.get():
++            return sqlite3.SQLITE_DENY
++
++    protected_tables = {
++        _REVIEW_NATIVE_MUTATION_AUTH_TABLE,
++        _REVIEW_RUN_CAPABILITY_TABLE,
++        _REVIEW_DISPATCH_AUTH_TABLE,
++        _REVIEW_SCHEMA_MIGRATION_TABLE,
++    }
+     mutating = {
+         sqlite3.SQLITE_INSERT,
+         sqlite3.SQLITE_UPDATE,
+         sqlite3.SQLITE_DELETE,
+-        sqlite3.SQLITE_DROP_TABLE,
+-        sqlite3.SQLITE_ALTER_TABLE,
+     }
+-    target = arg2 if action == sqlite3.SQLITE_ALTER_TABLE else arg1
+-    if (
+-        action in mutating
+-        and target == protected_table
+-        and not _REVIEW_NATIVE_MUTATION_AUTH.get()
+-    ):
+-        return sqlite3.SQLITE_DENY
++    if action in mutating:
++        target = str(arg1 or "")
++        if target in protected_tables:
++            if target == _REVIEW_DISPATCH_AUTH_TABLE:
++                allowed = _REVIEW_DISPATCH_AUTH.get() is not None
++            else:
++                allowed = _REVIEW_NATIVE_MUTATION_AUTH.get()
++            if not allowed:
++                return sqlite3.SQLITE_DENY
++
+     if (
+         action == sqlite3.SQLITE_PRAGMA
+         and str(arg1 or "").lower() == "writable_schema"
+-        and not _REVIEW_NATIVE_MUTATION_AUTH.get()
++        and not _REVIEW_SCHEMA_MIGRATION_AUTH.get()
+     ):
+         return sqlite3.SQLITE_DENY
+     return sqlite3.SQLITE_OK
+
+
+@@ -2776,24 +3073,86 @@
+                     definition,
+                 )
+
+
+ def _replace_review_boundary_triggers(conn: sqlite3.Connection) -> None:
+-    """Replace earlier function-backed triggers before installing this schema."""
++    """Replace review triggers only inside the trusted migration transaction."""
++    if not _REVIEW_SCHEMA_MIGRATION_AUTH.get():
++        raise PermissionError("review trigger replacement requires migration authorization")
+     for name in (
+         "trg_review_claim_body_immutable",
+         "trg_review_terminal_status_immutable",
+         "trg_review_task_delete_immutable",
++        "trg_review_event_insert_authorized",
+         "trg_review_event_update_immutable",
+         "trg_review_event_delete_immutable",
++        "trg_review_handoff_insert_authorized",
+         "trg_review_handoff_update_immutable",
+         "trg_review_handoff_delete_immutable",
+         "trg_review_link_insert_immutable",
+         "trg_review_link_delete_immutable",
+         "trg_review_link_update_immutable",
+     ):
+         conn.execute(f"DROP TRIGGER IF EXISTS {name}")
++
++
++def _execute_schema_script_atomically(conn: sqlite3.Connection, script: str) -> None:
++    """Execute a SQLite schema script without implicit transaction breaks."""
++    statement: list[str] = []
++    for line in script.splitlines(keepends=True):
++        statement.append(line)
++        candidate = "".join(statement)
++        if sqlite3.complete_statement(candidate):
++            if candidate.strip():
++                conn.execute(candidate)
++            statement.clear()
++    trailing = "".join(statement).strip()
++    if trailing:
++        conn.execute(trailing)
++
++
++def _assert_review_boundary_integrity(conn: sqlite3.Connection) -> None:
++    """Read back protected objects before a trusted schema commit."""
++    expected_tables = {
++        _REVIEW_NATIVE_MUTATION_AUTH_TABLE,
++        _REVIEW_RUN_CAPABILITY_TABLE,
++        _REVIEW_DISPATCH_AUTH_TABLE,
++        _REVIEW_SCHEMA_MIGRATION_TABLE,
++        "review_remediation_handoffs",
++    }
++    table_placeholders = ", ".join("?" for _ in expected_tables)
++    table_rows = conn.execute(
++        "SELECT name FROM sqlite_master WHERE type = 'table' "
++        f"AND name IN ({table_placeholders})",
++        tuple(sorted(expected_tables)),
++    ).fetchall()
++    actual_tables = {str(row["name"]) for row in table_rows}
++    if actual_tables != expected_tables:
++        raise sqlite3.DatabaseError(
++            "review schema migration did not create the complete protected table set"
++        )
++    placeholders = ", ".join("?" for _ in _REVIEW_PROTECTED_TRIGGER_NAMES)
++    trigger_rows = conn.execute(
++        "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' "
++        f"AND name IN ({placeholders})",
++        tuple(sorted(_REVIEW_PROTECTED_TRIGGER_NAMES)),
++    ).fetchall()
++    actual_triggers = {str(row["name"]) for row in trigger_rows}
++    if actual_triggers != set(_REVIEW_PROTECTED_TRIGGER_NAMES):
++        missing = sorted(set(_REVIEW_PROTECTED_TRIGGER_NAMES) - actual_triggers)
++        raise sqlite3.DatabaseError(
++            "review schema migration left protected triggers missing: "
++            + ", ".join(missing)
++        )
++    if any(not isinstance(row["sql"], str) or "TRIGGER" not in row["sql"].upper() for row in trigger_rows):
++        raise sqlite3.DatabaseError("review schema trigger readback is malformed")
++    messages = _run_integrity_check(conn)
++    if not _integrity_messages_ok(messages):
++        raise sqlite3.DatabaseError(
++            "review schema migration integrity_check failed: "
++            + (messages[0] if messages else "<no row>")
++        )
+
+
+ def connect(
+     db_path: Optional[Path] = None,
+     *,
+@@ -2917,19 +3276,31 @@
+                 # Surface corrupt cells as read errors instead of silent
+                 # wrong-data returns.
+                 conn.execute("PRAGMA cell_size_check=ON")
+                 needs_init = resolved not in _INITIALIZED_PATHS
+                 if needs_init:
+-                    # Idempotent: runs CREATE TABLE IF NOT EXISTS + the additive
+-                    # migrations. Cached so subsequent connect() calls in the same
+-                    # process are cheap. The lock prevents same-process dispatcher
+-                    # threads from racing through the additive ALTER TABLE pass with
+-                    # stale PRAGMA snapshots during gateway startup.
+-                    _preflight_review_schema_columns(conn)
+-                    _replace_review_boundary_triggers(conn)
+-                    conn.executescript(SCHEMA_SQL)
+-                    _migrate_add_optional_columns(conn)
++                    # DDL affecting review triggers/tables is one trusted atomic
++                    # migration. No committed interval may exist without the
++                    # protective triggers, and readback/integrity runs before
++                    # COMMIT. Data-only optional migrations follow the DDL commit
++                    # because some legacy paths own their own write transaction.
++                    with _review_schema_migration_authorized():
++                        _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
++                        try:
++                            _preflight_review_schema_columns(conn)
++                            _replace_review_boundary_triggers(conn)
++                            _execute_schema_script_atomically(conn, SCHEMA_SQL)
++                            _assert_review_boundary_integrity(conn)
++                            _execute_boundary_with_retry(conn, "COMMIT")
++                        except Exception:
++                            if conn.in_transaction:
++                                try:
++                                    conn.execute("ROLLBACK")
++                                except sqlite3.OperationalError:
++                                    pass
++                            raise
++                        _migrate_add_optional_columns(conn)
+                     _INITIALIZED_PATHS.add(resolved)
+         except Exception:
+             conn.close()
+             raise
+     return conn
+@@ -3267,10 +3638,13 @@
+             "OR coordinator_profile IS NULL OR coordinator_profile = '' "
+             "OR workspace_identity_json IS NULL OR workspace_identity_json = '')"
+         ).fetchall()
+         if incompatible:
+             with _review_native_mutation_authorized(), write_txn(conn):
++                conn.execute(
++                    "INSERT OR REPLACE INTO review_native_schema_migration_authorization(token) VALUES (1)"
++                )
+                 for legacy in incompatible:
+                     reason = "legacy_receipt_missing_v2_provenance"
+                     changed = conn.execute(
+                         "UPDATE review_remediation_handoffs "
+                         "SET status = 'applied', consumed_at = ?, tombstone_reason = ? "
+@@ -3289,10 +3663,13 @@
+                             "reason": reason,
+                             "contract_version": REVIEW_REMEDIATION_CONTRACT_VERSION,
+                         },
+                         run_id=legacy["review_run_id"],
+                     )
++                conn.execute(
++                    "DELETE FROM review_native_schema_migration_authorization WHERE token = 1"
++                )
+         conn.execute(
+             "CREATE UNIQUE INDEX IF NOT EXISTS idx_review_remediation_successor "
+             "ON review_remediation_handoffs(successor_task_id) "
+             "WHERE successor_task_id IS NOT NULL"
+         )
+@@ -3592,10 +3969,42 @@
+ ) -> None:
+     if installed:
+         conn.execute(
+             "DELETE FROM review_native_mutation_authorization WHERE token = 1"
+         )
++
++
++def _review_run_capability_create(
++    conn: sqlite3.Connection,
++    *,
++    task_id: str,
++    run_id: int,
++    claim_lock: str,
++    claim_expires: int,
++    source_status: str,
++) -> str:
++    """Mint one native-only capability for a review run."""
++    if type(run_id) is not int or run_id <= 0 or not claim_lock:
++        raise RuntimeError("review capability requires an exact run claim")
++    nonce = secrets.token_hex(32)
++    cur = conn.execute(
++        "INSERT INTO review_native_run_capabilities "
++        "(task_id, run_id, claim_lock, claim_expires, nonce, source_status, created_at) "
++        "VALUES (?, ?, ?, ?, ?, ?, ?)",
++        (
++            task_id,
++            run_id,
++            claim_lock,
++            int(claim_expires),
++            nonce,
++            source_status,
++            int(time.time()),
++        ),
++    )
++    if cur.rowcount != 1:
++        raise RuntimeError("native review run capability was not created")
++    return nonce
+
+
+ @contextlib.contextmanager
+ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
+     """Context manager for an IMMEDIATE write transaction.
+@@ -4904,10 +5313,11 @@
+     outcome: str,
+     summary: Optional[str] = None,
+     error: Optional[str] = None,
+     metadata: Optional[dict] = None,
+     status: Optional[str] = None,
++    expected_run_id: Optional[int] = None,
+ ) -> Optional[int]:
+     """Close the currently-active run for ``task_id`` and clear the pointer.
+
+     ``outcome`` is the semantic result (completed / blocked / crashed /
+     timed_out / spawn_failed / gave_up / reclaimed). ``status`` is the
+@@ -4921,10 +5331,12 @@
+         "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
+     ).fetchone()
+     if not row or not row["current_run_id"]:
+         return None
+     run_id = int(row["current_run_id"])
++    if expected_run_id is not None and run_id != int(expected_run_id):
++        return None
+     conn.execute(
+         """
+         UPDATE task_runs
+            SET status        = ?,
+                outcome       = ?,
+@@ -5438,15 +5850,24 @@
+                 expires,
+                 trow["max_runtime_seconds"] if trow else None,
+                 now,
+             ),
+         )
+-        run_id = run_cur.lastrowid
++        run_id = int(run_cur.lastrowid or 0)
+         conn.execute(
+             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
+             (run_id, task_id),
+         )
++        if standalone_packet is not None:
++            _review_run_capability_create(
++                conn,
++                task_id=task_id,
++                run_id=run_id,
++                claim_lock=lock,
++                claim_expires=expires,
++                source_status="ready",
++            )
+         _append_event(
+             conn, task_id, "claimed",
+             {"lock": lock, "expires": expires, "run_id": run_id},
+             run_id=run_id,
+         )
+@@ -5572,14 +5993,22 @@
+                 expires,
+                 trow["max_runtime_seconds"] if trow else None,
+                 now,
+             ),
+         )
+-        run_id = run_cur.lastrowid
++        run_id = int(run_cur.lastrowid or 0)
+         conn.execute(
+             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
+             (run_id, task_id),
++        )
++        _review_run_capability_create(
++            conn,
++            task_id=task_id,
++            run_id=run_id,
++            claim_lock=lock,
++            claim_expires=expires,
++            source_status="review",
+         )
+         graph_snapshot = _review_graph_snapshot(conn, task_id)
+         graph_json = _review_json(graph_snapshot)
+         _append_event(
+             conn,
+@@ -5964,27 +6393,32 @@
+
+     Returns True if a reclaim happened, False if the task isn't in a
+     reclaimable state (not running, or doesn't exist).
+     """
+     row = conn.execute(
+-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
++        "SELECT status, current_run_id, claim_lock, claim_expires, worker_pid "
++        "FROM tasks WHERE id = ?",
+         (task_id,),
+     ).fetchone()
+     if not row:
+         return False
+     if row["status"] != "running" and row["claim_lock"] is None:
+         # Nothing to reclaim — already ready / blocked / done.
+         return False
++    captured_run_id = _exact_positive_run_id(row["current_run_id"])
++    if captured_run_id is None:
++        return False
+     prev_lock = row["claim_lock"]
++    captured_claim_expires = row["claim_expires"]
++    captured_worker_pid = row["worker_pid"]
+     termination = _terminate_reclaimed_worker(
+-        row["worker_pid"], prev_lock, signal_fn=signal_fn,
++        captured_worker_pid, prev_lock, signal_fn=signal_fn,
+     )
+     with _review_native_mutation_authorized(), write_txn(conn):
+-        active_run_id = _current_run_id(conn, task_id)
++        active_run_id = captured_run_id
+         standalone_receipt = (
+-            active_run_id is not None
+-            and conn.execute(
++            conn.execute(
+                 "SELECT 1 FROM task_events WHERE task_id = ? AND run_id = ? "
+                 "AND kind = 'standalone_review_packet_claimed' LIMIT 1",
+                 (task_id, active_run_id),
+             ).fetchone()
+             is not None
+@@ -5996,12 +6430,14 @@
+         )
+         cur = conn.execute(
+             "UPDATE tasks SET status = ?, claim_lock = NULL, "
+             "claim_expires = NULL, worker_pid = NULL "
+             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
+-            "AND claim_lock IS ?",
+-            (retry_status, task_id, prev_lock),
++            "AND current_run_id IS ? AND claim_lock IS ? "
++            "AND claim_expires IS ? AND worker_pid IS ?",
++            (retry_status, task_id, captured_run_id, prev_lock,
++             captured_claim_expires, captured_worker_pid),
+         )
+         if cur.rowcount != 1:
+             return False
+         run_id = _end_run(
+             conn, task_id,
+@@ -6010,10 +6446,11 @@
+             error=(
+                 f"manual_reclaim: {reason}" if reason
+                 else f"manual_reclaim lock={prev_lock}"
+             ),
+             metadata=termination,
++            expected_run_id=captured_run_id,
+         )
+         if standalone_receipt:
+             _append_event(
+                 conn,
+                 task_id,
+@@ -7445,31 +7882,123 @@
+     if value is None or frozenset(value) != expected_keys:
+         return None
+     return value
+
+
+-def _repository_from_remote_url(value: str) -> Optional[str]:
++def _repository_identity_from_remote_url(value: str) -> Optional[dict[str, str]]:
++    """Return the complete authorized host + exact two-segment repo identity."""
+     remote = str(value or "").strip()
+     if not remote or any(char in remote for char in ("\n", "\r", "\x00")):
+         return None
+-    without_query = remote.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+-    if without_query.endswith(".git"):
+-        without_query = without_query[:-4]
++    without_query = remote.split("?", 1)[0].split("#", 1)[0]
++    if without_query != remote and ("?" in remote or "#" in remote):
++        return None
++    host: Optional[str] = None
++    repo_path: Optional[str] = None
+     if "://" in without_query:
+-        path = without_query.split("://", 1)[1].split("/", 1)
+-        if len(path) != 2:
++        try:
++            parsed = urlsplit(without_query)
++            if parsed.scheme.lower() not in {"https", "ssh"} or parsed.username or parsed.password:
++                return None
++            if parsed.hostname is None:
++                return None
++            host = parsed.hostname.casefold()
++            if parsed.port is not None:
++                host = f"{host}:{parsed.port}"
++            repo_path = parsed.path
++        except ValueError:
+             return None
+-        repo_path = path[1]
+-    elif ":" in without_query and "@" in without_query.split(":", 1)[0]:
+-        repo_path = without_query.split(":", 1)[1]
+     else:
+-        repo_path = without_query
+-    parts = [part for part in repo_path.split("/") if part]
+-    if len(parts) < 2:
++        match = re.fullmatch(r"([^@/:\s]+)@([^/:\s]+):(.+)", without_query)
++        if match is None:
++            return None
++        host = match.group(2).casefold()
++        repo_path = match.group(3)
++    if host not in _REVIEW_AUTHORIZED_REMOTE_HOSTS or repo_path is None:
+         return None
+-    repository = "/".join(parts[-2:])
+-    return repository if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) else None
++    if not repo_path.startswith("/"):
++        repo_path = "/" + repo_path
++    if repo_path.endswith("/") or repo_path.count("//"):
++        return None
++    parts = repo_path.strip("/").split("/")
++    if len(parts) != 2:
++        return None
++    decoded = [unquote(part) for part in parts]
++    if any(
++        not part
++        or part != raw
++        or part in {".", ".."}
++        or "/" in part
++        or not re.fullmatch(r"[A-Za-z0-9_.-]+", part)
++        for raw, part in zip(parts, decoded)
++    ):
++        return None
++    if decoded[1].endswith(".git"):
++        decoded[1] = decoded[1][:-4]
++    if not decoded[1] or not re.fullmatch(r"[A-Za-z0-9_.-]+", decoded[1]):
++        return None
++    repository = "/".join(decoded)
++    return {
++        "host": host,
++        "repository": repository,
++        "identity": f"{host}/{repository}",
++    }
++
++
++def _repository_from_remote_url(value: str) -> Optional[str]:
++    """Compatibility view of an authorized origin's owner/repository."""
++    identity = _repository_identity_from_remote_url(value)
++    return identity["repository"] if identity is not None else None
++
++
++_REVIEW_GIT_CONFIG_ARGS = (
++    "-c", "core.fsmonitor=false",
++    "-c", "diff.external=",
++    "-c", "core.attributesfile=/dev/null",
++    "-c", "core.hookspath=/dev/null",
++    "-c", "filter.lfs.process=",
++    "-c", "filter.lfs.smudge=",
++    "-c", "filter.lfs.clean=",
++)
++
++
++def _review_git_env() -> dict[str, str]:
++    """Return an isolated, non-interactive environment for every Git probe."""
++    return {
++        "PATH": "/usr/bin:/bin",
++        "HOME": str(Path.home()),
++        "GIT_CONFIG_NOSYSTEM": "1",
++        "GIT_CONFIG_SYSTEM": os.devnull,
++        "GIT_CONFIG_GLOBAL": os.devnull,
++        "GIT_TERMINAL_PROMPT": "0",
++        "GIT_PAGER": "cat",
++        "GIT_EDITOR": "/bin/false",
++        "GIT_SEQUENCE_EDITOR": "/bin/false",
++        "GIT_ASKPASS": "/bin/false",
++        "GIT_OPTIONAL_LOCKS": "0",
++    }
++
++
++def _review_git_probe(
++    workspace: Path, *arguments: str, timeout: float = 15
++) -> subprocess.CompletedProcess:
++    return subprocess.run(
++        [
++            "/usr/bin/git",
++            "--no-pager",
++            "--no-optional-locks",
++            *_REVIEW_GIT_CONFIG_ARGS,
++            "-C",
++            str(workspace),
++            *arguments,
++        ],
++        env=_review_git_env(),
++        text=True,
++        capture_output=True,
++        check=False,
++        timeout=timeout,
++    )
+
+
+ def _review_workspace_identity(
+     packet: Mapping[str, str],
+ ) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+@@ -7484,21 +8013,20 @@
+     if not workspace.is_dir():
+         return None, "target_worktree is not a directory"
+
+     def git_text(*arguments: str) -> Optional[str]:
+         try:
+-            probe = subprocess.run(
+-                ["/usr/bin/git", "-C", str(workspace), *arguments],
+-                env={"PATH": "/usr/bin:/bin", "HOME": str(Path.home())},
+-                text=True,
+-                capture_output=True,
+-                check=False,
+-                timeout=15,
+-            )
++            probe = _review_git_probe(workspace, *arguments, timeout=15)
+         except (OSError, subprocess.TimeoutExpired):
+             return None
+         return probe.stdout.strip() if probe.returncode == 0 else None
++
++    def git_ok(*arguments: str) -> bool:
++        try:
++            return _review_git_probe(workspace, *arguments, timeout=15).returncode == 0
++        except (OSError, subprocess.TimeoutExpired):
++            return False
+
+     root_text = git_text("rev-parse", "--show-toplevel")
+     git_dir_text = git_text("rev-parse", "--git-dir")
+     origin_url = git_text("config", "--get", "remote.origin.url")
+     head = git_text("rev-parse", "--verify", "HEAD^{commit}")
+@@ -7506,23 +8034,16 @@
+     base = git_text("rev-parse", "--verify", f"{packet['base_commit']}^{{commit}}")
+     candidate = git_text("rev-parse", "--verify", f"{packet['candidate_commit']}^{{commit}}")
+     if not all((root_text, git_dir_text, origin_url, head, branch, base, candidate)):
+         return None, "review worktree Git provenance is incomplete"
+     try:
+-        cleanliness = subprocess.run(
+-            [
+-                "/usr/bin/git",
+-                "-C",
+-                str(workspace),
+-                "status",
+-                "--porcelain=v1",
+-                "-z",
+-                "--untracked-files=all",
+-            ],
+-            env={"PATH": "/usr/bin:/bin", "HOME": str(Path.home())},
+-            capture_output=True,
+-            check=False,
++        cleanliness = _review_git_probe(
++            workspace,
++            "status",
++            "--porcelain=v1",
++            "-z",
++            "--untracked-files=all",
+             timeout=15,
+         )
+     except (OSError, subprocess.TimeoutExpired):
+         return None, "review worktree cleanliness could not be established"
+     if cleanliness.returncode != 0 or cleanliness.stdout:
+@@ -7538,47 +8059,55 @@
+         git_dir_stat = git_dir.stat()
+     except (OSError, RuntimeError):
+         return None, "review worktree Git paths are unstable"
+     if root != workspace:
+         return None, "target_worktree is not the repository root"
+-    if _repository_from_remote_url(origin_url) != packet["target_repository"]:
+-        return None, "target_repository does not match origin"
++    origin_identity = _repository_identity_from_remote_url(origin_url)
++    if (
++        origin_identity is None
++        or origin_identity["repository"] != packet["target_repository"]
++    ):
++        return None, "target_repository does not match the authorized origin identity"
+     if branch != packet["branch"]:
+         return None, "review branch does not match the checked out branch"
+     if head.casefold() != packet["candidate_commit"] or candidate.casefold() != packet["candidate_commit"]:
+         return None, "workspace HEAD does not match candidate_commit"
+     if base.casefold() != packet["base_commit"]:
+         return None, "base_commit is not present in the review repository"
++    if not git_ok("merge-base", "--is-ancestor", base, candidate):
++        return None, "base_commit is not an authorized ancestor of candidate_commit"
+     try:
+-        scope_probe = subprocess.run(
+-            [
+-                "/usr/bin/git",
+-                "-C",
+-                str(workspace),
+-                "diff",
+-                "--name-only",
+-                "--no-renames",
+-                "-z",
+-                packet["base_commit"],
+-                packet["candidate_commit"],
+-            ],
+-            env={"PATH": "/usr/bin:/bin", "HOME": str(Path.home())},
+-            capture_output=True,
+-            check=False,
++        scope_probe = _review_git_probe(
++            workspace,
++            "diff",
++            "--no-ext-diff",
++            "--no-textconv",
++            "--name-only",
++            "--no-renames",
++            "-z",
++            packet["base_commit"],
++            packet["candidate_commit"],
+             timeout=15,
+         )
+     except (OSError, subprocess.TimeoutExpired):
+         return None, "review scope could not be read"
+     if scope_probe.returncode != 0:
+         return None, "review scope could not be read"
+-    paths = sorted(path for path in scope_probe.stdout.split(b"\x00") if path)
++    paths = sorted(
++        path.encode("utf-8")
++        for path in scope_probe.stdout.split("\x00")
++        if path
++    )
+     scope_bytes = b"\x00".join(paths) + (b"\x00" if paths else b"")
+     if hashlib.sha256(scope_bytes).hexdigest() != packet["scope_manifest_sha256"]:
+         return None, "review scope manifest does not match the candidate diff"
+     return {
+         "contract_version": REVIEW_REMEDIATION_CONTRACT_VERSION,
+         "repository": packet["target_repository"],
++        "origin_host": origin_identity["host"],
++        "origin_repository": origin_identity["repository"],
++        "origin_identity": origin_identity["identity"],
+         "branch": packet["branch"],
+         "base_commit": packet["base_commit"],
+         "candidate_commit": packet["candidate_commit"],
+         "scope_manifest_sha256": packet["scope_manifest_sha256"],
+         "workspace_realpath": str(workspace),
+@@ -7627,10 +8156,12 @@
+
+ def _active_worker_run_rejection(
+     conn: sqlite3.Connection,
+     task_id: str,
+     expected_run_id: Any,
++    *,
++    require_native_profile: bool = False,
+ ) -> Optional[str]:
+     expected = _exact_positive_run_id(expected_run_id)
+     if expected is None:
+         return "an exact positive built-in expected_run_id is required"
+     task = conn.execute(
+@@ -7665,11 +8196,11 @@
+         or run["outcome"] is not None
+         or run["ended_at"] is not None
+         or run["claim_lock"] != task["claim_lock"]
+         or run["claim_expires"] != task["claim_expires"]
+         or _canonical_assignee(str(run["profile"] or "")) != task_profile
+-        or active_profile != task_profile
++        or (require_native_profile and active_profile != task_profile)
+     ):
+         return "active worker identity or lease provenance is invalid"
+     return None
+
+
+@@ -7973,17 +8504,12 @@
+         return None
+     git = Path("/usr/bin/git")
+     if not workspace.is_dir() or not git.is_file():
+         return None
+     try:
+-        probe = subprocess.run(
+-            [str(git), "-C", str(workspace), "rev-parse", "--verify", "HEAD^{commit}"],
+-            env={"PATH": "/usr/bin:/bin", "HOME": str(Path.home())},
+-            text=True,
+-            capture_output=True,
+-            timeout=5,
+-            check=False,
++        probe = _review_git_probe(
++            workspace, "rev-parse", "--verify", "HEAD^{commit}", timeout=5
+         )
+     except (OSError, subprocess.SubprocessError):
+         return None
+     value = probe.stdout.strip().casefold()
+     return value if probe.returncode == 0 and _REVIEW_COMMIT_RE.fullmatch(value) else None
+@@ -8050,11 +8576,13 @@
+         return None
+     run_id = _exact_positive_run_id(expected_run_id)
+     if run_id is None:
+         return False
+     with _review_native_mutation_authorized(), write_txn(conn):
+-        if _active_worker_run_rejection(conn, task_id, run_id) is not None:
++        if _active_worker_run_rejection(
++            conn, task_id, run_id, require_native_profile=True
++        ) is not None:
+             return False
+         task = conn.execute(
+             "SELECT id, title, body, assignee, created_by, workspace_path, "
+             "status, current_run_id, claim_lock, claim_expires FROM tasks WHERE id = ?",
+             (task_id,),
+@@ -8764,18 +9292,24 @@
+     )
+     if same_card_registered and (not same_card_claimed or same_card_error is not None):
+         return same_card_error or "same-card review claim receipt is missing"
+     if not isinstance(metadata, dict):
+         return "structured review completion metadata is required"
+-    verdict = str(
+-        metadata.get("review_outcome") or metadata.get("overall_verdict") or metadata.get("verdict") or ""
+-    ).strip().upper().replace("-", "_").replace(" ", "_")
+-    if verdict != "APPROVED":
++    verdict_fields = {
++        key for key in ("review_outcome", "overall_verdict", "verdict")
++        if key in metadata
++    }
++    if verdict_fields != {"review_outcome"} or (
++        type(metadata.get("review_outcome")) is not str
++        or metadata["review_outcome"] != "APPROVED"
++    ):
+         return "only exact APPROVED evidence may complete a review-gated task"
+     candidate = str(metadata.get("candidate_commit") or "").strip().casefold()
+     if not _REVIEW_COMMIT_RE.fullmatch(candidate):
+         return "review approval has no canonical candidate_commit"
++    if _active_native_profile() != _canonical_assignee(str(task["assignee"] or "")):
++        return "active native reviewer identity is invalid"
+
+     source_status = claim.get("source_status") or "ready"
+     expected_reviewer: Optional[str] = None
+     expected_candidate: Optional[str] = None
+     if is_standalone and packet is not None:
+@@ -9282,11 +9816,13 @@
+             False,
+             "request_review requires an exact active worker run; use a separate admin transition",
+         )
+     now = int(time.time())
+     with _review_native_mutation_authorized(), write_txn(conn):
+-        run_rejection = _active_worker_run_rejection(conn, task_id, fenced_run_id)
++        run_rejection = _active_worker_run_rejection(
++            conn, task_id, fenced_run_id, require_native_profile=True
++        )
+         if run_rejection is not None:
+             return _ret(False, run_rejection)
+         if not _parents_satisfied(conn, task_id):
+             return _ret(False, "parent dependencies are not satisfied")
+         trow = conn.execute(
+@@ -9466,11 +10002,13 @@
+     if fenced_run_id is None:
+         return False, "an exact positive built-in expected_run_id is required"
+
+     now = int(time.time())
+     with _review_native_mutation_authorized(), write_txn(conn):
+-        run_rejection = _active_worker_run_rejection(conn, task_id, fenced_run_id)
++        run_rejection = _active_worker_run_rejection(
++            conn, task_id, fenced_run_id, require_native_profile=True
++        )
+         if run_rejection is not None:
+             return False, run_rejection
+         task_row = conn.execute(
+             "SELECT status, assignee, current_run_id, claim_lock, claim_expires "
+             "FROM tasks WHERE id = ?",
+@@ -10876,29 +11414,81 @@
+         return p
+     raise ValueError(f"unknown workspace_kind: {kind}")
+
+
+ def set_workspace_path(
+-    conn: sqlite3.Connection, task_id: str, path: Path | str
++    conn: sqlite3.Connection, task_id: str, path: Path | str,
++    *,
++    expected_run_id: Optional[int] = None,
++    expected_claim_lock: Optional[str] = None,
++    expected_claim_expires: Optional[int] = None,
+ ) -> None:
+-    with write_txn(conn):
+-        conn.execute(
+-            "UPDATE tasks SET workspace_path = ? WHERE id = ?",
+-            (str(path), task_id),
+-        )
++    value = str(path)
++    if expected_run_id is None:
++        with write_txn(conn):
++            conn.execute(
++                "UPDATE tasks SET workspace_path = ? WHERE id = ?",
++                (value, task_id),
++            )
++        return
++    if expected_claim_lock is None or expected_claim_expires is None:
++        raise RuntimeError("workspace transition requires the exact dispatcher claim")
++    with _review_dispatch_transition(
++        conn,
++        task_id=task_id,
++        run_id=expected_run_id,
++        claim_lock=expected_claim_lock,
++        claim_expires=expected_claim_expires,
++        field="workspace_path",
++        value=value,
++    ):
++        cur = conn.execute(
++            "UPDATE tasks SET workspace_path = ? "
++            "WHERE id = ? AND status = 'running' AND current_run_id = ? "
++            "AND claim_lock = ? AND claim_expires = ?",
++            (value, task_id, expected_run_id, expected_claim_lock, expected_claim_expires),
++        )
++        if cur.rowcount != 1:
++            raise RuntimeError("workspace transition lost the dispatcher claim")
+
+
+ def set_branch_name(
+-    conn: sqlite3.Connection, task_id: str, branch_name: str
++    conn: sqlite3.Connection, task_id: str, branch_name: str,
++    *,
++    expected_run_id: Optional[int] = None,
++    expected_claim_lock: Optional[str] = None,
++    expected_claim_expires: Optional[int] = None,
+ ) -> None:
+-    with write_txn(conn):
+-        if _review_task_protection_reason(conn, task_id) is not None:
+-            raise RuntimeError("native review task branch binding is immutable")
+-        conn.execute(
+-            "UPDATE tasks SET branch_name = ? WHERE id = ?",
+-            (str(branch_name), task_id),
+-        )
++    value = str(branch_name)
++    if expected_run_id is None:
++        with write_txn(conn):
++            if _review_task_protection_reason(conn, task_id) is not None:
++                raise RuntimeError("native review task branch binding is immutable")
++            conn.execute(
++                "UPDATE tasks SET branch_name = ? WHERE id = ?",
++                (value, task_id),
++            )
++        return
++    if expected_claim_lock is None or expected_claim_expires is None:
++        raise RuntimeError("branch transition requires the exact dispatcher claim")
++    with _review_dispatch_transition(
++        conn,
++        task_id=task_id,
++        run_id=expected_run_id,
++        claim_lock=expected_claim_lock,
++        claim_expires=expected_claim_expires,
++        field="branch_name",
++        value=value,
++    ):
++        cur = conn.execute(
++            "UPDATE tasks SET branch_name = ? "
++            "WHERE id = ? AND status = 'running' AND current_run_id = ? "
++            "AND claim_lock = ? AND claim_expires = ?",
++            (value, task_id, expected_run_id, expected_claim_lock, expected_claim_expires),
++        )
++        if cur.rowcount != 1:
++            raise RuntimeError("branch transition lost the dispatcher claim")
+
+
+ # ---------------------------------------------------------------------------
+ def schedule_task(
+     conn: sqlite3.Connection,
+@@ -12466,29 +13056,67 @@
+         release_claim=True,
+         end_run=True,
+     )
+
+
+-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
++def _set_worker_pid(
++    conn: sqlite3.Connection, task_id: str, pid: int,
++    *,
++    expected_run_id: Optional[int] = None,
++    expected_claim_lock: Optional[str] = None,
++    expected_claim_expires: Optional[int] = None,
++) -> None:
+     """Record the spawned child's pid + emit a ``spawned`` event.
+
+-    The event's payload carries the pid so a human reading ``hermes kanban
+-    tail`` can correlate log lines with OS-level traces without opening
+-    the drawer.
+-    """
+-    with write_txn(conn):
+-        conn.execute(
+-            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
+-            (int(pid), task_id),
+-        )
+-        run_id = _current_run_id(conn, task_id)
+-        if run_id is not None:
++    Dispatcher callers pass the exact claim identity so protected review task
++    rows cannot be changed by a generic post-claim writer.
++    """
++    pid_value = int(pid)
++    if expected_run_id is None:
++        with write_txn(conn):
+             conn.execute(
+-                "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
+-                (int(pid), run_id),
+-            )
+-        _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
++                "UPDATE tasks SET worker_pid = ? WHERE id = ?",
++                (pid_value, task_id),
++            )
++            run_id = _current_run_id(conn, task_id)
++            if run_id is not None:
++                conn.execute(
++                    "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
++                    (pid_value, run_id),
++                )
++            _append_event(conn, task_id, "spawned", {"pid": pid_value}, run_id=run_id)
++        return
++    if expected_claim_lock is None or expected_claim_expires is None:
++        raise RuntimeError("worker PID transition requires the exact dispatcher claim")
++    with _review_dispatch_transition(
++        conn,
++        task_id=task_id,
++        run_id=expected_run_id,
++        claim_lock=expected_claim_lock,
++        claim_expires=expected_claim_expires,
++        field="worker_pid",
++        value=str(pid_value),
++    ):
++        cur = conn.execute(
++            "UPDATE tasks SET worker_pid = ? "
++            "WHERE id = ? AND status = 'running' AND current_run_id = ? "
++            "AND claim_lock = ? AND claim_expires = ?",
++            (pid_value, task_id, expected_run_id, expected_claim_lock, expected_claim_expires),
++        )
++        if cur.rowcount != 1:
++            raise RuntimeError("worker PID transition lost the dispatcher claim")
++        run_cur = conn.execute(
++            "UPDATE task_runs SET worker_pid = ? "
++            "WHERE id = ? AND task_id = ? AND status = 'running' "
++            "AND claim_lock = ? AND claim_expires = ?",
++            (pid_value, expected_run_id, task_id, expected_claim_lock, expected_claim_expires),
++        )
++        if run_cur.rowcount != 1:
++            raise RuntimeError("worker PID transition lost the exact run")
++        _append_event(
++            conn, task_id, "spawned", {"pid": pid_value}, run_id=expected_run_id
++        )
+
+
+ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
+     """Reset the unified consecutive-failures counter.
+
+@@ -13543,13 +14171,24 @@
+             )
+             if auto:
+                 result.auto_blocked.append(claimed.id)
+             continue
+         # Persist the resolved workspace path so the worker can cd there.
+-        set_workspace_path(conn, claimed.id, str(workspace))
++        set_workspace_path(
++            conn, claimed.id, str(workspace),
++            expected_run_id=claimed.current_run_id,
++            expected_claim_lock=claimed.claim_lock,
++            expected_claim_expires=claimed.claim_expires,
++        )
+         if claimed.workspace_kind == "worktree":
+-            set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
++            set_branch_name(
++                conn, claimed.id,
++                resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}",
++                expected_run_id=claimed.current_run_id,
++                expected_claim_lock=claimed.claim_lock,
++                expected_claim_expires=claimed.claim_expires,
++            )
+         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+         try:
+             # Back-compat: older spawn_fn signatures accept only
+             # (task, workspace). Test stubs in the suite rely on that.
+@@ -13562,11 +14201,16 @@
+                 else:
+                     pid = _spawn(claimed, str(workspace))
+             except (TypeError, ValueError):
+                 pid = _spawn(claimed, str(workspace))
+             if pid:
+-                _set_worker_pid(conn, claimed.id, int(pid))
++                _set_worker_pid(
++                    conn, claimed.id, int(pid),
++                    expected_run_id=claimed.current_run_id,
++                    expected_claim_lock=claimed.claim_lock,
++                    expected_claim_expires=claimed.claim_expires,
++                )
+             # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn
+             # returned and the PID (when reported) is durably persisted,
+             # per the RFC timing contract. Best-effort — can never break
+             # the dispatch loop.
+             _fire_worker_spawned_hook(
+@@ -13670,13 +14314,24 @@
+             )
+             if auto:
+                 result.auto_blocked.append(claimed.id)
+             continue
+         # Persist the resolved workspace path so the worker can cd there.
+-        set_workspace_path(conn, claimed.id, str(workspace))
++        set_workspace_path(
++            conn, claimed.id, str(workspace),
++            expected_run_id=claimed.current_run_id,
++            expected_claim_lock=claimed.claim_lock,
++            expected_claim_expires=claimed.claim_expires,
++        )
+         if claimed.workspace_kind == "worktree":
+-            set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
++            set_branch_name(
++                conn, claimed.id,
++                resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}",
++                expected_run_id=claimed.current_run_id,
++                expected_claim_lock=claimed.claim_lock,
++                expected_claim_expires=claimed.claim_expires,
++            )
+         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+         # Force-load the sdlc-review skill for review agents — it carries
+         # the review logic (AC verification, merge, etc.). The mandatory
+         # kanban lifecycle is already injected into every worker's system
+         # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
+@@ -13694,11 +14349,16 @@
+                 else:
+                     pid = _spawn(claimed, str(workspace))
+             except (TypeError, ValueError):
+                 pid = _spawn(claimed, str(workspace))
+             if pid:
+-                _set_worker_pid(conn, claimed.id, int(pid))
++                _set_worker_pid(
++                    conn, claimed.id, int(pid),
++                    expected_run_id=claimed.current_run_id,
++                    expected_claim_lock=claimed.claim_lock,
++                    expected_claim_expires=claimed.claim_expires,
++                )
+             # Worker-lifecycle observer (RFC #58548): same contract as the
+             # ready-lane fire above — after spawn + PID persistence.
+             _fire_worker_spawned_hook(
+                 conn, claimed, str(workspace), pid, board=board,
+             )

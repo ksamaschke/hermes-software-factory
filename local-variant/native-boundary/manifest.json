@@ -1,6 +1,6 @@
 {
   "schema": "factory.native-boundary.v1",
-  "artifact_version": "1.0.18",
+  "artifact_version": "1.0.24",
   "description": "Fail-closed native Kanban boundary patch for a disposable Hermes runtime copy.",
   "source_files": [
     {
@@ -10,18 +10,39 @@
     {
       "path": "hermes_cli/kanban_specify.py",
       "sha256": "67bdf407fc4ce626677c8aae7ee3a2a0da893c9015ad56410e0de3704ed19f13"
+    },
+    {
+      "path": "tools/kanban_tools.py",
+      "sha256": "bf5997e9ad1dc49d5c76afe4a1e81927c8c043951a2058ecffbb855f3a159b1d"
     }
   ],
   "patches": [
     {
       "path": "patches/001-native-boundary.patch",
-      "sha256": "8acb21fa334ae389829062e7d59f9cdfba242a3d2f3e574796e63da7a4a87fdd"
+      "sha256": "eb8cafc73ac01bc2bdcfa431d6ee34359ac9ce96f2d0bfa6d3289c7b0510dc15"
+    },
+    {
+      "path": "patches/002-review-boundary-findings.patch",
+      "sha256": "028791886a441bd1975e6c56d1bcc23bbdced54f1b34d2b749a3219b452dde54"
+    },
+    {
+      "path": "patches/003-review-lifecycle-security.patch",
+      "sha256": "0eb88ed06fa7fd801e11c6a312424410392879c96b406a0ad01dd458e33c13b3"
+    },
+    {
+      "path": "patches/004-review-lifecycle-followup.patch",
+      "sha256": "f1ccf928bf6c665272f68f63e8334a5d00de168824016e7445e9e79871c2ffbe"
     }
   ],
   "patched_paths": [
     "hermes_cli/kanban_db.py",
+    "hermes_cli/kanban.py",
     "hermes_cli/kanban_specify.py",
-    "hermes_cli/native_boundary.py"
+    "hermes_cli/native_boundary.py",
+    "tools/kanban_tools.py",
+    "agent/turn_finalizer.py",
+    "plugins/kanban/dashboard/plugin_api.py",
+    "tests/hermes_cli/test_kanban_review_lifecycle_complete.py"
   ],
   "copy_policy": {
     "fresh_copy_required": true,
