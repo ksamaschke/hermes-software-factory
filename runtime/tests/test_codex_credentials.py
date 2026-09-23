@@ -3,27 +3,34 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import inspect
 import json
 import multiprocessing as mp
 import os
+import pickle
 import stat
+import threading
 import time
 from pathlib import Path
 
 import pytest
 from software_factory.providers.openai_codex import (
     CredentialCorruptionError,
+    CredentialLockError,
     CredentialLockTimeoutError,
     CredentialPermissionError,
     CredentialPersistenceError,
+    CredentialRefreshError,
     CredentialValidationError,
     FileCodexCredentialBackend,
     OpenAICodexCredentials,
     OpenAICodexCredentialSource,
     PressureAdmissionTimeoutError,
+    ProviderLoopError,
     ProviderOperationError,
     ProviderPressure,
+    ProviderQueueFullError,
 )
 
 
@@ -346,13 +353,13 @@ def _crash_during_atomic_save(path: str, phase: str) -> None:
 
         module.os.fsync = crash_after_first_fsync
     else:
-        original_replace = module.os.replace
+        original_replace = module.os.rename
 
-        def replace_then_crash(source: str, destination: str) -> None:
-            original_replace(source, destination)
+        def replace_then_crash(source: str, destination: str, **kwargs) -> None:
+            original_replace(source, destination, **kwargs)
             os._exit(0)
 
-        module.os.replace = replace_then_crash
+        module.os.rename = replace_then_crash
     backend.save_sync(replacement)
 
 
@@ -497,3 +504,323 @@ def test_secret_store_backend_protocol_keeps_source_api_stable():
     assert run(source.save(new)) is None
     assert backend.saves == 2
     assert run(source.load()) == new
+
+
+def test_credential_serialization_and_caller_paths_fail_closed(tmp_path: Path):
+    marker = "secret-marker.synthetic"
+    value = OpenAICodexCredentials(
+        access_token=f"access-{marker}",
+        refresh_token=f"refresh-{marker}",
+        account_id=f"account-{marker}",
+    )
+    source = OpenAICodexCredentialSource(tmp_path / f"{marker}.json")
+    representations = (
+        repr(value),
+        str(value),
+        format(value),
+        repr([value]),
+        repr(source),
+    )
+    assert all(marker not in representation for representation in representations)
+    assert not hasattr(value, "as_mapping")
+    with pytest.raises(TypeError):
+        pickle.dumps(value)
+    with pytest.raises(TypeError):
+        dataclasses.asdict(value)
+    with pytest.raises(TypeError):
+        dict(value)
+    error = CredentialValidationError(path=tmp_path / marker)
+    assert marker not in str(error)
+    assert marker not in repr(error)
+
+
+def test_callback_failure_has_no_secret_bearing_exception_chain(tmp_path: Path):
+    async def probe() -> None:
+        source = OpenAICodexCredentialSource(tmp_path / "credentials.json")
+        current = credentials("old")
+        await source.save(current)
+
+        async def callback(_current: OpenAICodexCredentials):
+            raise RuntimeError("refresh-secret-marker.synthetic")
+
+        with pytest.raises(CredentialRefreshError) as raised:
+            await source.refresh(callback, expected=current, timeout=1.0)
+        assert raised.value.__context__ is None
+        assert raised.value.__cause__ is None
+        assert "synthetic" not in str(raised.value)
+        assert "synthetic" not in repr(raised.value)
+
+    run(probe())
+
+
+def test_hung_async_callback_times_out_and_releases_process_lock(tmp_path: Path):
+    async def probe() -> None:
+        source = OpenAICodexCredentialSource(tmp_path / "credentials.json")
+        current = credentials("old")
+        replacement = credentials("new")
+        await source.save(current)
+        callback_started = asyncio.Event()
+        callback_never_finishes = asyncio.Event()
+
+        async def callback(_current: OpenAICodexCredentials):
+            callback_started.set()
+            await callback_never_finishes.wait()
+            return replacement
+
+        task = asyncio.create_task(
+            source.refresh(callback, expected=current, timeout=0.05)
+        )
+        await callback_started.wait()
+        with pytest.raises(CredentialRefreshError) as raised:
+            await task
+        assert raised.value.code in {"refresh_callback_timeout", "refresh_timeout"}
+        await source.save(replacement)
+        assert await source.load() == replacement
+
+    run(probe())
+
+
+def test_sync_callback_is_offloaded_and_bounded(tmp_path: Path):
+    async def probe() -> None:
+        source = OpenAICodexCredentialSource(tmp_path / "credentials.json")
+        current = credentials("old")
+        await source.save(current)
+        started = threading.Event()
+        ticked = asyncio.Event()
+
+        def callback(_current: OpenAICodexCredentials):
+            started.set()
+            time.sleep(0.15)
+            return credentials("new")
+
+        async def ticker() -> None:
+            await asyncio.sleep(0.01)
+            ticked.set()
+
+        refresh = asyncio.create_task(
+            source.refresh(callback, expected=current, timeout=0.03)
+        )
+        tick = asyncio.create_task(ticker())
+        await asyncio.to_thread(started.wait, 1.0)
+        assert started.is_set()
+        with pytest.raises(CredentialRefreshError) as raised:
+            await refresh
+        await tick
+        assert raised.value.code == "refresh_callback_timeout"
+        assert ticked.is_set()
+        assert await source.load() == current
+
+    run(probe())
+
+
+def test_descriptor_anchor_does_not_follow_parent_replacement(tmp_path: Path):
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    parent.chmod(0o700)
+    path = parent / "credentials.json"
+    backend = FileCodexCredentialBackend(path)
+    moved = tmp_path / "moved-parent"
+    os.rename(parent, moved)
+    redirected = tmp_path / "redirected-parent"
+    redirected.mkdir()
+    parent.symlink_to(redirected, target_is_directory=True)
+    backend.save_sync(credentials("anchored"))
+    assert not (redirected / "credentials.json").exists()
+    assert (moved / "credentials.json").exists()
+    assert backend.load_sync() == credentials("anchored")
+
+
+def test_hardlink_retention_is_observed_before_publishing(tmp_path: Path, monkeypatch):
+    import software_factory.providers.openai_codex as module
+
+    path = tmp_path / "credentials.json"
+    backend = FileCodexCredentialBackend(path)
+    backend.save_sync(credentials("old"))
+    retained = tmp_path / "retained-hardlink"
+    original_fsync = module.os.fsync
+
+    def link_during_temp_sync(descriptor: int) -> None:
+        original_fsync(descriptor)
+        temporary = next(tmp_path.glob(".credentials.json.*.tmp"))
+        os.link(temporary, retained)
+
+    monkeypatch.setattr(module.os, "fsync", link_during_temp_sync)
+    with pytest.raises(CredentialPermissionError):
+        backend.save_sync(credentials("new"))
+    retained.unlink()
+    assert backend.load_sync() == credentials("old")
+
+
+def test_backend_io_failures_are_rethrown_without_exception_chains(
+    tmp_path, monkeypatch
+):
+    import software_factory.providers.openai_codex as module
+
+    path = tmp_path / "credentials.json"
+    backend = FileCodexCredentialBackend(path)
+    backend.save_sync(credentials("old"))
+    marker = "filesystem-secret-marker.synthetic"
+
+    def fail_sync(_descriptor: int) -> None:
+        raise OSError(marker)
+
+    monkeypatch.setattr(module.os, "fsync", fail_sync)
+    with pytest.raises(CredentialPersistenceError) as raised:
+        backend.save_sync(credentials("new"))
+    assert raised.value.__context__ is None
+    assert raised.value.__cause__ is None
+    assert marker not in str(raised.value)
+    assert backend.load_sync() == credentials("old")
+
+
+def test_lock_marker_replacement_fails_before_refresh(tmp_path: Path):
+    path = tmp_path / "credentials.json"
+    source = OpenAICodexCredentialSource(path)
+    run(source.save(credentials("old")))
+    marker = Path(f"{path}.lock")
+    outside = tmp_path / "outside-lock"
+    outside.write_text("not-a-lock", encoding="utf-8")
+    marker.symlink_to(outside)
+    with pytest.raises(CredentialLockError):
+        run(
+            source.refresh(
+                lambda _current: credentials("new"), expected=credentials("old")
+            )
+        )
+    marker.unlink()
+    assert run(source.load()) == credentials("old")
+
+
+def test_provider_pressure_wakes_clear_immediately_and_bounds_queue():
+    async def probe() -> None:
+        pressure = ProviderPressure(1, admission_timeout=1.0, max_queue=1)
+        pressure.observe_rate_limit(10.0, generation="pressure-a")
+        waiter = asyncio.create_task(pressure.acquire(timeout=0.5))
+        await asyncio.sleep(0.02)
+        assert not waiter.done()
+        pressure.clear_pressure(generation="pressure-a")
+        lease = await asyncio.wait_for(waiter, timeout=0.2)
+        lease.release()
+
+        held = await pressure.acquire(timeout=0.1)
+        queued = asyncio.create_task(pressure.acquire(timeout=0.5))
+        await asyncio.sleep(0.02)
+        with pytest.raises(ProviderQueueFullError):
+            await pressure.acquire(timeout=0.1)
+        held.release()
+        next_lease = await queued
+        next_lease.release()
+        assert pressure.in_flight == 0
+        assert pressure.queued == 0
+
+    run(probe())
+
+
+def test_provider_pressure_settles_waiters_on_base_exception_and_deduplicates_retained_generations():
+    class SyntheticAbort(BaseException):
+        pass
+
+    async def probe() -> None:
+        pressure = ProviderPressure(1, admission_timeout=0.5)
+        started = asyncio.Event()
+
+        async def aborting_operation():
+            started.set()
+            raise SyntheticAbort()
+
+        owner = asyncio.create_task(
+            pressure.run("abort-generation", aborting_operation)
+        )
+        await started.wait()
+        waiter = asyncio.create_task(
+            pressure.run("abort-generation", aborting_operation)
+        )
+        with pytest.raises(ProviderOperationError):
+            await owner
+        with pytest.raises(ProviderOperationError):
+            await waiter
+        assert pressure.in_flight == 0
+        assert pressure.queued == 0
+
+        calls = 0
+
+        async def operation():
+            nonlocal calls
+            calls += 1
+            return calls
+
+        assert await pressure.run("retained-a", operation) == 1
+        assert await pressure.run("retained-b", operation) == 2
+        assert await pressure.run("retained-a", operation) == 1
+        assert calls == 2
+
+    run(probe())
+
+
+def test_provider_pressure_bounds_operation_timeout_and_enforces_loop_affinity():
+    async def timeout_probe() -> None:
+        pressure = ProviderPressure(1, admission_timeout=0.5)
+        never = asyncio.Event()
+
+        async def hanging_operation():
+            await never.wait()
+
+        with pytest.raises(ProviderOperationError) as raised:
+            await pressure.run("timeout-generation", hanging_operation, timeout=0.03)
+        assert raised.value.code == "operation_timeout"
+        assert pressure.in_flight == 0
+        assert pressure.queued == 0
+        with pytest.raises(ProviderOperationError):
+            await pressure.run("timeout-generation", lambda: "not-called", timeout=0.03)
+
+    run(timeout_probe())
+    pressure = ProviderPressure()
+
+    async def bind_probe() -> None:
+        lease = await pressure.acquire(timeout=0.0)
+        lease.release()
+
+    run(bind_probe())
+    with pytest.raises(ProviderLoopError) as raised:
+        run(bind_probe())
+    assert raised.value.__context__ is None
+
+
+def test_rate_limit_generation_deduplication_is_bounded():
+    async def probe() -> None:
+        pressure = ProviderPressure(max_retained_generations=2)
+        pressure.observe_rate_limit(0.5, generation="rate-a")
+        first_deadline = pressure.blocked_until
+        pressure.observe_rate_limit(0.5, generation="rate-a")
+        assert pressure.blocked_until == first_deadline
+        pressure.observe_rate_limit(0.5, generation="rate-b")
+        pressure.observe_rate_limit(0.5, generation="rate-c")
+        assert len(pressure._rate_limit_generations) <= 2
+
+    run(probe())
+
+
+def test_provider_pressure_owner_cancellation_settles_shared_waiters():
+    async def probe() -> None:
+        pressure = ProviderPressure(1, admission_timeout=0.5)
+        started = asyncio.Event()
+        never = asyncio.Event()
+
+        async def operation() -> None:
+            started.set()
+            await never.wait()
+
+        owner = asyncio.create_task(pressure.run("cancel-generation", operation))
+        await started.wait()
+        waiter = asyncio.create_task(pressure.run("cancel-generation", operation))
+        owner.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await owner
+        with pytest.raises(ProviderOperationError) as raised:
+            await asyncio.wait_for(waiter, timeout=0.2)
+        assert raised.value.code == "operation_cancelled"
+        assert raised.value.__context__ is None
+        assert pressure.in_flight == 0
+        assert pressure.queued == 0
+
+    run(probe())

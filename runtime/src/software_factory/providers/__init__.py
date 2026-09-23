@@ -19,11 +19,20 @@ from .openai_codex import (
     OpenAICodexCredentialSource,
     PressureAdmissionTimeoutError,
     ProviderAdmission,
+    ProviderLoopError,
     ProviderOperationError,
     ProviderPressure,
+    ProviderQueueFullError,
+)
+from .pydantic_ai_codex import (
+    PINNED_PYDANTIC_AI_VERSION,
+    PydanticAIIntegrationError,
+    create_pydantic_ai_codex_provider,
+    get_pydantic_ai_codex_provider_class,
 )
 
 __all__ = (
+    "PINNED_PYDANTIC_AI_VERSION",
     "CodexCredentialBackend",
     "CodexCredentialError",
     "CodexCredentialStore",
@@ -42,6 +51,11 @@ __all__ = (
     "OpenAICodexCredentials",
     "PressureAdmissionTimeoutError",
     "ProviderAdmission",
+    "ProviderLoopError",
     "ProviderOperationError",
     "ProviderPressure",
+    "ProviderQueueFullError",
+    "PydanticAIIntegrationError",
+    "create_pydantic_ai_codex_provider",
+    "get_pydantic_ai_codex_provider_class",
 )
