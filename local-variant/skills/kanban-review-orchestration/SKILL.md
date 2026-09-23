@@ -1,7 +1,7 @@
 ---
 name: kanban-review-orchestration
 description: "Use for Kanban review orchestration and evidence gates."
-version: 1.0.0
+version: 1.4.0
 author: HEX
 license: MIT
 platforms: [macos, linux, windows]
@@ -58,11 +58,18 @@ fresh exact-scope reviewer leaf(s)
 bounded fan-in / coverage reconciliation
 ```
 
-A reviewer leaf is a separate Kanban task. Reassigning an implementation card
-to a reviewer, or using a same-card `request-review` run as the final
-independent review, is invalid for closure. If a worker puts an implementation
-card back into the review lane, reclaim or reclassify that card and create a
-fresh reviewer task.
+The factory supports two review lifecycle models and must never mix them:
+
+- **same-card review** — the implementation task has a durable
+  `review_requested` handoff, then a fresh independent reviewer run/profile
+  claims that same task from `source_status=review`. The implementer's
+  request-review run is not review evidence; the later reviewer run is.
+- **standalone review leaf** — a separate review task is claimed from
+  `source_status=ready` and carries no same-card handoff.
+
+Choose one model before dispatch. Do not create a redundant standalone leaf for
+a valid same-card review, and do not treat a standalone leaf as same-card merely
+because its body says `request_changes`.
 
 Create true dependencies in the original task creation call. A fan-in task
 must depend on every required leaf. Do not create an apparently-ready child and
@@ -166,9 +173,9 @@ missing or contradictory board field.
    continuation with a new idempotency key; never retry the unchanged packet.
 5. Keep review failures on the review path. Never convert a timed-out reviewer
    into an implementation continuation.
-6. If implementation rework is required, create a new focused implementer task
-   from the reviewer finding. Do not silently edit the review card into an
-   implementation card.
+6. If implementation rework is required from a standalone verdict, consume the
+   Native Boundary remediation receipt through the scheduled recovery path. Do
+   not silently edit the review card or manually create a second successor.
 7. Run fan-in only after every required leaf is terminal. Fan-in reads the leaf
    handoffs and reconciles coverage; it does not rescan the candidate or issue a
    substitute verdict.
@@ -178,23 +185,38 @@ missing or contradictory board field.
 `CHANGES_REQUESTED` is a routing result, not a reason to stop the factory or
 hand internal repair coordination to the operator. Continue the bounded loop:
 
-1. Convert each reviewer finding into a narrow implementation acceptance slice
-   and a new implementer card. Start from the current remote upstream `main`,
-   not a stale local tracking ref, and use a fresh clean clone/worktree so a
-   user-owned dirty checkout is never mutated.
-2. Verify the implementer commit, exact file scope, focused/full gates, and
-   clean worktree. Mark that implementation handoff terminal; do not call a
-   same-card `request-review` path when it can route the implementation card to
-   a generic reviewer or reuse its run history.
-3. Create a fresh reviewer child with the implementation card as a completed
-   parent. Revalidate the exact packet, durable budget/one-retry fields,
-   read-only boundary, and the configured independent reviewer route before
-   dispatch. Only that fresh reviewer verdict can reopen the loop or authorize
-   integration.
-4. After a fresh `APPROVED`, hand the candidate to a separate integration owner
+1. Classify the durable claim. For a same-card `CHANGES_REQUESTED`, use only the
+   native `kanban_request_changes` rework transition on the original task; do
+   not create a successor implementer task.
+2. For a standalone `CHANGES_REQUESTED`, require the current terminal native
+   remediation receipt and let `kanban_review_successor_recovery.py --apply`
+   consume only the active coordinator's receipt, preserve every direct parent,
+   replace only the unchanged child frontier, and archive the old leaf after
+   readback. Do not create a parallel manual card. The implementer then starts
+   from current remote upstream `main`, not a stale local tracking ref, in a
+   fresh clean clone/worktree so user-owned dirty state is never mutated.
+3. The immutable successor receipt remains review-gated even if its body,
+   idempotency key, graph links, or durable pointer is edited. Ordinary promote,
+   schedule, unblock, respecify, archive, delete, dashboard, and direct SQL
+   executed through Hermes-managed connections cannot mutate a claimed or
+   terminal native review boundary. This is not an operating-system security
+   boundary: a process running as the board database's owning user is trusted
+   and can rewrite the SQLite file, drop triggers, or register lookalike SQL
+   functions. Isolate hostile workers behind a broker or a distinct identity
+   without raw database write access. Its exact unexpired implementation run
+   requests a distinct reviewer with only
+   `candidate_commit`, `review_remediation_handoff_key`, and
+   `scope_manifest_sha256`; the native boundary validates these against the
+   current clean repository/worktree, branch, base, candidate, complete task
+   body, and changed-path manifest. Legacy receipts without current provenance
+   are atomically tombstoned rather than left pending.
+4. Verify the implementer commit, exact file scope, focused/full gates, and
+   clean worktree. Route exactly one fresh independent review for the new
+   candidate; never reuse the old leaf or its verdict.
+5. After a fresh `APPROVED`, hand the candidate to a separate integration owner
    for upstream PR creation, CI, branch-policy checks, merge, and merged-commit
    readback. A local branch or worker summary is not upstream delivery.
-5. Hand only the verified merged commit to a separate release owner. Back up the
+6. Hand only the verified merged commit to a separate release owner. Back up the
    installed artifact, install atomically from the merged source, and read back
    checksum, mode, compilation/help, and non-mutating smoke evidence. Do not
    install an unmerged worktree.
@@ -230,15 +252,50 @@ Use `references/candidate-gate-verification.md` when a board looks idle and
 `<sha> + uncommitted delta` candidate-identity trap, clean-checkout fixture
 rot after those files get committed, and how to route the repair.
 
-## Leaf lifecycle gap
+## Native standalone-leaf lifecycle
 
-A review leaf claimed from `ready` cannot call `kanban_request_changes`: that
-transition requires the run to have been claimed from `review`. A leaf that
-produced complete `CHANGES_REQUESTED` evidence and then failed that call has
-still delivered a verdict — the failure is a dispatch-lifecycle gap, not a
-review outcome. Record the verdict from the reviewer's report, archive the leaf
-as terminal, and route the findings. Do not re-run the review and do not
-downgrade the evidence to `REVIEW-INCOMPLETE`.
+All immutable and fail-closed claims in this section are scoped to
+Hermes-managed SQLite connections. A process running as the board database's
+owning OS user or holding raw file write access is trusted; isolate hostile
+workers behind a broker or a distinct OS identity without database write access.
+
+A standalone leaf claimed from `source_status=ready` must never call
+`kanban_request_changes`. Exact `APPROVED` calls `kanban_complete` once with
+`review_outcome: APPROVED` and the exact `candidate_commit`; Native Boundary
+`1.0.24` requires an exact positive current run ID from the native active
+reviewer profile, re-reads the strict packet, immutable claim receipt, resolved
+worktree/Git-dir identity, repository, branch, base, candidate, and changed-path
+manifest before release. A missing/string/float/stale run ID, role collision,
+self-attested, foreign, malformed, wrong-repository, or wrong-head approval
+remains blocked and cannot release children.
+
+For exact `CHANGES_REQUESTED`, the reviewer calls `kanban_block` once with
+`kind=dependency` and a reason beginning
+`STANDALONE_REVIEW_CHANGES_REQUESTED:`. The native transaction verifies the
+current ready-claimed run, independent reviewer, immutable packet, exact local
+HEAD, finding, coordinator identity, and current direct dependency frontier;
+it terminally closes the run and inserts one immutable SQLite outbox receipt.
+`REVIEW-INCOMPLETE` never uses that prefix and remains gated for coordinator
+adjudication.
+
+The scheduled recovery add-on verifies that the imported runtime carries the
+same Native Boundary contract and consumes only receipts owned by its native
+active profile. Each receipt has its own `BEGIN IMMEDIATE` transaction and
+readback, so one malformed receipt does not suppress unrelated current work. It
+revalidates the immutable packet/worktree receipt and complete direct-parent
+and child frontier, uses a full-digest reserved idempotency key, creates or
+reuses exactly one successor with the complete parent set, moves only the
+unchanged child frontier, records an immutable successor-body digest and review
+gate, reads the graph back, archives the old leaf, and marks the receipt applied.
+The rejected leaf remains in the canonical sticky
+`blocked/changes_requested` terminal state and cannot be recomputed or claimed
+again. A remediation successor cannot complete until its exact implementation
+run requests a distinct reviewer with candidate, handoff, and changed-path
+manifest metadata and that exact review run returns `APPROVED`. Concurrent or
+repeated consumption is idempotent. Any frontier change, identity collision,
+missing function, or malformed state fails closed without duplicate successor,
+archival, or downstream release. The coordinator never manually duplicates
+this native path.
 
 ## Pitfalls
 

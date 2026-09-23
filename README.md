@@ -176,10 +176,31 @@ have been read back.
 The recovery add-on validates the durable packet before dispatch, keeps authored
 acceptance questions verbatim, creates at most eight lossless two-file successor
 leaves, and preserves an incomplete packet when that bound cannot cover the
-whole scope. Successor creation is read back and rolled back to archived state
-if any card in the batch fails validation; failed create responses are
-rediscovered by exact idempotency key before cleanup. Dry-run performs only
-read-only inspection and planning.
+whole scope. Native Boundary artifact `1.0.24` also records a strict standalone
+`CHANGES_REQUESTED` packet as a sticky `blocked/changes_requested`, exact-run,
+live-lease, active-profile-fenced SQLite outbox receipt. Within the
+Hermes-managed connection boundary, the packet binds the complete task
+title/body, a clean worktree including untracked files, canonical repository/
+worktree/Git-dir identity, branch, base/candidate, changed-path manifest, three
+distinct roles, finding, and the complete direct-parent/child frontier. The same
+scheduled recovery add-on verifies the imported native contract and consumes
+only the active coordinator profile's receipts, one transaction/readback per
+receipt. It uses a permanent full-digest idempotency key, creates or reuses
+exactly one review-gated remediation task with every direct parent preserved,
+replaces only the unchanged child frontier, then archives the old leaf. SQLite
+guards reject generic promote, schedule, unblock, respecify, archive, delete,
+dashboard, receipt-pointer, and graph mutations issued through managed
+connections; only the native recovery transaction has scoped authority there.
+A process running as the board database's owning OS user, or any principal with
+raw file write access, is trusted and outside this SQLite boundary; hostile
+workers require a broker or distinct OS identity without database write access.
+Within the managed boundary, legacy receipts without v2 provenance are
+atomically tombstoned, a malformed receipt cannot suppress unrelated receipts,
+and pointer, body, or graph mutation cannot turn the remediation successor into
+an ordinary completable task. Worker transitions and heartbeats require the
+exact current run, claim lock, and unexpired lease. Failed create responses are
+rediscovered by exact idempotency key before cleanup.
+Dry-run performs only read-only inspection and planning.
 
 Run the review add-on in dry-run mode before scheduling it:
 
@@ -344,9 +365,10 @@ skills/kanban-progress-evidence/SKILL.md        evidence and closure accounting
 skills/kanban-progress-evidence/references/     closure matrix template
 skills/software-factory-recovery/SKILL.md      autonomous recovery procedure
 scripts/kanban_factory_recovery.py              deterministic recovery add-on
-scripts/kanban_review_successor_recovery.py     review packet guard and recursive successor bridge
+scripts/kanban_review_successor_recovery.py     review packet guard, native handoff consumer, and recursive successor bridge
 scripts/kanban_review_successor_recovery_cron.py installed no-agent wrapper
-scripts/forgejo_delivery_controller.py          bounded read-only Forgejo delivery observer
+scripts/review_lifecycle_contract.py             pure review-lifecycle planner and idempotency contract
+scripts/forgejo_delivery_controller.py           bounded read-only Forgejo delivery observer
 scripts/pydantic_agent_baseline.py               synthetic corpus validator and replay summary
 examples/project-policy.yaml                    adaptable tracker policy template
 examples/forgejo-delivery-overlay.json           anonymized observer overlay template
