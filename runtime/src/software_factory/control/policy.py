@@ -7,7 +7,8 @@ import re
 from collections.abc import Mapping, Sequence
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Any, Literal, TypeAlias
+from types import MappingProxyType
+from typing import Annotated, Any, Generic, Literal, TypeAlias, TypeVar
 from urllib.parse import urlsplit
 
 import yaml
@@ -18,6 +19,7 @@ from pydantic import (
     Field,
     StrictStr,
     ValidationError,
+    field_serializer,
     field_validator,
     model_validator,
 )
@@ -28,6 +30,64 @@ from ..api.contracts import Identifier, Revision
 
 class PolicyError(ValueError):
     """Raised when a project policy cannot be loaded fail-closed."""
+
+
+_MappingKey = TypeVar("_MappingKey")
+_MappingValue = TypeVar("_MappingValue")
+
+
+class ImmutableMapping(
+    Mapping[_MappingKey, _MappingValue], Generic[_MappingKey, _MappingValue]
+):
+    """A read-only mapping backed by its own defensive dictionary copy."""
+
+    __slots__ = ("_data",)
+
+    def __init__(self, values: Mapping[_MappingKey, _MappingValue]) -> None:
+        object.__setattr__(self, "_data", MappingProxyType(dict(values)))
+
+    def __getitem__(self, key: _MappingKey) -> _MappingValue:
+        return self._data[key]
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({dict(self._data)!r})"
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError(f"{type(self).__name__} is immutable")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError(f"{type(self).__name__} is immutable")
+
+
+def _deep_freeze(value: object) -> object:
+    """Recursively freeze mappings and JSON arrays after validation."""
+
+    if isinstance(value, Mapping):
+        return ImmutableMapping(
+            {key: _deep_freeze(nested) for key, nested in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_deep_freeze(item) for item in value)
+    return value
+
+
+def _policy_dump_value(value: object, mode: str) -> object:
+    """Turn immutable policy values back into ordinary Pydantic output values."""
+
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode=mode)
+    if isinstance(value, Mapping):
+        return {key: _policy_dump_value(nested, mode) for key, nested in value.items()}
+    if isinstance(value, (list, tuple)):
+        values = [_policy_dump_value(item, mode) for item in value]
+        return values if mode == "json" else tuple(values)
+    return value
 
 
 class ExecutorKind(StrEnum):
@@ -299,7 +359,9 @@ class LegacySettings(PolicyModel):
 class CompatibilityPolicy(PolicyModel):
     canary_only: bool = True
     default_executor: ExecutorKind = ExecutorKind.HERMES_PROFILE
-    fallback_executors: dict[str, RoleRoute] = Field(default_factory=dict)
+    fallback_executors: Mapping[str, RoleRoute] = Field(
+        default_factory=dict, validate_default=True
+    )
     allow_backend_change_on_retry: Literal["explicit_policy_only"] = (
         "explicit_policy_only"
     )
@@ -308,14 +370,27 @@ class CompatibilityPolicy(PolicyModel):
     @field_validator("fallback_executors")
     @classmethod
     def fallback_role_names_are_known(
-        cls, values: dict[str, RoleRoute]
-    ) -> dict[str, RoleRoute]:
+        cls, values: Mapping[str, RoleRoute]
+    ) -> Mapping[str, RoleRoute]:
         unknown = sorted(set(values) - ROLE_KEYS)
         if unknown:
             raise ValueError(
                 f"unknown compatibility fallback role(s): {', '.join(unknown)}"
             )
         return values
+
+    @model_validator(mode="after")
+    def mapping_fields_are_immutable(self) -> CompatibilityPolicy:
+        object.__setattr__(
+            self,
+            "fallback_executors",
+            _deep_freeze(self.fallback_executors),
+        )
+        return self
+
+    @field_serializer("fallback_executors")
+    def serialize_fallback_executors(self, value: Mapping[str, RoleRoute], info):
+        return _policy_dump_value(value, info.mode)
 
 
 class FactoryPolicy(PolicyModel):
@@ -327,27 +402,49 @@ class FactoryPolicy(PolicyModel):
     """
 
     version: Literal[1] = 1
-    runtime: dict[str, object] = Field(default_factory=dict)
-    transport: dict[str, object] = Field(default_factory=dict)
-    state: dict[str, object] = Field(default_factory=dict)
-    workspace: dict[str, object] = Field(default_factory=dict)
-    review: dict[str, object] = Field(default_factory=dict)
-    credentials: dict[str, object] = Field(default_factory=dict)
-    observability: dict[str, object] = Field(default_factory=dict)
-    migration_gates: dict[str, object] = Field(default_factory=dict)
-    tracker: dict[str, object] = Field(default_factory=dict)
-    decision_authority: dict[str, object] = Field(default_factory=dict)
-    operator_bridge: dict[str, object] = Field(default_factory=dict)
-    kanban: dict[str, object] = Field(default_factory=dict)
-    verification: dict[str, object] = Field(default_factory=dict)
-    safety: dict[str, object] = Field(default_factory=dict)
-    delivery: dict[str, object] = Field(default_factory=dict)
-    deployment: dict[str, object] = Field(default_factory=dict)
-    notifications: dict[str, object] = Field(default_factory=dict)
-    providers: dict[str, ProviderDefinition] = Field(default_factory=dict)
-    agents: dict[str, AgentDefinition] = Field(default_factory=dict)
-    handlers: dict[str, HandlerDefinition] = Field(default_factory=dict)
-    roles: dict[str, RoleRoute] = Field(min_length=1)
+    runtime: Mapping[str, object] = Field(default_factory=dict, validate_default=True)
+    transport: Mapping[str, object] = Field(default_factory=dict, validate_default=True)
+    state: Mapping[str, object] = Field(default_factory=dict, validate_default=True)
+    workspace: Mapping[str, object] = Field(default_factory=dict, validate_default=True)
+    review: Mapping[str, object] = Field(default_factory=dict, validate_default=True)
+    credentials: Mapping[str, object] = Field(
+        default_factory=dict, validate_default=True
+    )
+    observability: Mapping[str, object] = Field(
+        default_factory=dict, validate_default=True
+    )
+    migration_gates: Mapping[str, object] = Field(
+        default_factory=dict, validate_default=True
+    )
+    tracker: Mapping[str, object] = Field(default_factory=dict, validate_default=True)
+    decision_authority: Mapping[str, object] = Field(
+        default_factory=dict, validate_default=True
+    )
+    operator_bridge: Mapping[str, object] = Field(
+        default_factory=dict, validate_default=True
+    )
+    kanban: Mapping[str, object] = Field(default_factory=dict, validate_default=True)
+    verification: Mapping[str, object] = Field(
+        default_factory=dict, validate_default=True
+    )
+    safety: Mapping[str, object] = Field(default_factory=dict, validate_default=True)
+    delivery: Mapping[str, object] = Field(default_factory=dict, validate_default=True)
+    deployment: Mapping[str, object] = Field(
+        default_factory=dict, validate_default=True
+    )
+    notifications: Mapping[str, object] = Field(
+        default_factory=dict, validate_default=True
+    )
+    providers: Mapping[str, ProviderDefinition] = Field(
+        default_factory=dict, validate_default=True
+    )
+    agents: Mapping[str, AgentDefinition] = Field(
+        default_factory=dict, validate_default=True
+    )
+    handlers: Mapping[str, HandlerDefinition] = Field(
+        default_factory=dict, validate_default=True
+    )
+    roles: Mapping[str, RoleRoute] = Field(min_length=1)
     compatibility: CompatibilityPolicy = Field(default_factory=CompatibilityPolicy)
 
     @field_validator(
@@ -377,8 +474,8 @@ class FactoryPolicy(PolicyModel):
     @field_validator("providers", "agents", "handlers")
     @classmethod
     def registry_keys_are_non_empty(
-        cls, values: dict[str, object], info
-    ) -> dict[str, object]:
+        cls, values: Mapping[str, object], info
+    ) -> Mapping[str, object]:
         for key in values:
             if not key or any(character.isspace() for character in key):
                 raise ValueError(
@@ -388,7 +485,9 @@ class FactoryPolicy(PolicyModel):
 
     @field_validator("roles")
     @classmethod
-    def role_names_are_known(cls, values: dict[str, RoleRoute]) -> dict[str, RoleRoute]:
+    def role_names_are_known(
+        cls, values: Mapping[str, RoleRoute]
+    ) -> Mapping[str, RoleRoute]:
         unknown = sorted(set(values) - ROLE_KEYS)
         if unknown:
             raise ValueError(f"unknown role route(s): {', '.join(unknown)}")
@@ -415,6 +514,62 @@ class FactoryPolicy(PolicyModel):
             )
         _validate_provider_fallback_graph(self.providers)
         return self
+
+    @model_validator(mode="after")
+    def mapping_fields_are_immutable(self) -> FactoryPolicy:
+        for field_name in (
+            "runtime",
+            "transport",
+            "state",
+            "workspace",
+            "review",
+            "credentials",
+            "observability",
+            "migration_gates",
+            "tracker",
+            "decision_authority",
+            "operator_bridge",
+            "kanban",
+            "verification",
+            "safety",
+            "delivery",
+            "deployment",
+            "notifications",
+            "providers",
+            "agents",
+            "handlers",
+            "roles",
+        ):
+            object.__setattr__(
+                self, field_name, _deep_freeze(getattr(self, field_name))
+            )
+        return self
+
+    @field_serializer(
+        "runtime",
+        "transport",
+        "state",
+        "workspace",
+        "review",
+        "credentials",
+        "observability",
+        "migration_gates",
+        "tracker",
+        "decision_authority",
+        "operator_bridge",
+        "kanban",
+        "verification",
+        "safety",
+        "delivery",
+        "deployment",
+        "notifications",
+        "providers",
+        "agents",
+        "handlers",
+        "roles",
+    )
+    def serialize_mapping_fields(self, value: Mapping[str, object], info):
+        return _policy_dump_value(value, info.mode)
 
 
 def _validate_route_references(
@@ -674,6 +829,7 @@ __all__ = [
     "ExecutorRoute",
     "FactoryPolicy",
     "HandlerDefinition",
+    "ImmutableMapping",
     "LegacySettings",
     "Policy",
     "PolicyError",

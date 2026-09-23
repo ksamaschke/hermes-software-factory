@@ -353,6 +353,50 @@ def test_policy_is_top_level_strict_json_safe_and_requires_a_role():
             load_policy(invalid)
 
 
+def test_policy_mappings_are_deeply_immutable_and_defensively_copied():
+    document = runtime_policy()
+    runtime = {"nested": {"items": [{"name": "before"}]}}
+    document["runtime"] = runtime
+    policy = load_policy(document)
+
+    for field_name in ("providers", "agents", "handlers", "roles"):
+        with pytest.raises(AttributeError):
+            getattr(policy, field_name).clear()
+    with pytest.raises(AttributeError):
+        policy.compatibility.fallback_executors.clear()
+    with pytest.raises(TypeError):
+        policy.roles["implementer"] = policy.roles["implementer"]  # type: ignore[index]
+
+    with pytest.raises(AttributeError):
+        policy.runtime.clear()
+    with pytest.raises(TypeError):
+        policy.runtime["new"] = True  # type: ignore[index]
+    with pytest.raises(AttributeError):
+        policy.runtime["nested"].clear()  # type: ignore[union-attr]
+    with pytest.raises(TypeError):
+        policy.runtime["nested"]["new"] = True  # type: ignore[index]
+    with pytest.raises(AttributeError):
+        policy.runtime["nested"]["items"].append({"name": "after"})  # type: ignore[union-attr]
+    with pytest.raises(TypeError):
+        policy.runtime["nested"]["items"][0]["name"] = "changed"  # type: ignore[index]
+
+    runtime["nested"]["items"].append({"name": "source-only"})
+    runtime["nested"]["name"] = "source-only"
+    document["providers"]["primary"]["models"].append("openai:source-only")
+    document["roles"].clear()
+
+    assert policy.runtime["nested"]["items"][0]["name"] == "before"
+    assert len(policy.runtime["nested"]["items"]) == 1
+    assert "name" not in policy.runtime["nested"]
+    assert policy.providers["primary"].models == ("openai:model-1",)
+    assert "implementer" in policy.roles
+
+    payload = policy.model_dump(mode="json")
+    assert isinstance(payload["runtime"], dict)
+    assert isinstance(payload["runtime"]["nested"]["items"], list)
+    assert json.loads(policy.model_dump_json()) == payload
+
+
 def test_duplicate_yaml_keys_are_rejected_before_policy_validation():
     duplicate = "version: 1\nroles: {}\nroles: {}\n"
     with pytest.raises(PolicyError, match="duplicate"):
