@@ -15,6 +15,7 @@ from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
 
 from pydantic import (
+    BaseModel,
     Field,
     StrictBool,
     StrictInt,
@@ -24,13 +25,21 @@ from pydantic import (
 )
 
 from ..api.contracts import (
+    ClaimedRun,
     ContractModel,
     Identifier,
     Revision,
     RunIdentity,
     TaskEnvelope,
+    TaskState,
 )
-from ..control.policy import ROLE_KEYS, ExecutorKind, FactoryPolicy, RoleRoute
+from ..control.policy import (
+    ROLE_KEYS,
+    ExecutorKind,
+    FactoryPolicy,
+    RoleRoute,
+    _validate_model_family,
+)
 
 
 class RoutingError(ValueError):
@@ -107,6 +116,8 @@ class ExecutorBinding(ContractModel):
     handler: Identifier | None = None
     provider: Identifier | None = None
     model: Revision | None = None
+    vendor_family: Identifier | None = None
+    read_only_source: StrictBool | None = None
     policy_version: StrictInt = Field(ge=1)
     policy_fingerprint: StrictStr = Field(min_length=71, max_length=71)
     selection_reason: SelectionReason
@@ -213,6 +224,16 @@ class ExecutorBinding(ContractModel):
                 )
         if self.model is not None and self.provider is None:
             raise ValueError("a binding model requires a provider")
+        if (
+            self.selection_reason is SelectionReason.CANARY_EXACT_MATCH
+            and self.executor is not ExecutorKind.PYDANTIC_AGENT
+        ):
+            raise ValueError("canary selection reason requires pydantic_agent")
+        if (
+            self.selection_reason is SelectionReason.COMPATIBILITY_FALLBACK
+            and self.executor is not ExecutorKind.HERMES_PROFILE
+        ):
+            raise ValueError("compatibility fallback reason requires hermes_profile")
         return self
 
     @property
@@ -250,8 +271,18 @@ class ExecutorBinding(ContractModel):
 
     def backend_key(
         self,
-    ) -> tuple[str, str, str | None, str | None, str | None, str | None, str | None]:
-        """Return only route identity fields used for retry comparison."""
+    ) -> tuple[
+        str,
+        str,
+        str | None,
+        str | None,
+        str | None,
+        str | None,
+        str | None,
+        str | None,
+        bool | None,
+    ]:
+        """Return the complete concrete backend/capability selection."""
 
         return (
             self.executor.value,
@@ -261,6 +292,8 @@ class ExecutorBinding(ContractModel):
             self.handler,
             self.provider,
             self.model,
+            self.vendor_family,
+            self.read_only_source,
         )
 
 
@@ -297,10 +330,7 @@ class ExecutorSelectionRecord(ContractModel):
             getattr(self.run, field) != getattr(self.binding, field) for field in fields
         ):
             raise ValueError("selection record run and binding identities must match")
-        if (
-            self.run.executor_id is not None
-            and self.run.executor_id != self.binding.executor_id
-        ):
+        if self.run.executor_id != self.binding.executor_id:
             raise ValueError("selection record run executor_id must match binding")
         return self
 
@@ -363,29 +393,46 @@ class RetryDecision(ContractModel):
             (self.prior_run, self.prior_selection, "prior"),
             (self.retry_run, self.new_selection, "retry"),
         ):
-            if (
-                run.task_id != selection.task_id
-                or run.run_id != selection.run_id
-                or run.attempt != selection.attempt
-            ):
+            if run != selection.run:
                 raise ValueError(f"{label} run and selection identities must match")
-            if run.executor_id is not None and run.executor_id != selection.executor_id:
-                raise ValueError(f"{label} run executor_id must match selection")
-        if self.decision is RetryDecisionKind.SAME_BACKEND:
-            if not self.allowed or self.reason is not RetryDecisionReason.SAME_BACKEND:
-                raise ValueError("same-backend retry decisions must be allowed")
-        elif self.decision is RetryDecisionKind.BACKEND_CHANGE_ALLOWED:
+        if self.prior_selection.role != self.new_selection.role:
+            raise ValueError(
+                "retry decision selections must keep the same logical role"
+            )
+
+        backend_changed = (
+            self.prior_selection.backend_key() != self.new_selection.backend_key()
+        )
+        if self.reason is RetryDecisionReason.ACTIVE_RUN:
             if (
-                not self.allowed
-                or self.reason is not RetryDecisionReason.EXPLICIT_COMPATIBILITY
+                self.allowed
+                or self.decision is not RetryDecisionKind.BACKEND_CHANGE_REJECTED
             ):
-                raise ValueError(
-                    "allowed backend changes require explicit compatibility"
-                )
-        elif (
-            self.decision is RetryDecisionKind.BACKEND_CHANGE_REJECTED and self.allowed
+                raise ValueError("active-run retry decisions must reject the retry")
+            return self
+        if backend_changed:
+            if self.decision is RetryDecisionKind.SAME_BACKEND:
+                raise ValueError("same-backend retry decision has changed selections")
+            if self.allowed:
+                if (
+                    self.decision is not RetryDecisionKind.BACKEND_CHANGE_ALLOWED
+                    or self.reason is not RetryDecisionReason.EXPLICIT_COMPATIBILITY
+                ):
+                    raise ValueError(
+                        "allowed backend changes require explicit compatibility"
+                    )
+            elif (
+                self.decision is not RetryDecisionKind.BACKEND_CHANGE_REJECTED
+                or self.reason is not RetryDecisionReason.BACKEND_CHANGE_NOT_ALLOWED
+            ):
+                raise ValueError("rejected backend changes require a rejection reason")
+            return self
+        if (
+            not self.allowed
+            or self.decision is not RetryDecisionKind.SAME_BACKEND
+            or self.reason is not RetryDecisionReason.SAME_BACKEND
         ):
-            raise ValueError("rejected backend changes must not be allowed")
+            raise ValueError("same-backend retry decisions must be allowed")
         return self
 
     @property
@@ -405,6 +452,39 @@ class RetryDecision(ContractModel):
         return self.new_selection
 
 
+def _snapshot_default(value: object) -> object:
+    if isinstance(value, BaseModel):
+        return json.loads(value.model_dump_json())
+    raise TypeError(f"value of type {type(value).__name__} is not JSON serializable")
+
+
+def _snapshot_json(value: object, label: str) -> str:
+    try:
+        if isinstance(value, BaseModel):
+            return value.model_dump_json()
+        return json.dumps(
+            value,
+            default=_snapshot_default,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RoutingError(f"{label} has no trusted JSON snapshot") from exc
+
+
+def _validated_snapshot(model_type: type[BaseModel], value: object, label: str) -> Any:
+    try:
+        return model_type.model_validate_json(_snapshot_json(value, label))
+    except Exception as exc:
+        raise RoutingError(f"{label} failed trusted validation") from exc
+
+
+def _require_exact_bool(value: object, label: str) -> bool:
+    if type(value) is not bool:
+        raise RoutingError(f"{label} must be a built-in bool")
+    return value
+
+
 @runtime_checkable
 class ExecutorSelectionAdapter(Protocol):
     """Protocol the current dispatcher can call before its existing admission."""
@@ -421,7 +501,10 @@ class ExecutorSelectionAdapter(Protocol):
         prior_selection: ExecutorBinding,
         new_selection: ExecutorBinding,
         *,
-        prior_active: bool = False,
+        prior_state: TaskState | ClaimedRun | Mapping[str, Any] | None = None,
+        prior_lifecycle: TaskState | ClaimedRun | Mapping[str, Any] | None = None,
+        lifecycle_evidence: TaskState | ClaimedRun | Mapping[str, Any] | None = None,
+        prior_active: bool | None = None,
     ) -> RetryDecision: ...
 
 
@@ -447,7 +530,7 @@ class PolicyExecutorRouter:
 
     def __init__(
         self,
-        policy: FactoryPolicy,
+        policy: FactoryPolicy | Mapping[str, Any],
         *,
         known_profiles: Collection[str] | Mapping[str, object] | None = None,
         profiles: Collection[str] | Mapping[str, object] | None = None,
@@ -471,11 +554,16 @@ class PolicyExecutorRouter:
             ),
             None,
         )
-        self._policy = policy
-        self._policy_fingerprint = policy_fingerprint(policy)
-        self._known_profiles = (
-            None if configured_profiles is None else frozenset(configured_profiles)
-        )
+        self._policy = _validated_snapshot(FactoryPolicy, policy, "policy")
+        self._policy_fingerprint = policy_fingerprint(self._policy)
+        try:
+            self._known_profiles = (
+                None if configured_profiles is None else frozenset(configured_profiles)
+            )
+        except (TypeError, ValueError) as exc:
+            raise RoutingError(
+                "profile registry must be a stable identifier collection"
+            ) from exc
         self._validate_known_profiles()
 
     @property
@@ -508,6 +596,7 @@ class PolicyExecutorRouter:
     def _route_for(
         self, task_id: str, role: str, admitted: bool
     ) -> tuple[RoleRoute, SelectionReason]:
+        _require_exact_bool(admitted, "admitted")
         if role not in self._policy.roles:
             raise RoutingError(f"unknown logical role: {role!r}")
         route = self._policy.roles[role]
@@ -559,6 +648,8 @@ class PolicyExecutorRouter:
     ) -> ExecutorBinding:
         """Select and return one immutable binding before dispatcher admission."""
 
+        if admitted is not None:
+            _require_exact_bool(admitted, "admitted")
         provided_bindings = tuple(
             binding
             for binding in (existing_binding, active_binding, bound_binding)
@@ -567,6 +658,7 @@ class PolicyExecutorRouter:
         if len(provided_bindings) > 1:
             raise RoutingError("provide only one existing active binding")
         if run is not None:
+            run = _validated_snapshot(RunIdentity, run, "run")
             if request is not None:
                 raise RoutingError("provide request or run, not both")
             if any(value is not None for value in (task_id, run_id, attempt)):
@@ -583,6 +675,7 @@ class PolicyExecutorRouter:
                 )
             role = None
         elif isinstance(request, RunIdentity) and role is not None:
+            request = _validated_snapshot(RunIdentity, request, "run")
             request = DispatchRequest(
                 task_id=request.task_id,
                 run_id=request.run_id,
@@ -591,7 +684,6 @@ class PolicyExecutorRouter:
                 admitted=True if admitted is None else admitted,
             )
             role = None
-        existing = provided_bindings[0] if provided_bindings else None
         request = self._coerce_request(
             request,
             task_id=task_id,
@@ -600,17 +692,31 @@ class PolicyExecutorRouter:
             attempt=attempt,
             admitted=admitted,
         )
+        existing = None
+        if provided_bindings:
+            try:
+                existing = _validated_snapshot(
+                    ExecutorBinding, provided_bindings[0], "existing binding"
+                )
+            except RoutingError as exc:
+                raise ExecutorSelectionError(
+                    "existing binding failed trusted validation"
+                ) from exc
         route, reason = self._route_for(request.task_id, request.role, request.admitted)
         binding = self._binding_for(request, route, reason)
         if existing is None:
             return binding
         self._validate_existing_identity(existing, request)
-        if existing.backend_key() != binding.backend_key():
+        self._validate_binding_registries(existing, require_current=False)
+        if existing != binding:
+            if existing.backend_key() != binding.backend_key():
+                raise ExecutorSelectionError(
+                    "bound active run cannot change executor route"
+                )
             raise ExecutorSelectionError(
-                "bound active run cannot change executor route"
+                "bound active run binding is not canonical for the active policy"
             )
-        # Preserve the first durable reason/fingerprint rather than rewriting
-        # evidence when a dispatcher re-reads the same active run.
+        # Return the trusted snapshot, never the caller's unvalidated object.
         return existing
 
     def route(self, request: DispatchRequest, **kwargs: Any) -> ExecutorBinding:
@@ -637,32 +743,37 @@ class PolicyExecutorRouter:
         attempt: int | None,
         admitted: bool | None,
     ) -> DispatchRequest:
+        if admitted is not None:
+            _require_exact_bool(admitted, "admitted")
         supplied = (task_id, run_id, role, attempt)
         if request is not None and any(value is not None for value in supplied):
             raise RoutingError(
                 "request and explicit task/run fields cannot be combined"
             )
         if isinstance(request, DispatchRequest):
-            if admitted is not None and admitted != request.admitted:
+            canonical = _validated_snapshot(
+                DispatchRequest, request, "dispatch request"
+            )
+            if admitted is not None and admitted != canonical.admitted:
                 raise RoutingError("request admitted flag was specified twice")
-            return request
+            return canonical
         if isinstance(request, TaskEnvelope):
-            if admitted is None:
-                admitted = True
+            canonical = _validated_snapshot(TaskEnvelope, request, "task envelope")
             return DispatchRequest(
-                task_id=request.task_id,
-                run_id=request.run_id,
-                role=request.role.value,
-                admitted=admitted,
+                task_id=canonical.task_id,
+                run_id=canonical.run_id,
+                role=canonical.role.value,
+                admitted=True if admitted is None else admitted,
             )
         if isinstance(request, RunIdentity):
+            canonical = _validated_snapshot(RunIdentity, request, "run")
             if role is None:
                 raise RoutingError("a logical role is required with RunIdentity")
             return DispatchRequest(
-                task_id=request.task_id,
-                run_id=request.run_id,
+                task_id=canonical.task_id,
+                run_id=canonical.run_id,
                 role=role,
-                attempt=request.attempt,
+                attempt=canonical.attempt,
                 admitted=True if admitted is None else admitted,
             )
         if request is not None:
@@ -673,7 +784,9 @@ class PolicyExecutorRouter:
                 request_data["admitted"] = admitted
             else:
                 request_data = request
-            return DispatchRequest.model_validate(request_data)
+            return _validated_snapshot(
+                DispatchRequest, request_data, "dispatch request"
+            )
         if task_id is None or run_id is None or role is None:
             raise RoutingError("task_id, run_id, and role are required for selection")
         return DispatchRequest(
@@ -708,6 +821,8 @@ class PolicyExecutorRouter:
             handler=route.handler,
             provider=route.provider,
             model=route.model,
+            vendor_family=route.vendor_family,
+            read_only_source=route.read_only_source,
             policy_version=self._policy.version,
             policy_fingerprint=self._policy_fingerprint,
             selection_reason=reason,
@@ -727,76 +842,241 @@ class PolicyExecutorRouter:
                 "existing binding identity does not match the selected run"
             )
 
+    def _validate_binding_registries(
+        self, binding: ExecutorBinding, *, require_current: bool
+    ) -> None:
+        """Check serialized binding authority against the active registries."""
+
+        if binding.policy_version != self._policy.version:
+            raise RoutingError("binding policy_version is not active")
+        if require_current and binding.policy_fingerprint != self._policy_fingerprint:
+            raise RoutingError("binding policy_fingerprint is not active")
+        if binding.executor is ExecutorKind.PYDANTIC_AGENT:
+            if binding.agent not in self._policy.agents:
+                raise RoutingError(f"unknown bound agent: {binding.agent!r}")
+            if binding.provider is not None:
+                provider = self._policy.providers.get(binding.provider)
+                if provider is None:
+                    raise RoutingError(f"unknown bound provider: {binding.provider!r}")
+                if binding.model is not None:
+                    if provider.models and binding.model not in provider.models:
+                        raise RoutingError(
+                            f"unknown bound model {binding.model!r} for provider "
+                            f"{binding.provider!r}"
+                        )
+                    try:
+                        _validate_model_family(
+                            provider.kind, binding.model, "binding.model"
+                        )
+                    except ValueError as exc:
+                        raise RoutingError(str(exc)) from exc
+        elif binding.executor is ExecutorKind.HERMES_PROFILE:
+            if (
+                self._known_profiles is not None
+                and binding.profile not in self._known_profiles
+            ):
+                raise RoutingError(f"unknown bound Hermes profile: {binding.profile!r}")
+        elif binding.handler not in (
+            set(self._policy.handlers) | set(self._builtin_handlers)
+        ):
+            raise RoutingError(
+                f"unknown bound deterministic handler: {binding.handler!r}"
+            )
+
+    @property
+    def _builtin_handlers(self) -> frozenset[str]:
+        # Keep the registry check local to the router without making lifecycle
+        # or handler execution part of this module's responsibilities.
+        from ..control.policy import BUILTIN_DETERMINISTIC_HANDLERS
+
+        return BUILTIN_DETERMINISTIC_HANDLERS
+
+    def _validate_active_binding(self, binding: ExecutorBinding) -> None:
+        self._validate_binding_registries(binding, require_current=True)
+        admitted_values: tuple[bool, ...]
+        if binding.selection_reason is SelectionReason.CANARY_EXACT_MATCH:
+            admitted_values = (True,)
+        elif binding.selection_reason is SelectionReason.COMPATIBILITY_FALLBACK:
+            admitted_values = (False,)
+        else:
+            admitted_values = (False, True)
+        for admitted in admitted_values:
+            request = DispatchRequest(
+                task_id=binding.task_id,
+                run_id=binding.run_id,
+                role=binding.role,
+                attempt=binding.attempt,
+                admitted=admitted,
+            )
+            route, reason = self._route_for(
+                request.task_id, request.role, request.admitted
+            )
+            if reason is not binding.selection_reason:
+                continue
+            if self._binding_for(request, route, reason) == binding:
+                return
+        raise RoutingError("binding is not canonical for the active policy")
+
+    @staticmethod
+    def _canonical_lifecycle_evidence(
+        evidence: TaskState | ClaimedRun | Mapping[str, Any],
+    ) -> tuple[str, RunIdentity]:
+        if isinstance(evidence, TaskState):
+            state = _validated_snapshot(TaskState, evidence, "task state evidence")
+            run = state.run
+            if run is None:
+                raise RetryRoutingError("lifecycle evidence has no prior run identity")
+            if state.state in {"claimed", "running"}:
+                return "active", run
+            if state.state in {"completed", "blocked", "failed"}:
+                return "terminal", run
+            raise RetryRoutingError("lifecycle evidence is not authoritative")
+        if isinstance(evidence, ClaimedRun):
+            claimed = _validated_snapshot(ClaimedRun, evidence, "claimed run evidence")
+            return "active", claimed.run
+        if isinstance(evidence, RunIdentity):
+            raise RetryRoutingError(
+                "authoritative terminal lifecycle evidence is required, not RunIdentity"
+            )
+        if isinstance(evidence, Mapping):
+            if "state" in evidence:
+                return PolicyExecutorRouter._canonical_lifecycle_evidence(
+                    _validated_snapshot(TaskState, evidence, "task state evidence")
+                )
+            if "lease" in evidence or "envelope" in evidence:
+                return PolicyExecutorRouter._canonical_lifecycle_evidence(
+                    _validated_snapshot(ClaimedRun, evidence, "claimed run evidence")
+                )
+        raise RetryRoutingError("lifecycle evidence is not authoritative")
+
+    @staticmethod
+    def _lifecycle_inputs(
+        *,
+        prior_state: TaskState | ClaimedRun | Mapping[str, Any] | None,
+        prior_lifecycle: TaskState | ClaimedRun | Mapping[str, Any] | None,
+        lifecycle_evidence: TaskState | ClaimedRun | Mapping[str, Any] | None,
+    ) -> TaskState | ClaimedRun | Mapping[str, Any]:
+        supplied = tuple(
+            value
+            for value in (prior_state, prior_lifecycle, lifecycle_evidence)
+            if value is not None
+        )
+        if not supplied:
+            raise RetryRoutingError(
+                "authoritative terminal lifecycle evidence is required"
+            )
+        if len(supplied) > 1:
+            raise RetryRoutingError("provide only one lifecycle evidence value")
+        return supplied[0]
+
     def decide_retry(
         self,
         prior_selection: ExecutorBinding,
         new_selection: ExecutorBinding,
         *,
-        prior_active: bool = False,
+        prior_state: TaskState | ClaimedRun | Mapping[str, Any] | None = None,
+        prior_lifecycle: TaskState | ClaimedRun | Mapping[str, Any] | None = None,
+        lifecycle_evidence: TaskState | ClaimedRun | Mapping[str, Any] | None = None,
+        prior_active: bool | None = None,
         active: bool | None = None,
-        allow_backend_change: bool = False,
+        allow_backend_change: bool | None = None,
         explicit_policy: bool | None = None,
     ) -> RetryDecision:
-        """Compare a terminal selection with a distinct retry selection.
+        """Compare one terminal run with one distinct, policy-valid retry.
 
-        This method only returns a durable decision. It never mutates either
-        selection and never creates, claims, or reclaims a task.
+        Lifecycle state is evidence owned by the dispatcher.  This adapter only
+        validates and compares a supplied snapshot; it never queries or mutates
+        the lifecycle repository.
         """
 
-        if active is not None:
-            if prior_active and active is not prior_active:
-                raise RetryRoutingError("prior_active and active disagree")
-            prior_active = active
-        if explicit_policy is not None:
-            if allow_backend_change and explicit_policy is not allow_backend_change:
+        bool_hints = (
+            ("prior_active", prior_active),
+            ("active", active),
+            ("allow_backend_change", allow_backend_change),
+            ("explicit_policy", explicit_policy),
+        )
+        for label, value in bool_hints:
+            if value is not None:
+                _require_exact_bool(value, label)
+        if prior_active is not None and active is not None and prior_active != active:
+            raise RetryRoutingError("prior_active and active disagree")
+        if (
+            allow_backend_change is not None
+            and explicit_policy is not None
+            and allow_backend_change != explicit_policy
+        ):
+            raise RetryRoutingError("allow_backend_change and explicit_policy disagree")
+
+        prior = _validated_snapshot(ExecutorBinding, prior_selection, "prior binding")
+        new = _validated_snapshot(ExecutorBinding, new_selection, "retry binding")
+        try:
+            self._validate_binding_registries(prior, require_current=False)
+            self._validate_binding_registries(new, require_current=False)
+            if new.policy_fingerprint != self._policy_fingerprint:
                 raise RetryRoutingError(
-                    "allow_backend_change and explicit_policy disagree"
+                    "retry binding is not canonical for the active policy"
                 )
-            allow_backend_change = explicit_policy
-        self._validate_retry_candidates(prior_selection, new_selection)
-        prior_run = prior_selection.run
-        retry_run = new_selection.run
-        if prior_active:
+            self._validate_active_binding(new)
+            if prior.policy_fingerprint == self._policy_fingerprint:
+                self._validate_active_binding(prior)
+        except RetryRoutingError:
+            raise
+        except RoutingError as exc:
+            raise RetryRoutingError(str(exc)) from exc
+        self._validate_retry_candidates(prior, new)
+
+        evidence = self._lifecycle_inputs(
+            prior_state=prior_state,
+            prior_lifecycle=prior_lifecycle,
+            lifecycle_evidence=lifecycle_evidence,
+        )
+        lifecycle_status, lifecycle_run = self._canonical_lifecycle_evidence(evidence)
+        if lifecycle_run != prior.run:
+            raise RetryRoutingError("lifecycle evidence does not match the prior run")
+        lifecycle_active = lifecycle_status == "active"
+        for label, value in (("prior_active", prior_active), ("active", active)):
+            if value is not None and value != lifecycle_active:
+                raise RetryRoutingError(f"{label} contradicts lifecycle evidence")
+
+        if lifecycle_active:
             return RetryDecision(
-                task_id=prior_selection.task_id,
-                prior_run=prior_run,
-                retry_run=retry_run,
-                prior_selection=prior_selection,
-                new_selection=new_selection,
+                task_id=prior.task_id,
+                prior_run=prior.run,
+                retry_run=new.run,
+                prior_selection=prior,
+                new_selection=new,
                 allowed=False,
                 decision=RetryDecisionKind.BACKEND_CHANGE_REJECTED,
                 reason=RetryDecisionReason.ACTIVE_RUN,
             )
-        if prior_selection.backend_key() == new_selection.backend_key():
+        if prior.backend_key() == new.backend_key():
             return RetryDecision(
-                task_id=prior_selection.task_id,
-                prior_run=prior_run,
-                retry_run=retry_run,
-                prior_selection=prior_selection,
-                new_selection=new_selection,
+                task_id=prior.task_id,
+                prior_run=prior.run,
+                retry_run=new.run,
+                prior_selection=prior,
+                new_selection=new,
                 allowed=True,
                 decision=RetryDecisionKind.SAME_BACKEND,
                 reason=RetryDecisionReason.SAME_BACKEND,
             )
-        if self._explicit_backend_change_allowed(
-            prior_selection, new_selection, allow_backend_change
-        ):
+        if self._explicit_backend_change_allowed(prior, new):
             return RetryDecision(
-                task_id=prior_selection.task_id,
-                prior_run=prior_run,
-                retry_run=retry_run,
-                prior_selection=prior_selection,
-                new_selection=new_selection,
+                task_id=prior.task_id,
+                prior_run=prior.run,
+                retry_run=new.run,
+                prior_selection=prior,
+                new_selection=new,
                 allowed=True,
                 decision=RetryDecisionKind.BACKEND_CHANGE_ALLOWED,
                 reason=RetryDecisionReason.EXPLICIT_COMPATIBILITY,
             )
         return RetryDecision(
-            task_id=prior_selection.task_id,
-            prior_run=prior_run,
-            retry_run=retry_run,
-            prior_selection=prior_selection,
-            new_selection=new_selection,
+            task_id=prior.task_id,
+            prior_run=prior.run,
+            retry_run=new.run,
+            prior_selection=prior,
+            new_selection=new,
             allowed=False,
             decision=RetryDecisionKind.BACKEND_CHANGE_REJECTED,
             reason=RetryDecisionReason.BACKEND_CHANGE_NOT_ALLOWED,
@@ -817,9 +1097,12 @@ class PolicyExecutorRouter:
         | TaskEnvelope
         | Mapping[str, Any]
         | None = None,
-        prior_active: bool = False,
+        prior_state: TaskState | ClaimedRun | Mapping[str, Any] | None = None,
+        prior_lifecycle: TaskState | ClaimedRun | Mapping[str, Any] | None = None,
+        lifecycle_evidence: TaskState | ClaimedRun | Mapping[str, Any] | None = None,
+        prior_active: bool | None = None,
         active: bool | None = None,
-        allow_backend_change: bool = False,
+        allow_backend_change: bool | None = None,
         explicit_policy: bool | None = None,
     ) -> RetryDecision:
         """Convenience adapter for a retry selection followed by comparison."""
@@ -836,6 +1119,9 @@ class PolicyExecutorRouter:
         return self.decide_retry(
             prior_selection,
             new_selection,
+            prior_state=prior_state,
+            prior_lifecycle=prior_lifecycle,
+            lifecycle_evidence=lifecycle_evidence,
             prior_active=prior_active,
             active=active,
             allow_backend_change=allow_backend_change,
@@ -846,26 +1132,33 @@ class PolicyExecutorRouter:
     retry_decision = decide_retry
 
     def _explicit_backend_change_allowed(
-        self, prior: ExecutorBinding, new: ExecutorBinding, explicitly_requested: bool
+        self, prior: ExecutorBinding, new: ExecutorBinding
     ) -> bool:
-        policy_allows = self._policy.compatibility.allow_backend_change_on_retry
-        if policy_allows is False:
-            return False
-        if explicitly_requested and policy_allows not in {True, "explicit_policy_only"}:
+        # A caller boolean is only a request and never grants authority.  A
+        # boolean policy value is likewise non-authorizing; only the explicit
+        # exact-rule mode can reach the rule comparison below.
+        if self._policy.compatibility.allow_backend_change_on_retry != (
+            "explicit_policy_only"
+        ):
             return False
         for rule in self._policy.compatibility.retry_compatibility:
-            if rule.role is not None and rule.role != prior.role:
-                continue
-            if rule.from_executor is not prior.executor:
-                continue
-            if rule.to_executor is not new.executor:
-                continue
-            if rule.from_id is not None and rule.from_id != prior.executor_id:
-                continue
-            if rule.to_id is not None and rule.to_id != new.executor_id:
-                continue
-            return True
-        return explicitly_requested and policy_allows is True
+            if (
+                rule.role == prior.role
+                and rule.from_executor is prior.executor
+                and rule.to_executor is new.executor
+                and rule.from_id == prior.executor_id
+                and rule.to_id == new.executor_id
+                and rule.from_provider == prior.provider
+                and rule.to_provider == new.provider
+                and rule.from_model == prior.model
+                and rule.to_model == new.model
+                and rule.from_vendor_family == prior.vendor_family
+                and rule.to_vendor_family == new.vendor_family
+                and rule.from_read_only_source == prior.read_only_source
+                and rule.to_read_only_source == new.read_only_source
+            ):
+                return True
+        return False
 
     @staticmethod
     def _validate_retry_candidates(
@@ -881,11 +1174,12 @@ class PolicyExecutorRouter:
             raise RetryRoutingError("a retry must use a greater attempt number")
 
 
-def policy_fingerprint(policy: FactoryPolicy) -> str:
+def policy_fingerprint(policy: FactoryPolicy | Mapping[str, Any]) -> str:
     """Return a deterministic credential-free fingerprint of validated policy."""
 
+    canonical = _validated_snapshot(FactoryPolicy, policy, "policy")
     payload = json.dumps(
-        policy.model_dump(mode="json"),
+        canonical.model_dump(mode="json"),
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=True,

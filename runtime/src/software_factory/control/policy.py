@@ -436,18 +436,26 @@ class CanaryRule(PolicyModel):
 
 
 class RetryCompatibilityRule(PolicyModel):
-    """An explicit executor-kind change allowed on a retry.
+    """One exact source/target backend selection allowed on a retry.
 
-    The rule is only a policy gate. The routing boundary still compares the
-    complete prior and proposed selections, including their concrete
-    identities, before it can allow a backend change.
+    Every field is part of the authority decision.  Optional values are still
+    required in the input so that ``None`` means the concrete route has no
+    value, never that the field is a wildcard.
     """
 
     from_executor: ExecutorKind
     to_executor: ExecutorKind
-    from_id: Identifier | None = None
-    to_id: Identifier | None = None
-    role: Identifier | None = None
+    from_id: Identifier
+    to_id: Identifier
+    from_provider: Identifier | None
+    to_provider: Identifier | None
+    from_model: Revision | None
+    to_model: Revision | None
+    from_vendor_family: Identifier | None
+    to_vendor_family: Identifier | None
+    from_read_only_source: StrictBool | None
+    to_read_only_source: StrictBool | None
+    role: Identifier
 
     @model_validator(mode="before")
     @classmethod
@@ -466,6 +474,14 @@ class RetryCompatibilityRule(PolicyModel):
             "from_executor_id": "from_id",
             "target_id": "to_id",
             "to_executor_id": "to_id",
+            "source_provider": "from_provider",
+            "target_provider": "to_provider",
+            "source_model": "from_model",
+            "target_model": "to_model",
+            "source_vendor_family": "from_vendor_family",
+            "target_vendor_family": "to_vendor_family",
+            "source_read_only_source": "from_read_only_source",
+            "target_read_only_source": "to_read_only_source",
         }
         for alias, canonical in aliases.items():
             if alias not in data:
@@ -479,18 +495,10 @@ class RetryCompatibilityRule(PolicyModel):
 
     @field_validator("role")
     @classmethod
-    def role_is_known(cls, value: str | None) -> str | None:
-        if value is not None and value not in ROLE_KEYS:
+    def role_is_known(cls, value: str) -> str:
+        if value not in ROLE_KEYS:
             raise ValueError(f"unknown retry compatibility role: {value!r}")
         return value
-
-    @model_validator(mode="after")
-    def concrete_ids_are_paired(self) -> RetryCompatibilityRule:
-        if (self.from_id is None) != (self.to_id is None):
-            raise ValueError(
-                "retry compatibility from_id and to_id must be provided together"
-            )
-        return self
 
 
 # These are the deterministic lifecycle handlers named by the architecture
@@ -716,6 +724,14 @@ class CompatibilityPolicy(PolicyModel):
                 rule.to_executor,
                 rule.from_id,
                 rule.to_id,
+                rule.from_provider,
+                rule.to_provider,
+                rule.from_model,
+                rule.to_model,
+                rule.from_vendor_family,
+                rule.to_vendor_family,
+                rule.from_read_only_source,
+                rule.to_read_only_source,
                 rule.role,
             )
             if key in seen_retry_rules:
