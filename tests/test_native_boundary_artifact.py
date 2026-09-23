@@ -2081,12 +2081,13 @@ def test_staged_dispatch_validates_requeue_payload(
             run_id = run_cursor.lastrowid
             kind = __KIND__
             event_run_id = run_id if kind == "reclaimed" else None
-            conn.execute(
-                "INSERT INTO task_events "
-                "(task_id, run_id, kind, payload, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (task_id, event_run_id, kind, __PAYLOAD__, now),
-            )
+            with kb._review_native_mutation_authorized():
+                conn.execute(
+                    "INSERT INTO task_events "
+                    "(task_id, run_id, kind, payload, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (task_id, event_run_id, kind, __PAYLOAD__, now),
+                )
             conn.commit()
             guard = kb.check_respawn_guard(conn, task_id, lane="ready")
             result = kb.dispatch_once(
@@ -2665,7 +2666,7 @@ def test_staged_remote_reclaim_with_fresh_heartbeat_is_admitted(tmp_path):
     assert probe["payload"]["host_local"] is False
     assert probe["payload"]["heartbeat_stale"] is False
     assert probe["guard"] is None
-    assert probe["spawned"] == [probe["task_id"]]
+    assert probe["spawned"] == [probe["task_id"]], probe
     assert probe["guarded"] == []
 
 
@@ -2694,7 +2695,8 @@ def test_staged_dispatch_preflight_rejects_malformed_durable_storage(tmp_path):
                     assignee="default",
                     created_by="fixture",
                 )
-                mutate(conn, task_id)
+                with kb._review_native_mutation_authorized():
+                    mutate(conn, task_id)
                 conn.commit()
                 result = kb.dispatch_once(
                     conn,
@@ -2995,15 +2997,16 @@ def test_staged_malformed_task_is_quarantined_without_blocking_healthy_dispatch(
                 created_by="fixture",
                 priority=100,
             )
-            conn.execute(
-                "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                "VALUES (?, 'specified', ?, ?)",
-                (
-                    malformed,
-                    '{"changed_fields":["body"],"unexpected":true}',
-                    int(time.time()),
-                ),
-            )
+            with kb._review_native_mutation_authorized():
+                conn.execute(
+                    "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                    "VALUES (?, 'specified', ?, ?)",
+                    (
+                        malformed,
+                        '{"changed_fields":["body"],"unexpected":true}',
+                        int(time.time()),
+                    ),
+                )
             healthy = kb.create_task(
                 conn,
                 title="Independent healthy ready task",
@@ -3449,16 +3452,17 @@ def test_staged_newest_lifecycle_event_is_selected_explicitly(tmp_path):
                 expected_run_id=running.current_run_id,
             )
             assert kb.unblock_task(conn, task_id)
-            conn.execute(
-                "INSERT INTO task_events "
-                "(task_id, run_id, kind, payload, created_at) "
-                "VALUES (?, NULL, 'status', ?, ?)",
-                (
-                    task_id,
-                    '{"status":"ready","extra":true}',
-                    int(time.time()),
-                ),
-            )
+            with kb._review_native_mutation_authorized():
+                conn.execute(
+                    "INSERT INTO task_events "
+                    "(task_id, run_id, kind, payload, created_at) "
+                    "VALUES (?, NULL, 'status', ?, ?)",
+                    (
+                        task_id,
+                        '{"status":"ready","extra":true}',
+                        int(time.time()),
+                    ),
+                )
             conn.commit()
             rejections = dispatcher_state_rejections(conn)
             result = kb.dispatch_once(
@@ -3612,11 +3616,12 @@ def test_staged_status_event_rejects_forged_run_identity(tmp_path):
                 "WHERE id = ?",
                 (task_id,),
             )
-            conn.execute(
-                "INSERT INTO task_events(task_id, run_id, kind, payload, created_at) "
-                "VALUES (?, ?, 'status', ?, ?)",
-                (task_id, run_id, '{\"status\":\"ready\"}', int(time.time())),
-            )
+            with kb._review_native_mutation_authorized():
+                conn.execute(
+                    "INSERT INTO task_events(task_id, run_id, kind, payload, created_at) "
+                    "VALUES (?, ?, 'status', ?, ?)",
+                    (task_id, run_id, '{\"status\":\"ready\"}', int(time.time())),
+                )
             conn.commit()
             guard = kb.check_respawn_guard(conn, task_id, lane="ready")
             rejections = dispatcher_state_rejections(conn)
@@ -3838,12 +3843,13 @@ def test_staged_run_scoped_requeue_events_require_real_run_identity(tmp_path):
                 "VALUES (?, 'default', 'reclaimed', 'reclaimed', ?, ?)",
                 (reclaimed, now, now),
             )
-            conn.execute(
-                "INSERT INTO task_events "
-                "(task_id, run_id, kind, payload, created_at) "
-                "VALUES (?, NULL, 'reclaimed', ?, ?)",
-                (reclaimed, json.dumps(reclaimed_payload()), now),
-            )
+            with kb._review_native_mutation_authorized():
+                conn.execute(
+                    "INSERT INTO task_events "
+                    "(task_id, run_id, kind, payload, created_at) "
+                    "VALUES (?, NULL, 'reclaimed', ?, ?)",
+                    (reclaimed, json.dumps(reclaimed_payload()), now),
+                )
             changed = kb.create_task(
                 conn, title="changes-null", assignee="default"
             )
@@ -3853,12 +3859,13 @@ def test_staged_run_scoped_requeue_events_require_real_run_identity(tmp_path):
                 "VALUES (?, 'default', 'ready', 'changes_requested', ?, ?)",
                 (changed, now, now),
             )
-            conn.execute(
-                "INSERT INTO task_events "
-                "(task_id, run_id, kind, payload, created_at) "
-                "VALUES (?, NULL, 'changes_requested', ?, ?)",
-                (changed, json.dumps(changes_payload()), now),
-            )
+            with kb._review_native_mutation_authorized():
+                conn.execute(
+                    "INSERT INTO task_events "
+                    "(task_id, run_id, kind, payload, created_at) "
+                    "VALUES (?, NULL, 'changes_requested', ?, ?)",
+                    (changed, json.dumps(changes_payload()), now),
+                )
             healthy = kb.create_task(
                 conn, title="healthy", assignee="default"
             )
@@ -4123,11 +4130,12 @@ def test_staged_ancestor_reopen_review_handoff_rejects_tampering(
                     (parent, task),
                 )
             elif mutation == "later_lifecycle_event":
-                conn.execute(
-                    "INSERT INTO task_events(task_id, kind, payload, created_at) "
-                    "VALUES (?, 'status', ?, ?)",
-                    (task, json.dumps({"status": "review"}), int(time.time())),
-                )
+                with kb._review_native_mutation_authorized():
+                    conn.execute(
+                        "INSERT INTO task_events(task_id, kind, payload, created_at) "
+                        "VALUES (?, 'status', ?, ?)",
+                        (task, json.dumps({"status": "review"}), int(time.time())),
+                    )
             else:
                 raise AssertionError(mutation)
             conn.commit()
@@ -4273,15 +4281,16 @@ def test_staged_preflights_columns_before_indexes_and_triggers(tmp_path):
     )
     assert migrated.returncode == 0, migrated.stderr or migrated.stdout
     with sqlite3.connect(tasks_db) as conn:
-        conn.execute(
-            "UPDATE tasks SET status='blocked' WHERE id='legacy-ordinary'"
-        )
+        with pytest.raises(sqlite3.OperationalError, match="review_native_connection_authorized"):
+            conn.execute(
+                "UPDATE tasks SET status='blocked' WHERE id='legacy-ordinary'"
+            )
         assert conn.execute(
             "SELECT status FROM tasks WHERE id='legacy-ordinary'"
-        ).fetchone()[0] == "blocked"
+        ).fetchone()[0] == "ready"
 
 
-def test_staged_new_schema_keeps_old_runtime_ordinary_writes_compatible(tmp_path):
+def test_staged_new_schema_fails_closed_for_untrusted_legacy_writers(tmp_path):
     runtime = _staged_runtime()
     old_runtime = Path(
         os.environ.get(
@@ -4341,11 +4350,12 @@ def test_staged_new_schema_keeps_old_runtime_ordinary_writes_compatible(tmp_path
         text=True,
         check=False,
     )
-    assert blocked.returncode == 0, blocked.stderr or blocked.stdout
+    assert blocked.returncode != 0
+    assert "review_native_connection_authorized" in (blocked.stderr or blocked.stdout)
 
     with sqlite3.connect(db) as conn:
         status = conn.execute(
             "SELECT status FROM tasks WHERE id=?",
             (task_file.read_text(encoding="utf-8"),),
         ).fetchone()[0]
-    assert status == "blocked"
+    assert status == "ready"

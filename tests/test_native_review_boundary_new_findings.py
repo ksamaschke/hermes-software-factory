@@ -19,7 +19,6 @@ from pathlib import Path
 
 import pytest
 
-
 _RUNTIME = Path(os.environ.get("FACTORY_NATIVE_RUNTIME", ""))
 if not _RUNTIME.is_dir():
     pytest.skip(
@@ -208,7 +207,7 @@ def test_release_stale_claims_cas_captures_run_pid_lock_and_expiry(kanban_db, mo
 
     replacement_run: list[int] = []
 
-    def replace_before_release(pid, lock, *, signal_fn=None):
+    def replace_before_release(pid, lock, *, signal_fn=None, **_kwargs):
         replacement_run.append(_replace_with_same_lease(module, conn, task_id, captured))
         return {"termination_attempted": False, "terminated": False, "host_local": False}
 
@@ -251,7 +250,7 @@ def test_detect_stale_running_cas_captures_run_pid_lock_and_expiry(kanban_db, mo
 
     replacement_run: list[int] = []
 
-    def replace_before_detect(pid, lock, *, signal_fn=None):
+    def replace_before_detect(pid, lock, *, signal_fn=None, **_kwargs):
         replacement_run.append(_replace_with_same_lease(module, conn, task_id, captured))
         return {"termination_attempted": False, "terminated": False, "host_local": False}
 
@@ -278,7 +277,14 @@ def test_request_review_restores_ready_and_force_paths_without_generic_bypass(ka
     forced_id = module.create_task(conn, title="forced review", assignee="worker")
     forced_claim = module.claim_task(conn, forced_id, claimer="worker")
     assert forced_claim is not None
-    assert module.request_review(conn, forced_id, summary="operator override", force=True) is True
+    with module._operator_review_override_authorized() as capability:
+        assert module.request_review(
+            conn,
+            forced_id,
+            summary="operator override",
+            force=True,
+            operator_capability=capability,
+        ) is True
     assert module.get_task(conn, forced_id).status == "review"
 
     live_id = module.create_task(conn, title="live claim", assignee="worker")
@@ -294,7 +300,13 @@ def test_request_review_restores_ready_and_force_paths_without_generic_bypass(ka
 
     done_id = module.create_task(conn, title="done review", assignee="worker")
     assert module.complete_task(conn, done_id) is True
-    assert module.request_review(conn, done_id, force=True) is False
+    with module._operator_review_override_authorized() as capability:
+        assert module.request_review(
+            conn,
+            done_id,
+            force=True,
+            operator_capability=capability,
+        ) is False
 
 
 def test_protected_event_update_blocks_ordinary_to_protected(kanban_db):
@@ -358,12 +370,12 @@ def test_drift_rebuild_reinstalls_protected_triggers_before_connect_returns(kanb
     ],
 )
 def test_authorizer_denies_ordinary_drop_of_every_protected_base_table(kanban_db, table):
-    module, conn, _ = kanban_db
+    _module, conn, _ = kanban_db
     with pytest.raises(sqlite3.DatabaseError):
         conn.execute(f"DROP TABLE {table}")
 
 
-def test_steady_state_connect_validates_complete_protected_schema(kanban_db):
+def test_steady_state_connect_refuses_lossy_protected_schema_repair(kanban_db):
     module, conn, db_path = kanban_db
     conn.close()
     raw = sqlite3.connect(db_path)
@@ -371,15 +383,20 @@ def test_steady_state_connect_validates_complete_protected_schema(kanban_db):
     raw.commit()
     raw.close()
 
-    repaired = module.connect(db_path)
+    with pytest.raises(sqlite3.DatabaseError, match="refusing lossy repair"):
+        module.connect(db_path)
+    raw = sqlite3.connect(db_path)
     try:
-        assert repaired.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 0
+        assert raw.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'task_runs'"
+        ).fetchone()[0] == 0
     finally:
-        repaired.close()
+        raw.close()
 
 
 def test_git_provenance_never_executes_repository_filter_callbacks(kanban_db, tmp_path):
-    module, conn, _ = kanban_db
+    module, _conn, _ = kanban_db
     repo, packet = _make_git_review_repo(tmp_path)
     marker = tmp_path / "filter-ran.marker"
     _git(repo, "config", "filter.evil.clean", f"/bin/sh -c 'touch {marker}; cat'")
@@ -392,8 +409,8 @@ def test_git_provenance_never_executes_repository_filter_callbacks(kanban_db, tm
 
 
 def test_git_provenance_rejects_non_identical_remote_origin_values(kanban_db, tmp_path):
-    module, conn, _ = kanban_db
-    repo, packet = _make_git_review_repo(
+    module, _conn, _ = kanban_db
+    _repo, packet = _make_git_review_repo(
         tmp_path,
         origins=(
             "https://github.com/other/repository.git",

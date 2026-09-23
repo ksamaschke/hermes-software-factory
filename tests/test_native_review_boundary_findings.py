@@ -17,7 +17,6 @@ from pathlib import Path
 
 import pytest
 
-
 _RUNTIME = Path(os.environ.get("FACTORY_NATIVE_RUNTIME", ""))
 if not _RUNTIME.is_dir():
     pytest.skip(
@@ -234,14 +233,14 @@ def test_raw_connection_cannot_forge_review_evidence_or_handoff(kanban_db):
     conn.commit()
     raw = sqlite3.connect(db_path)
     try:
-        with pytest.raises(sqlite3.IntegrityError, match="native review evidence"):
+        with pytest.raises(sqlite3.Error, match="native review evidence|review_native_connection_authorized"):
             raw.execute(
                 "INSERT INTO task_events(task_id, run_id, kind, payload, created_at) "
                 "VALUES (?, ?, ?, ?, ?)",
                 (task_id, claimed.current_run_id, "standalone_review_packet_claimed", "{}", 2),
             )
         raw.rollback()
-        with pytest.raises(sqlite3.IntegrityError, match="native review handoff"):
+        with pytest.raises(sqlite3.Error, match="native review handoff|review_native_connection_authorized"):
             raw.execute(
                 """INSERT INTO review_remediation_handoffs(
                     handoff_key, leaf_task_id, review_run_id, reviewer_profile,
@@ -322,10 +321,16 @@ def test_reclaim_cas_captures_run_lease_and_worker_identity(kanban_db):
     with module._review_native_mutation_authorized(), module.write_txn(conn):
         conn.execute("UPDATE tasks SET worker_pid = 4242 WHERE id = ?", (task_id,))
         conn.execute("UPDATE task_runs SET worker_pid = 4242 WHERE id = ?", (first_run_id,))
+        module._append_event(
+            conn,
+            task_id,
+            "spawned",
+            {"pid": 4242, "process_identity": "fixture-process"},
+            run_id=first_run_id,
+        )
 
     def replace_after_snapshot(_pid, _signal):
-        replacement = sqlite3.connect(db_path)
-        replacement.row_factory = sqlite3.Row
+        replacement = module._sqlite_connect(db_path)
         try:
             with module._review_native_mutation_authorized(), module.write_txn(replacement):
                 cur = replacement.execute(
@@ -346,7 +351,12 @@ def test_reclaim_cas_captures_run_lease_and_worker_identity(kanban_db):
             replacement.close()
         raise ProcessLookupError()
 
-    assert module.reclaim_task(conn, task_id, signal_fn=replace_after_snapshot) is False
+    assert module.reclaim_task(
+        conn,
+        task_id,
+        signal_fn=replace_after_snapshot,
+        process_identity_fn=lambda _pid: "fixture-process",
+    ) is False
     live_task = conn.execute(
         "SELECT status, current_run_id, claim_lock, claim_expires, worker_pid "
         "FROM tasks WHERE id = ?",

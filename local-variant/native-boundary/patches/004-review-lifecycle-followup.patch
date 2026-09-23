@@ -1,0 +1,2131 @@
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -178,12 +178,50 @@ _REVIEW_SCHEMA_MIGRATION_AUTH: contextvars.ContextVar[bool] = contextvars.Contex
+ _REVIEW_DISPATCH_AUTH: contextvars.ContextVar[Optional[dict[str, Any]]] = contextvars.ContextVar(
+     "review_dispatch_transition_authorized", default=None
+ )
++_REVIEW_OPERATOR_OVERRIDE_CAPABILITY: contextvars.ContextVar[object | None] = (
++    contextvars.ContextVar("review_operator_override_capability", default=None)
++)
+
+ _REVIEW_NATIVE_MUTATION_AUTH_TABLE = "review_native_mutation_authorization"
+ _REVIEW_RUN_CAPABILITY_TABLE = "review_native_run_capabilities"
+ _REVIEW_DISPATCH_AUTH_TABLE = "review_native_dispatch_authorization"
+ _REVIEW_SCHEMA_MIGRATION_TABLE = "review_native_schema_migration_authorization"
+ _REVIEW_AUTHORIZED_REMOTE_HOSTS = frozenset({"github.com"})
++_REVIEW_MAX_GIT_STDOUT_BYTES = 4 * 1024 * 1024
++_REVIEW_MAX_GIT_STDERR_BYTES = 256 * 1024
++_REVIEW_MAX_TRACKED_FILES = 50_000
++_REVIEW_MAX_TRACKED_FILE_BYTES = 16 * 1024 * 1024
++_REVIEW_MAX_TRACKED_TOTAL_BYTES = 256 * 1024 * 1024
++_PROCESS_IDENTITY_TOKEN_MAX_BYTES = 512
++_REVIEW_PROTECTED_EVENT_KINDS = frozenset(
++    {
++        "standalone_review_packet_claimed",
++        "standalone_review_changes_requested",
++        "standalone_review_incomplete",
++        "standalone_review_approved",
++        "standalone_review_handoff_tombstoned",
++        "same_card_review_claimed",
++        "same_card_review_changes_requested",
++        "same_card_review_approved",
++    }
++)
++_REVIEW_LIFECYCLE_AUTHORITY_EVENT_KINDS = frozenset(
++    {
++        "blocked",
++        "changes_requested",
++        "completed",
++        "gave_up",
++        "promoted",
++        "reclaimed",
++        "review_requested",
++        "specified",
++        "spawned",
++        "stale",
++        "status",
++        "timed_out",
++        "unblocked",
++    }
++)
+ # Tables whose definitions or trigger-bearing relationships form the review
+ # authority boundary.  SQLite authorizer DDL protection covers the base tables
+ # as well as the transaction-local authorization tables; only the trusted
+@@ -233,6 +271,7 @@ _REVIEW_PROTECTED_TRIGGER_NAMES = frozenset(
+         "trg_review_terminal_status_immutable",
+         "trg_review_task_delete_immutable",
+         "trg_review_event_insert_authorized",
++        "trg_review_lifecycle_event_insert_authorized",
+         "trg_review_event_update_immutable",
+         "trg_review_event_delete_immutable",
+         "trg_review_handoff_insert_authorized",
+@@ -296,6 +335,27 @@ def _review_schema_migration_authorized():
+         _REVIEW_SCHEMA_MIGRATION_AUTH.reset(token)
+
+
++@contextlib.contextmanager
++def _operator_review_override_authorized():
++    """Mint one process-local capability for a trusted operator handoff.
++
++    Callers must first enforce their own orchestrator/profile authorization.
++    The opaque object is compared by identity inside :func:`request_review`;
++    a public ``force=True`` boolean is never sufficient authority.
++    """
++    capability = object()
++    token = _REVIEW_OPERATOR_OVERRIDE_CAPABILITY.set(capability)
++    try:
++        yield capability
++    finally:
++        _REVIEW_OPERATOR_OVERRIDE_CAPABILITY.reset(token)
++
++
++def _operator_review_capability_is_current(capability: object | None) -> bool:
++    current = _REVIEW_OPERATOR_OVERRIDE_CAPABILITY.get()
++    return capability is not None and capability is current
++
++
+ @contextlib.contextmanager
+ def _review_dispatch_transition(
+     conn: sqlite3.Connection,
+@@ -1867,10 +1927,15 @@ WHEN (
+     )
+     OR OLD.idempotency_key GLOB 'review-remediation:v2:*'
+ ) AND NOT (
+-    EXISTS (
+-        SELECT 1 FROM review_native_mutation_authorization WHERE token = 1
++    (
++        review_native_connection_authorized() = 1
++        AND EXISTS (
++            SELECT 1 FROM review_native_mutation_authorization WHERE token = 1
++        )
+     )
+-    OR EXISTS (
++    OR (
++        review_native_connection_authorized() = 1
++        AND EXISTS (
+         SELECT 1 FROM review_native_dispatch_authorization d
+          WHERE d.task_id = OLD.id
+            AND d.run_id = OLD.current_run_id
+@@ -1882,6 +1947,7 @@ WHEN (
+            AND OLD.body IS NEW.body
+            AND OLD.created_by IS NEW.created_by
+            AND OLD.idempotency_key IS NEW.idempotency_key
++        )
+     )
+ )
+ BEGIN
+@@ -1913,10 +1979,15 @@ WHEN (
+            )
+     )
+ ) AND NOT (
+-    EXISTS (
+-        SELECT 1 FROM review_native_mutation_authorization WHERE token = 1
++    (
++        review_native_connection_authorized() = 1
++        AND EXISTS (
++            SELECT 1 FROM review_native_mutation_authorization WHERE token = 1
++        )
+     )
+-    OR EXISTS (
++    OR (
++        review_native_connection_authorized() = 1
++        AND EXISTS (
+         SELECT 1 FROM review_native_dispatch_authorization d
+          WHERE d.task_id = OLD.id
+            AND d.run_id = OLD.current_run_id
+@@ -1936,6 +2007,7 @@ WHEN (
+            AND OLD.current_run_id IS NEW.current_run_id
+            AND OLD.claim_lock IS NEW.claim_lock
+            AND OLD.claim_expires IS NEW.claim_expires
++        )
+     )
+ )
+ BEGIN
+@@ -1963,8 +2035,11 @@ WHEN (
+                'same_card_review_approved'
+            )
+     )
+-) AND NOT EXISTS (
+-    SELECT 1 FROM review_native_mutation_authorization WHERE token = 1
++) AND (
++    review_native_connection_authorized() != 1
++    OR NOT EXISTS (
++        SELECT 1 FROM review_native_mutation_authorization WHERE token = 1
++    )
+ )
+ BEGIN
+     SELECT RAISE(ABORT, 'native review task cannot be deleted');
+@@ -1984,7 +2059,8 @@ WHEN NEW.kind IN (
+ ) AND NOT EXISTS (
+     SELECT 1 FROM review_native_schema_migration_authorization WHERE token = 1
+ ) AND (
+-    NOT EXISTS (
++    review_native_connection_authorized() != 1
++    OR NOT EXISTS (
+         SELECT 1 FROM review_native_mutation_authorization WHERE token = 1
+     )
+     OR NEW.run_id IS NULL
+@@ -2002,10 +2078,32 @@ BEGIN
+     SELECT RAISE(ABORT, 'native review evidence insert requires a native run capability');
+ END;
+
++CREATE TRIGGER IF NOT EXISTS trg_review_lifecycle_event_insert_authorized
++BEFORE INSERT ON task_events
++WHEN NEW.kind IN (
++    'blocked',
++    'changes_requested',
++    'completed',
++    'gave_up',
++    'promoted',
++    'reclaimed',
++    'review_requested',
++    'specified',
++    'spawned',
++    'stale',
++    'status',
++    'timed_out',
++    'unblocked'
++) AND review_native_connection_authorized() != 1
++BEGIN
++    SELECT RAISE(ABORT, 'lifecycle authority event requires a native producer capability');
++END;
++
+ CREATE TRIGGER IF NOT EXISTS trg_review_handoff_insert_authorized
+ BEFORE INSERT ON review_remediation_handoffs
+ WHEN (
+-    NOT EXISTS (
++    review_native_connection_authorized() != 1
++    OR NOT EXISTS (
+         SELECT 1 FROM review_native_mutation_authorization WHERE token = 1
+     )
+     OR NOT EXISTS (
+@@ -2037,8 +2135,11 @@ WHEN (OLD.kind IN (
+     'same_card_review_claimed',
+     'same_card_review_changes_requested',
+     'same_card_review_approved'
+-)) AND NOT EXISTS (
+-    SELECT 1 FROM review_native_mutation_authorization WHERE token = 1
++)) AND (
++    review_native_connection_authorized() != 1
++    OR NOT EXISTS (
++        SELECT 1 FROM review_native_mutation_authorization WHERE token = 1
++    )
+ )
+ BEGIN
+     SELECT RAISE(ABORT, 'native review evidence event is immutable');
+@@ -2055,8 +2156,11 @@ WHEN OLD.kind IN (
+     'same_card_review_claimed',
+     'same_card_review_changes_requested',
+     'same_card_review_approved'
+-) AND NOT EXISTS (
+-    SELECT 1 FROM review_native_mutation_authorization WHERE token = 1
++) AND (
++    review_native_connection_authorized() != 1
++    OR NOT EXISTS (
++        SELECT 1 FROM review_native_mutation_authorization WHERE token = 1
++    )
+ )
+ BEGIN
+     SELECT RAISE(ABORT, 'native review evidence event cannot be deleted');
+@@ -2064,7 +2168,8 @@ END;
+
+ CREATE TRIGGER IF NOT EXISTS trg_review_handoff_update_immutable
+ BEFORE UPDATE ON review_remediation_handoffs
+-WHEN NOT EXISTS (
++WHEN review_native_connection_authorized() != 1
++   OR NOT EXISTS (
+     SELECT 1 FROM review_native_mutation_authorization WHERE token = 1
+ )
+ BEGIN
+@@ -2073,7 +2178,8 @@ END;
+
+ CREATE TRIGGER IF NOT EXISTS trg_review_handoff_delete_immutable
+ BEFORE DELETE ON review_remediation_handoffs
+-WHEN NOT EXISTS (
++WHEN review_native_connection_authorized() != 1
++   OR NOT EXISTS (
+     SELECT 1 FROM review_native_mutation_authorization WHERE token = 1
+ )
+ BEGIN
+@@ -2111,8 +2217,11 @@ WHEN (
+            AND e.kind = 'same_card_review_claimed'
+            AND e.run_id = t.current_run_id
+     )
+-) AND NOT EXISTS (
+-    SELECT 1 FROM review_native_mutation_authorization WHERE token = 1
++) AND (
++    review_native_connection_authorized() != 1
++    OR NOT EXISTS (
++        SELECT 1 FROM review_native_mutation_authorization WHERE token = 1
++    )
+ )
+ BEGIN
+     SELECT RAISE(ABORT, 'native review graph is immutable');
+@@ -2149,8 +2258,11 @@ WHEN (
+            AND e.kind = 'same_card_review_claimed'
+            AND e.run_id = t.current_run_id
+     )
+-) AND NOT EXISTS (
+-    SELECT 1 FROM review_native_mutation_authorization WHERE token = 1
++) AND (
++    review_native_connection_authorized() != 1
++    OR NOT EXISTS (
++        SELECT 1 FROM review_native_mutation_authorization WHERE token = 1
++    )
+ )
+ BEGIN
+     SELECT RAISE(ABORT, 'native review graph is immutable');
+@@ -2187,8 +2299,11 @@ WHEN (
+            AND e.kind = 'same_card_review_claimed'
+            AND e.run_id = t.current_run_id
+     )
+-) AND NOT EXISTS (
+-    SELECT 1 FROM review_native_mutation_authorization WHERE token = 1
++) AND (
++    review_native_connection_authorized() != 1
++    OR NOT EXISTS (
++        SELECT 1 FROM review_native_mutation_authorization WHERE token = 1
++    )
+ )
+ BEGIN
+     SELECT RAISE(ABORT, 'native review graph is immutable');
+@@ -2240,6 +2355,19 @@ def _resolve_busy_timeout_ms() -> int:
+     return DEFAULT_BUSY_TIMEOUT_MS
+
+
++def _review_native_connection_authorized() -> int:
++    """Connection-local SQL capability exposed only by trusted runtimes.
++
++    Raw ``sqlite3.connect`` writers do not have this function registered, so
++    protected triggers fail closed even if durable marker rows are forged.
++    """
++    return int(
++        _REVIEW_NATIVE_MUTATION_AUTH.get()
++        or _REVIEW_SCHEMA_MIGRATION_AUTH.get()
++        or _REVIEW_DISPATCH_AUTH.get() is not None
++    )
++
++
+ def _review_boundary_authorizer(
+     action: int,
+     arg1: Optional[str],
+@@ -2345,6 +2473,12 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
+         cached_statements=0,
+     )
+     try:
++        conn.create_function(
++            "review_native_connection_authorized",
++            0,
++            _review_native_connection_authorized,
++            deterministic=False,
++        )
+         conn.set_authorizer(_review_boundary_authorizer)
+         # ``sqlite3.connect(timeout=...)`` normally maps to busy_timeout, but set
+         # the PRAGMA explicitly so it is observable and survives future wrapper
+@@ -3149,6 +3283,7 @@ def _replace_review_boundary_triggers(conn: sqlite3.Connection) -> None:
+         "trg_review_terminal_status_immutable",
+         "trg_review_task_delete_immutable",
+         "trg_review_event_insert_authorized",
++        "trg_review_lifecycle_event_insert_authorized",
+         "trg_review_event_update_immutable",
+         "trg_review_event_delete_immutable",
+         "trg_review_handoff_insert_authorized",
+@@ -3176,6 +3311,95 @@ def _execute_schema_script_atomically(conn: sqlite3.Connection, script: str) ->
+         conn.execute(trailing)
+
+
++def _normalise_review_trigger_sql(sql: str) -> str:
++    """Canonicalise SQLite's formatting while preserving trigger semantics."""
++    text = re.sub(r"--[^\n]*", " ", sql)
++    text = re.sub(r"\bIF\s+NOT\s+EXISTS\b", "", text, flags=re.IGNORECASE)
++    return re.sub(r"\s+", " ", text.strip().rstrip(";")).casefold()
++
++
++def _expected_review_trigger_sql() -> dict[str, str]:
++    expected: dict[str, str] = {}
++    statement = ""
++    for line in SCHEMA_SQL.splitlines(keepends=True):
++        statement += line
++        if not sqlite3.complete_statement(statement):
++            continue
++        match = re.search(
++            r"\bCREATE\s+TRIGGER(?:\s+IF\s+NOT\s+EXISTS)?\s+([A-Za-z0-9_]+)",
++            statement,
++            flags=re.IGNORECASE,
++        )
++        if match and match.group(1) in _REVIEW_PROTECTED_TRIGGER_NAMES:
++            expected[match.group(1)] = _normalise_review_trigger_sql(statement)
++        statement = ""
++    if set(expected) != set(_REVIEW_PROTECTED_TRIGGER_NAMES):
++        missing = sorted(set(_REVIEW_PROTECTED_TRIGGER_NAMES) - set(expected))
++        raise sqlite3.DatabaseError(
++            "protected trigger definitions are missing from SCHEMA_SQL: "
++            + ", ".join(missing)
++        )
++    return expected
++
++
++def _refuse_lossy_review_schema_repair(conn: sqlite3.Connection) -> None:
++    """Refuse to recreate missing native-boundary tables after prior install.
++
++    A genuinely legacy or empty board can receive the additive schema. Once any
++    protected object or native review evidence exists, a missing protected table
++    is evidence loss and must be recovered from a backup instead of silently
++    creating an empty replacement.
++    """
++    rows = conn.execute(
++        "SELECT type, name FROM sqlite_master WHERE type IN ('table', 'trigger')"
++    ).fetchall()
++    tables = {str(row["name"]) for row in rows if row["type"] == "table"}
++    missing = set(_REVIEW_PROTECTED_SCHEMA_TABLES) - tables
++    if not missing:
++        return
++    names = {str(row["name"]) for row in rows}
++    native_tables = {
++        "review_remediation_handoffs",
++        _REVIEW_NATIVE_MUTATION_AUTH_TABLE,
++        _REVIEW_RUN_CAPABILITY_TABLE,
++        _REVIEW_DISPATCH_AUTH_TABLE,
++        _REVIEW_SCHEMA_MIGRATION_TABLE,
++    }
++    existing_native_tables = sorted((native_tables - missing) & tables)
++    prior_boundary = bool(set(_REVIEW_PROTECTED_TRIGGER_NAMES) & names)
++    if not prior_boundary:
++        prior_boundary = any(
++            conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None
++            for table in existing_native_tables
++        )
++    if not prior_boundary and "task_events" in tables:
++        event_columns = {
++            str(row["name"])
++            for row in conn.execute("PRAGMA table_info(task_events)").fetchall()
++        }
++        if "kind" in event_columns:
++            placeholders = ", ".join("?" for _ in _REVIEW_PROTECTED_EVENT_KINDS)
++            prior_boundary = conn.execute(
++                f"SELECT 1 FROM task_events WHERE kind IN ({placeholders}) LIMIT 1",
++                tuple(sorted(_REVIEW_PROTECTED_EVENT_KINDS)),
++            ).fetchone() is not None
++    if not prior_boundary and "tasks" in tables:
++        task_columns = {
++            str(row["name"])
++            for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
++        }
++        if "idempotency_key" in task_columns:
++            prior_boundary = conn.execute(
++                "SELECT 1 FROM tasks "
++                "WHERE idempotency_key GLOB 'review-remediation:v2:*' LIMIT 1"
++            ).fetchone() is not None
++    if prior_boundary:
++        raise sqlite3.DatabaseError(
++            "refusing lossy repair of missing protected review tables: "
++            + ", ".join(sorted(missing))
++        )
++
++
+ def _assert_review_boundary_integrity(conn: sqlite3.Connection) -> None:
+     """Read back the complete protected schema before trusted use/commit."""
+     expected_tables = set(_REVIEW_PROTECTED_SCHEMA_TABLES)
+@@ -3216,11 +3440,18 @@ def _assert_review_boundary_integrity(conn: sqlite3.Connection) -> None:
+             "review schema migration left protected triggers missing: "
+             + ", ".join(missing)
+         )
+-    if any(
+-        not isinstance(row["sql"], str) or "TRIGGER" not in row["sql"].upper()
+-        for row in trigger_rows
+-    ):
+-        raise sqlite3.DatabaseError("review schema trigger readback is malformed")
++    trigger_by_name = {str(row["name"]): row["sql"] for row in trigger_rows}
++    expected_trigger_sql = _expected_review_trigger_sql()
++    drifted = sorted(
++        name
++        for name, expected_sql in expected_trigger_sql.items()
++        if not isinstance(trigger_by_name.get(name), str)
++        or _normalise_review_trigger_sql(str(trigger_by_name[name])) != expected_sql
++    )
++    if drifted:
++        raise sqlite3.DatabaseError(
++            "protected review trigger semantics drifted: " + ", ".join(drifted)
++        )
+     messages = _run_integrity_check(conn)
+     if not _integrity_messages_ok(messages):
+         raise sqlite3.DatabaseError(
+@@ -3361,6 +3592,7 @@ def connect(
+                     with _review_schema_migration_authorized():
+                         _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
+                         try:
++                            _refuse_lossy_review_schema_repair(conn)
+                             _preflight_review_schema_columns(conn)
+                             _replace_review_boundary_triggers(conn)
+                             _execute_schema_script_atomically(conn, SCHEMA_SQL)
+@@ -5380,11 +5612,15 @@ def _append_event(
+     """
+     now = int(time.time())
+     pl = json.dumps(payload, ensure_ascii=False) if payload else None
+-    conn.execute(
+-        "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+-        "VALUES (?, ?, ?, ?, ?)",
+-        (task_id, run_id, kind, pl, now),
+-    )
++    token = _REVIEW_NATIVE_MUTATION_AUTH.set(True)
++    try:
++        conn.execute(
++            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
++            "VALUES (?, ?, ?, ?, ?)",
++            (task_id, run_id, kind, pl, now),
++        )
++    finally:
++        _REVIEW_NATIVE_MUTATION_AUTH.reset(token)
+
+
+ def _end_run(
+@@ -5417,7 +5653,7 @@ def _end_run(
+     run_id = int(row["current_run_id"])
+     if expected_run_id is not None and run_id != int(expected_run_id):
+         return None
+-    run_where = "WHERE id = ? AND ended_at IS NULL"
++    run_where = "WHERE id = ? AND task_id = ? AND ended_at IS NULL"
+     run_params: list[Any] = [
+         status or outcome,
+         outcome,
+@@ -5426,15 +5662,16 @@ def _end_run(
+         json.dumps(metadata, ensure_ascii=False) if metadata else None,
+         now,
+         run_id,
++        task_id,
+     ]
+     if expected_claim is not None:
+         expected_lock, expected_expires, expected_pid = expected_claim
+         run_where += (
+-            " AND task_id = ? AND status = 'running' "
++            " AND status = 'running' "
+             "AND claim_lock IS ? AND claim_expires IS ? AND worker_pid IS ?"
+         )
+         run_params.extend([
+-            task_id, expected_lock, expected_expires, expected_pid,
++            expected_lock, expected_expires, expected_pid,
+         ])
+     run_cur = conn.execute(
+         f"""
+@@ -5452,11 +5689,16 @@ def _end_run(
+         """,
+         tuple(run_params),
+     )
+-    if expected_claim is not None and run_cur.rowcount != 1:
+-        raise RuntimeError("active run claim CAS failed while ending run")
+-    conn.execute(
+-        "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
++    if run_cur.rowcount != 1:
++        if expected_claim is not None:
++            raise RuntimeError("active run claim CAS failed while ending run")
++        return None
++    task_cur = conn.execute(
++        "UPDATE tasks SET current_run_id = NULL WHERE id = ? AND current_run_id = ?",
++        (task_id, run_id),
+     )
++    if task_cur.rowcount != 1:
++        raise RuntimeError("task/run pointer CAS failed while ending run")
+     return run_id
+
+
+@@ -6276,6 +6518,7 @@ def release_stale_claims(
+     conn: sqlite3.Connection,
+     *,
+     signal_fn=None,
++    process_identity_fn=None,
+     excluded_task_ids: Optional[set[Any]] = None,
+ ) -> int:
+     """Reclaim expired claims using a complete captured-state CAS.
+@@ -6376,8 +6619,15 @@ def release_stale_claims(
+                 )
+             continue
+
++        captured_process_identity = _spawned_process_identity(
++            conn, task_id, captured_run_id, captured_pid
++        )
+         termination = _terminate_reclaimed_worker(
+-            captured_pid, captured_lock, signal_fn=signal_fn,
++            captured_pid,
++            captured_lock,
++            expected_process_identity=captured_process_identity,
++            process_identity_fn=process_identity_fn,
++            signal_fn=signal_fn,
+         )
+         if _worker_survived_termination(termination):
+             _defer_reclaim_for_live_worker(
+@@ -6450,7 +6700,7 @@ def release_stale_claims(
+                 "heartbeat_stale": bool(heartbeat_stale),
+                 "retry_status": retry_status,
+             }
+-            payload.update(termination)
++            payload.update(_reclaim_termination_event_fields(termination))
+             _append_event(conn, task_id, "reclaimed", payload, run_id=run_id)
+             reclaimed += 1
+         if _kanban_observer_consumed("on_kanban_worker_stale_claim"):
+@@ -6473,6 +6723,7 @@ def reclaim_task(
+     *,
+     reason: Optional[str] = None,
+     signal_fn=None,
++    process_identity_fn=None,
+ ) -> bool:
+     """Operator-driven reclaim: release the claim and restore its source phase.
+
+@@ -6501,9 +6752,29 @@ def reclaim_task(
+     prev_lock = row["claim_lock"]
+     captured_claim_expires = row["claim_expires"]
+     captured_worker_pid = row["worker_pid"]
++    captured_process_identity = _spawned_process_identity(
++        conn, task_id, captured_run_id, captured_worker_pid
++    )
+     termination = _terminate_reclaimed_worker(
+-        captured_worker_pid, prev_lock, signal_fn=signal_fn,
++        captured_worker_pid,
++        prev_lock,
++        expected_process_identity=captured_process_identity,
++        process_identity_fn=process_identity_fn,
++        signal_fn=signal_fn,
+     )
++    if _worker_survived_termination(termination):
++        _defer_reclaim_for_live_worker(
++            conn,
++            task_id,
++            prev_lock,
++            int(time.time()),
++            termination,
++            reason="manual_reclaim_process_identity_unverified",
++            captured_run_id=captured_run_id,
++            captured_worker_pid=captured_worker_pid,
++            captured_claim_expires=captured_claim_expires,
++        )
++        return False
+     with _review_native_mutation_authorized(), write_txn(conn):
+         active_run_id = captured_run_id
+         standalone_receipt = (
+@@ -6540,6 +6811,7 @@ def reclaim_task(
+             ),
+             metadata=termination,
+             expected_run_id=captured_run_id,
++            expected_claim=(prev_lock, captured_claim_expires, captured_worker_pid),
+         )
+         if standalone_receipt:
+             _append_event(
+@@ -6559,7 +6831,7 @@ def reclaim_task(
+             "prev_lock": prev_lock,
+             "retry_status": retry_status,
+         }
+-        payload.update(termination)
++        payload.update(_reclaim_termination_event_fields(termination))
+         _append_event(
+             conn, task_id, "reclaimed",
+             payload,
+@@ -8052,6 +8324,75 @@ _REVIEW_GIT_CONFIG_ARGS = (
+ )
+
+
++def _review_run_bounded(
++    command: list[str],
++    *,
++    timeout: float,
++) -> subprocess.CompletedProcess:
++    """Run one isolated Git probe with strict byte/time/UTF-8 bounds."""
++    process = subprocess.Popen(
++        command,
++        env=_review_git_env(),
++        stdin=subprocess.DEVNULL,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++    )
++    stdout = bytearray()
++    stderr = bytearray()
++    overflow = threading.Event()
++
++    def _drain(stream, sink: bytearray, limit: int) -> None:
++        try:
++            while True:
++                chunk = stream.read(65536)
++                if not chunk:
++                    break
++                if len(sink) + len(chunk) > limit:
++                    overflow.set()
++                    try:
++                        process.kill()
++                    except OSError:
++                        pass
++                    break
++                sink.extend(chunk)
++        finally:
++            try:
++                stream.close()
++            except OSError:
++                pass
++
++    assert process.stdout is not None and process.stderr is not None
++    out_thread = threading.Thread(
++        target=_drain,
++        args=(process.stdout, stdout, _REVIEW_MAX_GIT_STDOUT_BYTES),
++        daemon=True,
++    )
++    err_thread = threading.Thread(
++        target=_drain,
++        args=(process.stderr, stderr, _REVIEW_MAX_GIT_STDERR_BYTES),
++        daemon=True,
++    )
++    out_thread.start()
++    err_thread.start()
++    try:
++        returncode = process.wait(timeout=timeout)
++    except subprocess.TimeoutExpired as exc:
++        process.kill()
++        process.wait()
++        raise RuntimeError("repository Git probe exceeded its time limit") from exc
++    finally:
++        out_thread.join(timeout=2)
++        err_thread.join(timeout=2)
++    if overflow.is_set():
++        raise RuntimeError("repository Git probe exceeded its output limit")
++    try:
++        stdout_text = bytes(stdout).decode("utf-8", errors="strict")
++        stderr_text = bytes(stderr).decode("utf-8", errors="strict")
++    except UnicodeDecodeError as exc:
++        raise RuntimeError("repository Git probe returned malformed UTF-8 paths") from exc
++    return subprocess.CompletedProcess(command, returncode, stdout_text, stderr_text)
++
++
+ def _review_git_callback_overrides(workspace: Path) -> Optional[tuple[str, ...]]:
+     """Enumerate and disable every repository-configured callback key.
+
+@@ -8062,7 +8403,7 @@ def _review_git_callback_overrides(workspace: Path) -> Optional[tuple[str, ...]]
+     ``None`` fails closed if the local config cannot be read.
+     """
+     try:
+-        result = subprocess.run(
++        result = _review_run_bounded(
+             [
+                 "/usr/bin/git",
+                 "--no-pager",
+@@ -8076,13 +8417,9 @@ def _review_git_callback_overrides(workspace: Path) -> Optional[tuple[str, ...]]
+                 "--get-regexp",
+                 r"^(filter|diff)\.",
+             ],
+-            env=_review_git_env(),
+-            text=True,
+-            capture_output=True,
+-            check=False,
+             timeout=15,
+         )
+-    except (OSError, subprocess.TimeoutExpired):
++    except (OSError, RuntimeError):
+         return None
+     if result.returncode not in {0, 1}:
+         return None
+@@ -8123,7 +8460,7 @@ def _review_git_probe(
+     callback_overrides = _review_git_callback_overrides(workspace)
+     if callback_overrides is None:
+         raise RuntimeError("repository Git callback configuration could not be isolated")
+-    return subprocess.run(
++    return _review_run_bounded(
+         [
+             "/usr/bin/git",
+             "--no-pager",
+@@ -8134,10 +8471,6 @@ def _review_git_probe(
+             str(workspace),
+             *arguments,
+         ],
+-        env=_review_git_env(),
+-        text=True,
+-        capture_output=True,
+-        check=False,
+         timeout=timeout,
+     )
+
+@@ -8166,9 +8499,14 @@ def _review_git_worktree_clean(workspace: Path) -> bool:
+     if algorithm not in {"sha1", "sha256"}:
+         return False
+     root = workspace.resolve(strict=True)
++    tracked_count = 0
++    tracked_bytes = 0
+     for record in (tracked.stdout or "").split("\x00"):
+         if not record:
+             continue
++        tracked_count += 1
++        if tracked_count > _REVIEW_MAX_TRACKED_FILES:
++            return False
+         try:
+             header, raw_path = record.split("\t", 1)
+             mode, expected_oid, stage = header.split()
+@@ -8192,15 +8530,22 @@ def _review_git_worktree_clean(workspace: Path) -> bool:
+                 if not item_stat or not candidate.is_symlink():
+                     return False
+                 data = os.fsencode(os.readlink(candidate))
++                if len(data) > _REVIEW_MAX_TRACKED_FILE_BYTES:
++                    return False
+             elif mode in {"100644", "100755"}:
+                 if not stat.S_ISREG(item_stat.st_mode):
+                     return False
++                if item_stat.st_size > _REVIEW_MAX_TRACKED_FILE_BYTES:
++                    return False
+                 executable = bool(item_stat.st_mode & 0o111)
+                 if executable != (mode == "100755"):
+                     return False
+                 data = candidate.read_bytes()
+             else:
+                 return False
++            tracked_bytes += len(data)
++            if tracked_bytes > _REVIEW_MAX_TRACKED_TOTAL_BYTES:
++                return False
+         except (OSError, RuntimeError, ValueError):
+             return False
+         digest = hashlib.new(
+@@ -8213,7 +8558,6 @@ def _review_git_worktree_clean(workspace: Path) -> bool:
+             workspace,
+             "ls-files",
+             "--others",
+-            "--exclude-standard",
+             "-z",
+             timeout=15,
+         )
+@@ -9731,7 +10075,7 @@ def block_task(
+     fenced_run_id = _exact_positive_run_id(expected_run_id)
+     recurrences = 0
+     now = int(time.time())
+-    with write_txn(conn):
++    with _review_native_mutation_authorized(), write_txn(conn):
+         cur_row = conn.execute(
+             "SELECT status, block_kind, block_recurrences, claim_lock, claim_expires "
+             "FROM tasks WHERE id = ?",
+@@ -10013,6 +10357,7 @@ def request_review(
+     reviewer: Optional[str] = None,
+     expected_run_id: Optional[int] = None,
+     force: bool = False,
++    operator_capability: object | None = None,
+     with_reason: bool = False,
+ ):
+     """Transition implementation work into the first-class review phase.
+@@ -10025,10 +10370,11 @@ def request_review(
+     reviewer provenance persisted by the latest ``changes_requested`` event.
+
+     When the task is ``running`` under a live claim, a caller that supplies no
+-    ``expected_run_id`` must pass ``force=True`` (explicit human/CLI override)
+-    — otherwise the request is refused instead of silently clearing the live
+-    worker's ``claim_lock``/``worker_pid``. Workers prove ownership by passing
+-    their own run id as ``expected_run_id`` (unchanged).
++    ``expected_run_id`` must pass both ``force=True`` and a process-local
++    ``operator_capability`` minted by an authenticated orchestrator surface.
++    The boolean alone is never authority, and even an operator override remains
++    fenced to the exact live run/claim/lease tuple. Workers prove ownership by
++    passing their own run id as ``expected_run_id``.
+
+     Returns ``bool`` by default. With ``with_reason=True`` returns
+     ``(ok, reason)`` mirroring :func:`request_changes` — ``reason`` is a
+@@ -10046,6 +10392,8 @@ def request_review(
+     raw_metadata = metadata
+     if type(force) is not bool:
+         return _ret(False, "force must be an explicit boolean authorization")
++    if force and not _operator_review_capability_is_current(operator_capability):
++        return _ret(False, "force requires an authenticated operator capability")
+     fenced_run_id = _exact_positive_run_id(expected_run_id)
+     if expected_run_id is not None and fenced_run_id is None:
+         return _ret(False, "expected_run_id must be an exact positive built-in integer")
+@@ -10080,13 +10428,19 @@ def request_review(
+                 _exact_positive_run_id(trow["current_run_id"]) is None
+                 or not str(trow["claim_lock"] or "").strip()
+                 or _exact_positive_run_id(trow["claim_expires"]) is None
++                or int(trow["claim_expires"]) <= now
+             ):
+                 return _ret(
+                     False,
+-                    "force requires an exact current worker claim; malformed running state is not overridable",
++                    "force requires an exact live current worker claim; malformed or expired running state is not overridable",
+                 )
+         elif fenced_run_id is not None:
+             return _ret(False, "expected_run_id does not match an active worker run")
++        elif any(
++            trow[field] is not None
++            for field in ("current_run_id", "claim_lock", "claim_expires", "worker_pid")
++        ):
++            return _ret(False, "ready task carries inconsistent active-run state")
+
+         implementer = _canonical_assignee(str(trow["assignee"] or ""))
+         if not implementer:
+@@ -10195,7 +10549,7 @@ def request_review(
+             trow["worker_pid"],
+         ])
+         lease_guard = ""
+-        if trow["status"] == "running" and fenced_run_id is not None and not force:
++        if trow["status"] == "running":
+             lease_guard = "\n               AND claim_expires > ?"
+             update_params.append(now)
+         cur = conn.execute(
+@@ -10221,6 +10575,16 @@ def request_review(
+                 "task is not in running/ready (or expected_run_id did not "
+                 "match the current run)",
+             )
++        ending_run_id = (
++            _exact_positive_run_id(trow["current_run_id"])
++            if trow["status"] == "running"
++            else None
++        )
++        ending_claim = (
++            (trow["claim_lock"], trow["claim_expires"], trow["worker_pid"])
++            if ending_run_id is not None
++            else None
++        )
+         run_id = _end_run(
+             conn,
+             task_id,
+@@ -10228,6 +10592,8 @@ def request_review(
+             status="review",
+             summary=summary,
+             metadata=metadata,
++            expected_run_id=ending_run_id,
++            expected_claim=ending_claim,
+         )
+         if run_id is None and (summary or metadata):
+             run_id = _synthesize_ended_run(
+@@ -12124,13 +12490,88 @@ def _pid_alive(pid: Optional[int]) -> bool:
+     return True
+
+
++def _process_identity_token(pid: Optional[int]) -> Optional[str]:
++    """Return a bounded process-start identity that survives PID reuse checks."""
++    if not pid or pid <= 0:
++        return None
++    try:
++        if sys.platform == "linux":
++            stat_text = Path(f"/proc/{int(pid)}/stat").read_text(
++                encoding="utf-8", errors="strict"
++            )
++            close_paren = stat_text.rfind(")")
++            if close_paren < 0:
++                return None
++            fields = stat_text[close_paren + 2 :].split()
++            if len(fields) <= 19:
++                return None
++            start_ticks = fields[19]
++            boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(
++                encoding="ascii", errors="strict"
++            ).strip()
++            token = f"linux:{boot_id}:{start_ticks}"
++        elif sys.platform == "darwin":
++            proc = subprocess.run(
++                ["ps", "-o", "lstart=", "-p", str(int(pid))],
++                stdout=subprocess.PIPE,
++                stderr=subprocess.DEVNULL,
++                text=True,
++                encoding="utf-8",
++                errors="strict",
++                timeout=1,
++                check=False,
++            )
++            if proc.returncode != 0:
++                return None
++            token = f"darwin:{(proc.stdout or '').strip()}"
++        else:
++            return None
++    except (OSError, UnicodeError, subprocess.SubprocessError, TimeoutError):
++        return None
++    return token[:_PROCESS_IDENTITY_TOKEN_MAX_BYTES] if token else None
++
++
++def _spawned_process_identity(
++    conn: sqlite3.Connection,
++    task_id: str,
++    run_id: Optional[int],
++    pid: Optional[int],
++) -> Optional[str]:
++    if run_id is None or pid is None:
++        return None
++    row = conn.execute(
++        "SELECT payload FROM task_events "
++        "WHERE task_id = ? AND run_id = ? AND kind = 'spawned' "
++        "ORDER BY id DESC LIMIT 1",
++        (task_id, run_id),
++    ).fetchone()
++    if row is None or not isinstance(row["payload"], str):
++        return None
++    try:
++        payload = json.loads(row["payload"])
++    except (json.JSONDecodeError, TypeError, ValueError):
++        return None
++    token = payload.get("process_identity") if isinstance(payload, dict) else None
++    if (
++        type(payload.get("pid")) is not int
++        or payload.get("pid") != int(pid)
++        or not isinstance(token, str)
++        or not token
++        or len(token.encode("utf-8")) > _PROCESS_IDENTITY_TOKEN_MAX_BYTES
++    ):
++        return None
++    return token
++
++
+ def _terminate_reclaimed_worker(
+     pid: Optional[int],
+     claim_lock: Optional[str],
+     *,
++    expected_process_identity: Optional[str] = None,
++    process_identity_fn=None,
+     signal_fn=None,
+ ) -> dict[str, Any]:
+-    """Best-effort host-local worker termination for reclaim paths."""
++    """Best-effort host-local termination fenced against PID reuse."""
+     import signal
+
+     info: dict[str, Any] = {
+@@ -12139,6 +12580,8 @@ def _terminate_reclaimed_worker(
+         "termination_attempted": False,
+         "terminated": False,
+         "sigkill": False,
++        "process_identity_verified": False,
++        "process_identity_mismatch": False,
+     }
+     if not pid or pid <= 0 or not claim_lock:
+         return info
+@@ -12148,19 +12591,31 @@ def _terminate_reclaimed_worker(
+         return info
+     info["host_local"] = True
+
++    identity = process_identity_fn or _process_identity_token
++    live_identity = identity(int(pid))
++    if not expected_process_identity or live_identity != expected_process_identity:
++        info["process_identity_mismatch"] = bool(live_identity)
++        info["termination_attempted"] = _pid_alive(pid)
++        info["identity_unverified_alive"] = _pid_alive(pid)
++        return info
++    info["process_identity_verified"] = True
++
+     kill = signal_fn if signal_fn is not None else (
+         os.kill if hasattr(os, "kill") else None
+     )
+     if kill is None:
+         return info
+
++    # Re-read immediately before every signal; the PID may have been reused
++    # after the durable claim snapshot or during the TERM grace period.
++    if identity(int(pid)) != expected_process_identity:
++        info["process_identity_mismatch"] = True
++        info["identity_unverified_alive"] = _pid_alive(pid)
++        return info
+     info["termination_attempted"] = True
+     try:
+         kill(int(pid), signal.SIGTERM)
+     except ProcessLookupError:
+-        # Process is already gone — that's a successful termination, not a
+-        # survival. Leaving terminated=False here would make the reclaim guard
+-        # misread a dead worker as still-alive and defer forever.
+         info["terminated"] = True
+         return info
+     except OSError:
+@@ -12170,22 +12625,43 @@ def _terminate_reclaimed_worker(
+         if not _pid_alive(pid):
+             info["terminated"] = True
+             return info
++        if identity(int(pid)) != expected_process_identity:
++            # The original process is gone and the PID now belongs elsewhere.
++            info["terminated"] = True
++            info["process_identity_mismatch"] = True
++            return info
+         time.sleep(0.5)
+
+     if _pid_alive(pid):
++        if identity(int(pid)) != expected_process_identity:
++            info["terminated"] = True
++            info["process_identity_mismatch"] = True
++            return info
+         try:
+-            # signal.SIGKILL doesn't exist on Windows; fall back to SIGTERM
+-            # (which maps to TerminateProcess via the stdlib shim).
+             _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+             kill(int(pid), _sigkill)
+             info["sigkill"] = True
+-        except (ProcessLookupError, OSError):
++        except ProcessLookupError:
++            info["terminated"] = True
++            return info
++        except OSError:
+             return info
+
+     info["terminated"] = not _pid_alive(pid)
+     return info
+
+
++def _reclaim_termination_event_fields(termination: Mapping[str, Any]) -> dict[str, Any]:
++    """Keep requeue-authority payloads on their stable, exact public schema."""
++    return {
++        "prev_pid": termination.get("prev_pid"),
++        "host_local": bool(termination.get("host_local")),
++        "termination_attempted": bool(termination.get("termination_attempted")),
++        "terminated": bool(termination.get("terminated")),
++        "sigkill": bool(termination.get("sigkill")),
++    }
++
++
+ def _worker_survived_termination(termination: dict) -> bool:
+     """True when we tried to kill our own host-local worker and it is still alive.
+
+@@ -12327,6 +12803,7 @@ def enforce_max_runtime(
+     conn: sqlite3.Connection,
+     *,
+     signal_fn=None,
++    process_identity_fn=None,
+     excluded_task_ids: Optional[set[Any]] = None,
+ ) -> list[str]:
+     """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
+@@ -12341,18 +12818,21 @@ def enforce_max_runtime(
+     (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a
+     test hook; defaults to ``os.kill`` on POSIX.
+     """
+-    import signal
+     timed_out: list[str] = []
+     excluded_task_ids = excluded_task_ids or set()
+     now = int(time.time())
+     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+
+     rows = conn.execute(
+-        "SELECT t.id, t.worker_pid, "
++        "SELECT t.id, t.current_run_id, t.worker_pid, t.claim_lock, "
++        "       t.claim_expires, "
+         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
+-        "       t.max_runtime_seconds, t.claim_lock "
++        "       t.max_runtime_seconds, "
++        "       r.claim_lock AS run_claim_lock, "
++        "       r.claim_expires AS run_claim_expires, "
++        "       r.worker_pid AS run_worker_pid "
+         "FROM tasks t "
+-        "LEFT JOIN task_runs r ON r.id = t.current_run_id "
++        "LEFT JOIN task_runs r ON r.id = t.current_run_id AND r.task_id = t.id "
+         "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
+         "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
+         "  AND t.worker_pid IS NOT NULL"
+@@ -12372,34 +12852,43 @@ def enforce_max_runtime(
+
+         pid = int(row["worker_pid"])
+         tid = row["id"]
+-        # SIGTERM then SIGKILL. Keep it simple: 5 s grace. Workers that
+-        # want a cleaner shutdown can install their own SIGTERM handler
+-        # before the grace expires.
+-        killed = False
+-        kill = signal_fn if signal_fn is not None else (
+-            os.kill if hasattr(os, "kill") else None
++        captured_run_id = _exact_positive_run_id(row["current_run_id"])
++        captured_lock = row["claim_lock"]
++        captured_expires = row["claim_expires"]
++        if (
++            captured_run_id is None
++            or row["run_claim_lock"] != captured_lock
++            or row["run_claim_expires"] != captured_expires
++            or row["run_worker_pid"] != pid
++        ):
++            continue
++        captured_process_identity = _spawned_process_identity(
++            conn, tid, captured_run_id, pid
+         )
+-        if kill is not None:
+-            try:
+-                kill(pid, signal.SIGTERM)
+-            except (ProcessLookupError, OSError):
+-                pass
+-            # Short polling wait — no time.sleep on the write txn.
+-            for _ in range(10):
+-                if not _pid_alive(pid):
+-                    break
+-                time.sleep(0.5)
+-            if _pid_alive(pid):
+-                try:
+-                    # signal.SIGKILL doesn't exist on Windows.
+-                    _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+-                    kill(pid, _sigkill)
+-                    killed = True
+-                except (ProcessLookupError, OSError):
+-                    pass
++        termination = _terminate_reclaimed_worker(
++            pid,
++            captured_lock,
++            expected_process_identity=captured_process_identity,
++            process_identity_fn=process_identity_fn,
++            signal_fn=signal_fn,
++        )
++        if _worker_survived_termination(termination):
++            _defer_reclaim_for_live_worker(
++                conn,
++                tid,
++                captured_lock,
++                now,
++                termination,
++                reason="max_runtime_worker_alive_or_identity_unverified",
++                captured_run_id=captured_run_id,
++                captured_worker_pid=pid,
++                captured_claim_expires=captured_expires,
++            )
++            continue
++        killed = bool(termination.get("sigkill"))
+
+         with _review_native_mutation_authorized(), write_txn(conn):
+-            active_run_id = _current_run_id(conn, tid)
++            active_run_id = captured_run_id
+             standalone_receipt = (
+                 active_run_id is not None
+                 and conn.execute(
+@@ -12419,8 +12908,16 @@ def enforce_max_runtime(
+                 "claim_expires = NULL, worker_pid = NULL, "
+                 "last_heartbeat_at = NULL "
+                 "WHERE id = ? AND status = 'running' "
+-                "  AND worker_pid = ? AND claim_lock IS ?",
+-                (retry_status, tid, pid, row["claim_lock"]),
++                "  AND current_run_id IS ? AND worker_pid IS ? "
++                "  AND claim_lock IS ? AND claim_expires IS ?",
++                (
++                    retry_status,
++                    tid,
++                    captured_run_id,
++                    pid,
++                    captured_lock,
++                    captured_expires,
++                ),
+             )
+             if cur.rowcount == 1:
+                 payload = {
+@@ -12430,12 +12927,19 @@ def enforce_max_runtime(
+                     "sigkill": killed,
+                     "retry_status": retry_status,
+                 }
++                payload.update(termination)
+                 run_id = _end_run(
+                     conn, tid,
+                     outcome=("review_incomplete" if standalone_receipt else "timed_out"),
+                     status=("blocked" if standalone_receipt else "timed_out"),
+                     error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
+                     metadata=payload,
++                    expected_run_id=captured_run_id,
++                    expected_claim=(
++                        row["run_claim_lock"],
++                        row["run_claim_expires"],
++                        row["run_worker_pid"],
++                    ),
+                 )
+                 if standalone_receipt:
+                     _append_event(
+@@ -12470,6 +12974,8 @@ def enforce_max_runtime(
+                     "sigkill": killed,
+                     "retry_status": retry_status,
+                 },
++                expected_run_id=captured_run_id,
++                expected_settled_status=retry_status,
+             )
+     return timed_out
+
+@@ -12486,6 +12992,7 @@ def detect_stale_running(
+     *,
+     stale_timeout_seconds: int = 0,
+     signal_fn=None,
++    process_identity_fn=None,
+     excluded_task_ids: Optional[set[Any]] = None,
+ ) -> list[str]:
+     """Reclaim heartbeat-stale workers only when the captured run still owns the lease."""
+@@ -12519,8 +13026,15 @@ def detect_stale_running(
+         captured_pid = row["worker_pid"]
+         captured_lock = row["claim_lock"]
+         captured_expires = row["claim_expires"]
++        captured_process_identity = _spawned_process_identity(
++            conn, task_id, captured_run_id, captured_pid
++        )
+         termination = _terminate_reclaimed_worker(
+-            captured_pid, captured_lock, signal_fn=signal_fn,
++            captured_pid,
++            captured_lock,
++            expected_process_identity=captured_process_identity,
++            process_identity_fn=process_identity_fn,
++            signal_fn=signal_fn,
+         )
+         if _worker_survived_termination(termination):
+             _defer_reclaim_for_live_worker(
+@@ -12811,14 +13325,15 @@ def detect_crashed_workers(
+     # clean-exit-but-still-running case, which is accounted against its
+     # own bounded violation streak instead of the unified failure
+     # counter (see the post-txn loop below).
+-    crash_details: list[tuple[str, int, str, bool, str]] = []
+-    # (task_id, pid, claimer, protocol_violation, error_text)
++    crash_details: list[tuple[str, int, str, bool, str, int, str]] = []
++    # (task_id, pid, claimer, protocol_violation, error_text, run_id, retry_status)
+     # Worker-exit observer payloads (RFC #58548), collected inside the main
+     # txn and fired only after every reclaim/accounting txn has committed.
+     exited_hook_payloads: list[dict] = []
+     with _review_native_mutation_authorized(), write_txn(conn):
+         rows = conn.execute(
+-            "SELECT id, worker_pid, claim_lock, started_at, assignee "
++            "SELECT id, worker_pid, claim_lock, claim_expires, current_run_id, "
++            "started_at, assignee "
+             "FROM tasks "
+             "WHERE status = 'running' AND worker_pid IS NOT NULL"
+         ).fetchall()
+@@ -12905,7 +13420,9 @@ def detect_crashed_workers(
+                     event_payload["exit_kind"] = kind
+                     event_payload["exit_code"] = code
+
+-            active_run_id = _current_run_id(conn, row["id"])
++            active_run_id = _exact_positive_run_id(row["current_run_id"])
++            if active_run_id is None:
++                continue
+             standalone_receipt = (
+                 active_run_id is not None
+                 and conn.execute(
+@@ -12925,8 +13442,16 @@ def detect_crashed_workers(
+                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                 "claim_expires = NULL, worker_pid = NULL "
+                 "WHERE id = ? AND status = 'running' "
+-                "  AND worker_pid = ? AND claim_lock IS ?",
+-                (retry_status, row["id"], pid, row["claim_lock"]),
++                "  AND current_run_id = ? AND worker_pid = ? "
++                "  AND claim_lock IS ? AND claim_expires IS ?",
++                (
++                    retry_status,
++                    row["id"],
++                    active_run_id,
++                    pid,
++                    row["claim_lock"],
++                    row["claim_expires"],
++                ),
+             )
+             if cur.rowcount == 1:
+                 # Rate-limited requeues are a clean release, not a crash —
+@@ -12943,6 +13468,12 @@ def detect_crashed_workers(
+                     status=("blocked" if standalone_receipt else _run_outcome),
+                     error=error_text,
+                     metadata=dict(event_payload),
++                    expected_run_id=active_run_id,
++                    expected_claim=(
++                        row["claim_lock"],
++                        row["claim_expires"],
++                        pid,
++                    ),
+                 )
+                 if standalone_receipt:
+                     _append_event(
+@@ -12997,8 +13528,15 @@ def detect_crashed_workers(
+                         )
+                     crashed.append(row["id"])
+                     crash_details.append(
+-                        (row["id"], pid, row["claim_lock"],
+-                         protocol_violation, error_text)
++                        (
++                            row["id"],
++                            pid,
++                            row["claim_lock"],
++                            protocol_violation,
++                            error_text,
++                            active_run_id,
++                            retry_status,
++                        )
+                     )
+     # Outside the main txn: account each crashed task and maybe trip the
+     # breaker (the retried task transitions to blocked with a ``gave_up`` event
+@@ -13020,10 +13558,18 @@ def detect_crashed_workers(
+     if crash_details:
+         # Fingerprint errors to detect systemic failures.
+         _fp_counts: dict[str, int] = {}
+-        for _, _, _, _, err_text in crash_details:
++        for _, _, _, _, err_text, _, _ in crash_details:
+             fp = _error_fingerprint(err_text)
+             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
+-        for tid, pid, claimer, protocol_violation, error_text in crash_details:
++        for (
++            tid,
++            pid,
++            claimer,
++            protocol_violation,
++            error_text,
++            failed_run_id,
++            settled_status,
++        ) in crash_details:
+             if protocol_violation:
+                 streak = _protocol_violation_streak(conn, tid)
+                 trow = conn.execute(
+@@ -13066,6 +13612,8 @@ def detect_crashed_workers(
+                         "protocol_violations": streak,
+                         "protocol_violation_limit": violation_limit,
+                     },
++                    expected_run_id=failed_run_id,
++                    expected_settled_status=settled_status,
+                 )
+                 if tripped:
+                     auto_blocked.append(tid)
+@@ -13080,6 +13628,8 @@ def detect_crashed_workers(
+                 release_claim=False,
+                 end_run=False,
+                 event_payload_extra={"pid": pid, "claimer": claimer},
++                expected_run_id=failed_run_id,
++                expected_settled_status=settled_status,
+             )
+             if tripped:
+                 auto_blocked.append(tid)
+@@ -13119,6 +13669,10 @@ def _record_task_failure(
+     release_claim: bool = False,
+     end_run: bool = False,
+     event_payload_extra: Optional[dict] = None,
++    expected_run_id: Optional[int] = None,
++    expected_claim_lock: Optional[str] = None,
++    expected_claim_expires: Optional[int] = None,
++    expected_settled_status: Optional[str] = None,
+ ) -> bool:
+     """Record a non-success outcome (spawn_failed / crashed / timed_out)
+     and maybe trip the circuit breaker.
+@@ -13165,19 +13719,43 @@ def _record_task_failure(
+     """
+     if failure_limit is None:
+         failure_limit = DEFAULT_FAILURE_LIMIT
++    fenced_run_id = _exact_positive_run_id(expected_run_id)
++    if fenced_run_id is None:
++        # Failure accounting without the originating run is an ABA write.
++        return False
+     blocked = False
+-    with write_txn(conn):
++    with _review_native_mutation_authorized(), write_txn(conn):
+         row = conn.execute(
+-            "SELECT consecutive_failures, status, max_retries, current_run_id "
++            "SELECT consecutive_failures, status, max_retries, current_run_id, "
++            "claim_lock, claim_expires, worker_pid "
+             "FROM tasks WHERE id = ?", (task_id,),
+         ).fetchone()
+         if row is None:
+             return False
+-        retry_status = (
+-            _retry_status_for_run(conn, task_id, row["current_run_id"])
+-            if release_claim
+-            else ("review" if row["status"] == "review" else "ready")
+-        )
++        if release_claim:
++            if (
++                row["status"] != "running"
++                or _exact_positive_run_id(row["current_run_id"]) != fenced_run_id
++                or row["claim_lock"] != expected_claim_lock
++                or row["claim_expires"] != expected_claim_expires
++            ):
++                return False
++            retry_status = _retry_status_for_run(conn, task_id, fenced_run_id)
++        else:
++            if (
++                row["current_run_id"] is not None
++                or not expected_settled_status
++                or row["status"] != expected_settled_status
++            ):
++                return False
++            settled = conn.execute(
++                "SELECT 1 FROM task_runs WHERE id = ? AND task_id = ? "
++                "AND ended_at IS NOT NULL AND outcome = ? LIMIT 1",
++                (fenced_run_id, task_id, outcome),
++            ).fetchone()
++            if settled is None:
++                return False
++            retry_status = row["status"]
+         failures = int(row["consecutive_failures"]) + 1
+
+         # Per-task override wins over both caller-supplied and default
+@@ -13196,23 +13774,36 @@ def _record_task_failure(
+             # Trip the breaker.
+             if release_claim:
+                 # Spawn path: still running, also clear claim state.
+-                conn.execute(
++                cur = conn.execute(
+                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+                     "claim_expires = NULL, worker_pid = NULL, "
+                     "consecutive_failures = ?, last_failure_error = ? "
+-                    "WHERE id = ? AND status IN ('running', 'ready', 'review')",
+-                    (failures, error[:500], task_id),
++                    "WHERE id = ? AND status = 'running' AND current_run_id = ? "
++                    "AND claim_lock IS ? AND claim_expires IS ? AND worker_pid IS ?",
++                    (
++                        failures,
++                        error[:500],
++                        task_id,
++                        fenced_run_id,
++                        expected_claim_lock,
++                        expected_claim_expires,
++                        row["worker_pid"],
++                    ),
+                 )
+             else:
+                 # Timeout/crash path: source phase already restored with claim
+                 # cleared; just flip to blocked + update
+                 # counter fields.
+-                conn.execute(
++                cur = conn.execute(
+                     "UPDATE tasks SET status = 'blocked', "
+                     "consecutive_failures = ?, last_failure_error = ? "
+-                    "WHERE id = ? AND status IN ('ready', 'review', 'running')",
+-                    (failures, error[:500], task_id),
++                    "WHERE id = ? AND status = ? AND current_run_id IS NULL "
++                    "AND claim_lock IS NULL AND claim_expires IS NULL "
++                    "AND worker_pid IS NULL",
++                    (failures, error[:500], task_id, expected_settled_status),
+                 )
++            if cur.rowcount != 1:
++                return False
+             run_id = None
+             if end_run:
+                 # Only the spawn path has an open run to close.
+@@ -13227,6 +13818,12 @@ def _record_task_failure(
+                         "limit_source": limit_source,
+                         "retry_status": retry_status,
+                     },
++                    expected_run_id=fenced_run_id,
++                    expected_claim=(
++                        expected_claim_lock,
++                        expected_claim_expires,
++                        row["worker_pid"],
++                    ),
+                 )
+             payload = {
+                 "failures": failures,
+@@ -13246,20 +13843,39 @@ def _record_task_failure(
+             # Below threshold.
+             if release_claim:
+                 # Spawn path: restore the claimed source phase + clear claim.
+-                conn.execute(
++                cur = conn.execute(
+                     "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                     "claim_expires = NULL, worker_pid = NULL, "
+                     "consecutive_failures = ?, last_failure_error = ? "
+-                    "WHERE id = ? AND status = 'running'",
+-                    (retry_status, failures, error[:500], task_id),
++                    "WHERE id = ? AND status = 'running' AND current_run_id = ? "
++                    "AND claim_lock IS ? AND claim_expires IS ? AND worker_pid IS ?",
++                    (
++                        retry_status,
++                        failures,
++                        error[:500],
++                        task_id,
++                        fenced_run_id,
++                        expected_claim_lock,
++                        expected_claim_expires,
++                        row["worker_pid"],
++                    ),
+                 )
+             else:
+                 # Timeout/crash path: caller already restored the source phase.
+-                conn.execute(
++                cur = conn.execute(
+                     "UPDATE tasks SET consecutive_failures = ?, "
+-                    "last_failure_error = ? WHERE id = ?",
+-                    (failures, error[:500], task_id),
++                    "last_failure_error = ? WHERE id = ? AND status = ? "
++                    "AND current_run_id IS NULL AND claim_lock IS NULL "
++                    "AND claim_expires IS NULL AND worker_pid IS NULL",
++                    (
++                        failures,
++                        error[:500],
++                        task_id,
++                        expected_settled_status,
++                    ),
+                 )
++            if cur.rowcount != 1:
++                return False
+             if end_run:
+                 # Spawn path: close the open run with outcome.
+                 run_id = _end_run(
+@@ -13270,6 +13886,12 @@ def _record_task_failure(
+                         "failures": failures,
+                         "retry_status": retry_status,
+                     },
++                    expected_run_id=fenced_run_id,
++                    expected_claim=(
++                        expected_claim_lock,
++                        expected_claim_expires,
++                        row["worker_pid"],
++                    ),
+                 )
+                 _append_event(
+                     conn, task_id, outcome,
+@@ -13292,6 +13914,9 @@ def _record_spawn_failure(
+     error: str,
+     *,
+     failure_limit: int = None,
++    expected_run_id: Optional[int] = None,
++    expected_claim_lock: Optional[str] = None,
++    expected_claim_expires: Optional[int] = None,
+ ) -> bool:
+     return _record_task_failure(
+         conn, task_id, error,
+@@ -13299,6 +13924,9 @@ def _record_spawn_failure(
+         failure_limit=failure_limit,
+         release_claim=True,
+         end_run=True,
++        expected_run_id=expected_run_id,
++        expected_claim_lock=expected_claim_lock,
++        expected_claim_expires=expected_claim_expires,
+     )
+
+
+@@ -13315,6 +13943,10 @@ def _set_worker_pid(
+     rows cannot be changed by a generic post-claim writer.
+     """
+     pid_value = int(pid)
++    process_identity = _process_identity_token(pid_value)
++    spawn_payload: dict[str, Any] = {"pid": pid_value}
++    if process_identity is not None:
++        spawn_payload["process_identity"] = process_identity
+     if expected_run_id is None:
+         with write_txn(conn):
+             conn.execute(
+@@ -13327,7 +13959,7 @@ def _set_worker_pid(
+                     "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
+                     (pid_value, run_id),
+                 )
+-            _append_event(conn, task_id, "spawned", {"pid": pid_value}, run_id=run_id)
++            _append_event(conn, task_id, "spawned", spawn_payload, run_id=run_id)
+         return
+     if expected_claim_lock is None or expected_claim_expires is None:
+         raise RuntimeError("worker PID transition requires the exact dispatcher claim")
+@@ -13357,7 +13989,7 @@ def _set_worker_pid(
+         if run_cur.rowcount != 1:
+             raise RuntimeError("worker PID transition lost the exact run")
+         _append_event(
+-            conn, task_id, "spawned", {"pid": pid_value}, run_id=expected_run_id
++            conn, task_id, "spawned", spawn_payload, run_id=expected_run_id
+         )
+
+
+@@ -14412,6 +15044,9 @@ def _dispatch_once_locked(
+             auto = _record_spawn_failure(
+                 conn, claimed.id, f"workspace: {exc}",
+                 failure_limit=failure_limit,
++                expected_run_id=claimed.current_run_id,
++                expected_claim_lock=claimed.claim_lock,
++                expected_claim_expires=claimed.claim_expires,
+             )
+             if auto:
+                 result.auto_blocked.append(claimed.id)
+@@ -14480,6 +15115,9 @@ def _dispatch_once_locked(
+             auto = _record_spawn_failure(
+                 conn, claimed.id, str(exc),
+                 failure_limit=failure_limit,
++                expected_run_id=claimed.current_run_id,
++                expected_claim_lock=claimed.claim_lock,
++                expected_claim_expires=claimed.claim_expires,
+             )
+             if auto:
+                 result.auto_blocked.append(claimed.id)
+@@ -14555,6 +15193,9 @@ def _dispatch_once_locked(
+             auto = _record_spawn_failure(
+                 conn, claimed.id, f"workspace: {exc}",
+                 failure_limit=failure_limit,
++                expected_run_id=claimed.current_run_id,
++                expected_claim_lock=claimed.claim_lock,
++                expected_claim_expires=claimed.claim_expires,
+             )
+             if auto:
+                 result.auto_blocked.append(claimed.id)
+@@ -14616,6 +15257,9 @@ def _dispatch_once_locked(
+             auto = _record_spawn_failure(
+                 conn, claimed.id, str(exc),
+                 failure_limit=failure_limit,
++                expected_run_id=claimed.current_run_id,
++                expected_claim_lock=claimed.claim_lock,
++                expected_claim_expires=claimed.claim_expires,
+             )
+             if auto:
+                 result.auto_blocked.append(claimed.id)
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -2546,6 +2546,22 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
+             print(f"kanban: --metadata: {exc}", file=sys.stderr)
+             return 2
+     reviewer = getattr(args, "reviewer", None)
++    force = bool(getattr(args, "force", False))
++    if force:
++        try:
++            from tools.kanban_tools import _check_kanban_orchestrator_mode
++        except Exception:
++            print(
++                "kanban: --force requires an authenticated Kanban orchestrator profile",
++                file=sys.stderr,
++            )
++            return 1
++        if not _check_kanban_orchestrator_mode():
++            print(
++                "kanban: --force requires an authenticated Kanban orchestrator profile",
++                file=sys.stderr,
++            )
++            return 1
+     with kb.connect_closing() as conn:
+         gate_verdict, rejection = _goal_mode_handoff_rejection(
+             kb.get_task(conn, tid),
+@@ -2566,16 +2582,23 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
+                 file=sys.stderr,
+             )
+             return 1
+-        ok, reason = kb.request_review(
+-            conn,
+-            tid,
+-            summary=summary,
+-            metadata=metadata,
+-            reviewer=reviewer,
+-            expected_run_id=_worker_run_id_for(tid),
+-            force=bool(getattr(args, "force", False)),
+-            with_reason=True,
++        capability_context = (
++            kb._operator_review_override_authorized()
++            if force
++            else contextlib.nullcontext(None)
+         )
++        with capability_context as operator_capability:
++            ok, reason = kb.request_review(
++                conn,
++                tid,
++                summary=summary,
++                metadata=metadata,
++                reviewer=reviewer,
++                expected_run_id=_worker_run_id_for(tid),
++                force=force,
++                operator_capability=operator_capability,
++                with_reason=True,
++            )
+         if not ok:
+             detail = reason or "not running/ready?"
+             print(
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -28,6 +28,7 @@ through the board.
+ """
+ from __future__ import annotations
+
++import contextlib
+ import json
+ import logging
+ import os
+@@ -166,10 +167,30 @@ def _worker_run_id(task_id: str) -> Optional[int]:
+         return None
+
+
++_REMEDIATION_REVIEW_METADATA_KEYS = frozenset(
++    {
++        "candidate_commit",
++        "review_remediation_handoff_key",
++        "scope_manifest_sha256",
++    }
++)
++
++
++def _is_exact_remediation_review_metadata(metadata: Optional[dict]) -> bool:
++    return isinstance(metadata, dict) and set(metadata) == set(
++        _REMEDIATION_REVIEW_METADATA_KEYS
++    )
++
++
+ def _stamp_worker_session_metadata(
+     task_id: str, metadata: Optional[dict]
+ ) -> Optional[dict]:
+-    """Add trusted worker session id metadata for this worker's own task."""
++    """Add worker session provenance without corrupting typed review metadata."""
++    if _is_exact_remediation_review_metadata(metadata):
++        # These three opaque identifiers are validated against the protected
++        # handoff row in kanban_db. Session provenance is already bound to the
++        # task/run and must not be injected into this exact-key contract.
++        return dict(metadata or {})
+     if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+         return metadata
+     session_id = os.environ.get("HERMES_SESSION_ID")
+@@ -180,6 +201,26 @@ def _stamp_worker_session_metadata(
+     return stamped
+
+
++def _prepare_request_review_metadata(
++    task_id: str, metadata: Optional[dict]
++) -> Optional[dict]:
++    """Preserve typed handoff identifiers; redact only free-form metadata."""
++    if metadata is None:
++        return _stamp_worker_session_metadata(task_id, None)
++    if _is_exact_remediation_review_metadata(metadata):
++        try:
++            json.dumps(metadata)
++        except (TypeError, ValueError) as exc:
++            raise ValueError("metadata could not be safely serialized") from exc
++        return dict(metadata)
++    metadata_json = redact_sensitive_text(json.dumps(metadata), force=True)
++    try:
++        redacted = json.loads(metadata_json)
++    except json.JSONDecodeError as exc:
++        raise ValueError("metadata could not be safely serialized") from exc
++    return _stamp_worker_session_metadata(task_id, redacted)
++
++
+ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
+     """Reject worker-driven destructive calls on foreign task IDs.
+
+@@ -967,18 +1008,22 @@ def _handle_request_review(args: dict, **kw) -> str:
+         return tool_error(
+             f"metadata must be an object/dict, got {type(metadata).__name__}"
+         )
+-    if metadata is not None:
+-        metadata_json = redact_sensitive_text(json.dumps(metadata), force=True)
+-        try:
+-            metadata = json.loads(metadata_json)
+-        except json.JSONDecodeError:
+-            return tool_error("metadata could not be safely serialized")
+-    metadata = _stamp_worker_session_metadata(tid, metadata)
++    try:
++        metadata = _prepare_request_review_metadata(tid, metadata)
++    except (TypeError, ValueError) as exc:
++        return tool_error(str(exc))
+     reviewer = args.get("reviewer") or None
+     if reviewer:
+         # Model-supplied free text stored durably on the event payload —
+         # redact like summary / kanban_block's reason.
+         reviewer = redact_sensitive_text(str(reviewer), force=True)
++    force = args.get("force", False)
++    if type(force) is not bool:
++        return tool_error("force must be a boolean")
++    if force and not _check_kanban_orchestrator_mode():
++        return tool_error(
++            "force is restricted to an authenticated Kanban orchestrator profile"
++        )
+     board = args.get("board")
+     try:
+         kb, conn = _connect(board=board)
+@@ -997,14 +1042,22 @@ def _handle_request_review(args: dict, **kw) -> str:
+                     "Provide acceptance evidence matching the card before "
+                     "requesting review."
+                 )
+-            ok, fail_reason = kb.request_review(
+-                conn, tid,
+-                summary=summary,
+-                metadata=metadata,
+-                reviewer=reviewer,
+-                expected_run_id=_worker_run_id(tid),
+-                with_reason=True,
++            capability_context = (
++                kb._operator_review_override_authorized()
++                if force
++                else contextlib.nullcontext(None)
+             )
++            with capability_context as operator_capability:
++                ok, fail_reason = kb.request_review(
++                    conn, tid,
++                    summary=summary,
++                    metadata=metadata,
++                    reviewer=reviewer,
++                    expected_run_id=_worker_run_id(tid),
++                    force=force,
++                    operator_capability=operator_capability,
++                    with_reason=True,
++                )
+             if not ok:
+                 detail = fail_reason or "unknown id or not in running/ready"
+                 return tool_error(
+@@ -2072,6 +2125,13 @@ KANBAN_REQUEST_REVIEW_SCHEMA = {
+                 ),
+                 "additionalProperties": True,
+             },
++            "force": {
++                "type": "boolean",
++                "description": (
++                    "Authenticated orchestrator-only override for an exact live "
++                    "worker claim. A task-scoped worker cannot use this flag."
++                ),
++            },
+             "board": _board_schema_prop(),
+         },
+         "required": ["summary"],
+--- a/agent/turn_finalizer.py
++++ b/agent/turn_finalizer.py
+@@ -83,6 +83,17 @@ def _record_kanban_budget_exhausted(
+         from hermes_cli import kanban_db as _kb
+         _conn = _kb.connect()
+         try:
++            try:
++                _expected_run_id = int(os.environ.get("HERMES_KANBAN_RUN_ID", ""))
++            except (TypeError, ValueError):
++                _expected_run_id = None
++            _expected_claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
++            _claim = _conn.execute(
++                "SELECT claim_expires FROM tasks WHERE id = ? "
++                "AND current_run_id = ? AND claim_lock = ?",
++                (kanban_task, _expected_run_id, _expected_claim_lock),
++            ).fetchone()
++            _expected_claim_expires = _claim["claim_expires"] if _claim else None
+             _kb._record_task_failure(
+                 _conn,
+                 kanban_task,
+@@ -99,6 +110,9 @@ def _record_kanban_budget_exhausted(
+                     "budget_used": api_call_count,
+                     "budget_max": max_iterations,
+                 },
++                expected_run_id=_expected_run_id,
++                expected_claim_lock=_expected_claim_lock,
++                expected_claim_expires=_expected_claim_expires,
+             )
+         finally:
+             try:
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -1199,20 +1199,15 @@ def _set_status_direct(
+                 summary=f"status changed to {effective_status} (dashboard/direct)",
+             )
+             terminations.append((prev["worker_pid"], prev["claim_lock"]))
+-        conn.execute(
+-            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+-            "VALUES (?, ?, 'status', ?, ?)",
+-            (
+-                task_id,
+-                run_id,
+-                json.dumps(
+-                    {
+-                        "status": effective_status,
+-                        "requested_status": new_status,
+-                    }
+-                ),
+-                int(time.time()),
+-            ),
++        kanban_db._append_event(
++            conn,
++            task_id,
++            "status",
++            {
++                "status": effective_status,
++                "requested_status": new_status,
++            },
++            run_id=run_id,
+         )
+         if reopening_satisfied_parent:
+             _invalidate_descendants_for_parent_reopen(
+--- a/tests/hermes_cli/test_kanban_review_lifecycle_complete.py
++++ b/tests/hermes_cli/test_kanban_review_lifecycle_complete.py
+@@ -68,7 +68,13 @@ def _claimed_review(
+     return task_id, review
+
+
+-def test_same_card_review_supports_changes_and_approval_without_block_loop(conn):
++def test_same_card_review_supports_changes_and_approval_without_block_loop(
++    conn,
++    monkeypatch: pytest.MonkeyPatch,
++):
++    candidate = "a" * 40
++    monkeypatch.setattr(kb, "_active_native_profile", lambda: "reviewer")
++    monkeypatch.setattr(kb, "_review_workspace_head", lambda _path: candidate)
+     task_id = kb.create_task(conn, title="Implement guarded export", assignee="builder")
+     implementation = kb.claim_task(conn, task_id, claimer="builder:1")
+     assert implementation is not None
+@@ -78,7 +84,7 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
+         task_id,
+         reviewer="reviewer",
+         summary="Implementation and focused tests are ready.",
+-        metadata={"commit": "abc123"},
++        metadata={"candidate_commit": candidate},
+         expected_run_id=implementation.current_run_id,
+     )
+
+@@ -95,7 +101,7 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
+     assert requested.payload["summary"] == "Implementation and focused tests are ready."
+     implementation_run = _run(kb.list_runs(conn, task_id), "review_requested")
+     assert implementation_run.summary == "Implementation and focused tests are ready."
+-    assert implementation_run.metadata == {"commit": "abc123"}
++    assert implementation_run.metadata == {"candidate_commit": candidate}
+
+     review = kb.claim_review_task(conn, task_id, claimer="reviewer:1")
+     assert review is not None
+@@ -124,6 +130,7 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
+         conn,
+         task_id,
+         summary="Fallback regression added.",
++        metadata={"candidate_commit": candidate},
+         expected_run_id=implementation_2.current_run_id,
+     )
+     awaiting_rereview = kb.get_task(conn, task_id)
+@@ -140,6 +147,7 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
+         conn,
+         task_id,
+         summary="Approved after independent verification.",
++        metadata={"review_outcome": "APPROVED", "candidate_commit": candidate},
+         expected_run_id=review_2.current_run_id,
+     )
+
+@@ -161,7 +169,7 @@ def test_rereview_requires_explicit_reviewer_when_provenance_is_invalid(
+         reason="Correct the implementation.",
+         expected_run_id=review.current_run_id,
+     ) == (True, "builder")
+-    with kb.write_txn(conn):
++    with kb._review_native_mutation_authorized(), kb.write_txn(conn):
+         if bad_payload is None:
+             conn.execute(
+                 "DELETE FROM task_events "
+@@ -203,7 +211,7 @@ def test_rereview_requires_explicit_reviewer_when_provenance_is_invalid(
+     assert restored.assignee == "reviewer"
+
+
+-def test_review_changes_reapply_parent_gate(conn):
++def test_review_changes_fail_closed_while_parent_frontier_has_drifted(conn):
+     parent_id = kb.create_task(conn, title="Upstream prerequisite", assignee="planner")
+     task_id = kb.create_task(
+         conn,
+@@ -229,15 +237,28 @@ def test_review_changes_reapply_parent_gate(conn):
+     conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (parent_id,))
+     conn.commit()
+
++    rejected = kb.request_changes(
++        conn,
++        task_id,
++        reason="Parent contract changed; rework after it lands.",
++        expected_run_id=review.current_run_id,
++    )
++    assert rejected[0] is False
++    assert "changed after claim" in (rejected[1] or "")
++    still_reviewing = kb.get_task(conn, task_id)
++    assert still_reviewing is not None
++    assert still_reviewing.status == "running"
++
++    assert kb.complete_task(conn, parent_id)
+     assert kb.request_changes(
+         conn,
+         task_id,
+         reason="Parent contract changed; rework after it lands.",
+         expected_run_id=review.current_run_id,
+     ) == (True, "builder")
+-    regated = kb.get_task(conn, task_id)
+-    assert regated is not None
+-    assert regated.status == "todo"
++    rework = kb.get_task(conn, task_id)
++    assert rework is not None
++    assert rework.status == "ready"
+
+
+ def test_parent_reopen_blocks_request_review_until_parent_is_done(conn) -> None:
+@@ -251,7 +272,7 @@ def test_parent_reopen_blocks_request_review_until_parent_is_done(conn) -> None:
+     )
+     implementation = kb.claim_task(conn, task_id)
+     assert implementation is not None
+-    with kb.write_txn(conn):
++    with kb._review_native_mutation_authorized(), kb.write_txn(conn):
+         conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (parent_id,))
+     assert not kb.request_review(
+         conn,
+@@ -302,7 +323,7 @@ def test_request_changes_fails_closed_on_malformed_review_provenance(
+         expected_run_id=review.current_run_id,
+     )
+     assert ok is False
+-    assert "implementer provenance" in (detail or "")
++    assert detail == "review_requested receipt is malformed"
+     task = kb.get_task(conn, task_id)
+     assert task is not None
+     assert task.status == "running"
+@@ -312,7 +333,7 @@ def test_request_changes_fails_closed_on_malformed_review_provenance(
+
+ def test_reclaim_fails_safe_on_non_object_claim_provenance(conn) -> None:
+     task_id, _review = _claimed_review(conn, "Non-object claimed payload")
+-    with kb.write_txn(conn):
++    with kb._review_native_mutation_authorized(), kb.write_txn(conn):
+         conn.execute(
+             "UPDATE task_events SET payload = '[]' "
+             "WHERE task_id = ? AND kind = 'claimed' "
+@@ -345,9 +366,12 @@ def test_interrupted_review_runs_retry_in_review_phase(
+             task_id,
+             "reviewer process failed to spawn",
+             failure_limit=3,
++            expected_run_id=review.current_run_id,
++            expected_claim_lock=review.claim_lock,
++            expected_claim_expires=review.claim_expires,
+         )
+     elif reclaim_kind == "expired_claim":
+-        with kb.write_txn(conn):
++        with kb._review_native_mutation_authorized(), kb.write_txn(conn):
+             conn.execute(
+                 "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+                 (int(time.time()) - 1, task_id),
+@@ -357,7 +381,7 @@ def test_interrupted_review_runs_retry_in_review_phase(
+         assert kb.reclaim_task(conn, task_id, reason="operator retry")
+     else:
+         old = int(time.time()) - 1_000
+-        with kb.write_txn(conn):
++        with kb._review_native_mutation_authorized(), kb.write_txn(conn):
+             conn.execute(
+                 "UPDATE tasks SET started_at = ?, last_heartbeat_at = NULL "
+                 "WHERE id = ?",
+@@ -379,12 +403,15 @@ def test_interrupted_review_runs_retry_in_review_phase(
+
+
+ def test_review_retry_still_trips_the_failure_breaker(conn) -> None:
+-    task_id, _review = _claimed_review(conn, "Reviewer repeatedly fails")
++    task_id, review = _claimed_review(conn, "Reviewer repeatedly fails")
+     assert kb._record_spawn_failure(
+         conn,
+         task_id,
+         "reviewer cannot start",
+         failure_limit=1,
++        expected_run_id=review.current_run_id,
++        expected_claim_lock=review.claim_lock,
++        expected_claim_expires=review.claim_expires,
+     )
+     blocked = kb.get_task(conn, task_id)
+     assert blocked is not None
+@@ -436,7 +463,7 @@ def test_review_dependency_wait_reenters_review_after_parent_finishes(conn) -> N
+     )
+     review = kb.claim_review_task(conn, task_id)
+     assert review is not None
+-    with kb.write_txn(conn):
++    with kb._review_native_mutation_authorized(), kb.write_txn(conn):
+         conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (parent_id,))
+     assert kb.block_task(
+         conn,
+@@ -467,7 +494,7 @@ def test_crashed_and_timed_out_review_runs_retry_in_review_phase(
+         "Timeout during review",
+         max_runtime_seconds=1,
+     )
+-    with kb.write_txn(conn):
++    with kb._review_native_mutation_authorized(), kb.write_txn(conn):
+         conn.execute(
+             "UPDATE tasks SET worker_pid = ?, started_at = ? WHERE id = ?",
+             (999_998, old, timed_out_id),
+@@ -482,7 +509,7 @@ def test_crashed_and_timed_out_review_runs_retry_in_review_phase(
+     assert timed_out.status == "review"
+
+     crashed_id, crashed_run = _claimed_review(conn, "Crash during review")
+-    with kb.write_txn(conn):
++    with kb._review_native_mutation_authorized(), kb.write_txn(conn):
+         conn.execute(
+             "UPDATE tasks SET worker_pid = ?, started_at = ? WHERE id = ?",
+             (999_999, old, crashed_id),
+@@ -654,7 +681,7 @@ def test_review_transitions_preserve_consecutive_failures(conn) -> None:
+     failure_limit=2 breaker. Only complete_task's success path resets it.
+     """
+     task_id = kb.create_task(conn, title="flaky feature", assignee="builder")
+-    with kb.write_txn(conn):
++    with kb._review_native_mutation_authorized(), kb.write_txn(conn):
+         conn.execute(
+             "UPDATE tasks SET consecutive_failures = 1 WHERE id = ?",
+             (task_id,),
+@@ -691,8 +718,27 @@ def test_review_transitions_preserve_consecutive_failures(conn) -> None:
+     # A crash now increments 1 -> 2 and trips a failure_limit=2 breaker —
+     # the counter accumulated across the review cycle instead of being
+     # amnesia-reset back to 0.
++    crashing = kb.claim_task(conn, task_id, claimer="builder:crash")
++    assert crashing is not None
++    with kb._review_native_mutation_authorized(), kb.write_txn(conn):
++        conn.execute(
++            "UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
++            "claim_expires=NULL, worker_pid=NULL WHERE id=? AND current_run_id=?",
++            (task_id, crashing.current_run_id),
++        )
++        conn.execute(
++            "UPDATE task_runs SET status='crashed', outcome='crashed', ended_at=? "
++            "WHERE id=? AND task_id=?",
++            (int(time.time()), crashing.current_run_id, task_id),
++        )
+     tripped = kb._record_task_failure(
+-        conn, task_id, "worker crashed", outcome="crashed", failure_limit=2,
++        conn,
++        task_id,
++        "worker crashed",
++        outcome="crashed",
++        failure_limit=2,
++        expected_run_id=crashing.current_run_id,
++        expected_settled_status="ready",
+     )
+     assert tripped is True
+     assert _failures(conn, task_id) == 2
+@@ -700,7 +746,7 @@ def test_review_transitions_preserve_consecutive_failures(conn) -> None:
+
+     # Sanity: complete_task's success path still clears the counter.
+     ok_id = kb.create_task(conn, title="healthy", assignee="builder")
+-    with kb.write_txn(conn):
++    with kb._review_native_mutation_authorized(), kb.write_txn(conn):
+         conn.execute(
+             "UPDATE tasks SET consecutive_failures = 1 WHERE id = ?",
+             (ok_id,),
