@@ -254,13 +254,16 @@ task/run/events rather than task prose:
   reviewer run claimed from `source_status=review`. `APPROVED` uses
   `kanban_complete` once with structured metadata containing exactly
   `review_outcome: APPROVED` as the sole verdict field and the exact 40-hex
-  `candidate_commit` copied from the implementation handoff. The metadata
-  container must be an exact built-in `dict`, every key must be an exact
-  built-in string, and both values plus any present head, remediation-scope, or
-  handoff identities must be exact built-in strings, never numbers, bytes,
-  string subclasses, or stringable lookalikes. Do not include
-  `verdict`, `overall_verdict`, `terminal_verdict`, `review_verdict`, or any
-  other `*_verdict` key;
+  `candidate_commit` copied from the implementation handoff. The metadata is a
+  recursively materialized exact built-in JSON tree: its root and every nested
+  mapping/list use exact built-in containers, keys and strings use exact
+  built-in strings, floats are finite, and integers fit signed 64-bit. Never
+  pass bytes, tuples, custom mappings, subclasses, cycles, or stringable
+  lookalikes. The candidate and any head aliases are canonical 40-hex commits
+  and must match; the remediation
+  scope is canonical 64-hex and may occur with its opaque handoff key only on a
+  validated remediation successor. Do not include `verdict`, `overall_verdict`,
+  `terminal_verdict`, `review_verdict`, or any other `*_verdict` key;
   `CHANGES_REQUESTED` uses `kanban_request_changes`, whose native rework
   transition on the original task is the only implementation lane. The
   orchestrator must not create a second implementer task for that verdict. The

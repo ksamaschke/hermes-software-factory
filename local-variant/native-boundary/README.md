@@ -94,16 +94,19 @@ isolation boundary is stated explicitly.
   profile, live lease and claim lock, prior terminal `review_requested`
   implementation run, immutable packet/body/pointer receipt, clean worktree,
   candidate, changed-path manifest, repository/worktree identity, and local HEAD.
-  Review metadata is accepted only in an exact built-in `dict`; top-level keys
-  must be exact built-in strings, and the accepted mapping is copied once before
-  validation or persistence. Review identity fields are validated before JSON
-  serialization or redaction:
-  `candidate_commit`, present head aliases, `review_outcome`, the remediation
-  scope digest and the opaque handoff key must use the exact built-in `str`
-  type whenever present, even outside a recognized remediation payload. Numbers,
-  booleans, floats, bytes, string subclasses, and stringable lookalikes are
-  rejected atomically before lookup, serialization, or durable lifecycle
-  receipts. Missing, stale, expired,
+  Review metadata is accepted only in an exact built-in `dict`, recursively
+  materialized into an unaliased snapshot. Every nested mapping/list and key
+  must use exact built-in JSON container/string types; only finite JSON scalars
+  are accepted, with integers bounded to the signed 64-bit range. Cycles,
+  excessive nesting, bytes, tuples, custom mappings, subclasses, and
+  stringable lookalikes are rejected before serialization. Protected values are
+  validated under one shared native/public semantic contract: `candidate_commit`
+  and present head aliases are canonical
+  40-hex commits and aliases must match; `review_outcome` is completion-only and
+  must be the literal `APPROVED`; the remediation scope is a canonical 64-hex
+  digest; and the opaque handoff key and scope must occur together only for a
+  validated remediation successor. Failures are atomic before transaction,
+  JSON serialization, or durable lifecycle receipts. Missing, stale, expired,
   or otherwise malformed run IDs, role collisions, non-approval,
   self-attestation, stale or foreign evidence, pointer/body/graph tampering, and
   malformed provenance cannot complete the task or release status-gated

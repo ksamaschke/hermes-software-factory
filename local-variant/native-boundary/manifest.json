@@ -56,6 +56,10 @@
     {
       "path": "patches/010-review-protected-value-boundary.patch",
       "sha256": "77efb4e934480fd0e685d27da6f2cc70a9bc87edbc2bd4c7684fc93b3527d01c"
+    },
+    {
+      "path": "patches/011-review-metadata-semantic-boundary.patch",
+      "sha256": "597520eef6e68b7c08f1608e92449b377e9ed64e4a2a9a158e550705107e44df"
     }
   ],
   "patched_paths": [
@@ -63,6 +67,7 @@
     "hermes_cli/kanban.py",
     "hermes_cli/kanban_specify.py",
     "hermes_cli/native_boundary.py",
+    "hermes_cli/review_metadata_boundary.py",
     "tools/kanban_tools.py",
     "agent/turn_finalizer.py",
     "plugins/kanban/dashboard/plugin_api.py",

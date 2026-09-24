@@ -206,10 +206,15 @@ hand internal repair coordination to the operator. Continue the bounded loop:
    without raw database write access. Its exact unexpired implementation run
    requests a distinct reviewer with only
    `candidate_commit`, `review_remediation_handoff_key`, and
-   `scope_manifest_sha256`; the metadata container must be an exact built-in
-   `dict`, every key must be an exact built-in string, and all three values must
-   be exact built-in strings before normalization, serialization, or redaction.
-   The native boundary validates them against the current clean
+   `scope_manifest_sha256`; the metadata root and every nested mapping/list must
+   be exact built-in JSON containers, keys and strings must be exact built-in
+   strings, floats must be finite, and integers must fit signed 64-bit. Cycles,
+   bytes, tuples, custom mappings, subclasses, and stringable lookalikes fail
+   before serialization. Candidate and head aliases are matching canonical
+   40-hex commits; scope is canonical
+   64-hex; and the scope plus opaque handoff key are accepted only for the
+   validated remediation successor. The native boundary then validates them
+   against the current clean
    repository/worktree, branch, base, candidate,
    complete task body, and changed-path manifest. Legacy receipts without
    current provenance are atomically tombstoned rather than left pending.
