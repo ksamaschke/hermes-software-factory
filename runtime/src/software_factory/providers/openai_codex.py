@@ -22,6 +22,7 @@ import json
 import math
 import os
 import stat
+import threading
 import time
 from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -64,6 +65,7 @@ __all__ = (
 
 _MAX_CREDENTIAL_FIELD_LENGTH = 128 * 1024
 _DEFAULT_MAX_FILE_BYTES = 512 * 1024
+_MAX_FILE_BYTES = 16 * 1024 * 1024
 _DEFAULT_LOCK_TIMEOUT = 5.0
 _MAX_LOCK_TIMEOUT = 300.0
 _DEFAULT_REFRESH_TIMEOUT = 30.0
@@ -74,7 +76,12 @@ _DEFAULT_MAX_BACKOFF = 60.0
 _DEFAULT_MAX_QUEUE = 128
 _DEFAULT_MAX_RETAINED_GENERATIONS = 128
 _DEFAULT_MAX_GENERATION_SCOPES = 64
-_MAX_GENERATION_VALUE = (1 << 63) - 1
+_MAX_CAPACITY = 1_024
+_MAX_QUEUE = 4_096
+_MAX_RETAINED_GENERATIONS = 4_096
+_MAX_GENERATION_SCOPES = 1_024
+_MAX_BACKOFF = 3_600.0
+_MAX_GENERATION_VALUE = (1 << 31) - 1
 
 _SCHEMA_FIELDS = ("access_token", "refresh_token", "account_id")
 _SCHEMA_FIELD_SET = frozenset(_SCHEMA_FIELDS)
@@ -209,6 +216,28 @@ class ProviderQueueFullError(CodexCredentialError):
 
     def __init__(self, code: str = "queue_full") -> None:
         super().__init__(code, category="provider_pressure")
+
+
+_STORAGE_ERROR_CATEGORIES = frozenset(
+    {"corruption", "permission", "persistence", "not_found", "lock", "schema"}
+)
+_STORAGE_ERROR_TYPES = (
+    CredentialCorruptionError,
+    CredentialPermissionError,
+    CredentialPersistenceError,
+    CredentialNotFoundError,
+    CredentialLockError,
+    CredentialValidationError,
+)
+
+
+def _is_credential_storage_error(error: BaseException) -> bool:
+    """Classify only local storage failures; refresh/network errors stay transient."""
+
+    return isinstance(error, _STORAGE_ERROR_TYPES) or (
+        isinstance(error, CodexCredentialError)
+        and getattr(error, "category", None) in _STORAGE_ERROR_CATEGORIES
+    )
 
 
 class PressureAdmissionTimeoutError(CodexCredentialError):
@@ -454,11 +483,21 @@ def _validate_duration(
     value: float | None, *, default: float, maximum: float, code: str
 ) -> float:
     resolved = default if value is None else value
-    if type(resolved) not in {int, float} or not math.isfinite(float(resolved)):
+    if type(resolved) not in {int, float}:
         raise ValueError(code)
-    if float(resolved) < 0 or float(resolved) > maximum:
+    try:
+        numeric = float(resolved)
+    except (OverflowError, ValueError):
+        raise ValueError(code) from None
+    if not math.isfinite(numeric) or numeric < 0 or numeric > maximum:
         raise ValueError(code)
-    return float(resolved)
+    return numeric
+
+
+def _validate_int(value: object, *, minimum: int, maximum: int, code: str) -> int:
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise ValueError(code)
+    return value
 
 
 _DRAIN_FAILED = object()
@@ -936,7 +975,7 @@ class _CredentialPathMixin:
         try:
             decoded = bytes(data).decode("utf-8")
             payload = json.loads(decoded, object_pairs_hook=_strict_object_pairs)
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        except (RecursionError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
             payload = None
             read_failure = CredentialCorruptionError("invalid_json")
         if read_failure is not None:
@@ -961,13 +1000,53 @@ class _CredentialPathMixin:
         descriptor: int | None = None
         temporary_info: os.stat_result | None = None
         write_failure: CodexCredentialError | None = None
+        published_by_us = False
+        directory_dirty = False
+
+        def scrub_inode() -> None:
+            """Erase a staged inode while its original descriptor remains open."""
+
+            if descriptor is None:
+                return
+            with contextlib.suppress(BaseException):
+                os.ftruncate(descriptor, 0)
+            with contextlib.suppress(BaseException):
+                os.fsync(descriptor)
+
+        def unlink_published_inode() -> None:
+            """Remove our target name only when it still names the staged inode."""
+
+            nonlocal directory_dirty
+            if descriptor is None:
+                return
+            try:
+                fd_info = os.fstat(descriptor)
+                path_info = os.stat(
+                    self.path.name, dir_fd=parent_fd, follow_symlinks=False
+                )
+            except OSError:
+                return
+            if (fd_info.st_dev, fd_info.st_ino) != (
+                path_info.st_dev,
+                path_info.st_ino,
+            ):
+                return
+            try:
+                os.unlink(self.path.name, dir_fd=parent_fd)
+            except OSError:
+                return
+            directory_dirty = True
+
         try:
             for _ in range(32):
                 candidate = f".{self.path.name}.{os.getpid()}.{time.monotonic_ns()}.{next(_TEMP_COUNTER)}.tmp"
                 try:
+                    # Keep this exact descriptor open through rename and the
+                    # post-publish link-count validation.  O_RDWR is required
+                    # to scrub the inode if a hardlink race is observed.
                     descriptor = os.open(
                         candidate,
-                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW | _O_CLOEXEC,
+                        os.O_RDWR | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW | _O_CLOEXEC,
                         0o600,
                         dir_fd=parent_fd,
                     )
@@ -1022,9 +1101,6 @@ class _CredentialPathMixin:
                 write_failure = CredentialPermissionError("temporary_hardlink")
                 raise write_failure
             temporary_info = final_temporary_info
-            with contextlib.suppress(OSError):
-                os.close(descriptor)
-            descriptor = None
 
             current, failure = self._stat_target(
                 parent_fd, require_mode=not allow_insecure_existing
@@ -1052,36 +1128,69 @@ class _CredentialPathMixin:
                     dst_dir_fd=parent_fd,
                 )
                 temporary_name = None
+                published_by_us = True
+                directory_dirty = True
                 os.fsync(parent_fd)
             except OSError:
                 write_failure = CredentialPersistenceError("atomic_replace_failed")
                 raise write_failure
             self._assert_current_parent(parent_fd)
 
+            # Validate the inode through the retained descriptor, not a path
+            # lookup alone.  A same-UID race can add a hardlink after rename;
+            # every link must lose the bytes before we report failure.
+            try:
+                published_fd_info = os.fstat(descriptor)
+            except OSError:
+                write_failure = CredentialPersistenceError("published_stat_failed")
+                raise write_failure
+            if temporary_info is None or (
+                published_fd_info.st_dev,
+                published_fd_info.st_ino,
+            ) != (temporary_info.st_dev, temporary_info.st_ino):
+                write_failure = CredentialPermissionError("published_changed_identity")
+                raise write_failure
+            if (
+                not stat.S_ISREG(published_fd_info.st_mode)
+                or stat.S_IMODE(published_fd_info.st_mode) != 0o600
+                or published_fd_info.st_nlink != 1
+            ):
+                write_failure = CredentialPermissionError("published_hardlink")
+                raise write_failure
             published, failure = self._stat_target(parent_fd, require_mode=True)
             if failure is not None:
                 write_failure = failure
                 raise write_failure
-            if published is None or temporary_info is None:
-                write_failure = CredentialPersistenceError("published_missing")
-                raise write_failure
-            if (published.st_dev, published.st_ino) != (
-                temporary_info.st_dev,
-                temporary_info.st_ino,
-            ):
+            if published is None or (
+                published.st_dev,
+                published.st_ino,
+            ) != (published_fd_info.st_dev, published_fd_info.st_ino):
                 write_failure = CredentialPermissionError("published_changed_identity")
                 raise write_failure
-            if published.st_nlink != 1:
-                write_failure = CredentialPermissionError("published_hardlink")
+        except CodexCredentialError as error:
+            write_failure = error
         except OSError:
             write_failure = CredentialPersistenceError("atomic_replace_failed")
+        except BaseException:  # noqa: BLE001 - filesystem details are untrusted
+            write_failure = CredentialPersistenceError("atomic_replace_failed")
         finally:
+            if write_failure is not None:
+                # Do not leave staged or newly published bytes behind on any
+                # failed atomicity check.  The descriptor still names the
+                # inode even when a race removed both visible names.
+                scrub_inode()
+                if published_by_us:
+                    unlink_published_inode()
             if descriptor is not None:
-                with contextlib.suppress(OSError):
+                with contextlib.suppress(BaseException):
                     os.close(descriptor)
             if temporary_name is not None:
-                with contextlib.suppress(OSError):
+                with contextlib.suppress(BaseException):
                     os.unlink(temporary_name, dir_fd=parent_fd)
+                directory_dirty = True
+            if directory_dirty and write_failure is not None:
+                with contextlib.suppress(Exception):
+                    os.fsync(parent_fd)
         if write_failure is not None:
             raise write_failure
 
@@ -1198,9 +1307,12 @@ class FileCodexCredentialBackend(_CredentialPathMixin):
     Supported semantics are POSIX local filesystems that implement descriptor-
     relative open/stat/replace/unlink, ``O_NOFOLLOW``/``O_NONBLOCK``, directory
     fsync, and directory flocking.  The constructor fails closed otherwise.
+    The security boundary assumes a local, non-hostile same-UID environment:
+    that principal can read a target it is authorized to access by design, so
+    the backend does not claim protection from that reader.  Kernel liveness is
+    also assumed; cooperative cancellation drains worker threads but cannot
+    forcibly interrupt a permanently hung kernel filesystem syscall.
     """
-
-    enforces_refresh_timeout = True
 
     def __init__(
         self,
@@ -1216,24 +1328,27 @@ class FileCodexCredentialBackend(_CredentialPathMixin):
         self.path = Path(os.path.abspath(raw_path))
         if self.path.name in {"", ".", ".."}:
             raise ValueError("credential path must name a file")
-        if (
-            type(max_file_bytes) is not int
-            or not 256 <= max_file_bytes <= 16 * 1024 * 1024
-        ):
-            raise ValueError("max_file_bytes must be bounded")
-        self.max_file_bytes = max_file_bytes
-        self.lock_timeout = _validate_duration(
+        normalized_max_file_bytes = _validate_int(
+            max_file_bytes,
+            minimum=256,
+            maximum=_MAX_FILE_BYTES,
+            code="max_file_bytes must be bounded",
+        )
+        normalized_lock_timeout = _validate_duration(
             lock_timeout,
             default=_DEFAULT_LOCK_TIMEOUT,
             maximum=_MAX_LOCK_TIMEOUT,
             code="lock_timeout must be finite and bounded",
         )
-        self.refresh_timeout = _validate_duration(
+        normalized_refresh_timeout = _validate_duration(
             refresh_timeout,
             default=_DEFAULT_REFRESH_TIMEOUT,
             maximum=_MAX_REFRESH_TIMEOUT,
             code="refresh_timeout must be finite and bounded",
         )
+        self.max_file_bytes = normalized_max_file_bytes
+        self.lock_timeout = normalized_lock_timeout
+        self.refresh_timeout = normalized_refresh_timeout
         self.lock_path = Path(f"{self.path}.lock")
         self._filesystem_supported = self._supported()
         self._anchor_fd = self._open_trusted_anchor()
@@ -1531,7 +1646,13 @@ class FileCodexCredentialBackend(_CredentialPathMixin):
 
 
 class OpenAICodexCredentialSource:
-    """PydanticAI-shaped source with an explicit atomic refresh operation."""
+    """Replaceable storage facade with an explicit atomic refresh operation.
+
+    The broader backend protocol remains available to applications that review
+    another secret store separately.  The pinned PydanticAI adapter accepts this
+    concrete facade; only its audited file backend carries the local POSIX
+    timeout and cancellation contract described by that adapter.
+    """
 
     def __init__(
         self,
@@ -1544,22 +1665,35 @@ class OpenAICodexCredentialSource:
     ) -> None:
         if (path is None) == (backend is None):
             raise ValueError("provide exactly one credential path or backend")
-        if backend is None:
-            backend = FileCodexCredentialBackend(
-                cast(os.PathLike[str] | str, path),
-                max_file_bytes=max_file_bytes,
-                lock_timeout=lock_timeout,
-                refresh_timeout=refresh_timeout,
-            )
-        self._backend = backend
-        self.path = getattr(backend, "path", None)
-        self.lock_path = getattr(backend, "lock_path", None)
-        self.refresh_timeout = _validate_duration(
+        normalized_max_file_bytes = _validate_int(
+            max_file_bytes,
+            minimum=256,
+            maximum=_MAX_FILE_BYTES,
+            code="max_file_bytes must be bounded",
+        )
+        normalized_lock_timeout = _validate_duration(
+            lock_timeout,
+            default=_DEFAULT_LOCK_TIMEOUT,
+            maximum=_MAX_LOCK_TIMEOUT,
+            code="lock_timeout must be finite and bounded",
+        )
+        normalized_refresh_timeout = _validate_duration(
             refresh_timeout,
             default=_DEFAULT_REFRESH_TIMEOUT,
             maximum=_MAX_REFRESH_TIMEOUT,
             code="refresh_timeout must be finite and bounded",
         )
+        if backend is None:
+            backend = FileCodexCredentialBackend(
+                cast(os.PathLike[str] | str, path),
+                max_file_bytes=normalized_max_file_bytes,
+                lock_timeout=normalized_lock_timeout,
+                refresh_timeout=normalized_refresh_timeout,
+            )
+        self._backend = backend
+        self.path = getattr(backend, "path", None)
+        self.lock_path = getattr(backend, "lock_path", None)
+        self.refresh_timeout = normalized_refresh_timeout
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(application_owned=True)"
@@ -1635,18 +1769,12 @@ class OpenAICodexCredentialSource:
         failure: CodexCredentialError | None = None
         value: object | None = None
         try:
-            if getattr(self._backend, "enforces_refresh_timeout", False):
-                value = await self._backend.refresh(
-                    refresh_callback, expected=expected, timeout=duration
-                )
-            else:
-                value = await _await_before_deadline(
-                    self._backend.refresh(
-                        refresh_callback, expected=expected, timeout=duration
-                    ),
-                    time.monotonic() + duration,
-                    timeout_code="refresh_timeout",
-                )
+            # Do not duck-type a timeout marker here.  The file backend owns
+            # the cooperative deadline/drain implementation; arbitrary
+            # replaceable backends make no finite-time guarantee.
+            value = await self._backend.refresh(
+                refresh_callback, expected=expected, timeout=duration
+            )
         except asyncio.CancelledError:
             raise
         except TimeoutError:
@@ -1811,11 +1939,12 @@ class _ScrubbableFuture(asyncio.Future[None]):
 
 
 class _SharedOperation:
-    __slots__ = ("future", "participants")
+    __slots__ = ("future", "participants", "published")
 
     def __init__(self, future: asyncio.Future[Any]) -> None:
         self.future: asyncio.Future[Any] | None = future
         self.participants = 1
+        self.published = False
 
 
 class ProviderAdmission:
@@ -1867,18 +1996,30 @@ class ProviderPressure:
         max_generation_scopes: int = _DEFAULT_MAX_GENERATION_SCOPES,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        if type(capacity) is not int or capacity < 1:
-            raise ValueError("capacity must be a positive integer")
-        if type(max_queue) is not int or max_queue < 1:
-            raise ValueError("max_queue must be a positive integer")
-        if type(max_retained_generations) is not int or max_retained_generations < 1:
-            raise ValueError("max_retained_generations must be a positive integer")
-        if type(max_generation_scopes) is not int or max_generation_scopes < 1:
-            raise ValueError("max_generation_scopes must be a positive integer")
-        self.capacity = capacity
-        self.max_queue = max_queue
-        self.max_retained_generations = max_retained_generations
-        self.max_generation_scopes = max_generation_scopes
+        self.capacity = _validate_int(
+            capacity,
+            minimum=1,
+            maximum=_MAX_CAPACITY,
+            code="capacity must be a bounded positive integer",
+        )
+        self.max_queue = _validate_int(
+            max_queue,
+            minimum=1,
+            maximum=_MAX_QUEUE,
+            code="max_queue must be a bounded positive integer",
+        )
+        self.max_retained_generations = _validate_int(
+            max_retained_generations,
+            minimum=1,
+            maximum=_MAX_RETAINED_GENERATIONS,
+            code="max_retained_generations must be a bounded positive integer",
+        )
+        self.max_generation_scopes = _validate_int(
+            max_generation_scopes,
+            minimum=1,
+            maximum=_MAX_GENERATION_SCOPES,
+            code="max_generation_scopes must be a bounded positive integer",
+        )
         self.admission_timeout = _validate_duration(
             admission_timeout,
             default=_DEFAULT_ADMISSION_TIMEOUT,
@@ -1888,7 +2029,7 @@ class ProviderPressure:
         self.max_backoff = _validate_duration(
             max_backoff,
             default=_DEFAULT_MAX_BACKOFF,
-            maximum=_MAX_ADMISSION_TIMEOUT,
+            maximum=_MAX_BACKOFF,
             code="max_backoff must be finite and bounded",
         )
         if not callable(clock):
@@ -1901,7 +2042,9 @@ class ProviderPressure:
         self._in_flight = 0
         self._blocked_until = 0.0
         self._leases: dict[int, ProviderAdmission] = {}
+        self._scope_lock = threading.RLock()
         self._scopes = {0}
+        self._free_scopes: set[int] = set()
         self._next_scope = 1
         self._generation_high_water: dict[int, int] = {0: 0}
         self._active: dict[ProviderGeneration, _SharedOperation] = {}
@@ -1917,14 +2060,45 @@ class ProviderPressure:
     def new_scope(self) -> int:
         """Reserve one bounded provider scope for a shared pressure object."""
 
-        if len(self._scopes) >= self.max_generation_scopes:
-            raise ProviderOperationError("generation_scope_limit")
-        scope = self._next_scope
-        self._next_scope += 1
-        self._scopes.add(scope)
-        self._generation_high_water[scope] = 0
-        self._rate_limit_high_water[scope] = 0
-        return scope
+        with self._scope_lock:
+            if self._free_scopes:
+                scope = min(self._free_scopes)
+                self._free_scopes.remove(scope)
+            else:
+                if len(self._scopes) >= self.max_generation_scopes:
+                    raise ProviderOperationError("generation_scope_limit")
+                if self._next_scope > _MAX_GENERATION_VALUE:
+                    raise ProviderOperationError("generation_scope_exhausted")
+                scope = self._next_scope
+                self._next_scope += 1
+            self._scopes.add(scope)
+            self._generation_high_water[scope] = 0
+            self._rate_limit_high_water[scope] = 0
+            return scope
+
+    def release_scope(self, scope: int) -> None:
+        """Release an idle non-default scope so it can be safely reused."""
+
+        if type(scope) is not int or scope <= 0 or scope > _MAX_GENERATION_VALUE:
+            raise ProviderOperationError("generation_scope_invalid")
+        with self._scope_lock:
+            if scope not in self._scopes:
+                return
+            if any(generation.scope == scope for generation in self._active) or any(
+                lease.generation is not None and lease.generation.scope == scope
+                for lease in self._leases.values()
+            ):
+                raise ProviderOperationError("generation_scope_active")
+            self._scopes.remove(scope)
+            self._free_scopes.add(scope)
+            self._generation_high_water.pop(scope, None)
+            self._rate_limit_high_water.pop(scope, None)
+            self._rate_limit_deadlines.pop(scope, None)
+            for generation in tuple(self._completed):
+                if generation.scope == scope:
+                    del self._completed[generation]
+            self._recompute_pressure()
+            self._wake_waiters()
 
     def _bind_loop(self) -> asyncio.AbstractEventLoop:
         try:
@@ -1962,7 +2136,9 @@ class ProviderPressure:
             raise ValueError("generation scope is out of bounds")
         if not 1 <= sequence <= _MAX_GENERATION_VALUE:
             raise ValueError("generation sequence is out of bounds")
-        if scope not in self._scopes:
+        with self._scope_lock:
+            registered = scope in self._scopes
+        if not registered:
             raise ValueError("generation scope is not registered")
         return ProviderGeneration(scope, sequence)
 
@@ -2023,11 +2199,18 @@ class ProviderPressure:
         self._require_sync_loop()
         if retry_after is None:
             return
-        if type(retry_after) not in {int, float} or not math.isfinite(
-            float(retry_after)
-        ):
+        if type(retry_after) not in {int, float}:
             return
-        normalized = self._normalize_generation(generation)
+        try:
+            retry_value = float(retry_after)
+        except (OverflowError, ValueError):
+            return
+        if not math.isfinite(retry_value):
+            return
+        try:
+            normalized = self._normalize_generation(generation)
+        except (OverflowError, TypeError, ValueError):
+            raise ProviderOperationError("generation_invalid") from None
         if normalized is None:
             current = self._rate_limit_high_water[0]
             if current >= _MAX_GENERATION_VALUE:
@@ -2037,7 +2220,7 @@ class ProviderPressure:
         if normalized.sequence <= high_water:
             return
         self._rate_limit_high_water[normalized.scope] = normalized.sequence
-        delay = max(0.0, min(float(retry_after), self.max_backoff))
+        delay = max(0.0, min(retry_value, self.max_backoff))
         self._rate_limit_deadlines[normalized.scope] = self._clock() + delay
         self._recompute_pressure()
         self._wake_waiters()
@@ -2046,7 +2229,10 @@ class ProviderPressure:
 
     def clear_pressure(self, *, generation: object | None = None) -> None:
         self._require_sync_loop()
-        normalized = self._normalize_generation(generation)
+        try:
+            normalized = self._normalize_generation(generation)
+        except (OverflowError, TypeError, ValueError):
+            raise ProviderOperationError("generation_invalid") from None
         if normalized is None:
             self._rate_limit_deadlines.clear()
         elif normalized.sequence == self._rate_limit_high_water[normalized.scope]:
@@ -2066,13 +2252,19 @@ class ProviderPressure:
         self, *, timeout: float | None = None, generation: object | None = None
     ) -> ProviderAdmission:
         self._bind_loop()
-        normalized = self._normalize_generation(generation)
-        duration = _validate_duration(
-            timeout,
-            default=self.admission_timeout,
-            maximum=_MAX_ADMISSION_TIMEOUT,
-            code="admission_timeout must be finite and bounded",
-        )
+        try:
+            normalized = self._normalize_generation(generation)
+        except (OverflowError, TypeError, ValueError):
+            raise ProviderOperationError("generation_invalid") from None
+        try:
+            duration = _validate_duration(
+                timeout,
+                default=self.admission_timeout,
+                maximum=_MAX_ADMISSION_TIMEOUT,
+                code="admission_timeout must be finite and bounded",
+            )
+        except (OverflowError, TypeError, ValueError):
+            raise ProviderOperationError("admission_timeout_invalid") from None
         assert self._state_lock is not None
         assert self._wake_event is not None
         deadline = self._clock() + duration
@@ -2082,38 +2274,53 @@ class ProviderPressure:
                 raise ProviderQueueFullError()
             self._queue.append(ticket)
         while True:
-            async with self._state_lock:
-                now = self._clock()
-                if (
-                    self._queue
-                    and self._queue[0] is ticket
-                    and self._in_flight < self.capacity
-                    and now >= self._blocked_until
-                ):
-                    self._queue.popleft()
-                    self._in_flight += 1
-                    lease = ProviderAdmission(self, normalized, id(ticket))
-                    self._leases[id(ticket)] = lease
-                    return lease
-                remaining = deadline - now
-                if remaining <= 0:
-                    with contextlib.suppress(ValueError):
-                        self._queue.remove(ticket)
-                    self._wake_event.set()
-                    raise PressureAdmissionTimeoutError()
-                pressure_wait = max(0.0, self._blocked_until - now)
-                self._wake_event.clear()
-                wait_timeout = min(remaining, pressure_wait if pressure_wait else 0.05)
+            try:
+                async with self._state_lock:
+                    now = self._clock()
+                    if (
+                        self._queue
+                        and self._queue[0] is ticket
+                        and self._in_flight < self.capacity
+                        and now >= self._blocked_until
+                    ):
+                        self._queue.popleft()
+                        self._in_flight += 1
+                        lease = ProviderAdmission(self, normalized, id(ticket))
+                        self._leases[id(ticket)] = lease
+                        return lease
+                    remaining = deadline - now
+                    if remaining <= 0:
+                        with contextlib.suppress(ValueError):
+                            self._queue.remove(ticket)
+                        self._wake_event.set()
+                        raise PressureAdmissionTimeoutError()
+                    pressure_wait = max(0.0, self._blocked_until - now)
+                    self._wake_event.clear()
+                    wait_timeout = min(
+                        remaining, pressure_wait if pressure_wait else 0.05
+                    )
+            except asyncio.CancelledError:
+                cleanup = asyncio.create_task(self._remove_ticket(ticket))
+                await _await_task_drained(cleanup)
+                raise
             try:
                 await asyncio.wait_for(self._wake_event.wait(), timeout=wait_timeout)
             except TimeoutError:
                 continue
             except asyncio.CancelledError:
-                async with self._state_lock:
-                    with contextlib.suppress(ValueError):
-                        self._queue.remove(ticket)
-                    self._wake_event.set()
+                cleanup = asyncio.create_task(self._remove_ticket(ticket))
+                await _await_task_drained(cleanup)
                 raise
+
+    async def _remove_ticket(self, ticket: object) -> None:
+        """Remove a queued admission even when cancellation hit the state lock."""
+
+        assert self._state_lock is not None
+        async with self._state_lock:
+            with contextlib.suppress(ValueError):
+                self._queue.remove(ticket)
+            assert self._wake_event is not None
+            self._wake_event.set()
 
     @asynccontextmanager
     async def slot(
@@ -2142,13 +2349,66 @@ class ProviderPressure:
             future._callbacks = None  # type: ignore[attr-defined]
 
     async def _settle_participant(self, shared: _SharedOperation) -> None:
+        """Drop one waiter under the state lock, then scrub its delivery."""
+
         assert self._state_lock is not None
+        future_to_scrub: asyncio.Future[Any] | None = None
         async with self._state_lock:
-            shared.participants = max(0, shared.participants - 1)
+            if shared.participants > 0:
+                shared.participants -= 1
             if shared.participants == 0 and shared.future is not None:
-                future = shared.future
-                self._scrub_future(future)
+                future_to_scrub = shared.future
                 shared.future = None
+        if future_to_scrub is not None:
+            self._scrub_future(future_to_scrub)
+
+    async def _settle_owner(
+        self,
+        normalized: ProviderGeneration,
+        shared: _SharedOperation,
+        result: Any,
+        safe_failure: CodexCredentialError | None,
+        completion_status: str,
+    ) -> None:
+        """Commit pressure state before publishing a result to any waiter.
+
+        This coroutine is always shielded and drained by its caller.  The state
+        lock transaction removes the active entry, records only categorical
+        completion metadata, and accounts for the owner before the future can
+        expose a value.  A successful value is therefore never published while
+        the operation is still active or before its owner bookkeeping is done.
+        """
+
+        assert self._state_lock is not None
+        future_to_publish: asyncio.Future[Any] | None = None
+        future_to_scrub: asyncio.Future[Any] | None = None
+        async with self._state_lock:
+            if self._active.get(normalized) is shared:
+                self._active.pop(normalized, None)
+            self._completed[normalized] = _CompletionMetadata(completion_status)
+            self._completed.move_to_end(normalized)
+            while len(self._completed) > self.max_retained_generations:
+                self._completed.popitem(last=False)
+            if shared.participants > 0:
+                shared.participants -= 1
+            future = shared.future
+            if shared.participants == 0:
+                if future is not None:
+                    future_to_scrub = future
+                shared.future = None
+            elif future is not None and not shared.published:
+                shared.published = True
+                future_to_publish = future
+
+        if future_to_publish is not None:
+            if safe_failure is None:
+                future_to_publish.set_result(result)
+            else:
+                future_to_publish.set_exception(safe_failure)
+                with contextlib.suppress(BaseException):
+                    future_to_publish.exception()
+        if future_to_scrub is not None:
+            self._scrub_future(future_to_scrub)
 
     async def run(
         self,
@@ -2158,9 +2418,12 @@ class ProviderPressure:
         timeout: float | None = None,
     ) -> Any:
         self._bind_loop()
-        normalized = self._assert_generation(generation)
+        try:
+            normalized = self._assert_generation(generation)
+        except (OverflowError, TypeError, ValueError):
+            raise ProviderOperationError("generation_invalid") from None
         if not callable(operation):
-            raise TypeError("operation must be callable")
+            raise ProviderOperationError("operation_invalid")
         assert self._state_lock is not None
         owner = False
         shared: _SharedOperation | None = None
@@ -2175,6 +2438,8 @@ class ProviderPressure:
                     return ProviderCompletion(
                         metadata.status if metadata is not None else "replayed"
                     )
+                if len(self._active) >= self.capacity + self.max_queue:
+                    raise ProviderQueueFullError()
                 self._generation_high_water[normalized.scope] = normalized.sequence
                 future = _ScrubbableFuture()
                 shared = _SharedOperation(future)
@@ -2197,12 +2462,15 @@ class ProviderPressure:
         cancelled = False
         result: Any = None
         try:
-            duration = _validate_duration(
-                timeout,
-                default=self.admission_timeout,
-                maximum=_MAX_ADMISSION_TIMEOUT,
-                code="operation_timeout must be finite and bounded",
-            )
+            try:
+                duration = _validate_duration(
+                    timeout,
+                    default=self.admission_timeout,
+                    maximum=_MAX_ADMISSION_TIMEOUT,
+                    code="operation_timeout must be finite and bounded",
+                )
+            except (OverflowError, TypeError, ValueError):
+                raise ProviderOperationError("operation_timeout_invalid") from None
             async with asyncio.timeout(duration):
                 async with self.slot(timeout=duration, generation=normalized):
                     result = operation()
@@ -2211,56 +2479,49 @@ class ProviderPressure:
         except asyncio.CancelledError:
             failure_code = "operation_cancelled"
             cancelled = True
-        except CredentialPersistenceError:
-            failure_code = "credential_persistence"
-        except PressureAdmissionTimeoutError:
-            failure_code = "admission_timeout"
-        except ProviderQueueFullError:
-            failure_code = "queue_full"
+        except CodexCredentialError as error:
+            if _is_credential_storage_error(error):
+                failure_code = "credential_persistence"
+            elif isinstance(error, PressureAdmissionTimeoutError):
+                failure_code = "admission_timeout"
+            elif isinstance(error, ProviderQueueFullError):
+                failure_code = "queue_full"
+            elif isinstance(error, CredentialRefreshError):
+                failure_code = "provider_refresh_failed"
+            elif isinstance(error, ProviderOperationError):
+                failure_code = _safe_code(error.code, "operation_aborted")
+            else:
+                failure_code = "operation_aborted"
         except TimeoutError:
             failure_code = "operation_timeout"
         except BaseException:  # noqa: BLE001 - every waiter receives a safe error
             failure_code = "operation_aborted"
 
-        safe_failure: (
-            ProviderOperationError
-            | PressureAdmissionTimeoutError
-            | ProviderQueueFullError
-            | None
-        ) = None
+        safe_failure: CodexCredentialError | None = None
         if failure_code == "admission_timeout":
             safe_failure = PressureAdmissionTimeoutError()
         elif failure_code == "queue_full":
             safe_failure = ProviderQueueFullError()
         elif failure_code is not None:
             safe_failure = ProviderOperationError(failure_code)
+        completion_status = "completed" if safe_failure is None else safe_failure.code
 
-        assert shared.future is not None
-        if safe_failure is None:
-            shared.future.set_result(result)
-            completion_status = "completed"
-        else:
-            shared.future.set_exception(safe_failure)
-            with contextlib.suppress(BaseException):
-                shared.future.exception()
-            completion_status = safe_failure.code
+        settlement = asyncio.create_task(
+            self._settle_owner(
+                normalized,
+                shared,
+                result,
+                safe_failure,
+                completion_status,
+            )
+        )
+        await _await_task_drained(settlement)
 
-        async with self._state_lock:
-            self._active.pop(normalized, None)
-            self._completed[normalized] = _CompletionMetadata(completion_status)
-            self._completed.move_to_end(normalized)
-            while len(self._completed) > self.max_retained_generations:
-                self._completed.popitem(last=False)
-
-        try:
-            if cancelled:
-                raise asyncio.CancelledError
-            if safe_failure is not None:
-                raise safe_failure
-            return result
-        finally:
-            cleanup = asyncio.create_task(self._settle_participant(shared))
-            await _await_task_drained(cleanup)
+        if cancelled:
+            raise asyncio.CancelledError
+        if safe_failure is not None:
+            raise safe_failure
+        return result
 
 
 CodexProviderPressure = ProviderPressure
