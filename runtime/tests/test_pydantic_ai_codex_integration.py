@@ -260,24 +260,27 @@ async def test_pressure_wraps_actual_pydantic_ai_refresh_path(tmp_path: Path):
 
 
 def _provider_process_worker(path: str, calls, calls_lock, ready, results) -> None:
-    async def fake_refresh(credentials, *, http_client=None):
-        del credentials, http_client
+    async def handler(request):
+        if "token" not in request.url.path:
+            return httpx2.Response(500, json={"error": "unexpected_request"})
         with calls_lock:
             calls.value += 1
         await asyncio.sleep(0.05)
-        return pydantic_codex.OpenAICodexCredentials(
-            access_token="access-new.synthetic",
-            refresh_token="refresh-new.synthetic",
-            account_id="account.synthetic",
+        return httpx2.Response(
+            200,
+            json={
+                "access_token": "access-new.synthetic",
+                "refresh_token": "refresh-new.synthetic",
+                "account_id": "account.synthetic",
+            },
         )
 
     async def run() -> None:
         source = OpenAICodexCredentialSource(path)
-        provider = create_pydantic_ai_codex_provider(source)
-        await provider._load_if_needed()
-        original = pydantic_codex._refresh_credentials
-        pydantic_codex._refresh_credentials = fake_refresh
+        client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+        provider = create_pydantic_ai_codex_provider(source, http_client=client)
         try:
+            await provider._load_if_needed()
             await asyncio.to_thread(ready.wait)
             await provider._refresh_for_401(
                 provider._revision,
@@ -287,7 +290,7 @@ def _provider_process_worker(path: str, calls, calls_lock, ready, results) -> No
         except Exception:  # noqa: BLE001 - child reports only a boolean
             results.put(False)
         finally:
-            pydantic_codex._refresh_credentials = original
+            await client.aclose()
 
     asyncio.run(run())
 
