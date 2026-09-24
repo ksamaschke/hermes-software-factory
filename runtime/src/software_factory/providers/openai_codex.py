@@ -1180,7 +1180,8 @@ class _CredentialPathMixin:
                 # inode even when a race removed both visible names.
                 scrub_inode()
                 if published_by_us:
-                    unlink_published_inode()
+                    with contextlib.suppress(BaseException):
+                        unlink_published_inode()
             if descriptor is not None:
                 with contextlib.suppress(BaseException):
                     os.close(descriptor)
@@ -1189,7 +1190,7 @@ class _CredentialPathMixin:
                     os.unlink(temporary_name, dir_fd=parent_fd)
                 directory_dirty = True
             if directory_dirty and write_failure is not None:
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(BaseException):
                     os.fsync(parent_fd)
         if write_failure is not None:
             raise write_failure
