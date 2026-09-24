@@ -14,7 +14,6 @@ import math
 from collections.abc import Collection, Mapping
 from datetime import date, datetime, time
 from enum import Enum, StrEnum
-from types import MappingProxyType
 from typing import Any, Protocol, runtime_checkable
 
 from pydantic import (
@@ -28,6 +27,7 @@ from pydantic import (
     model_validator,
 )
 
+from .._safety import TraversalBudget, TraversalBudgetError
 from ..api.contracts import (
     AcceptanceCriterion,
     BlockedOutcome,
@@ -129,6 +129,14 @@ class DispatchRequest(ContractModel):
     attempt: StrictInt = Field(default=1, ge=1)
     admitted: StrictBool = True
 
+    @model_validator(mode="before")
+    @classmethod
+    def request_mapping_is_approved(cls, value: object) -> object:
+        if type(value) not in _APPROVED_MAPPING_TYPES:
+            _reject_unapproved_mapping(value, "dispatch request")
+            return value
+        return _approved_mapping_copy(value, "dispatch request")
+
     @field_validator("task_id", "run_id", "role")
     @classmethod
     def route_request_identities_are_exact(cls, value: str, info) -> str:
@@ -186,7 +194,8 @@ class ExecutorBinding(ContractModel):
     @model_validator(mode="before")
     @classmethod
     def normalize_routing_names(cls, value: object) -> object:
-        if type(value) not in {dict, ImmutableMapping, MappingProxyType}:
+        if type(value) not in _APPROVED_MAPPING_TYPES:
+            _reject_unapproved_mapping(value, "executor binding")
             return value
         data = _approved_mapping_copy(value, "executor binding")
         if "run" in data:
@@ -226,6 +235,7 @@ class ExecutorBinding(ContractModel):
     @field_validator("role")
     @classmethod
     def role_is_known(cls, value: str) -> str:
+        _validate_exact_route_identifier(value, "binding role")
         if value not in ROLE_KEYS:
             raise ValueError(f"unknown logical role: {value!r}")
         return value
@@ -367,6 +377,7 @@ class ExecutorSelectionRecord(ContractModel):
     @classmethod
     def normalize_selection_alias(cls, value: object) -> object:
         if type(value) not in _APPROVED_MAPPING_TYPES:
+            _reject_unapproved_mapping(value, "selection record")
             return value
         data = _approved_mapping_copy(value, "selection record")
         if "selection" in data:
@@ -425,7 +436,8 @@ class RetryCompatibilityProof(ContractModel):
     @model_validator(mode="before")
     @classmethod
     def normalize_proof_names(cls, value: object) -> object:
-        if type(value) not in {dict, ImmutableMapping, MappingProxyType}:
+        if type(value) not in _APPROVED_MAPPING_TYPES:
+            _reject_unapproved_mapping(value, "retry compatibility proof")
             return value
         data = _approved_mapping_copy(value, "retry compatibility proof")
         aliases = {
@@ -539,6 +551,7 @@ class RetryDecision(ContractModel):
     @classmethod
     def normalize_retry_names(cls, value: object) -> object:
         if type(value) not in _APPROVED_MAPPING_TYPES:
+            _reject_unapproved_mapping(value, "retry decision")
             return value
         data = _approved_mapping_copy(value, "retry decision")
         aliases = {
@@ -662,9 +675,8 @@ class RetryDecision(ContractModel):
         return self.new_selection
 
 
-_APPROVED_MAPPING_TYPES = frozenset({dict, ImmutableMapping, MappingProxyType})
+_APPROVED_MAPPING_TYPES = frozenset({dict, ImmutableMapping})
 _APPROVED_SEQUENCE_TYPES = frozenset({list, tuple})
-_MAX_SNAPSHOT_DEPTH = 64
 
 _TRUSTED_SNAPSHOT_MODELS = frozenset(
     {
@@ -721,13 +733,34 @@ _TRUSTED_SNAPSHOT_ENUMS = frozenset(
 )
 
 
+def _reject_unapproved_mapping(value: object, label: str) -> None:
+    """Reject mapping subclasses/proxies before Pydantic can iterate them."""
+
+    if type(value) in _APPROVED_MAPPING_TYPES:
+        return
+    if isinstance(value, Mapping):
+        raise ValueError(  # noqa: TRY004 - Pydantic validators require ValueError
+            f"{label} must use an approved exact mapping container"
+        )
+
+
+def _validate_public_route_identifier(value: object, label: str) -> str:
+    """Validate route lookup identities before any map/hash/equality operation."""
+
+    try:
+        return _validate_exact_route_identifier(value, label)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise RoutingError(str(exc)) from exc
+
+
 def _approved_mapping_copy(value: object, label: str) -> dict[str, object]:
     """Materialize one approved mapping without invoking candidate methods."""
 
     if type(value) not in _APPROVED_MAPPING_TYPES:
         raise ValueError(f"{label} must use an approved exact mapping container")
     result: dict[str, object] = {}
-    for key, nested in value.items():  # type: ignore[union-attr]
+    items = dict.items(value) if type(value) is dict else value.items()  # type: ignore[union-attr]
+    for key, nested in items:
         if type(key) is not str:
             raise ValueError(f"{label} mapping keys must be built-in strings")
         if key in result:
@@ -736,16 +769,33 @@ def _approved_mapping_copy(value: object, label: str) -> dict[str, object]:
     return result
 
 
-def _snapshot_value(value: object, label: str, depth: int = 0) -> object:
-    """Copy only exact built-ins, approved containers, enums, and known models."""
+def _mapping_items(value: object):
+    """Iterate only an exact mapping admitted by the routing boundary."""
 
-    if depth > _MAX_SNAPSHOT_DEPTH:
-        raise RoutingError(f"{label} exceeds the snapshot nesting limit")
+    if type(value) is dict:
+        return dict.items(value)
+    if type(value) is ImmutableMapping:
+        return value.items()  # type: ignore[union-attr]
+    raise TypeError("mapping was not exact-admitted")
+
+
+def _snapshot_value(
+    value: object,
+    label: str,
+    depth: int = 0,
+    *,
+    budget: TraversalBudget | None = None,
+) -> object:
+    """Copy exact values with one aggregate, identity-aware budget."""
+
+    budget = budget or TraversalBudget()
     if value is None or type(value) in {bool, int, str}:
+        budget.charge_scalar(value, label)
         return value
     if type(value) is float:
         if not math.isfinite(value):
             raise RoutingError(f"{label} contains a non-finite float")
+        budget.charge_scalar(value, label)
         return value
     if isinstance(value, Enum):
         if type(value) not in _TRUSTED_SNAPSHOT_ENUMS:
@@ -753,31 +803,46 @@ def _snapshot_value(value: object, label: str, depth: int = 0) -> object:
         enum_value = value.value
         if type(enum_value) not in {bool, int, float, str}:
             raise RoutingError(f"{label} contains an unsupported enum value")
+        budget.charge_scalar(enum_value, label)
         return enum_value
     if type(value) in {datetime, date, time}:
+        budget.charge_encoded(32, label)
         return value
     if type(value) is HttpUrl:
-        return str(value)
+        converted = str(value)
+        if type(converted) is not str:
+            raise RoutingError(f"{label} URL did not produce a built-in string")
+        budget.charge_string(converted, label)
+        return converted
     if isinstance(value, BaseModel):
         if type(value) not in _TRUSTED_SNAPSHOT_MODELS:
             raise RoutingError(
                 f"{label} contains an unexpected or subclassed Pydantic model"
             )
-        return _snapshot_model(value, type(value), label, depth + 1)
+        return _snapshot_model(value, type(value), label, depth + 1, budget=budget)
     if type(value) in _APPROVED_MAPPING_TYPES:
+        length = len(value)  # exact type is checked before calling len
+        budget.enter(value, depth=depth, label=label, length=length)
         result: dict[str, object] = {}
-        for key, nested in value.items():  # type: ignore[union-attr]
+        for key, nested in _mapping_items(value):
             if type(key) is not str:
                 raise RoutingError(f"{label} mapping keys must be built-in strings")
+            budget.charge_string(key, f"{label}.{key}")
             if key in result:
                 raise RoutingError(f"{label} contains duplicate key {key!r}")
-            result[key] = _snapshot_value(nested, f"{label}.{key}", depth + 1)
+            result[key] = _snapshot_value(
+                nested, f"{label}.{key}", depth + 1, budget=budget
+            )
         return result
     if type(value) in _APPROVED_SEQUENCE_TYPES:
+        length = len(value)  # exact type is checked before calling len
+        budget.enter(value, depth=depth, label=label, length=length)
         return tuple(
-            _snapshot_value(item, f"{label}[{index}]", depth + 1)
-            for index, item in enumerate(value)  # type: ignore[arg-type]
+            _snapshot_value(item, f"{label}[{index}]", depth + 1, budget=budget)
+            for index, item in enumerate(value)
         )
+    if isinstance(value, Mapping):
+        raise RoutingError(f"{label} must use an approved exact mapping container")
     raise RoutingError(f"{label} contains an unsupported or hostile value")
 
 
@@ -786,11 +851,15 @@ def _snapshot_model(
     model_type: type[BaseModel],
     label: str,
     depth: int = 0,
+    *,
+    budget: TraversalBudget | None = None,
 ) -> dict[str, object]:
     """Read a model's raw declared state without serializer or copy hooks."""
 
     if type(value) is not model_type or model_type not in _TRUSTED_SNAPSHOT_MODELS:
         raise RoutingError(f"{label} is not the exact trusted model type")
+    budget = budget or TraversalBudget()
+    budget.enter(value, depth=depth, label=label, length=1)
     try:
         raw_state = object.__getattribute__(value, "__dict__")
         extra = object.__getattribute__(value, "__pydantic_extra__")
@@ -799,6 +868,12 @@ def _snapshot_model(
         raise RoutingError(f"{label} has no trusted raw model state") from exc
     if type(raw_state) is not dict:
         raise RoutingError(f"{label} raw model state is not an exact dict")
+    budget.enter(
+        raw_state,
+        depth=depth + 1,
+        label=f"{label}.__dict__",
+        length=len(raw_state),
+    )
     if extra is not None and (type(extra) is not dict or extra):
         raise RoutingError(f"{label} contains unknown extra fields")
     if private is not None and (type(private) is not dict or private):
@@ -815,7 +890,9 @@ def _snapshot_model(
             f"{label} field state is not exact (missing={missing!r}, extra={extra_names!r})"
         )
     return {
-        name: _snapshot_value(raw_state[name], f"{label}.{name}", depth + 1)
+        name: _snapshot_value(
+            raw_state[name], f"{label}.{name}", depth + 2, budget=budget
+        )
         for name in expected_names
     }
 
@@ -825,6 +902,8 @@ def _validated_payload(
 ) -> Any:
     try:
         return model_type.model_validate(payload)
+    except (RecursionError, MemoryError, TraversalBudgetError) as exc:
+        raise RoutingError(f"{label} exceeded the bounded safety limits") from exc
     except Exception as exc:
         raise RoutingError(f"{label} failed trusted validation") from exc
 
@@ -832,16 +911,26 @@ def _validated_payload(
 def _validated_snapshot(model_type: type[BaseModel], value: object, label: str) -> Any:
     """Take a hook-free immutable snapshot, then validate a fresh model."""
 
-    if type(value) is model_type:
-        payload = _snapshot_model(value, model_type, label)
-    elif type(value) in _APPROVED_MAPPING_TYPES:
-        payload = _snapshot_value(value, label)
-        assert isinstance(payload, dict)
-    else:
-        raise RoutingError(
-            f"{label} must be an exact trusted model or approved mapping"
-        )
-    return _validated_payload(model_type, payload, label)
+    try:
+        budget = TraversalBudget()
+        if type(value) is model_type:
+            payload = _snapshot_model(value, model_type, label, budget=budget)
+        elif type(value) in _APPROVED_MAPPING_TYPES:
+            payload = _snapshot_value(value, label, budget=budget)
+            assert isinstance(payload, dict)
+        else:
+            if isinstance(value, Mapping):
+                raise RoutingError(
+                    f"{label} must use an approved exact mapping container"
+                )
+            raise RoutingError(
+                f"{label} must be an exact trusted model or approved mapping"
+            )
+        return _validated_payload(model_type, payload, label)
+    except RoutingError:
+        raise
+    except (RecursionError, MemoryError, TraversalBudgetError) as exc:
+        raise RoutingError(f"{label} exceeded the bounded safety limits") from exc
 
 
 def _binding_run_payload(value: object) -> dict[str, object]:
@@ -856,6 +945,8 @@ def _binding_run_payload(value: object) -> dict[str, object]:
         snapshot = _snapshot_value(value, "executor binding run")
         assert isinstance(snapshot, dict)
         payload = snapshot
+    elif isinstance(value, Mapping):
+        raise ValueError("executor binding run must use an approved exact mapping")
     else:
         raise ValueError("executor binding run must be an exact RunIdentity mapping")
     allowed = {"task_id", "run_id", "attempt", "executor_id"}
@@ -879,23 +970,46 @@ def _binding_run_payload(value: object) -> dict[str, object]:
     }
 
 
-def _snapshot_jsonable(value: object) -> object:
-    """Convert an already-safe snapshot to deterministic JSON primitives."""
+def _snapshot_jsonable(
+    value: object,
+    *,
+    budget: TraversalBudget | None = None,
+    depth: int = 0,
+) -> object:
+    """Convert an already-safe snapshot with the same bounded traversal."""
 
+    budget = budget or TraversalBudget()
     if value is None or type(value) in {bool, int, float, str}:
+        if type(value) is float and not math.isfinite(value):
+            raise RoutingError("trusted snapshot contains a non-finite float")
+        budget.charge_scalar(value, "trusted snapshot")
         return value
     if isinstance(value, Enum):
-        return value.value
-    if type(value) is datetime:
-        return datetime.isoformat(value)
-    if type(value) is date:
-        return date.isoformat(value)
-    if type(value) is time:
-        return time.isoformat(value)
+        if type(value) not in _TRUSTED_SNAPSHOT_ENUMS:
+            raise RoutingError("trusted snapshot contains an untrusted enum")
+        enum_value = value.value
+        budget.charge_scalar(enum_value, "trusted snapshot enum")
+        return enum_value
+    if type(value) in {datetime, date, time}:
+        converted = value.isoformat()
+        budget.charge_string(converted, "trusted snapshot datetime")
+        return converted
     if type(value) is dict:
-        return {key: _snapshot_jsonable(nested) for key, nested in value.items()}
+        budget.enter(value, depth=depth, label="trusted snapshot", length=len(value))
+        result: dict[str, object] = {}
+        for key, nested in dict.items(value):
+            if type(key) is not str:
+                raise RoutingError("trusted snapshot mapping keys must be strings")
+            budget.charge_string(key, "trusted snapshot key")
+            result[key] = _snapshot_jsonable(nested, budget=budget, depth=depth + 1)
+        return result
     if type(value) is tuple:
-        return [_snapshot_jsonable(item) for item in value]
+        budget.enter(value, depth=depth, label="trusted snapshot", length=len(value))
+        return [
+            _snapshot_jsonable(item, budget=budget, depth=depth + 1) for item in value
+        ]
+    if isinstance(value, Mapping):
+        raise RoutingError("trusted snapshot must use exact mapping containers")
     raise RoutingError("trusted snapshot is not JSON-safe")
 
 
@@ -918,7 +1032,7 @@ def _require_exact_bool(value: object, label: str) -> bool:
 
 _MAX_KNOWN_PROFILES = 4096
 _APPROVED_PROFILE_CONTAINERS = frozenset(
-    {list, tuple, set, frozenset, dict, ImmutableMapping, MappingProxyType}
+    {list, tuple, set, frozenset, dict, ImmutableMapping}
 )
 
 
@@ -930,39 +1044,48 @@ def _materialize_profile_registry(value: object) -> frozenset[str]:
             "profile registry must be an exact list, tuple, set, frozenset, "
             "or approved immutable mapping"
         )
-    if len(value) > _MAX_KNOWN_PROFILES:  # type: ignore[arg-type]
-        raise RoutingError("profile registry exceeds its bounded size")
-    if type(value) in {dict, ImmutableMapping, MappingProxyType}:
-        try:
-            names = tuple(_approved_mapping_copy(value, "profile registry"))
-        except ValueError as exc:
-            raise RoutingError(str(exc)) from exc
-    else:
-        names = tuple(value)  # all remaining types are exact built-in containers
-    checked: list[str] = []
-    seen: set[str] = set()
-    for index, name in enumerate(names):
-        if type(name) is not str:
-            raise RoutingError(
-                f"profile registry entry {index} must be a built-in identifier string"
-            )
-        if (
-            not name
-            or len(name) > 256
-            or any(character.isspace() for character in name)
-        ):
-            raise RoutingError(
-                f"profile registry entry {index} must be a non-empty identifier"
-            )
-        if "\x00" in name:
-            raise RoutingError(f"profile registry entry {index} must not contain NUL")
-        if name in seen:
-            raise RoutingError(
-                f"profile registry contains duplicate identifier {name!r}"
-            )
-        seen.add(name)
-        checked.append(name)
-    return frozenset(checked)
+    budget = TraversalBudget()
+    try:
+        length = len(value)  # exact container type is checked before len
+        if length > _MAX_KNOWN_PROFILES:
+            raise RoutingError("profile registry exceeds its bounded size")
+        budget.enter(value, depth=0, label="profile registry", length=length)
+        if type(value) in {dict, ImmutableMapping}:
+            try:
+                names = tuple(_approved_mapping_copy(value, "profile registry"))
+            except ValueError as exc:
+                raise RoutingError(str(exc)) from exc
+        else:
+            names = tuple(value)  # all remaining types are exact built-in containers
+        checked: list[str] = []
+        seen: set[str] = set()
+        for index, name in enumerate(names):
+            if type(name) is not str:
+                raise RoutingError(
+                    f"profile registry entry {index} must be a built-in identifier string"
+                )
+            budget.charge_string(name, f"profile registry entry {index}")
+            if (
+                not name
+                or len(name) > 256
+                or any(character.isspace() for character in name)
+            ):
+                raise RoutingError(
+                    f"profile registry entry {index} must be a non-empty identifier"
+                )
+            if "\x00" in name:
+                raise RoutingError(
+                    f"profile registry entry {index} must not contain NUL"
+                )
+            if name in seen:
+                raise RoutingError(
+                    f"profile registry contains duplicate identifier {name!r}"
+                )
+            seen.add(name)
+            checked.append(name)
+        return frozenset(checked)
+    except TraversalBudgetError as exc:
+        raise RoutingError(str(exc)) from exc
 
 
 @runtime_checkable
@@ -1034,14 +1157,19 @@ class PolicyExecutorRouter:
             ),
             None,
         )
-        self._policy = _validated_snapshot(FactoryPolicy, policy, "policy")
-        self._policy_fingerprint = policy_fingerprint(self._policy)
-        self._known_profiles = (
-            None
-            if configured_profiles is None
-            else _materialize_profile_registry(configured_profiles)
-        )
-        self._validate_known_profiles()
+        try:
+            self._policy = _validated_snapshot(FactoryPolicy, policy, "policy")
+            self._policy_fingerprint = policy_fingerprint(self._policy)
+            self._known_profiles = (
+                None
+                if configured_profiles is None
+                else _materialize_profile_registry(configured_profiles)
+            )
+            self._validate_known_profiles()
+        except RoutingError:
+            raise
+        except (RecursionError, MemoryError, TraversalBudgetError) as exc:
+            raise RoutingError("policy exceeds the bounded safety limits") from exc
 
     @property
     def policy(self) -> FactoryPolicy:
@@ -1073,6 +1201,8 @@ class PolicyExecutorRouter:
     def _route_for(
         self, task_id: str, role: str, admitted: bool
     ) -> tuple[RoleRoute, SelectionReason]:
+        task_id = _validate_public_route_identifier(task_id, "route task_id")
+        role = _validate_public_route_identifier(role, "route role")
         _require_exact_bool(admitted, "admitted")
         if role not in self._policy.roles:
             raise RoutingError(f"unknown logical role: {role!r}")
@@ -1125,6 +1255,9 @@ class PolicyExecutorRouter:
     ) -> ExecutorBinding:
         """Select and return one immutable binding before dispatcher admission."""
 
+        for label, value in (("task_id", task_id), ("run_id", run_id), ("role", role)):
+            if value is not None:
+                _validate_public_route_identifier(value, f"selection {label}")
         if admitted is not None:
             _require_exact_bool(admitted, "admitted")
         provided_bindings = tuple(
@@ -1196,7 +1329,15 @@ class PolicyExecutorRouter:
         # Return the trusted snapshot, never the caller's unvalidated object.
         return existing
 
-    def route(self, request: DispatchRequest, **kwargs: Any) -> ExecutorBinding:
+    def route(
+        self,
+        request: DispatchRequest
+        | RunIdentity
+        | TaskEnvelope
+        | Mapping[str, Any]
+        | None = None,
+        **kwargs: Any,
+    ) -> ExecutorBinding:
         """Adapter alias used by dispatchers that call their boundary ``route``."""
 
         return self.select(request, **kwargs)
@@ -1256,7 +1397,12 @@ class PolicyExecutorRouter:
         if request is not None:
             if type(request) not in _APPROVED_MAPPING_TYPES:
                 raise RoutingError("dispatch request must use an approved mapping")
-            request_snapshot = _snapshot_value(request, "dispatch request")
+            try:
+                request_snapshot = _snapshot_value(request, "dispatch request")
+            except (RecursionError, MemoryError, TraversalBudgetError) as exc:
+                raise RoutingError(
+                    "dispatch request exceeds the bounded safety limits"
+                ) from exc
             assert isinstance(request_snapshot, dict)
             if admitted is not None:
                 if "admitted" in request_snapshot:
@@ -1421,7 +1567,12 @@ class PolicyExecutorRouter:
                 "authoritative terminal lifecycle evidence is required, not RunIdentity"
             )
         if type(evidence) in _APPROVED_MAPPING_TYPES:
-            snapshot = _snapshot_value(evidence, "lifecycle evidence")
+            try:
+                snapshot = _snapshot_value(evidence, "lifecycle evidence")
+            except (RecursionError, MemoryError, TraversalBudgetError) as exc:
+                raise RetryRoutingError(
+                    "lifecycle evidence exceeds the bounded safety limits"
+                ) from exc
             assert isinstance(snapshot, dict)
             if "state" in snapshot:
                 return PolicyExecutorRouter._canonical_lifecycle_evidence(
@@ -1520,8 +1671,10 @@ class PolicyExecutorRouter:
             rule_id=rule.rule_id,
         )
 
-    def _validate_retry_decision_authorization(self, decision: RetryDecision) -> None:
-        """Verify a backend-change proof against exactly one active rule."""
+    def _validate_retry_decision_authorization(
+        self, decision: RetryDecision, *, allow_lifecycle_override: bool = False
+    ) -> None:
+        """Recompute backend-change authority from the active policy."""
 
         self._validate_active_binding(decision.prior_selection)
         self._validate_active_binding(decision.new_selection)
@@ -1529,18 +1682,36 @@ class PolicyExecutorRouter:
             decision.prior_selection.backend_key()
             != decision.new_selection.backend_key()
         )
-        if not backend_changed or not decision.allowed:
+        if not backend_changed:
             if decision.compatibility_proof is not None:
                 raise RetryRoutingError(
-                    "same-backend or rejected retry decisions must not carry compatibility proof"
+                    "same-backend retry decisions must not carry compatibility proof"
                 )
             return
+
+        if decision.reason is RetryDecisionReason.ACTIVE_RUN:
+            if not allow_lifecycle_override:
+                raise RetryRoutingError(
+                    "active-run retry decisions require lifecycle evidence"
+                )
+            return
+
         rule = self._matching_retry_rule(
             decision.prior_selection, decision.new_selection
         )
         if rule is None:
+            if decision.allowed:
+                raise RetryRoutingError(
+                    "allowed backend change has no exact active policy rule"
+                )
+            if decision.compatibility_proof is not None:
+                raise RetryRoutingError(
+                    "rejected backend changes must not carry compatibility proof"
+                )
+            return
+        if not decision.allowed:
             raise RetryRoutingError(
-                "retry compatibility proof does not match an active policy rule"
+                "rejected backend change is authorized by an exact active policy rule"
             )
         expected = self._compatibility_proof(
             decision.prior_selection, decision.new_selection, rule
@@ -1555,15 +1726,27 @@ class PolicyExecutorRouter:
     ) -> RetryDecision:
         """Validate direct retry-decision readback against this active policy."""
 
-        canonical = _validated_snapshot(RetryDecision, decision, "retry decision")
+        try:
+            canonical = _validated_snapshot(RetryDecision, decision, "retry decision")
+        except RoutingError as exc:
+            raise RetryRoutingError(str(exc)) from exc
         try:
             self._validate_retry_decision_authorization(canonical)
         except RoutingError as exc:
             raise RetryRoutingError(str(exc)) from exc
         return canonical
 
-    def _finalize_retry_decision(self, decision: RetryDecision) -> RetryDecision:
-        return self.validate_retry_decision(decision)
+    def _finalize_retry_decision(
+        self, decision: RetryDecision, *, allow_lifecycle_override: bool = False
+    ) -> RetryDecision:
+        try:
+            canonical = _validated_snapshot(RetryDecision, decision, "retry decision")
+            self._validate_retry_decision_authorization(
+                canonical, allow_lifecycle_override=allow_lifecycle_override
+            )
+        except RoutingError as exc:
+            raise RetryRoutingError(str(exc)) from exc
+        return canonical
 
     def decide_retry(
         self,
@@ -1654,7 +1837,8 @@ class PolicyExecutorRouter:
                     allowed=False,
                     decision=RetryDecisionKind.BACKEND_CHANGE_REJECTED,
                     reason=RetryDecisionReason.ACTIVE_RUN,
-                )
+                ),
+                allow_lifecycle_override=True,
             )
         if prior.backend_key() == new.backend_key():
             return self._finalize_retry_decision(
@@ -1770,16 +1954,26 @@ class PolicyExecutorRouter:
 def policy_fingerprint(policy: FactoryPolicy | Mapping[str, Any]) -> str:
     """Return a deterministic credential-free fingerprint of validated policy."""
 
-    canonical = _validated_snapshot(FactoryPolicy, policy, "policy")
-    snapshot = _snapshot_model(canonical, FactoryPolicy, "policy")
-    payload = json.dumps(
-        _snapshot_jsonable(snapshot),
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-        allow_nan=False,
-    ).encode("utf-8")
-    return "sha256:" + hashlib.sha256(payload).hexdigest()
+    try:
+        canonical = _validated_snapshot(FactoryPolicy, policy, "policy")
+        budget = TraversalBudget()
+        snapshot = _snapshot_model(canonical, FactoryPolicy, "policy", budget=budget)
+        jsonable = _snapshot_jsonable(snapshot, budget=budget)
+        payload = json.dumps(
+            jsonable,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+        budget.charge_encoded(len(payload), "policy fingerprint")
+        return "sha256:" + hashlib.sha256(payload).hexdigest()
+    except RoutingError:
+        raise
+    except (RecursionError, MemoryError, TraversalBudgetError) as exc:
+        raise RoutingError(
+            "policy fingerprint exceeds the bounded safety limits"
+        ) from exc
 
 
 # Focused aliases keep the boundary discoverable for dispatcher integrations.

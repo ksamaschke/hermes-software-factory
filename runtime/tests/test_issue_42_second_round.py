@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -15,7 +14,12 @@ from software_factory.api.contracts import (
     RunIdentity,
     TaskState,
 )
-from software_factory.control.policy import FactoryPolicy, PolicyError, load_policy
+from software_factory.control.policy import (
+    FactoryPolicy,
+    ImmutableMapping,
+    PolicyError,
+    load_policy,
+)
 from software_factory.execution import (
     DispatchRequest,
     ExecutorBinding,
@@ -318,7 +322,7 @@ def test_known_profiles_validate_shape_before_hashing_and_equality():
 
     # Mapping registries are accepted only as exact string-keyed containers.
     router = PolicyExecutorRouter(
-        policy, known_profiles=MappingProxyType({"implementer": object()})
+        policy, known_profiles=ImmutableMapping({"implementer": object()})
     )
     assert (
         router.select(

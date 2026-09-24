@@ -7,7 +7,7 @@ import json
 import math
 import re
 from collections.abc import Mapping
-from enum import StrEnum
+from enum import Enum, StrEnum
 from pathlib import Path
 from types import MappingProxyType
 from typing import Annotated, Any, Generic, Literal, Self, TypeAlias, TypeVar
@@ -29,7 +29,8 @@ from pydantic import (
 )
 from yaml.constructor import ConstructorError
 
-from ..api.contracts import Identifier, Revision
+from .._safety import TraversalBudget, TraversalBudgetError
+from ..api.contracts import MAX_IDENTIFIER_LENGTH, Identifier, Revision
 
 
 class PolicyError(ValueError):
@@ -48,6 +49,11 @@ class ImmutableMapping(
     __slots__ = ("_data",)
 
     def __init__(self, values: Mapping[_MappingKey, _MappingValue]) -> None:
+        # Only the runtime's own exact mapping or an exact dict may become an
+        # immutable mapping.  In particular, do not let a proxy preserve a
+        # hostile dict subclass' iteration hooks at this boundary.
+        if type(values) not in {dict, ImmutableMapping}:
+            raise TypeError("ImmutableMapping requires an exact dict snapshot")
         object.__setattr__(self, "_data", MappingProxyType(dict(values)))
 
     def __getitem__(self, key: _MappingKey) -> _MappingValue:
@@ -69,28 +75,89 @@ class ImmutableMapping(
         raise AttributeError(f"{type(self).__name__} is immutable")
 
 
-def _deep_freeze(value: object) -> object:
-    """Recursively freeze mappings and JSON arrays after validation."""
+_APPROVED_MAPPING_TYPES = frozenset({dict, ImmutableMapping})
 
+
+def _reject_unapproved_mapping(value: object, field_name: str) -> None:
+    """Reject mapping subclasses/proxies before Pydantic can iterate them."""
+
+    if type(value) in _APPROVED_MAPPING_TYPES:
+        return
     if isinstance(value, Mapping):
-        return ImmutableMapping(
-            {key: _deep_freeze(nested) for key, nested in value.items()}
+        raise ValueError(  # noqa: TRY004 - Pydantic validators require ValueError
+            f"{field_name} must use an approved exact mapping container"
         )
-    if isinstance(value, (list, tuple)):
-        return tuple(_deep_freeze(item) for item in value)
-    return value
 
 
-_APPROVED_MAPPING_TYPES = frozenset({dict, ImmutableMapping, MappingProxyType})
+def _mapping_items(value: object):
+    """Iterate only an already exact-admitted mapping."""
+
+    if type(value) is dict:
+        return dict.items(value)
+    if type(value) is ImmutableMapping:
+        return value.items()  # type: ignore[union-attr]
+    raise TypeError("mapping was not exact-admitted")
+
+
+def _deep_freeze(
+    value: object,
+    *,
+    budget: TraversalBudget | None = None,
+    depth: int = 0,
+    path: str = "policy",
+) -> object:
+    """Recursively freeze a bounded, already-validated policy graph."""
+
+    budget = budget or TraversalBudget()
+    if value is None or type(value) in {bool, int, str}:
+        budget.charge_scalar(value, path)
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError(f"{path} must contain finite JSON numbers")
+        budget.charge_scalar(value, path)
+        return value
+    if type(value) in _APPROVED_MAPPING_TYPES:
+        length = len(value)  # exact type is checked before calling len
+        budget.enter(value, depth=depth, label=path, length=length)
+        result: dict[str, object] = {}
+        for key, nested in _mapping_items(value):
+            if type(key) is not str:
+                raise ValueError(f"{path} mapping keys must be built-in strings")
+            budget.charge_string(key, f"{path}.{key}")
+            if key in result:
+                raise ValueError(f"{path} contains duplicate mapping key {key!r}")
+            result[key] = _deep_freeze(
+                nested, budget=budget, depth=depth + 1, path=f"{path}.{key}"
+            )
+        return ImmutableMapping(result)
+    if type(value) in {list, tuple}:
+        length = len(value)  # exact type is checked before calling len
+        budget.enter(value, depth=depth, label=path, length=length)
+        return tuple(
+            _deep_freeze(item, budget=budget, depth=depth + 1, path=f"{path}[{index}]")
+            for index, item in enumerate(value)
+        )
+    if isinstance(value, BaseModel):
+        # Nested policy models have already passed their typed validators.  We
+        # still account for their identity so aliases cannot bypass the graph
+        # budget during the surrounding mapping freeze.
+        if type(value).__module__.split(".")[0] != "software_factory":
+            raise ValueError(f"{path} contains an untrusted model")
+        budget.enter(value, depth=depth, label=path, length=1)
+        return value
+    _reject_unapproved_mapping(value, path)
+    raise ValueError(f"{path} contains an unsupported policy value")
 
 
 def _approved_mapping_copy(value: object, field_name: str) -> dict[str, object]:
     """Materialize only exact mappings with exact built-in string keys."""
 
+    _reject_unapproved_mapping(value, field_name)
     if type(value) not in _APPROVED_MAPPING_TYPES:
         raise ValueError(f"{field_name} must use an approved exact mapping container")
     result: dict[str, object] = {}
-    for key, nested in value.items():  # type: ignore[union-attr]
+    for key, nested in _mapping_items(value):
         if type(key) is not str:
             raise ValueError(f"{field_name} mapping keys must be built-in strings")
         if key in result:
@@ -104,9 +171,12 @@ def _policy_dump_value(value: object, mode: str) -> object:
 
     if isinstance(value, BaseModel):
         return value.model_dump(mode=mode)
-    if isinstance(value, Mapping):
-        return {key: _policy_dump_value(nested, mode) for key, nested in value.items()}
-    if isinstance(value, (list, tuple)):
+    if type(value) in _APPROVED_MAPPING_TYPES:
+        return {
+            key: _policy_dump_value(nested, mode)
+            for key, nested in _mapping_items(value)
+        }
+    if type(value) in {list, tuple}:
         values = [_policy_dump_value(item, mode) for item in value]
         return values if mode == "json" else tuple(values)
     return value
@@ -136,8 +206,8 @@ class PolicyModel(BaseModel):
 
         del deep  # validation creates a fresh object graph regardless of this hint
         values = self.model_dump(mode="python")
-        if update:
-            values.update(dict(update))
+        if update is not None:
+            values.update(_approved_mapping_copy(update, "policy model update"))
         return type(self).model_validate(values)
 
     def model_copy(
@@ -157,35 +227,64 @@ def _as_tuple_input(value: object, field_name: str) -> tuple[object, ...]:
     return tuple(value)
 
 
-def _json_safe_value(value: object, path: str) -> object:
-    """Copy only JSON values, rejecting handles and provider objects."""
+def _json_safe_value(
+    value: object,
+    path: str,
+    *,
+    budget: TraversalBudget | None = None,
+    depth: int = 0,
+) -> object:
+    """Copy only JSON values with one aggregate graph budget."""
 
+    budget = budget or TraversalBudget()
     if value is None or type(value) in {bool, int, str}:
+        budget.charge_scalar(value, path)
         return value
     if type(value) is float:
         if not math.isfinite(value):
             raise ValueError(f"{path} must contain finite JSON numbers")
+        budget.charge_scalar(value, path)
         return value
-    if type(value) in {dict, ImmutableMapping, MappingProxyType}:
+    if isinstance(value, Enum):
+        if type(value) not in {ExecutorKind, ProviderKind}:
+            raise ValueError(f"{path} contains an untrusted enum")
+        enum_value = value.value
+        if type(enum_value) not in {bool, int, float, str}:
+            raise ValueError(f"{path} contains an unsupported enum value")
+        budget.charge_scalar(enum_value, path)
+        return enum_value
+    if type(value) in _APPROVED_MAPPING_TYPES:
+        length = len(value)  # exact type is checked before calling len
+        budget.enter(value, depth=depth, label=path, length=length)
         result: dict[str, object] = {}
-        for key, nested in value.items():
+        for key, nested in _mapping_items(value):
             if type(key) is not str:
                 raise ValueError(f"{path} mapping keys must be strings")
+            budget.charge_string(key, f"{path}.{key}")
             if key in result:
                 raise ValueError(f"{path} contains duplicate mapping key {key!r}")
-            result[key] = _json_safe_value(nested, f"{path}.{key}")
+            result[key] = _json_safe_value(
+                nested, f"{path}.{key}", budget=budget, depth=depth + 1
+            )
         return result
     if type(value) in {list, tuple}:
-        return [_json_safe_value(item, f"{path}[]") for item in value]
+        length = len(value)  # exact type is checked before calling len
+        budget.enter(value, depth=depth, label=path, length=length)
+        return [
+            _json_safe_value(item, f"{path}[{index}]", budget=budget, depth=depth + 1)
+            for index, item in enumerate(value)
+        ]
+    _reject_unapproved_mapping(value, path)
     raise ValueError(
         f"{path} must contain only JSON-safe scalar, array, or mapping values"
     )
 
 
 def _json_safe_mapping(value: object, field_name: str) -> dict[str, object]:
-    if type(value) not in {dict, ImmutableMapping, MappingProxyType}:
+    _reject_unapproved_mapping(value, field_name)
+    if type(value) not in _APPROVED_MAPPING_TYPES:
         raise ValueError(f"{field_name} must be a JSON-safe mapping")
-    checked = _json_safe_value(value, field_name)
+    checked = _json_safe_value(value, field_name, budget=TraversalBudget())
     assert isinstance(checked, dict)
     return checked
 
@@ -340,6 +439,15 @@ _GLOB_SYNTAX = frozenset("*?[]{}\\()!+@^~")
 def _validate_exact_route_identifier(value: str, field_name: str) -> str:
     """Require a literal route identity, never a glob or escaped pattern."""
 
+    if type(value) is not str:
+        raise ValueError(f"{field_name} must be a built-in identifier string")
+    if not value or len(value) > MAX_IDENTIFIER_LENGTH:
+        raise ValueError(
+            f"{field_name} must be a non-empty identifier no longer than "
+            f"{MAX_IDENTIFIER_LENGTH} characters"
+        )
+    if "\x00" in value or any(character.isspace() for character in value):
+        raise ValueError(f"{field_name} must not contain whitespace or NUL")
     if any(character in _GLOB_SYNTAX for character in value):
         raise ValueError(f"{field_name} must be an exact literal identifier")
     return value
@@ -475,6 +583,7 @@ class CanaryRule(PolicyModel):
     @field_validator("role")
     @classmethod
     def role_is_known(cls, value: str) -> str:
+        _validate_exact_route_identifier(value, "canary role")
         if value not in ROLE_KEYS:
             raise ValueError(f"unknown canary role: {value!r}")
         return value
@@ -507,6 +616,7 @@ class RetryCompatibilityRule(PolicyModel):
     @classmethod
     def normalize_executor_aliases(cls, value: object) -> object:
         if type(value) not in _APPROVED_MAPPING_TYPES:
+            _reject_unapproved_mapping(value, "retry compatibility rule")
             return value
         data = _approved_mapping_copy(value, "retry compatibility rule")
         aliases = {
@@ -552,6 +662,7 @@ class RetryCompatibilityRule(PolicyModel):
     @field_validator("role")
     @classmethod
     def role_is_known(cls, value: str) -> str:
+        _validate_exact_route_identifier(value, "unknown retry compatibility role")
         if value not in ROLE_KEYS:
             raise ValueError(f"unknown retry compatibility role: {value!r}")
         return value
@@ -701,6 +812,7 @@ class CompatibilityPolicy(PolicyModel):
         """Accept descriptive aliases, but reject ambiguous policy sources."""
 
         if type(value) not in _APPROVED_MAPPING_TYPES:
+            _reject_unapproved_mapping(value, "compatibility policy")
             return value
         data = _approved_mapping_copy(value, "compatibility policy")
 
@@ -899,7 +1011,11 @@ class CompatibilityPolicy(PolicyModel):
         object.__setattr__(
             self,
             "fallback_executors",
-            _deep_freeze(self.fallback_executors),
+            _deep_freeze(
+                self.fallback_executors,
+                budget=TraversalBudget(),
+                path="compatibility.fallback_executors",
+            ),
         )
         return self
 
@@ -979,6 +1095,16 @@ class FactoryPolicy(PolicyModel):
     )
     roles: Mapping[str, RoleRoute] = Field(min_length=1)
     compatibility: CompatibilityPolicy = Field(default_factory=CompatibilityPolicy)
+
+    @model_validator(mode="before")
+    @classmethod
+    def canonicalize_policy_graph(cls, value: object) -> object:
+        """Reject untrusted maps and bound the complete raw policy graph."""
+
+        if type(value) not in _APPROVED_MAPPING_TYPES:
+            _reject_unapproved_mapping(value, "project policy")
+            return value
+        return _json_safe_mapping(value, "project policy")
 
     @field_validator(
         "runtime",
@@ -1079,6 +1205,7 @@ class FactoryPolicy(PolicyModel):
 
     @model_validator(mode="after")
     def mapping_fields_are_immutable(self) -> FactoryPolicy:
+        budget = TraversalBudget()
         for field_name in (
             "runtime",
             "transport",
@@ -1103,8 +1230,23 @@ class FactoryPolicy(PolicyModel):
             "roles",
         ):
             object.__setattr__(
-                self, field_name, _deep_freeze(getattr(self, field_name))
+                self,
+                field_name,
+                _deep_freeze(
+                    getattr(self, field_name),
+                    budget=budget,
+                    path=f"policy.{field_name}",
+                ),
             )
+        object.__setattr__(
+            self.compatibility,
+            "fallback_executors",
+            _deep_freeze(
+                self.compatibility.fallback_executors,
+                budget=budget,
+                path="policy.compatibility.fallback_executors",
+            ),
+        )
         return self
 
     @field_serializer(
@@ -1271,6 +1413,12 @@ def _load_json(text: str) -> object:
 
 
 def _load_text_document(text: str) -> object:
+    if type(text) is not str:
+        raise PolicyError("policy text must be a built-in string")
+    try:
+        TraversalBudget().charge_string(text, "policy text")
+    except TraversalBudgetError as exc:
+        raise PolicyError(str(exc)) from exc
     stripped = text.lstrip()
     if stripped.startswith(("{", "[")):
         try:
@@ -1283,7 +1431,7 @@ def _load_text_document(text: str) -> object:
 
 
 def _read_document(source: str | Path | Mapping[str, Any]) -> dict[str, Any]:
-    if type(source) in {dict, ImmutableMapping, MappingProxyType}:
+    if type(source) in _APPROVED_MAPPING_TYPES:
         try:
             document = _json_safe_mapping(source, "project policy")
         except ValueError as exc:
@@ -1291,10 +1439,16 @@ def _read_document(source: str | Path | Mapping[str, Any]) -> dict[str, Any]:
     elif isinstance(source, Mapping):
         raise PolicyError("project policy mapping must use an approved container")
     else:
-        raw_source = str(source)
-        looks_like_yaml = isinstance(source, str) and (
-            "\n" in source or source.lstrip().startswith(("{", "[", "version:"))
-        )
+        if isinstance(source, str):
+            if type(source) is not str:
+                raise PolicyError("policy text must be a built-in string")
+            raw_source = source
+            looks_like_yaml = "\n" in source or source.lstrip().startswith(
+                ("{", "[", "version:")
+            )
+        else:
+            raw_source = str(source)
+            looks_like_yaml = False
         if looks_like_yaml:
             try:
                 document = _load_text_document(raw_source)
@@ -1336,7 +1490,7 @@ def _read_document(source: str | Path | Mapping[str, Any]) -> dict[str, Any]:
                     raise PolicyError(
                         f"policy path does not exist and text is invalid: {source}: {exc}"
                     ) from exc
-    if type(document) not in {dict, ImmutableMapping, MappingProxyType}:
+    if type(document) not in _APPROVED_MAPPING_TYPES:
         raise PolicyError("project policy must be a YAML mapping")
     try:
         return _json_safe_mapping(document, "project policy")
@@ -1399,16 +1553,19 @@ def load_policy(source: str | Path | Mapping[str, Any]) -> FactoryPolicy:
     compatibility mapper; they are never silently treated as runtime routes.
     """
 
-    document = _read_document(source)
-    if "roles" not in document:
-        if "profiles" not in document:
-            raise PolicyError("policy must define runtime roles or legacy profiles")
-        document = _legacy_policy(document)
-    elif "profiles" in document:
-        raise PolicyError("policy cannot define both runtime roles and legacy profiles")
-
     try:
+        document = _read_document(source)
+        if "roles" not in document:
+            if "profiles" not in document:
+                raise PolicyError("policy must define runtime roles or legacy profiles")
+            document = _legacy_policy(document)
+        elif "profiles" in document:
+            raise PolicyError(
+                "policy cannot define both runtime roles and legacy profiles"
+            )
         return FactoryPolicy.model_validate(document)
+    except (RecursionError, MemoryError) as exc:
+        raise PolicyError("policy exceeds the bounded safety limits") from exc
     except ValidationError as exc:
         raise PolicyError(f"invalid project policy: {exc}") from exc
 
