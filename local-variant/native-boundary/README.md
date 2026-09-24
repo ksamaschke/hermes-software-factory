@@ -94,7 +94,10 @@ isolation boundary is stated explicitly.
   profile, live lease and claim lock, prior terminal `review_requested`
   implementation run, immutable packet/body/pointer receipt, clean worktree,
   candidate, changed-path manifest, repository/worktree identity, and local HEAD.
-  Review identity fields are validated before JSON serialization or redaction:
+  Review metadata is accepted only in an exact built-in `dict`; top-level keys
+  must be exact built-in strings, and the accepted mapping is copied once before
+  validation or persistence. Review identity fields are validated before JSON
+  serialization or redaction:
   `candidate_commit`, present head aliases, the remediation scope digest and the
   opaque handoff key must use the exact built-in `str` type. Numbers, booleans,
   floats, bytes, string subclasses, and stringable lookalikes are rejected

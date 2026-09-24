@@ -10,13 +10,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 
 import pytest
-
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -405,6 +404,20 @@ with kb.connect_closing(db) as conn:
         def __str__(self):
             return self.value
 
+    class SneakyDict(dict):
+        def __init__(self, raw, exposed):
+            super().__init__(raw)
+            self.exposed = exposed
+
+        def items(self):
+            return self.exposed.items()
+
+        def get(self, key, default=None):
+            return self.exposed.get(key, default)
+
+        def __getitem__(self, key):
+            return self.exposed[key]
+
     invalid_request_values = [
         ("candidate_commit", int("1" * 40)),
         ("candidate_commit", True),
@@ -450,6 +463,70 @@ with kb.connect_closing(db) as conn:
             "AND kind = 'review_requested'",
             (successor_id,),
         ).fetchone()["n"] == before_receipts
+
+    sneaky_request_metadata = SneakyDict(
+        {
+            "candidate_commit": int("1" * 40),
+            "review_remediation_handoff_key": StringSubclass(
+                receipt["handoff_key"]
+            ),
+            "scope_manifest_sha256": b"b" * 64,
+        },
+        review_metadata,
+    )
+    before_receipts = conn.execute(
+        "SELECT COUNT(*) AS n FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_requested'",
+        (successor_id,),
+    ).fetchone()["n"]
+    with active("implementer"):
+        requested, request_reason = kb.request_review(
+            conn,
+            successor_id,
+            summary="reject dict subclass remediation metadata",
+            metadata=sneaky_request_metadata,
+            reviewer="reviewer",
+            expected_run_id=implementation_claim.current_run_id,
+            with_reason=True,
+        )
+    assert not requested, request_reason
+    assert "exact built-in dict" in str(request_reason)
+    assert kb.get_task(conn, successor_id).status == "running"
+    implementation_run = kb.latest_run(conn, successor_id)
+    assert implementation_run.status == "running"
+    assert implementation_run.outcome is None
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_requested'",
+        (successor_id,),
+    ).fetchone()["n"] == before_receipts
+
+    subclass_key_request_metadata = {
+        StringSubclass("candidate_commit"): remediation_head,
+        "review_remediation_handoff_key": receipt["handoff_key"],
+        "scope_manifest_sha256": remediation_scope,
+    }
+    with active("implementer"):
+        requested, request_reason = kb.request_review(
+            conn,
+            successor_id,
+            summary="reject string subclass metadata key",
+            metadata=subclass_key_request_metadata,
+            reviewer="reviewer",
+            expected_run_id=implementation_claim.current_run_id,
+            with_reason=True,
+        )
+    assert not requested, request_reason
+    assert "metadata keys must use exact built-in strings" in str(request_reason)
+    assert kb.get_task(conn, successor_id).status == "running"
+    implementation_run = kb.latest_run(conn, successor_id)
+    assert implementation_run.status == "running"
+    assert implementation_run.outcome is None
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_requested'",
+        (successor_id,),
+    ).fetchone()["n"] == before_receipts
 
     original_redact_review_value = kb.redact_review_value
 
@@ -547,6 +624,64 @@ with kb.connect_closing(db) as conn:
             "AND kind = 'completed'",
             (successor_id,),
         ).fetchone()["n"] == before_completed
+
+    valid_completion_metadata = {"review_outcome": "APPROVED", **review_metadata}
+    sneaky_completion_metadata = SneakyDict(
+        {
+            "review_outcome": StringSubclass("APPROVED"),
+            "candidate_commit": int("1" * 40),
+            "review_remediation_handoff_key": StringSubclass(
+                receipt["handoff_key"]
+            ),
+            "scope_manifest_sha256": b"b" * 64,
+        },
+        valid_completion_metadata,
+    )
+    before_completed = conn.execute(
+        "SELECT COUNT(*) AS n FROM task_events WHERE task_id = ? "
+        "AND kind = 'completed'",
+        (successor_id,),
+    ).fetchone()["n"]
+    with active("reviewer"):
+        assert not kb.complete_task(
+            conn,
+            successor_id,
+            summary="reject dict subclass completion metadata",
+            metadata=sneaky_completion_metadata,
+            expected_run_id=second_review.current_run_id,
+        )
+    assert kb.get_task(conn, successor_id).status == "running"
+    reviewer_run = kb.latest_run(conn, successor_id)
+    assert reviewer_run.status == "running"
+    assert reviewer_run.outcome is None
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM task_events WHERE task_id = ? "
+        "AND kind = 'completed'",
+        (successor_id,),
+    ).fetchone()["n"] == before_completed
+
+    subclass_key_completion_metadata = {
+        StringSubclass("review_outcome"): "APPROVED",
+        **review_metadata,
+    }
+    with active("reviewer"):
+        assert not kb.complete_task(
+            conn,
+            successor_id,
+            summary="reject string subclass completion key",
+            metadata=subclass_key_completion_metadata,
+            expected_run_id=second_review.current_run_id,
+        )
+    assert kb.get_task(conn, successor_id).status == "running"
+    reviewer_run = kb.latest_run(conn, successor_id)
+    assert reviewer_run.status == "running"
+    assert reviewer_run.outcome is None
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM task_events WHERE task_id = ? "
+        "AND kind = 'completed'",
+        (successor_id,),
+    ).fetchone()["n"] == before_completed
+
     with active("reviewer"):
         assert kb.complete_task(
             conn,

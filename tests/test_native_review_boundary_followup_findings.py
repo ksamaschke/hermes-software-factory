@@ -47,6 +47,21 @@ class _StringableLookalike:
         return self.value
 
 
+class _SneakyDict(dict):
+    def __init__(self, raw: dict, exposed: dict):
+        super().__init__(raw)
+        self._exposed = exposed
+
+    def items(self):
+        return self._exposed.items()
+
+    def get(self, key, default=None):
+        return self._exposed.get(key, default)
+
+    def __getitem__(self, key):
+        return self._exposed[key]
+
+
 @pytest.fixture
 def kanban_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
@@ -501,6 +516,82 @@ def test_public_review_request_rejects_non_string_candidate_identity(
     )
 
 
+def test_public_review_request_rejects_dict_subclass_before_serialization(
+    kanban_db, monkeypatch
+):
+    module, conn, db_path = kanban_db
+    task_id, claimed = _claim(module, conn, "dict subclass public review handoff")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+    monkeypatch.setenv("HERMES_SESSION_ID", "implementer-session")
+    sys.modules.pop("tools.kanban_tools", None)
+    tools = importlib.import_module("tools.kanban_tools")
+    monkeypatch.setattr(
+        tools,
+        "_connect",
+        lambda board=None: (module, module.connect(db_path)),
+    )
+    metadata = _SneakyDict(
+        {"candidate_commit": int("1" * 40)},
+        {"candidate_commit": "a" * 40},
+    )
+
+    response = json.loads(
+        tools._handle_request_review(
+            {
+                "summary": "must reject dict subclass metadata",
+                "reviewer": "reviewer",
+                "metadata": metadata,
+            }
+        )
+    )
+    assert response.get("ok") is not True
+    assert "exact built-in dict" in response["error"]
+    task = module.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == claimed.current_run_id
+    run = module.latest_run(conn, task_id)
+    assert run is not None
+    assert run.status == "running"
+    assert run.outcome is None
+    assert not any(
+        event.kind == "review_requested" for event in module.list_events(conn, task_id)
+    )
+
+
+def test_native_review_request_rejects_dict_subclass_before_lookup(kanban_db):
+    module, conn, _ = kanban_db
+    task_id, claimed = _claim(module, conn, "dict subclass native review handoff")
+    metadata = _SneakyDict(
+        {"candidate_commit": int("1" * 40)},
+        {"candidate_commit": "a" * 40},
+    )
+
+    ok, reason = module.request_review(
+        conn,
+        task_id,
+        summary="must reject dict subclass metadata",
+        reviewer="reviewer",
+        metadata=metadata,
+        expected_run_id=claimed.current_run_id,
+        with_reason=True,
+    )
+    assert not ok
+    assert "exact built-in dict" in str(reason)
+    task = module.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == claimed.current_run_id
+    run = module.latest_run(conn, task_id)
+    assert run is not None
+    assert run.status == "running"
+    assert run.outcome is None
+    assert not any(
+        event.kind == "review_requested" for event in module.list_events(conn, task_id)
+    )
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -763,9 +854,7 @@ def test_remediation_metadata_rejects_string_subclass_key(monkeypatch):
         tools._prepare_request_review_metadata("task-remediation", metadata)
 
 
-def test_none_review_metadata_survives_public_tool_boundary(
-    kanban_db, monkeypatch
-):
+def test_none_review_metadata_survives_public_tool_boundary(kanban_db, monkeypatch):
     module, conn, db_path = kanban_db
     task_id, claimed = _claim(module, conn, "legacy public review handoff")
     monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
@@ -872,7 +961,9 @@ def test_public_completion_rejects_normalized_verdict_aliases(
     assert run is not None
     assert run.status == "running"
     assert run.outcome is None
-    assert not any(event.kind == "completed" for event in module.list_events(conn, task_id))
+    assert not any(
+        event.kind == "completed" for event in module.list_events(conn, task_id)
+    )
 
 
 @pytest.mark.parametrize(
@@ -953,7 +1044,126 @@ def test_public_completion_rejects_non_string_candidate_identity(
     assert run is not None
     assert run.status == "running"
     assert run.outcome is None
-    assert not any(event.kind == "completed" for event in module.list_events(conn, task_id))
+    assert not any(
+        event.kind == "completed" for event in module.list_events(conn, task_id)
+    )
+
+
+def test_public_completion_rejects_dict_subclass_before_serialization(
+    kanban_db, monkeypatch
+):
+    module, conn, db_path = kanban_db
+    candidate = "a" * 40
+    task_id, implementation = _claim(module, conn, "dict subclass public completion")
+    assert module.request_review(
+        conn,
+        task_id,
+        summary="structured implementation handoff",
+        metadata={"candidate_commit": candidate},
+        reviewer="reviewer",
+        expected_run_id=implementation.current_run_id,
+    )
+    review = module.claim_review_task(
+        conn,
+        task_id,
+        claimer="reviewer:dict-subclass-public-test",
+    )
+    assert review is not None
+    assert review.current_run_id is not None
+    monkeypatch.setattr(module, "_active_native_profile", lambda: "reviewer")
+    monkeypatch.setattr(module, "_review_workspace_head", lambda _path: candidate)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
+    monkeypatch.setenv("HERMES_SESSION_ID", "reviewer-session")
+    sys.modules.pop("tools.kanban_tools", None)
+    tools = importlib.import_module("tools.kanban_tools")
+    monkeypatch.setattr(
+        tools,
+        "_connect",
+        lambda board=None: (module, module.connect(db_path)),
+    )
+    metadata = _SneakyDict(
+        {
+            "review_outcome": _StringLookalike("APPROVED"),
+            "candidate_commit": int("1" * 40),
+        },
+        {
+            "review_outcome": "APPROVED",
+            "candidate_commit": candidate,
+        },
+    )
+    before_events = [event.id for event in module.list_events(conn, task_id)]
+
+    response = json.loads(
+        tools._handle_complete(
+            {
+                "summary": "must reject dict subclass metadata",
+                "metadata": metadata,
+            }
+        )
+    )
+    assert response.get("ok") is not True
+    assert "exact built-in dict" in response["error"]
+    task = module.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == review.current_run_id
+    run = module.latest_run(conn, task_id)
+    assert run is not None
+    assert run.status == "running"
+    assert run.outcome is None
+    assert [event.id for event in module.list_events(conn, task_id)] == before_events
+
+
+def test_native_completion_rejects_dict_subclass_before_lookup(kanban_db, monkeypatch):
+    module, conn, _ = kanban_db
+    candidate = "a" * 40
+    task_id, implementation = _claim(module, conn, "dict subclass native completion")
+    assert module.request_review(
+        conn,
+        task_id,
+        summary="structured implementation handoff",
+        metadata={"candidate_commit": candidate},
+        reviewer="reviewer",
+        expected_run_id=implementation.current_run_id,
+    )
+    review = module.claim_review_task(
+        conn,
+        task_id,
+        claimer="reviewer:dict-subclass-native-test",
+    )
+    assert review is not None
+    assert review.current_run_id is not None
+    monkeypatch.setattr(module, "_active_native_profile", lambda: "reviewer")
+    monkeypatch.setattr(module, "_review_workspace_head", lambda _path: candidate)
+    metadata = _SneakyDict(
+        {
+            "review_outcome": _StringLookalike("APPROVED"),
+            "candidate_commit": int("1" * 40),
+        },
+        {
+            "review_outcome": "APPROVED",
+            "candidate_commit": candidate,
+        },
+    )
+    before_events = [event.id for event in module.list_events(conn, task_id)]
+
+    assert not module.complete_task(
+        conn,
+        task_id,
+        summary="must reject dict subclass metadata",
+        metadata=metadata,
+        expected_run_id=review.current_run_id,
+    )
+    task = module.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == review.current_run_id
+    run = module.latest_run(conn, task_id)
+    assert run is not None
+    assert run.status == "running"
+    assert run.outcome is None
+    assert [event.id for event in module.list_events(conn, task_id)] == before_events
 
 
 def test_public_completion_accepts_matching_string_candidate_aliases(

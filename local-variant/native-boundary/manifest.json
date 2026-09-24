@@ -48,6 +48,10 @@
     {
       "path": "patches/008-review-public-type-boundary.patch",
       "sha256": "5b0c3351ce115b02dc84174ce1d3a0e8a3598cf06d36bd3f4ae0675b3fb81054"
+    },
+    {
+      "path": "patches/009-review-metadata-container-boundary.patch",
+      "sha256": "833c0f8b1f2e365410634f10f73a3ebc9e1f47bf91370538a33dafa4a97726a6"
     }
   ],
   "patched_paths": [

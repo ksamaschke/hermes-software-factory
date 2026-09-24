@@ -254,10 +254,11 @@ task/run/events rather than task prose:
   reviewer run claimed from `source_status=review`. `APPROVED` uses
   `kanban_complete` once with structured metadata containing exactly
   `review_outcome: APPROVED` as the sole verdict field and the exact 40-hex
-  `candidate_commit` copied from the implementation handoff. Both values and
-  any present head, remediation-scope, or handoff identities must be exact
-  built-in strings, never numbers, bytes, string subclasses, or stringable
-  lookalikes. Do not include
+  `candidate_commit` copied from the implementation handoff. The metadata
+  container must be an exact built-in `dict`, every key must be an exact
+  built-in string, and both values plus any present head, remediation-scope, or
+  handoff identities must be exact built-in strings, never numbers, bytes,
+  string subclasses, or stringable lookalikes. Do not include
   `verdict`, `overall_verdict`, `terminal_verdict`, `review_verdict`, or any
   other `*_verdict` key;
   `CHANGES_REQUESTED` uses `kanban_request_changes`, whose native rework
