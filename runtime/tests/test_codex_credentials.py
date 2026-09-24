@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import errno
 import inspect
 import json
 import multiprocessing as mp
@@ -17,6 +18,7 @@ from typing import Any, cast
 
 import pytest
 from software_factory.providers.openai_codex import (
+    CredentialCleanupError,
     CredentialCorruptionError,
     CredentialLockError,
     CredentialLockTimeoutError,
@@ -29,6 +31,7 @@ from software_factory.providers.openai_codex import (
     OpenAICodexCredentialSource,
     PressureAdmissionTimeoutError,
     ProviderCompletion,
+    ProviderGeneration,
     ProviderLoopError,
     ProviderOperationError,
     ProviderPressure,
@@ -419,6 +422,101 @@ def test_provider_capacity_queues_without_duplicate_concurrency():
     run(_pressure_capacity_probe())
 
 
+def test_provider_admission_tokens_survive_forced_id_reuse_and_churn(monkeypatch):
+    import software_factory.providers.openai_codex as module
+
+    async def probe() -> None:
+        pressure = ProviderPressure(2, admission_timeout=0.5)
+        monkeypatch.setattr(module, "id", lambda _value: 7, raising=False)
+
+        first = await pressure.acquire()
+        second = await pressure.acquire()
+        assert pressure.in_flight == 2
+        first.release()
+        first.release()
+        assert pressure.in_flight == 1
+        second.release()
+        second.release()
+        assert pressure.in_flight == 0
+
+        for _ in range(128):
+            leases = [await pressure.acquire(), await pressure.acquire()]
+            leases[0].release()
+            leases[1].release()
+        assert pressure.in_flight == 0
+        assert pressure.queued == 0
+        assert pressure._leases == {}
+
+    run(probe())
+
+
+def test_provider_admission_token_overflow_fails_closed():
+    import software_factory.providers.openai_codex as module
+
+    async def probe() -> None:
+        pressure = ProviderPressure(1, admission_timeout=0.1)
+        pressure._next_lease_token = module._MAX_LEASE_TOKEN + 1
+        with pytest.raises(ProviderOperationError) as raised:
+            await pressure.acquire()
+        assert raised.value.code == "lease_token_exhausted"
+        assert pressure.in_flight == 0
+        assert pressure.queued == 0
+        assert pressure._leases == {}
+
+    run(probe())
+
+
+def test_scope_release_rejects_pending_admission_and_reuse_has_no_stale_entry():
+    async def probe() -> None:
+        pressure = ProviderPressure(1, admission_timeout=0.5)
+        scope = pressure.new_scope()
+        generation = ProviderGeneration(scope, 1)
+        pressure._bind_loop()
+        assert pressure._state_lock is not None
+        await pressure._state_lock.acquire()
+        pending = asyncio.create_task(
+            pressure.acquire(generation=generation, timeout=0.5)
+        )
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if pressure._pending_admissions.get(scope) == 1:
+                break
+        assert pressure._pending_admissions.get(scope) == 1
+        with pytest.raises(ProviderOperationError) as raised:
+            pressure.release_scope(scope)
+        assert raised.value.code == "generation_scope_active"
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert pressure._pending_admissions == {}
+        pressure._state_lock.release()
+        pressure.release_scope(scope)
+        assert pressure.new_scope() == scope
+
+        held = await pressure.acquire(generation=ProviderGeneration(scope, 2))
+        waiter = asyncio.create_task(
+            pressure.acquire(generation=ProviderGeneration(scope, 3), timeout=0.5)
+        )
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if pressure._pending_admissions.get(scope) == 1:
+                break
+        assert pressure.queued == 1
+        with pytest.raises(ProviderOperationError):
+            pressure.release_scope(scope)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        held.release()
+        pressure.release_scope(scope)
+        assert pressure._pending_admissions == {}
+        assert pressure._leases == {}
+        assert pressure.queued == 0
+        assert pressure.in_flight == 0
+
+    run(probe())
+
+
 def test_rate_limit_backoff_is_bounded_and_updates_admission_pressure():
     async def probe() -> None:
         pressure = ProviderPressure(1, admission_timeout=0.03, max_backoff=0.5)
@@ -677,6 +775,110 @@ def test_hardlink_retention_is_observed_before_publishing(tmp_path: Path, monkey
         backend.save_sync(credentials("new"))
     retained.unlink()
     assert backend.load_sync() == credentials("old")
+
+
+def test_post_publication_hardlink_is_scrubbed_before_ftruncate_failure(
+    tmp_path: Path, monkeypatch
+):
+    import software_factory.providers.openai_codex as module
+
+    path = tmp_path / "credentials.json"
+    retained = tmp_path / "retained-published-hardlink"
+    backend = FileCodexCredentialBackend(path)
+    backend.save_sync(credentials("old"))
+    original_rename = module.os.rename
+
+    def publish_and_retain(source: str, destination: str, **kwargs: Any) -> None:
+        original_rename(source, destination, **kwargs)
+        os.link(path, retained)
+
+    monkeypatch.setattr(module.os, "rename", publish_and_retain)
+
+    def fail_truncate(_descriptor: int, _size: int) -> None:
+        raise OSError(errno.EIO, "ftruncate failure")
+
+    monkeypatch.setattr(module.os, "ftruncate", fail_truncate)
+    with pytest.raises(CredentialCleanupError):
+        backend.save_sync(credentials("new"))
+
+    observed = retained.read_bytes()
+    assert observed
+    assert not any(observed)
+    retained.unlink()
+
+
+def test_post_publication_hardlink_is_scrubbed_before_fsync_failure(
+    tmp_path: Path, monkeypatch
+):
+    import software_factory.providers.openai_codex as module
+
+    path = tmp_path / "credentials.json"
+    retained = tmp_path / "retained-published-hardlink"
+    backend = FileCodexCredentialBackend(path)
+    backend.save_sync(credentials("old"))
+    original_rename = module.os.rename
+    published = False
+
+    def publish_and_retain(source: str, destination: str, **kwargs: Any) -> None:
+        nonlocal published
+        original_rename(source, destination, **kwargs)
+        os.link(path, retained)
+        published = True
+
+    def fail_after_publication(_descriptor: int) -> None:
+        if published:
+            raise OSError(errno.EIO, "fsync failure")
+
+    monkeypatch.setattr(module.os, "rename", publish_and_retain)
+    monkeypatch.setattr(module.os, "fsync", fail_after_publication)
+    with pytest.raises(CredentialCleanupError):
+        backend.save_sync(credentials("new"))
+
+    assert not any(retained.read_bytes())
+    retained.unlink()
+
+
+def test_post_publication_scrub_retries_partial_writes_and_eintr(
+    tmp_path: Path, monkeypatch
+):
+    import software_factory.providers.openai_codex as module
+
+    path = tmp_path / "credentials.json"
+    retained = tmp_path / "retained-published-hardlink"
+    backend = FileCodexCredentialBackend(path)
+    backend.save_sync(credentials("old"))
+    original_rename = module.os.rename
+    original_write = module.os.write
+    published = False
+    interrupted = False
+    shortened = False
+
+    def publish_and_retain(source: str, destination: str, **kwargs: Any) -> None:
+        nonlocal published
+        original_rename(source, destination, **kwargs)
+        os.link(path, retained)
+        published = True
+
+    def partial_and_interrupted(descriptor: int, data: bytes) -> int:
+        nonlocal interrupted, shortened
+        if published and not interrupted:
+            interrupted = True
+            raise OSError(errno.EINTR, "interrupted scrub write")
+        if published and not shortened:
+            shortened = True
+            return original_write(descriptor, data[:1])
+        return original_write(descriptor, data)
+
+    monkeypatch.setattr(module.os, "rename", publish_and_retain)
+    monkeypatch.setattr(module.os, "write", partial_and_interrupted)
+    with pytest.raises(CredentialPermissionError):
+        backend.save_sync(credentials("new"))
+
+    observed = retained.read_bytes()
+    assert interrupted
+    assert shortened
+    assert not any(observed)
+    retained.unlink()
 
 
 def test_backend_io_failures_are_rethrown_without_exception_chains(

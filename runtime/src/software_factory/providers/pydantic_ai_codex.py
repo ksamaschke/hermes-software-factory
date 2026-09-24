@@ -626,6 +626,10 @@ def get_pydantic_ai_codex_provider_class() -> type[Any]:
             try:
                 super().__init__(credential_source=source, **kwargs)
             except BaseException:
+                close_backend = getattr(source._backend, "close", None)
+                if callable(close_backend):
+                    with contextlib.suppress(BaseException):
+                        close_backend()
                 with contextlib.suppress(BaseException):
                     self._application_pressure.release_scope(scope)
                 raise

@@ -40,6 +40,7 @@ __all__ = (
     "CodexCredentialError",
     "CodexCredentialStore",
     "CodexProviderPressure",
+    "CredentialCleanupError",
     "CredentialCorruptionError",
     "CredentialLockError",
     "CredentialLockTimeoutError",
@@ -82,6 +83,8 @@ _MAX_RETAINED_GENERATIONS = 4_096
 _MAX_GENERATION_SCOPES = 1_024
 _MAX_BACKOFF = 3_600.0
 _MAX_GENERATION_VALUE = (1 << 31) - 1
+_MAX_LEASE_TOKEN = (1 << 63) - 1
+_SCRUB_CHUNK_SIZE = 64 * 1024
 
 _SCHEMA_FIELDS = ("access_token", "refresh_token", "account_id")
 _SCHEMA_FIELD_SET = frozenset(_SCHEMA_FIELDS)
@@ -166,6 +169,15 @@ class CredentialPersistenceError(CodexCredentialError):
         self, code: str = "persistence_failed", *, path: object | None = None
     ) -> None:
         super().__init__(code, category="persistence", path=path)
+
+
+class CredentialCleanupError(CredentialPersistenceError, CredentialPermissionError):
+    """A failed publication could not establish a verified scrubbed inode."""
+
+    def __init__(self, code: str = "cleanup_failed") -> None:
+        # Keep this fatal error recognizable as both a persistence and a
+        # permission failure for callers that already classify either family.
+        CodexCredentialError.__init__(self, code, category="persistence")
 
 
 class CredentialNotFoundError(CodexCredentialError):
@@ -262,6 +274,8 @@ def _clone_credential_error(
     code = _safe_code(getattr(error, "code", None), fallback.code)
     if isinstance(error, CredentialCorruptionError):
         return CredentialCorruptionError(code)
+    if isinstance(error, CredentialCleanupError):
+        return CredentialCleanupError(code)
     if isinstance(error, CredentialPermissionError):
         return CredentialPermissionError(code)
     if isinstance(error, CredentialNotFoundError):
@@ -982,6 +996,120 @@ class _CredentialPathMixin:
             raise read_failure
         return _credentials_from_payload(payload)
 
+    def _scrub_descriptor(self, descriptor: int) -> None:
+        """Zero and verify one inode through its retained descriptor.
+
+        A pathname can have more than one link after publication.  Scrubbing
+        through the descriptor reaches the inode behind every link, while the
+        bounded exact-write loop avoids relying on one short ``write`` call.
+        Truncation is a second reduction of the residual state, not the primary
+        erasure operation, because a failing ``ftruncate`` must not leave the
+        original bytes behind.
+        """
+
+        try:
+            initial = os.fstat(descriptor)
+        except OSError:
+            raise CredentialCleanupError("cleanup_stat_failed") from None
+        if not stat.S_ISREG(initial.st_mode) or initial.st_size < 0:
+            raise CredentialCleanupError("cleanup_inode_invalid") from None
+
+        failures = False
+        size = initial.st_size
+        if size > _MAX_FILE_BYTES:
+            failures = True
+            size = 0
+        try:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+        except OSError:
+            failures = True
+        else:
+            remaining = size
+            zeros = b"\x00" * _SCRUB_CHUNK_SIZE
+            while remaining and not failures:
+                requested = min(remaining, len(zeros))
+                retries = 0
+                while True:
+                    try:
+                        count = os.write(descriptor, zeros[:requested])
+                    except OSError as error:
+                        if error.errno == errno.EINTR and retries < 8:
+                            retries += 1
+                            continue
+                        failures = True
+                        break
+                    if type(count) is not int or count <= 0 or count > requested:
+                        failures = True
+                        break
+                    remaining -= count
+                    break
+
+        def sync_descriptor() -> bool:
+            for _ in range(8):
+                try:
+                    os.fsync(descriptor)
+                    return True
+                except OSError as error:
+                    if error.errno != errno.EINTR:
+                        return False
+            return False
+
+        if not sync_descriptor():
+            failures = True
+
+        truncate_retries = 0
+        while True:
+            try:
+                os.ftruncate(descriptor, 0)
+                break
+            except OSError as error:
+                if error.errno == errno.EINTR and truncate_retries < 8:
+                    truncate_retries += 1
+                    continue
+                failures = True
+                break
+
+        if not sync_descriptor():
+            failures = True
+
+        verified = True
+        try:
+            current = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or current.st_size < 0
+                or current.st_size > _MAX_FILE_BYTES
+            ):
+                verified = False
+            elif current.st_size:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                remaining = current.st_size
+                while remaining:
+                    retries = 0
+                    while True:
+                        try:
+                            chunk = os.read(
+                                descriptor, min(remaining, _SCRUB_CHUNK_SIZE)
+                            )
+                        except OSError as error:
+                            if error.errno == errno.EINTR and retries < 8:
+                                retries += 1
+                                continue
+                            verified = False
+                            chunk = b""
+                        break
+                    if not verified or not chunk or any(chunk):
+                        verified = False
+                        break
+                    remaining -= len(chunk)
+        except OSError:
+            verified = False
+
+        if failures or not verified:
+            # This is deliberately fatal.  The caller must not turn an
+            # unverified cleanup into an apparently ordinary save failure.
+            raise CredentialCleanupError("cleanup_failed") from None
+
     def _write_atomic_unlocked(
         self,
         parent_fd: int,
@@ -1002,16 +1130,8 @@ class _CredentialPathMixin:
         write_failure: CodexCredentialError | None = None
         published_by_us = False
         directory_dirty = False
-
-        def scrub_inode() -> None:
-            """Erase a staged inode while its original descriptor remains open."""
-
-            if descriptor is None:
-                return
-            with contextlib.suppress(BaseException):
-                os.ftruncate(descriptor, 0)
-            with contextlib.suppress(BaseException):
-                os.fsync(descriptor)
+        scrub_failure: CredentialCleanupError | None = None
+        directory_failure = False
 
         def unlink_published_inode() -> None:
             """Remove our target name only when it still names the staged inode."""
@@ -1178,7 +1298,13 @@ class _CredentialPathMixin:
                 # Do not leave staged or newly published bytes behind on any
                 # failed atomicity check.  The descriptor still names the
                 # inode even when a race removed both visible names.
-                scrub_inode()
+                if descriptor is not None:
+                    try:
+                        self._scrub_descriptor(descriptor)
+                    except CredentialCleanupError as error:
+                        scrub_failure = error
+                    except BaseException:  # noqa: BLE001 - cleanup fails closed
+                        scrub_failure = CredentialCleanupError("cleanup_failed")
                 if published_by_us:
                     with contextlib.suppress(BaseException):
                         unlink_published_inode()
@@ -1190,8 +1316,12 @@ class _CredentialPathMixin:
                     os.unlink(temporary_name, dir_fd=parent_fd)
                 directory_dirty = True
             if directory_dirty and write_failure is not None:
-                with contextlib.suppress(BaseException):
+                try:
                     os.fsync(parent_fd)
+                except BaseException:  # noqa: BLE001 - filesystem details are untrusted
+                    directory_failure = True
+        if scrub_failure is not None or directory_failure:
+            raise CredentialCleanupError("cleanup_failed") from None
         if write_failure is not None:
             raise write_failure
 
@@ -1549,8 +1679,9 @@ class FileCodexCredentialBackend(_CredentialPathMixin):
             except CredentialRefreshError:
                 raise
             except CredentialPersistenceError as error:
-                persistence_code = error.code
-                persistence_failure = CredentialPersistenceError(persistence_code)
+                persistence_failure = _clone_credential_error(
+                    error, CredentialPersistenceError("rotation_failed")
+                )
             except asyncio.CancelledError:
                 raise
             except BaseException:  # noqa: BLE001 - persistence details are untrusted
@@ -2043,10 +2174,13 @@ class ProviderPressure:
         self._in_flight = 0
         self._blocked_until = 0.0
         self._leases: dict[int, ProviderAdmission] = {}
+        self._next_lease_token = 1
         self._scope_lock = threading.RLock()
         self._scopes = {0}
         self._free_scopes: set[int] = set()
         self._next_scope = 1
+        self._scope_epochs: dict[int, int] = {0: 0}
+        self._pending_admissions: dict[int, int] = {}
         self._generation_high_water: dict[int, int] = {0: 0}
         self._active: dict[ProviderGeneration, _SharedOperation] = {}
         self._completed: OrderedDict[ProviderGeneration, _CompletionMetadata] = (
@@ -2073,6 +2207,7 @@ class ProviderPressure:
                 scope = self._next_scope
                 self._next_scope += 1
             self._scopes.add(scope)
+            self._scope_epochs[scope] = self._scope_epochs.get(scope, 0) + 1
             self._generation_high_water[scope] = 0
             self._rate_limit_high_water[scope] = 0
             return scope
@@ -2085,6 +2220,8 @@ class ProviderPressure:
         with self._scope_lock:
             if scope not in self._scopes:
                 return
+            if self._pending_admissions.get(scope, 0):
+                raise ProviderOperationError("generation_scope_active")
             if any(generation.scope == scope for generation in self._active) or any(
                 lease.generation is not None and lease.generation.scope == scope
                 for lease in self._leases.values()
@@ -2116,12 +2253,14 @@ class ProviderPressure:
             raise ProviderLoopError()
         return loop
 
-    def _normalize_generation(
+    def _normalize_generation_with_epoch(
         self, generation: object | None, *, allow_none: bool = True
-    ) -> ProviderGeneration | None:
+    ) -> tuple[ProviderGeneration | None, int]:
         if generation is None:
             if allow_none:
-                return None
+                scope = 0
+                with self._scope_lock:
+                    return None, self._scope_epochs[scope]
             raise TypeError("generation is required")
         if type(generation) is int:
             scope = 0
@@ -2138,10 +2277,45 @@ class ProviderPressure:
         if not 1 <= sequence <= _MAX_GENERATION_VALUE:
             raise ValueError("generation sequence is out of bounds")
         with self._scope_lock:
-            registered = scope in self._scopes
-        if not registered:
-            raise ValueError("generation scope is not registered")
-        return ProviderGeneration(scope, sequence)
+            if scope not in self._scopes:
+                raise ValueError("generation scope is not registered")
+            epoch = self._scope_epochs[scope]
+        return ProviderGeneration(scope, sequence), epoch
+
+    def _normalize_generation(
+        self, generation: object | None, *, allow_none: bool = True
+    ) -> ProviderGeneration | None:
+        normalized, _epoch = self._normalize_generation_with_epoch(
+            generation, allow_none=allow_none
+        )
+        return normalized
+
+    def _register_pending(self, scope: int, epoch: int) -> None:
+        with self._scope_lock:
+            if scope not in self._scopes or self._scope_epochs.get(scope) != epoch:
+                raise ProviderOperationError("generation_scope_released")
+            self._pending_admissions[scope] = self._pending_admissions.get(scope, 0) + 1
+
+    def _clear_pending(self, scope: int) -> None:
+        with self._scope_lock:
+            count = self._pending_admissions.get(scope, 0)
+            if count <= 1:
+                self._pending_admissions.pop(scope, None)
+            else:
+                self._pending_admissions[scope] = count - 1
+
+    def _scope_epoch_current(self, scope: int, epoch: int) -> bool:
+        with self._scope_lock:
+            return scope in self._scopes and self._scope_epochs.get(scope) == epoch
+
+    def _allocate_lease_token(self) -> int:
+        """Allocate a non-reused lease token while the state lock is held."""
+
+        token = self._next_lease_token
+        if type(token) is not int or not 1 <= token <= _MAX_LEASE_TOKEN:
+            raise ProviderOperationError("lease_token_exhausted")
+        self._next_lease_token = token + 1
+        return token
 
     def _assert_generation(self, generation: object) -> ProviderGeneration:
         normalized = self._normalize_generation(generation, allow_none=False)
@@ -2242,11 +2416,16 @@ class ProviderPressure:
         self._wake_waiters()
 
     def _release(self, lease: ProviderAdmission) -> None:
-        self._require_sync_loop()
-        current = self._leases.pop(lease._identity, None)
-        if current is None:
+        current = self._leases.get(lease._identity)
+        if current is not lease:
             return
-        self._in_flight = max(0, self._in_flight - 1)
+        self._require_sync_loop()
+        current = self._leases.get(lease._identity)
+        if current is not lease:
+            return
+        self._leases.pop(lease._identity, None)
+        if self._in_flight > 0:
+            self._in_flight -= 1
         self._wake_waiters()
 
     async def acquire(
@@ -2254,7 +2433,7 @@ class ProviderPressure:
     ) -> ProviderAdmission:
         self._bind_loop()
         try:
-            normalized = self._normalize_generation(generation)
+            normalized, scope_epoch = self._normalize_generation_with_epoch(generation)
         except (OverflowError, TypeError, ValueError):
             raise ProviderOperationError("generation_invalid") from None
         try:
@@ -2270,48 +2449,66 @@ class ProviderPressure:
         assert self._wake_event is not None
         deadline = self._clock() + duration
         ticket = object()
-        async with self._state_lock:
-            if len(self._queue) >= self.max_queue:
-                raise ProviderQueueFullError()
-            self._queue.append(ticket)
-        while True:
-            try:
-                async with self._state_lock:
-                    now = self._clock()
-                    if (
-                        self._queue
-                        and self._queue[0] is ticket
-                        and self._in_flight < self.capacity
-                        and now >= self._blocked_until
-                    ):
-                        self._queue.popleft()
-                        self._in_flight += 1
-                        lease = ProviderAdmission(self, normalized, id(ticket))
-                        self._leases[id(ticket)] = lease
-                        return lease
-                    remaining = deadline - now
-                    if remaining <= 0:
-                        with contextlib.suppress(ValueError):
-                            self._queue.remove(ticket)
-                        self._wake_event.set()
-                        raise PressureAdmissionTimeoutError()
-                    pressure_wait = max(0.0, self._blocked_until - now)
-                    self._wake_event.clear()
-                    wait_timeout = min(
-                        remaining, pressure_wait if pressure_wait else 0.05
+        scope = normalized.scope if normalized is not None else 0
+        self._register_pending(scope, scope_epoch)
+        try:
+            async with self._state_lock:
+                if len(self._queue) >= self.max_queue:
+                    raise ProviderQueueFullError()
+                self._queue.append(ticket)
+            while True:
+                try:
+                    async with self._state_lock:
+                        now = self._clock()
+                        if not self._scope_epoch_current(scope, scope_epoch):
+                            with contextlib.suppress(ValueError):
+                                self._queue.remove(ticket)
+                            self._wake_event.set()
+                            raise ProviderOperationError("generation_scope_released")
+                        if (
+                            self._queue
+                            and self._queue[0] is ticket
+                            and self._in_flight < self.capacity
+                            and now >= self._blocked_until
+                        ):
+                            try:
+                                token = self._allocate_lease_token()
+                            except ProviderOperationError:
+                                self._queue.popleft()
+                                self._wake_event.set()
+                                raise
+                            self._queue.popleft()
+                            self._in_flight += 1
+                            lease = ProviderAdmission(self, normalized, token)
+                            self._leases[token] = lease
+                            return lease
+                        remaining = deadline - now
+                        if remaining <= 0:
+                            with contextlib.suppress(ValueError):
+                                self._queue.remove(ticket)
+                            self._wake_event.set()
+                            raise PressureAdmissionTimeoutError()
+                        pressure_wait = max(0.0, self._blocked_until - now)
+                        self._wake_event.clear()
+                        wait_timeout = min(
+                            remaining, pressure_wait if pressure_wait else 0.05
+                        )
+                except asyncio.CancelledError:
+                    cleanup = asyncio.create_task(self._remove_ticket(ticket))
+                    await _await_task_drained(cleanup)
+                    raise
+                try:
+                    await asyncio.wait_for(
+                        self._wake_event.wait(), timeout=wait_timeout
                     )
-            except asyncio.CancelledError:
-                cleanup = asyncio.create_task(self._remove_ticket(ticket))
-                await _await_task_drained(cleanup)
-                raise
-            try:
-                await asyncio.wait_for(self._wake_event.wait(), timeout=wait_timeout)
-            except TimeoutError:
-                continue
-            except asyncio.CancelledError:
-                cleanup = asyncio.create_task(self._remove_ticket(ticket))
-                await _await_task_drained(cleanup)
-                raise
+                except TimeoutError:
+                    continue
+                except asyncio.CancelledError:
+                    cleanup = asyncio.create_task(self._remove_ticket(ticket))
+                    await _await_task_drained(cleanup)
+                    raise
+        finally:
+            self._clear_pending(scope)
 
     async def _remove_ticket(self, ticket: object) -> None:
         """Remove a queued admission even when cancellation hit the state lock."""
@@ -2420,32 +2617,44 @@ class ProviderPressure:
     ) -> Any:
         self._bind_loop()
         try:
-            normalized = self._assert_generation(generation)
+            normalized, scope_epoch = self._normalize_generation_with_epoch(
+                generation, allow_none=False
+            )
         except (OverflowError, TypeError, ValueError):
             raise ProviderOperationError("generation_invalid") from None
+        assert normalized is not None
         if not callable(operation):
             raise ProviderOperationError("operation_invalid")
         assert self._state_lock is not None
         owner = False
         shared: _SharedOperation | None = None
-        async with self._state_lock:
-            shared = self._active.get(normalized)
-            if shared is not None:
-                shared.participants += 1
-            else:
-                high_water = self._generation_high_water[normalized.scope]
-                if normalized.sequence <= high_water or normalized in self._completed:
-                    metadata = self._completed.get(normalized)
-                    return ProviderCompletion(
-                        metadata.status if metadata is not None else "replayed"
-                    )
-                if len(self._active) >= self.capacity + self.max_queue:
-                    raise ProviderQueueFullError()
-                self._generation_high_water[normalized.scope] = normalized.sequence
-                future = _ScrubbableFuture()
-                shared = _SharedOperation(future)
-                self._active[normalized] = shared
-                owner = True
+        self._register_pending(normalized.scope, scope_epoch)
+        try:
+            async with self._state_lock:
+                if not self._scope_epoch_current(normalized.scope, scope_epoch):
+                    raise ProviderOperationError("generation_scope_released")
+                shared = self._active.get(normalized)
+                if shared is not None:
+                    shared.participants += 1
+                else:
+                    high_water = self._generation_high_water[normalized.scope]
+                    if (
+                        normalized.sequence <= high_water
+                        or normalized in self._completed
+                    ):
+                        metadata = self._completed.get(normalized)
+                        return ProviderCompletion(
+                            metadata.status if metadata is not None else "replayed"
+                        )
+                    if len(self._active) >= self.capacity + self.max_queue:
+                        raise ProviderQueueFullError()
+                    self._generation_high_water[normalized.scope] = normalized.sequence
+                    future = _ScrubbableFuture()
+                    shared = _SharedOperation(future)
+                    self._active[normalized] = shared
+                    owner = True
+        finally:
+            self._clear_pending(normalized.scope)
         assert shared is not None
         if not owner:
             assert shared.future is not None
