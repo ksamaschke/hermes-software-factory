@@ -24,6 +24,7 @@ import os
 import stat
 import threading
 import time
+import weakref
 from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -97,6 +98,10 @@ _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 _O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 _TEMP_COUNTER = itertools.count()
+_AUDITED_SOURCE_INSTANCES: weakref.WeakSet[Any] = weakref.WeakSet()
+_AUDITED_SOURCE_STATES: weakref.WeakKeyDictionary[Any, tuple[Any, ...]] = (
+    weakref.WeakKeyDictionary()
+)
 
 
 # ---------------------------------------------------------------------------
@@ -442,7 +447,7 @@ def _coerce_credentials(
 ) -> OpenAICodexCredentials:
     """Copy only the three structural fields from a provider credential value."""
 
-    if isinstance(credentials, OpenAICodexCredentials):
+    if type(credentials) is OpenAICodexCredentials:
         return credentials
     foreign = cast(Any, credentials)
     failure: CredentialValidationError | None = None
@@ -1119,6 +1124,8 @@ class _CredentialPathMixin:
     ) -> None:
         self._assert_current_parent(parent_fd)
         data = _serialized_credentials(credentials, path=self.path)
+        if len(data) > self.max_file_bytes:
+            raise CredentialValidationError("serialized_credentials_too_large")
         existing, failure = self._stat_target(
             parent_fd, require_mode=not allow_insecure_existing
         )
@@ -1338,6 +1345,9 @@ class _CredentialPathMixin:
         self._write_atomic_unlocked(
             parent_fd, credentials, allow_insecure_existing=False
         )
+        persisted = self._read_unlocked(parent_fd)
+        if not _same_credentials(persisted, credentials):
+            raise CredentialPersistenceError("save_readback_failed")
 
     def _recover_unlocked(
         self, parent_fd: int, credentials: OpenAICodexCredentials
@@ -1347,6 +1357,9 @@ class _CredentialPathMixin:
         self._write_atomic_unlocked(
             parent_fd, credentials, allow_insecure_existing=True
         )
+        persisted = self._read_unlocked(parent_fd)
+        if not _same_credentials(persisted, credentials):
+            raise CredentialPersistenceError("recovery_readback_failed")
 
     def _load_sync(self) -> OpenAICodexCredentials:
         descriptor = self._acquire_sync(None)
@@ -1825,7 +1838,18 @@ class OpenAICodexCredentialSource:
         self._backend = backend
         self.path = getattr(backend, "path", None)
         self.lock_path = getattr(backend, "lock_path", None)
+        self.max_file_bytes = normalized_max_file_bytes
+        self.lock_timeout = normalized_lock_timeout
         self.refresh_timeout = normalized_refresh_timeout
+        _AUDITED_SOURCE_INSTANCES.add(self)
+        _AUDITED_SOURCE_STATES[self] = (
+            backend,
+            self.path,
+            self.lock_path,
+            self.max_file_bytes,
+            self.lock_timeout,
+            self.refresh_timeout,
+        )
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(application_owned=True)"
@@ -1969,7 +1993,7 @@ class OpenAICodexCredentialSource:
             )
         except asyncio.CancelledError:
             raise
-        except BaseException:  # noqa: BLE001 - replaceable backend text is untrusted
+        except BaseException:  # noqa: BLE001 - replaceable backend details are untrusted
             failure = CredentialLockError("backend_lock_failed")
         if failure is not None:
             raise failure
@@ -1992,6 +2016,125 @@ class OpenAICodexCredentialSource:
                 raise exit_failure
 
 
+def _is_audited_file_source(value: object) -> bool:
+    """Recognize only constructor-created facades over the exact file backend."""
+
+    if type(value) is not OpenAICodexCredentialSource:
+        return False
+    try:
+        if value not in _AUDITED_SOURCE_INSTANCES:
+            return False
+        source_state = _AUDITED_SOURCE_STATES.get(value)
+        if type(source_state) is not tuple or len(source_state) != 6:
+            return False
+        source_fields = {
+            "_backend",
+            "path",
+            "lock_path",
+            "max_file_bytes",
+            "lock_timeout",
+            "refresh_timeout",
+        }
+        source_values = vars(value)
+        if set(source_values) != source_fields:
+            return False
+        backend = source_values["_backend"]
+        if type(backend) is not FileCodexCredentialBackend:
+            return False
+        backend_fields = {
+            "path",
+            "max_file_bytes",
+            "lock_timeout",
+            "refresh_timeout",
+            "lock_path",
+            "_filesystem_supported",
+            "_anchor_fd",
+            "_parent_identity",
+            "_parent_metadata",
+            "_last_fingerprint",
+        }
+        backend_values = vars(backend)
+        if set(backend_values) != backend_fields:
+            return False
+        path = backend_values["path"]
+        lock_path = backend_values["lock_path"]
+        source_max = source_values["max_file_bytes"]
+        backend_max = backend_values["max_file_bytes"]
+        source_lock_timeout = source_values["lock_timeout"]
+        backend_lock_timeout = backend_values["lock_timeout"]
+        source_refresh_timeout = source_values["refresh_timeout"]
+        backend_refresh_timeout = backend_values["refresh_timeout"]
+        if type(path) is not type(Path(".")) or type(lock_path) is not type(path):
+            return False
+        if (
+            type(source_max) is not int
+            or type(backend_max) is not int
+            or not 256 <= source_max <= _MAX_FILE_BYTES
+            or not 256 <= backend_max <= _MAX_FILE_BYTES
+            or type(source_lock_timeout) is not float
+            or type(backend_lock_timeout) is not float
+            or not math.isfinite(source_lock_timeout)
+            or not math.isfinite(backend_lock_timeout)
+            or not 0 <= source_lock_timeout <= _MAX_LOCK_TIMEOUT
+            or not 0 <= backend_lock_timeout <= _MAX_LOCK_TIMEOUT
+            or type(source_refresh_timeout) is not float
+            or type(backend_refresh_timeout) is not float
+            or not math.isfinite(source_refresh_timeout)
+            or not math.isfinite(backend_refresh_timeout)
+            or not 0 <= source_refresh_timeout <= _MAX_REFRESH_TIMEOUT
+            or not 0 <= backend_refresh_timeout <= _MAX_REFRESH_TIMEOUT
+        ):
+            return False
+        if (
+            backend is not source_state[0]
+            or source_values["path"] != source_state[1]
+            or source_values["lock_path"] != source_state[2]
+            or source_max != source_state[3]
+            or source_lock_timeout != source_state[4]
+            or source_refresh_timeout != source_state[5]
+        ):
+            return False
+        if source_values["path"] != path or source_values["lock_path"] != lock_path:
+            return False
+        if source_max != backend_max:
+            return False
+        if source_lock_timeout != backend_lock_timeout:
+            return False
+        if source_refresh_timeout != backend_refresh_timeout:
+            return False
+        if backend_values["_filesystem_supported"] is not True:
+            return False
+        anchor_fd = backend_values["_anchor_fd"]
+        if type(anchor_fd) is not int or anchor_fd < 0:
+            return False
+        identity = backend_values["_parent_identity"]
+        metadata = backend_values["_parent_metadata"]
+        if (
+            type(identity) is not tuple
+            or len(identity) != 2
+            or any(type(item) is not int for item in identity)
+            or type(metadata) is not tuple
+            or len(metadata) != 4
+            or any(type(item) is not int for item in metadata)
+        ):
+            return False
+        fingerprint = backend_values["_last_fingerprint"]
+        if fingerprint is not None and (
+            type(fingerprint) is not bytes
+            or len(fingerprint) != hashlib.sha256().digest_size
+        ):
+            return False
+        info = os.fstat(anchor_fd)
+        return (info.st_dev, info.st_ino) == identity and (
+            info.st_dev,
+            info.st_uid,
+            info.st_gid,
+            stat.S_IMODE(info.st_mode),
+        ) == metadata
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+
+
 FileCredentialSource = OpenAICodexCredentialSource
 
 
@@ -2000,30 +2143,72 @@ FileCredentialSource = OpenAICodexCredentialSource
 
 
 class ProviderGeneration:
-    """Validated, bounded sequence identity for one pressure scope."""
+    """Validated, bounded identity for one sequence in one scope epoch."""
 
-    __slots__ = ("scope", "sequence")
+    __slots__ = ("_sealed", "epoch", "scope", "sequence")
 
-    def __init__(self, scope: int, sequence: int) -> None:
-        if type(scope) is not int or type(sequence) is not int:
-            raise TypeError("generation scope and sequence must be integers")
+    def __init__(self, scope: int, sequence: int, epoch: int = 1) -> None:
+        if (
+            type(scope) is not int
+            or type(sequence) is not int
+            or type(epoch) is not int
+        ):
+            raise TypeError("generation scope, sequence, and epoch must be integers")
         if not 0 <= scope <= _MAX_GENERATION_VALUE:
             raise ValueError("generation scope is out of bounds")
         if not 1 <= sequence <= _MAX_GENERATION_VALUE:
             raise ValueError("generation sequence is out of bounds")
-        self.scope = scope
-        self.sequence = sequence
+        if not 1 <= epoch <= _MAX_GENERATION_VALUE:
+            raise ValueError("generation epoch is out of bounds")
+        object.__setattr__(self, "scope", scope)
+        object.__setattr__(self, "sequence", sequence)
+        object.__setattr__(self, "epoch", epoch)
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if getattr(self, "_sealed", False):
+            raise AttributeError("provider generations are immutable")
+        object.__setattr__(self, name, value)
+
+    @property
+    def scope_epoch(self) -> int:
+        return self.epoch
+
+    def _valid(self) -> bool:
+        try:
+            scope = self.scope
+            sequence = self.sequence
+            epoch = self.epoch
+        except AttributeError:
+            return False
+        return (
+            type(scope) is int
+            and type(sequence) is int
+            and type(epoch) is int
+            and 0 <= scope <= _MAX_GENERATION_VALUE
+            and 1 <= sequence <= _MAX_GENERATION_VALUE
+            and 1 <= epoch <= _MAX_GENERATION_VALUE
+        )
 
     def __repr__(self) -> str:
-        return f"<ProviderGeneration scope={self.scope} sequence={self.sequence}>"
+        return (
+            f"<ProviderGeneration scope={self.scope} epoch={self.epoch} "
+            f"sequence={self.sequence}>"
+        )
 
     def __hash__(self) -> int:
-        return hash((self.scope, self.sequence))
+        if not self._valid():
+            raise TypeError("invalid provider generation")
+        return hash((self.scope, self.epoch, self.sequence))
 
     def __eq__(self, other: object) -> bool:
+        if type(other) is not ProviderGeneration:
+            return False
+        if not self._valid() or not other._valid():
+            return False
         return (
-            type(other) is ProviderGeneration
-            and self.scope == other.scope
+            self.scope == other.scope
+            and self.epoch == other.epoch
             and self.sequence == other.sequence
         )
 
@@ -2107,6 +2292,21 @@ class ProviderAdmission:
         self._pressure._release(self)
 
 
+class _AdmissionTicket:
+    __slots__ = ("epoch", "scope")
+
+    def __init__(self, scope: int, epoch: int) -> None:
+        if (
+            type(scope) is not int
+            or type(epoch) is not int
+            or not 0 <= scope <= _MAX_GENERATION_VALUE
+            or not 1 <= epoch <= _MAX_GENERATION_VALUE
+        ):
+            raise TypeError("admission ticket identity must use bounded integers")
+        self.scope = scope
+        self.epoch = epoch
+
+
 class ProviderPressure:
     """Finite provider concurrency with secret-free, bounded single-flight state.
 
@@ -2179,8 +2379,9 @@ class ProviderPressure:
         self._scopes = {0}
         self._free_scopes: set[int] = set()
         self._next_scope = 1
-        self._scope_epochs: dict[int, int] = {0: 0}
+        self._scope_epochs: dict[int, int] = {0: 1}
         self._pending_admissions: dict[int, int] = {}
+        self._pending_admission_epochs: dict[int, int] = {}
         self._generation_high_water: dict[int, int] = {0: 0}
         self._active: dict[ProviderGeneration, _SharedOperation] = {}
         self._completed: OrderedDict[ProviderGeneration, _CompletionMetadata] = (
@@ -2196,21 +2397,43 @@ class ProviderPressure:
         """Reserve one bounded provider scope for a shared pressure object."""
 
         with self._scope_lock:
-            if self._free_scopes:
-                scope = min(self._free_scopes)
-                self._free_scopes.remove(scope)
-            else:
+            scope: int | None = None
+            epoch: int | None = None
+            while self._free_scopes:
+                candidate = min(self._free_scopes)
+                self._free_scopes.remove(candidate)
+                candidate_epoch = self._scope_epochs.get(candidate, 0) + 1
+                if candidate_epoch <= _MAX_GENERATION_VALUE:
+                    scope = candidate
+                    epoch = candidate_epoch
+                    break
+            if scope is None:
                 if len(self._scopes) >= self.max_generation_scopes:
                     raise ProviderOperationError("generation_scope_limit")
                 if self._next_scope > _MAX_GENERATION_VALUE:
                     raise ProviderOperationError("generation_scope_exhausted")
                 scope = self._next_scope
                 self._next_scope += 1
+                epoch = 1
+            assert epoch is not None
             self._scopes.add(scope)
-            self._scope_epochs[scope] = self._scope_epochs.get(scope, 0) + 1
+            self._scope_epochs[scope] = epoch
             self._generation_high_water[scope] = 0
             self._rate_limit_high_water[scope] = 0
             return scope
+
+    def scope_epoch(self, scope: int) -> int:
+        """Return the positive epoch currently bound to an active scope."""
+
+        if type(scope) is not int or not 0 <= scope <= _MAX_GENERATION_VALUE:
+            raise ProviderOperationError("generation_scope_invalid")
+        with self._scope_lock:
+            if scope not in self._scopes:
+                raise ProviderOperationError("generation_scope_released")
+            epoch = self._scope_epochs.get(scope)
+        if type(epoch) is not int or not 1 <= epoch <= _MAX_GENERATION_VALUE:
+            raise ProviderOperationError("generation_scope_invalid")
+        return epoch
 
     def release_scope(self, scope: int) -> None:
         """Release an idle non-default scope so it can be safely reused."""
@@ -2220,6 +2443,11 @@ class ProviderPressure:
         with self._scope_lock:
             if scope not in self._scopes:
                 return
+            state_lock = self._state_lock
+            if state_lock is not None and state_lock.locked():
+                # This synchronous API cannot safely inspect event-loop-owned
+                # active/queued state while its transaction is in progress.
+                raise ProviderOperationError("generation_scope_active")
             if self._pending_admissions.get(scope, 0):
                 raise ProviderOperationError("generation_scope_active")
             if any(generation.scope == scope for generation in self._active) or any(
@@ -2258,16 +2486,18 @@ class ProviderPressure:
     ) -> tuple[ProviderGeneration | None, int]:
         if generation is None:
             if allow_none:
-                scope = 0
-                with self._scope_lock:
-                    return None, self._scope_epochs[scope]
+                return None, self.scope_epoch(0)
             raise TypeError("generation is required")
         if type(generation) is int:
             scope = 0
             sequence = generation
+            supplied_epoch: int | None = None
         elif type(generation) is ProviderGeneration:
+            if not generation._valid():
+                raise TypeError("generation fields are invalid")
             scope = generation.scope
             sequence = generation.sequence
+            supplied_epoch = generation.epoch
         else:
             raise TypeError("generation must be a bounded integer sequence")
         if type(scope) is not int or type(sequence) is not int:
@@ -2279,8 +2509,12 @@ class ProviderPressure:
         with self._scope_lock:
             if scope not in self._scopes:
                 raise ValueError("generation scope is not registered")
-            epoch = self._scope_epochs[scope]
-        return ProviderGeneration(scope, sequence), epoch
+            epoch = self._scope_epochs.get(scope)
+            if type(epoch) is not int or not 1 <= epoch <= _MAX_GENERATION_VALUE:
+                raise ValueError("generation scope epoch is invalid")
+            if supplied_epoch is not None and supplied_epoch != epoch:
+                raise ValueError("generation scope epoch is stale")
+        return ProviderGeneration(scope, sequence, epoch), epoch
 
     def _normalize_generation(
         self, generation: object | None, *, allow_none: bool = True
@@ -2294,6 +2528,10 @@ class ProviderPressure:
         with self._scope_lock:
             if scope not in self._scopes or self._scope_epochs.get(scope) != epoch:
                 raise ProviderOperationError("generation_scope_released")
+            previous_epoch = self._pending_admission_epochs.get(scope)
+            if previous_epoch is not None and previous_epoch != epoch:
+                raise ProviderOperationError("generation_scope_released")
+            self._pending_admission_epochs[scope] = epoch
             self._pending_admissions[scope] = self._pending_admissions.get(scope, 0) + 1
 
     def _clear_pending(self, scope: int) -> None:
@@ -2301,6 +2539,7 @@ class ProviderPressure:
             count = self._pending_admissions.get(scope, 0)
             if count <= 1:
                 self._pending_admissions.pop(scope, None)
+                self._pending_admission_epochs.pop(scope, None)
             else:
                 self._pending_admissions[scope] = count - 1
 
@@ -2390,7 +2629,7 @@ class ProviderPressure:
             current = self._rate_limit_high_water[0]
             if current >= _MAX_GENERATION_VALUE:
                 raise ProviderOperationError("generation_exhausted")
-            normalized = ProviderGeneration(0, current + 1)
+            normalized = ProviderGeneration(0, current + 1, self.scope_epoch(0))
         high_water = self._rate_limit_high_water[normalized.scope]
         if normalized.sequence <= high_water:
             return
@@ -2448,8 +2687,8 @@ class ProviderPressure:
         assert self._state_lock is not None
         assert self._wake_event is not None
         deadline = self._clock() + duration
-        ticket = object()
         scope = normalized.scope if normalized is not None else 0
+        ticket = _AdmissionTicket(scope, scope_epoch)
         self._register_pending(scope, scope_epoch)
         try:
             async with self._state_lock:
@@ -2689,6 +2928,8 @@ class ProviderPressure:
         except asyncio.CancelledError:
             failure_code = "operation_cancelled"
             cancelled = True
+        except CredentialCleanupError:
+            failure_code = "credential_cleanup"
         except CodexCredentialError as error:
             if _is_credential_storage_error(error):
                 failure_code = "credential_persistence"
@@ -2697,7 +2938,7 @@ class ProviderPressure:
             elif isinstance(error, ProviderQueueFullError):
                 failure_code = "queue_full"
             elif isinstance(error, CredentialRefreshError):
-                failure_code = "provider_refresh_failed"
+                failure_code = _safe_code(error.code, "provider_refresh_failed")
             elif isinstance(error, ProviderOperationError):
                 failure_code = _safe_code(error.code, "operation_aborted")
             else:
@@ -2712,9 +2953,17 @@ class ProviderPressure:
             safe_failure = PressureAdmissionTimeoutError()
         elif failure_code == "queue_full":
             safe_failure = ProviderQueueFullError()
+        elif failure_code == "credential_cleanup":
+            safe_failure = CredentialCleanupError()
         elif failure_code is not None:
             safe_failure = ProviderOperationError(failure_code)
-        completion_status = "completed" if safe_failure is None else safe_failure.code
+        completion_status = (
+            "completed"
+            if safe_failure is None
+            else "credential_cleanup"
+            if isinstance(safe_failure, CredentialCleanupError)
+            else safe_failure.code
+        )
 
         settlement = asyncio.create_task(
             self._settle_owner(

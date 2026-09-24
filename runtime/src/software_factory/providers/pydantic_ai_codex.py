@@ -22,8 +22,10 @@ from pathlib import Path
 from typing import Any, TypeAlias, cast
 
 from .openai_codex import (
+    _DRAIN_FAILED,
     _MAX_REFRESH_TIMEOUT,
     CodexCredentialError,
+    CredentialCleanupError,
     CredentialRefreshError,
     OpenAICodexCredentialSource,
     ProviderCompletion,
@@ -31,6 +33,7 @@ from .openai_codex import (
     ProviderOperationError,
     ProviderPressure,
     _await_task_drained,
+    _is_audited_file_source,
     _is_credential_storage_error,
     _validate_duration,
 )
@@ -53,6 +56,9 @@ _REVIEWED_MODULE_SOURCE_SHA256 = (
     "bff0d91fbcf9dc0334c9d2981df56dbcc2e3602c1baecef37d4001a0f769960c"
 )
 _REVIEWED_DEPENDENCY_MODULES = {
+    "pydantic_ai.providers": (
+        "ffdc17a232a229cf8003cf670da3ea728e5a4d5028144566bc91bd7edf99ec2b"
+    ),
     "pydantic_ai.providers._openai_compatible": (
         "2a65e3e3e3ccd5352de327d458f40f393805532f0c4117e6b10141d827ae2957"
     ),
@@ -72,6 +78,20 @@ _REVIEWED_DEPENDENCY_SOURCES: dict[str, tuple[str, str, str, str]] = {
         "pydantic_ai._http",
         "create_async_httpx2_client",
         "2934907ac8128a26b3d3f65006bc504536ab5bdfbd0609ee4ff53d3cc66e85aa",
+    ),
+}
+_REVIEWED_PROVIDER_CONTEXT_SOURCES: dict[str, tuple[str, str, str, str]] = {
+    "Provider.__aenter__": (
+        "function",
+        "pydantic_ai.providers",
+        "Provider.__aenter__",
+        "7ee5b3715d08e736b68d63ae7f944276af21e3a84bb2155eba6e1fbe4e96ef35",
+    ),
+    "Provider.__aexit__": (
+        "function",
+        "pydantic_ai.providers",
+        "Provider.__aexit__",
+        "210cfc715a4b70d61d17795a3b8de05b9967ecd269a73991823fb8dff4a7c07f",
     ),
 }
 _REVIEWED_NAMESPACE_SOURCES: dict[str, tuple[str, str, str, str]] = {
@@ -421,6 +441,19 @@ def _load_pinned_provider_module() -> Any:
         ):
             raise PydanticAIIntegrationError("pydantic_ai_dependency_artifact_changed")
         dependencies[dependency_name] = dependency
+    provider_base = getattr(dependencies["pydantic_ai.providers"], "Provider", None)
+    if (
+        not inspect.isclass(provider_base)
+        or provider_base.__module__ != "pydantic_ai.providers"
+        or provider_base.__name__ != "Provider"
+        or provider_base.__qualname__ != "Provider"
+    ):
+        raise PydanticAIIntegrationError("pydantic_ai_context_seam_changed")
+    for context_name, expected in _REVIEWED_PROVIDER_CONTEXT_SOURCES.items():
+        member_name = context_name.rsplit(".", 1)[-1]
+        member = _static_member(provider_base, member_name)
+        if not _guarded_source(member, expected):
+            raise PydanticAIIntegrationError("pydantic_ai_context_seam_changed")
     for constant_name, expected in _REVIEWED_CONSTANTS.items():
         try:
             actual = getattr(module, constant_name)
@@ -527,6 +560,60 @@ def _load_pinned_provider_module() -> Any:
 
 
 _MAX_ADAPTER_ATTEMPT_SEQUENCE = (1 << 31) - 1
+_FATAL_ADAPTER_STATUSES = frozenset(
+    {
+        "audited_file_source_required",
+        "context_seam_changed",
+        "credential_cleanup",
+        "generation_exhausted",
+        "generation_invalid",
+        "generation_scope_active",
+        "generation_scope_exhausted",
+        "generation_scope_invalid",
+        "generation_scope_limit",
+        "generation_scope_release_failed",
+        "generation_scope_released",
+        "lease_token_exhausted",
+        "pydantic_ai_context_seam_changed",
+        "pydantic_ai_dependency_artifact_changed",
+        "pydantic_ai_dependency_seam_changed",
+        "pydantic_ai_inherited_provider_changed",
+        "pydantic_ai_module_artifact_changed",
+        "pydantic_ai_persistence_error_changed",
+        "pydantic_ai_persistence_signature_changed",
+        "pydantic_ai_refresh_seam_missing",
+        "pydantic_ai_refresh_signature_changed",
+        "pydantic_ai_reviewed_constant_changed",
+        "pydantic_ai_reviewed_constant_missing",
+        "pydantic_ai_reviewed_seam_changed",
+        "pydantic_ai_signature_unavailable",
+        "pydantic_ai_constructor_signature_changed",
+        "pydantic_ai_locked_signature_changed",
+        "provider_closed",
+        "provider_pressure_required",
+        "provider_refresh_cancelled",
+        "refresh_failure_exhausted",
+        "refresh_generation_exhausted",
+        "reviewed_seam_changed",
+    }
+)
+_RETRYABLE_ADAPTER_STATUSES = frozenset(
+    {
+        "operation_timeout",
+        "provider_refresh_failed",
+        "refresh_callback_timeout",
+        "refresh_timeout",
+    }
+)
+
+
+def _safe_fatal_refresh_error(status: object) -> CodexCredentialError | None:
+    safe_status = _safe_integration_code(status, "provider_refresh_failed")
+    if safe_status == "credential_cleanup":
+        return CredentialCleanupError()
+    if safe_status in _FATAL_ADAPTER_STATUSES:
+        return CredentialRefreshError(safe_status)
+    return None
 
 
 def _safe_integration_code(value: object, fallback: str) -> str:
@@ -558,17 +645,11 @@ def _validate_adapter_timeout(value: object) -> float | None:
 
 
 def _require_audited_file_source(value: object) -> OpenAICodexCredentialSource:
-    """Require the exact reviewed application source facade.
+    """Require the exact reviewed application source facade and backend."""
 
-    The adapter's reviewed integration seam is the concrete source facade,
-    not an arbitrary object satisfying the backend protocol.  The facade may
-    wrap a separately reviewed backend; only the audited file backend carries
-    the local POSIX deadline/drain guarantees documented by this adapter.
-    """
-
-    if type(value) is not OpenAICodexCredentialSource:
+    if not _is_audited_file_source(value):
         raise PydanticAIIntegrationError("audited_file_source_required")
-    return value
+    return cast(OpenAICodexCredentialSource, value)
 
 
 ProviderClassFactory: TypeAlias = Callable[..., Any]
@@ -621,8 +702,9 @@ def get_pydantic_ai_codex_provider_class() -> type[Any]:
             self._application_attempt_lock = asyncio.Lock()
             self._application_idle_event: asyncio.Event | None = None
             self._application_active_operations = 0
-            self._application_close_task: asyncio.Task[None] | None = None
+            self._application_close_task: asyncio.Task[str | None] | None = None
             self._application_refresh_timeout = validated_refresh_timeout
+            external_http_client = kwargs.get("http_client")
             try:
                 super().__init__(credential_source=source, **kwargs)
             except BaseException:
@@ -633,6 +715,18 @@ def get_pydantic_ai_codex_provider_class() -> type[Any]:
                 with contextlib.suppress(BaseException):
                     self._application_pressure.release_scope(scope)
                 raise
+            self._application_external_http_client = (
+                external_http_client
+                if external_http_client is not None
+                else (
+                    getattr(self, "_http_client", None)
+                    if getattr(self, "_own_http_client", None) is None
+                    else None
+                )
+            )
+            self._application_provider_auth = getattr(self, "_auth", None)
+            self._application_http_client_released = False
+            self._last_refresh_error = None
 
         def _bind_application_activity(self) -> None:
             if self._application_idle_event is None:
@@ -681,16 +775,36 @@ def get_pydantic_ai_codex_provider_class() -> type[Any]:
                 except BaseException:  # noqa: BLE001 - provider text is untrusted
                     raise CredentialRefreshError("provider_refresh_failed") from None
 
+            async def audited_refresh() -> Any:
+                try:
+                    audited_source = _require_audited_file_source(source)
+                except PydanticAIIntegrationError:
+                    raise CredentialRefreshError(
+                        "audited_file_source_required"
+                    ) from None
+                result = await audited_source.refresh(
+                    network_refresh,
+                    expected=rejected,
+                    timeout=self._application_refresh_timeout,
+                )
+                try:
+                    _require_audited_file_source(source)
+                except PydanticAIIntegrationError:
+                    raise CredentialRefreshError(
+                        "audited_file_source_required"
+                    ) from None
+                return result
+
             try:
                 outcome = await self._application_pressure.run(
                     generation,
-                    lambda: source.refresh(
-                        network_refresh,
-                        expected=rejected,
-                        timeout=self._application_refresh_timeout,
-                    ),
+                    audited_refresh,
                     timeout=self._application_refresh_timeout,
                 )
+            except CredentialCleanupError:
+                return "credential_cleanup"
+            except CredentialRefreshError as error:
+                return _safe_integration_code(error, "provider_refresh_failed")
             except ProviderOperationError as error:
                 return _safe_integration_code(error, "provider_refresh_failed")
             except asyncio.CancelledError:
@@ -712,17 +826,29 @@ def get_pydantic_ai_codex_provider_class() -> type[Any]:
             async with self._application_attempt_lock:
                 task = self._application_attempt_task
                 if task is None or task.done():
+                    sequence = self._application_attempt_sequence
                     if (
-                        self._application_attempt_sequence
-                        >= _MAX_ADAPTER_ATTEMPT_SEQUENCE
+                        type(sequence) is not int
+                        or sequence < 0
+                        or sequence >= _MAX_ADAPTER_ATTEMPT_SEQUENCE
                     ):
                         raise CredentialRefreshError("refresh_generation_exhausted")
-                    self._application_attempt_sequence += 1
+                    sequence += 1
+                    self._application_attempt_sequence = sequence
                     try:
                         generation = ProviderGeneration(
                             self._application_scope,
-                            self._application_attempt_sequence,
+                            sequence,
+                            self._application_pressure.scope_epoch(
+                                self._application_scope
+                            ),
                         )
+                    except ProviderOperationError as error:
+                        raise CredentialRefreshError(
+                            _safe_integration_code(
+                                error, "refresh_generation_exhausted"
+                            )
+                        ) from None
                     except (OverflowError, TypeError, ValueError):
                         raise CredentialRefreshError(
                             "refresh_generation_exhausted"
@@ -742,6 +868,148 @@ def get_pydantic_ai_codex_provider_class() -> type[Any]:
                 if self._application_attempt_task is task and task.done():
                     self._application_attempt_task = None
 
+        async def _load_if_needed(self) -> None:
+            self._begin_application_operation()
+            try:
+                if self._credentials is not None:
+                    _require_audited_file_source(
+                        getattr(self, "_credential_source", None)
+                    )
+                    return
+                async with self._refresh_lock:
+                    if self._credentials is not None:
+                        _require_audited_file_source(
+                            getattr(self, "_credential_source", None)
+                        )
+                        return
+                    source = _require_audited_file_source(
+                        getattr(self, "_credential_source", None)
+                    )
+                    credentials = await source.load()
+                    _require_audited_file_source(
+                        getattr(self, "_credential_source", None)
+                    )
+                    self._credentials = credentials
+            finally:
+                self._end_application_operation()
+
+        def _refresh_failure_code(self, error: BaseException) -> str:
+            """Reduce a refresh exception to a categorical, secret-free status."""
+
+            if isinstance(error, CredentialCleanupError):
+                return "credential_cleanup"
+            if isinstance(error, PydanticAIIntegrationError):
+                return _safe_integration_code(error, "reviewed_seam_changed")
+            if isinstance(error, CredentialRefreshError):
+                return _safe_integration_code(error, "provider_refresh_failed")
+            if isinstance(error, CodexCredentialError) and _is_credential_storage_error(
+                error
+            ):
+                return "credential_persistence"
+            try:
+                module = _load_pinned_provider_module()
+                persistence_error = module.CredentialsPersistenceError
+            except BaseException:  # noqa: BLE001 - dependency identity is untrusted
+                persistence_error = None
+            if persistence_error is not None and type(error) is persistence_error:
+                return "credential_persistence"
+            # Unexpected exceptions are not retryable network failures.  Keep the
+            # proactive path fail-closed rather than allowing stale credentials.
+            return "reviewed_seam_changed"
+
+        def _reconstruct_refresh_error(self, status: object) -> BaseException:
+            safe_status = _safe_integration_code(status, "reviewed_seam_changed")
+            if safe_status == "credential_cleanup":
+                return CredentialCleanupError()
+            if safe_status == "credential_persistence":
+                try:
+                    return _new_upstream_persistence_error(
+                        _load_pinned_provider_module()
+                    )
+                except BaseException:  # noqa: BLE001 - guard failure is fatal
+                    return PydanticAIIntegrationError(
+                        "pydantic_ai_persistence_error_changed"
+                    )
+            return CredentialRefreshError(safe_status)
+
+        @staticmethod
+        def _clear_exception_context(error: BaseException) -> BaseException:
+            error.__cause__ = None
+            error.__context__ = None
+            error.__traceback__ = None
+            return error
+
+        def _is_fatal_refresh_status(self, status: str) -> bool:
+            return status not in _RETRYABLE_ADAPTER_STATUSES
+
+        async def _refresh_if_stale(self) -> None:
+            """Refresh proactively without swallowing fatal integration guards."""
+
+            if not self._is_stale():
+                return
+            failure_status: str | None = None
+            try:
+                async with self._refresh_lock:
+                    if self._is_stale():
+                        await self._refresh_locked()
+            except asyncio.CancelledError:
+                raise
+            except BaseException as error:  # noqa: BLE001 - classify, then forget raw error
+                failure_status = self._refresh_failure_code(error)
+            if failure_status is not None and self._is_fatal_refresh_status(
+                failure_status
+            ):
+                safe_error = self._clear_exception_context(
+                    self._reconstruct_refresh_error(failure_status)
+                )
+                raise safe_error
+            # Only categorical, genuinely retryable refresh failures are ignored
+            # here; the subsequent 401 path performs the surfaced retry.
+
+        async def _refresh_for_401(
+            self, revision_used: int, *, refresh_failures: int
+        ) -> None:
+            """Single-flight 401 refresh with categorical failure readback."""
+
+            if self._revision != revision_used:
+                return
+            async with self._refresh_lock:
+                if self._revision != revision_used:
+                    return
+                last = self._last_refresh_error
+                if (
+                    last is not None
+                    and last[0] == revision_used
+                    and self._refresh_failures != refresh_failures
+                ):
+                    safe_error = self._clear_exception_context(
+                        self._reconstruct_refresh_error(last[1])
+                    )
+                    raise safe_error
+                failure_status: str | None = None
+                try:
+                    await self._refresh_locked()
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as error:  # noqa: BLE001 - never retain raw errors
+                    failure_status = self._refresh_failure_code(error)
+                if failure_status is not None:
+                    refresh_failure_count = self._refresh_failures
+                    if (
+                        type(refresh_failure_count) is not int
+                        or refresh_failure_count < 0
+                        or refresh_failure_count >= _MAX_ADAPTER_ATTEMPT_SEQUENCE
+                    ):
+                        failure_status = "refresh_failure_exhausted"
+                    else:
+                        self._refresh_failures = refresh_failure_count + 1
+                    self._last_refresh_error = (revision_used, failure_status)
+                    safe_error = self._clear_exception_context(
+                        self._reconstruct_refresh_error(failure_status)
+                    )
+                    raise safe_error
+                self._last_refresh_error = None
+
         async def _refresh_locked(self) -> None:
             self._begin_application_operation()
             try:
@@ -749,15 +1017,19 @@ def get_pydantic_ai_codex_provider_class() -> type[Any]:
                     reviewed_module = _load_pinned_provider_module()
                 except BaseException:  # noqa: BLE001 - guard failures are categorical
                     raise CredentialRefreshError("reviewed_seam_changed") from None
-                source = getattr(self, "_credential_source", None)
-                if type(source) is not OpenAICodexCredentialSource:
-                    raise CredentialRefreshError("audited_file_source_required")
+                source = _require_audited_file_source(
+                    getattr(self, "_credential_source", None)
+                )
                 rejected = self.credentials
                 status = await self._application_refresh_status(source, rejected)
+                fatal = _safe_fatal_refresh_error(status)
+                if fatal is not None:
+                    raise fatal
                 if status == "credential_persistence":
                     raise _new_upstream_persistence_error(reviewed_module)
                 if status not in {"completed", "replayed"}:
                     raise CredentialRefreshError("provider_refresh_failed")
+                source = _require_audited_file_source(source)
                 storage_failure = False
                 try:
                     persisted = await source.load()
@@ -776,36 +1048,104 @@ def get_pydantic_ai_codex_provider_class() -> type[Any]:
                 if storage_failure:
                     raise _new_upstream_persistence_error(reviewed_module)
                 assert persisted is not None
+                _require_audited_file_source(source)
                 if status == "replayed" and persisted == rejected:
                     raise CredentialRefreshError("provider_refresh_failed")
                 self._replace(persisted)
             finally:
                 self._end_application_operation()
 
-        async def _close_application(self) -> None:
+        async def _close_application(self) -> str | None:
+            """Drain work, delegate the pinned client lifecycle, then release refs."""
+
             self._application_closing = True
+            failure_status: str | None = None
             event = self._application_idle_event
             if event is not None and not event.is_set():
                 await event.wait()
             task = self._application_attempt_task
             if task is not None and not task.done():
-                await asyncio.shield(task)
+                await _await_task_drained(task)
+
+            # Explicit close() is also supported outside a context manager.  If
+            # __aexit__ already delegated the outer base exit, the count is zero
+            # and the owned client is already closed by the pinned implementation.
+            entered_count = getattr(self, "_entered_count", 0)
+            while type(entered_count) is int and entered_count > 0:
+                try:
+                    await super().__aexit__(None, None, None)
+                except asyncio.CancelledError:
+                    raise
+                except BaseException:  # noqa: BLE001 - upstream close is untrusted
+                    failure_status = failure_status or "provider_http_close_failed"
+                entered_count = getattr(self, "_entered_count", 0)
+
+            owned_client = getattr(self, "_own_http_client", None)
+            if owned_client is not None and not getattr(
+                owned_client, "is_closed", True
+            ):
+                try:
+                    await owned_client.aclose()
+                except asyncio.CancelledError:
+                    raise
+                except BaseException:  # noqa: BLE001 - upstream close is untrusted
+                    failure_status = failure_status or "provider_http_close_failed"
+
+            auth = getattr(self, "_application_provider_auth", None)
+            for client in (
+                getattr(self, "_application_external_http_client", None),
+                owned_client,
+            ):
+                if client is None:
+                    continue
+                try:
+                    if getattr(client, "auth", None) is auth:
+                        client.auth = None
+                except asyncio.CancelledError:
+                    raise
+                except BaseException:  # noqa: BLE001 - client ownership is untrusted
+                    failure_status = failure_status or "provider_http_detach_failed"
+
+            source = getattr(self, "_credential_source", None)
+            if not self._application_http_client_released:
+                backend_closed = True
+                if not _is_audited_file_source(source):
+                    backend_closed = False
+                    failure_status = failure_status or "audited_file_source_required"
+                else:
+                    try:
+                        cast(Any, source)._backend.close()
+                    except BaseException:  # noqa: BLE001 - backend details are untrusted
+                        backend_closed = False
+                        failure_status = (
+                            failure_status or "credential_backend_close_failed"
+                        )
+                if backend_closed:
+                    self._application_http_client_released = True
+
             if not self._application_scope_released:
-                source = getattr(self, "_credential_source", None)
-                if type(source) is OpenAICodexCredentialSource:
-                    with contextlib.suppress(BaseException):
-                        source._backend.close()  # type: ignore[attr-defined]
                 try:
                     self._application_pressure.release_scope(self._application_scope)
                 except ProviderOperationError:
-                    raise PydanticAIIntegrationError(
-                        "generation_scope_release_failed"
-                    ) from None
+                    failure_status = failure_status or "generation_scope_release_failed"
                 except BaseException:  # noqa: BLE001 - pressure details are untrusted
-                    raise PydanticAIIntegrationError(
-                        "generation_scope_release_failed"
-                    ) from None
-                self._application_scope_released = True
+                    failure_status = failure_status or "generation_scope_release_failed"
+                else:
+                    self._application_scope_released = True
+
+            if failure_status is None:
+                # Drop provider-held references after all delegated cleanup has
+                # completed; an external client itself remains caller-owned.
+                self._auth = None
+                self._http_client = None
+                self._own_http_client = None
+                self._http_client_factory = None
+                self._client = None
+                self._credentials = None
+                self._credential_source = None
+                self._application_external_http_client = None
+                self._application_provider_auth = None
+            return failure_status
 
         async def close(self) -> None:
             """Drain active refresh work, then release this provider's scope once."""
@@ -814,7 +1154,13 @@ def get_pydantic_ai_codex_provider_class() -> type[Any]:
             if task is None:
                 task = asyncio.create_task(self._close_application())
                 self._application_close_task = task
-            await _await_task_drained(task)
+            outcome = await _await_task_drained(task)
+            if outcome is _DRAIN_FAILED:
+                self._application_close_task = None
+                raise PydanticAIIntegrationError("provider_cleanup_failed")
+            if type(outcome) is str:
+                self._application_close_task = None
+                raise PydanticAIIntegrationError(outcome)
 
         async def aclose(self) -> None:
             await self.close()
@@ -822,10 +1168,35 @@ def get_pydantic_ai_codex_provider_class() -> type[Any]:
         async def __aenter__(self) -> Any:
             if self._application_closing:
                 raise PydanticAIIntegrationError("provider_closed")
-            return self
+            try:
+                return await super().__aenter__()
+            except asyncio.CancelledError:
+                cleanup = asyncio.create_task(self.close())
+                with contextlib.suppress(BaseException):
+                    await _await_task_drained(cleanup)
+                raise
+            except BaseException:
+                cleanup = asyncio.create_task(self.close())
+                with contextlib.suppress(BaseException):
+                    await _await_task_drained(cleanup)
+                raise
 
-        async def __aexit__(self, _exc_type: object, _exc: object, _tb: object) -> None:
-            await self.close()
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+            try:
+                result = await super().__aexit__(exc_type, exc, tb)
+            except asyncio.CancelledError:
+                cleanup = asyncio.create_task(self.close())
+                with contextlib.suppress(BaseException):
+                    await _await_task_drained(cleanup)
+                raise
+            except BaseException:
+                cleanup = asyncio.create_task(self.close())
+                with contextlib.suppress(BaseException):
+                    await _await_task_drained(cleanup)
+                raise
+            if getattr(self, "_entered_count", 0) == 0:
+                await self.close()
+            del result
 
     ApplicationOwnedCodexProvider.__name__ = "ApplicationOwnedCodexProvider"
     ApplicationOwnedCodexProvider.__qualname__ = "ApplicationOwnedCodexProvider"

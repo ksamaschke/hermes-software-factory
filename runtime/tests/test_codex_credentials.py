@@ -493,9 +493,12 @@ def test_scope_release_rejects_pending_admission_and_reuse_has_no_stale_entry():
         pressure.release_scope(scope)
         assert pressure.new_scope() == scope
 
-        held = await pressure.acquire(generation=ProviderGeneration(scope, 2))
+        epoch = pressure.scope_epoch(scope)
+        held = await pressure.acquire(generation=ProviderGeneration(scope, 2, epoch))
         waiter = asyncio.create_task(
-            pressure.acquire(generation=ProviderGeneration(scope, 3), timeout=0.5)
+            pressure.acquire(
+                generation=ProviderGeneration(scope, 3, epoch), timeout=0.5
+            )
         )
         for _ in range(20):
             await asyncio.sleep(0)
@@ -1170,3 +1173,70 @@ def test_cancelled_file_operation_drains_its_worker(
         await backend.save(credentials("after-drain"))
 
     run(probe())
+
+
+def test_scope_epoch_rejects_replayed_generation_after_integer_scope_reuse():
+    async def probe() -> None:
+        pressure = ProviderPressure(1)
+        scope = pressure.new_scope()
+        first_epoch = pressure.scope_epoch(scope)
+        stale = ProviderGeneration(scope, 1, first_epoch)
+        pressure.release_scope(scope)
+        pressure.new_scope()
+        second_epoch = pressure.scope_epoch(scope)
+        assert second_epoch != first_epoch
+
+        with pytest.raises(ProviderOperationError) as raised:
+            await pressure.acquire(generation=stale, timeout=0.0)
+        assert raised.value.code == "generation_invalid"
+        assert pressure.queued == 0
+        assert pressure.in_flight == 0
+        assert pressure._pending_admissions == {}
+
+        with pytest.raises(ProviderOperationError) as raised:
+            await pressure.run(stale, lambda: None)
+        assert raised.value.code == "generation_invalid"
+        pressure.release_scope(scope)
+
+    run(probe())
+
+
+def test_serialized_file_limit_is_checked_before_rotation_and_readback(
+    tmp_path: Path,
+):
+    import software_factory.providers.openai_codex as module
+
+    path = tmp_path / "credentials.json"
+    boundary = OpenAICodexCredentials(
+        access_token="access-λ" * 40,
+        refresh_token="refresh-λ" * 40,
+        account_id="account.synthetic",
+    )
+    boundary_bytes = module._serialized_credentials(boundary, path=path)
+    limit = len(boundary_bytes)
+    assert limit > 256
+
+    source = module.OpenAICodexCredentialSource(path, max_file_bytes=limit)
+    run(source.save(boundary))
+    assert path.read_bytes() == boundary_bytes
+    assert run(source.load()) == boundary
+
+    larger = OpenAICodexCredentials(
+        access_token=boundary.access_token + "x",
+        refresh_token=boundary.refresh_token,
+        account_id=boundary.account_id,
+    )
+    before = path.read_bytes()
+    with pytest.raises(CredentialValidationError) as raised:
+        run(source.save(larger))
+    assert raised.value.code == "serialized_credentials_too_large"
+    assert path.read_bytes() == before
+    assert run(source.load()) == boundary
+
+    too_small_path = tmp_path / "too-small.json"
+    too_small = module.OpenAICodexCredentialSource(
+        too_small_path, max_file_bytes=limit - 1
+    )
+    with pytest.raises(CredentialValidationError):
+        run(too_small.save(boundary))
+    assert not too_small_path.exists()

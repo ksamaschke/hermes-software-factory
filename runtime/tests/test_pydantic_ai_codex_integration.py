@@ -12,7 +12,6 @@ import asyncio
 import multiprocessing as mp
 from functools import wraps
 from pathlib import Path
-from typing import Any, cast
 
 import pytest
 
@@ -21,7 +20,9 @@ httpx2 = pytest.importorskip("httpx2")
 
 import pydantic_ai.providers.openai_codex as pydantic_codex
 from software_factory.providers import (
+    CredentialCleanupError,
     CredentialPersistenceError,
+    CredentialRefreshError,
     OpenAICodexCredentials,
     OpenAICodexCredentialSource,
     ProviderPressure,
@@ -67,27 +68,27 @@ def test_same_signature_refresh_mutation_fails_closed(monkeypatch):
 
 
 @_asyncio_test
-async def test_persistence_failure_uses_the_guarded_upstream_exception(monkeypatch):
+async def test_persistence_failure_uses_the_guarded_upstream_exception(
+    monkeypatch, tmp_path: Path
+):
     current = _credentials("old")
+    source = OpenAICodexCredentialSource(tmp_path / "credentials.json")
+    await source.save(current)
 
-    class FailingBackend:
-        async def load(self) -> OpenAICodexCredentials:
-            return current
+    async def failing_refresh(
+        _backend,
+        _callback,
+        *,
+        expected=None,
+        timeout=None,
+    ):
+        del expected, timeout
+        raise CredentialPersistenceError("synthetic_backend_failure")
 
-        async def save(self, _value: OpenAICodexCredentials) -> None:
-            raise AssertionError("save should not be reached")
-
-        async def refresh(
-            self,
-            _callback: object,
-            *,
-            expected: OpenAICodexCredentials | None = None,
-            timeout: float | None = None,
-        ) -> OpenAICodexCredentials:
-            del expected, timeout
-            raise CredentialPersistenceError("synthetic_backend_failure")
-
-    source = OpenAICodexCredentialSource(backend=cast(Any, FailingBackend()))
+    monkeypatch.setattr(
+        "software_factory.providers.openai_codex.FileCodexCredentialBackend.refresh",
+        failing_refresh,
+    )
     provider = create_pydantic_ai_codex_provider(source)
     await provider._load_if_needed()
     monkeypatch.setattr(provider, "_is_stale", lambda: True)
@@ -330,3 +331,213 @@ def test_wrong_pydantic_ai_version_fails_closed(monkeypatch):
     monkeypatch.setattr(integration, "_installed_version", lambda: "2.48.1")
     with pytest.raises(PydanticAIIntegrationError):
         integration.get_pydantic_ai_codex_provider_class()
+
+
+@_asyncio_test
+async def test_guard_failure_aborts_proactive_and_direct_refresh_without_network(
+    monkeypatch, tmp_path: Path
+):
+    import software_factory.providers.pydantic_ai_codex as integration
+
+    source = OpenAICodexCredentialSource(tmp_path / "credentials.json")
+    await source.save(_credentials("old"))
+    network_calls = 0
+
+    async def handler(_request):
+        nonlocal network_calls
+        network_calls += 1
+        return httpx2.Response(500, json={"error": "unexpected"})
+
+    client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+    provider = create_pydantic_ai_codex_provider(
+        source, pressure=ProviderPressure(1), http_client=client
+    )
+    try:
+        await provider._load_if_needed()
+        revision = provider._revision
+
+        def broken_guard():
+            raise RuntimeError("guard failure")
+
+        monkeypatch.setattr(integration, "_load_pinned_provider_module", broken_guard)
+        monkeypatch.setattr(provider, "_is_stale", lambda: True)
+        with pytest.raises(CredentialRefreshError) as proactive:
+            await provider._refresh_if_stale()
+        assert proactive.value.code == "reviewed_seam_changed"
+        assert provider._revision == revision
+        assert network_calls == 0
+
+        with pytest.raises(CredentialRefreshError) as direct:
+            await provider._refresh_for_401(
+                revision, refresh_failures=provider._refresh_failures
+            )
+        assert direct.value.code == "reviewed_seam_changed"
+        assert direct.value.__context__ is None
+        assert provider._revision == revision
+        assert network_calls == 0
+    finally:
+        monkeypatch.undo()
+        await provider.close()
+        await client.aclose()
+
+
+@_asyncio_test
+async def test_cleanup_failure_is_exact_categorical_and_not_retried(
+    monkeypatch, tmp_path: Path
+):
+    import software_factory.providers.openai_codex as codex
+
+    path = tmp_path / "credentials.json"
+    source = OpenAICodexCredentialSource(path)
+    await source.save(_credentials("old"))
+    source_two = OpenAICodexCredentialSource(path)
+    network_calls = 0
+
+    async def handler(_request):
+        nonlocal network_calls
+        network_calls += 1
+        return httpx2.Response(
+            200,
+            json={
+                "access_token": "access-new.synthetic",
+                "refresh_token": "refresh-new.synthetic",
+                "account_id": "account.synthetic",
+            },
+        )
+
+    def fail_save(_backend, _parent_fd, _value):
+        raise CredentialCleanupError("synthetic_cleanup")
+
+    monkeypatch.setattr(codex.FileCodexCredentialBackend, "_save_unlocked", fail_save)
+    clients = [
+        httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
+        httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
+    ]
+    pressure = ProviderPressure(2)
+    provider = create_pydantic_ai_codex_provider(
+        source, pressure=pressure, http_client=clients[0]
+    )
+    provider_two = create_pydantic_ai_codex_provider(
+        source_two, pressure=pressure, http_client=clients[1]
+    )
+    try:
+        await asyncio.gather(provider._load_if_needed(), provider_two._load_if_needed())
+        revision = provider._revision
+        results = await asyncio.gather(
+            provider._refresh_for_401(revision, refresh_failures=0),
+            provider._refresh_for_401(revision, refresh_failures=0),
+            return_exceptions=True,
+        )
+        assert all(isinstance(result, CredentialCleanupError) for result in results)
+        assert all(result.__context__ is None for result in results)
+        assert provider._last_refresh_error == (revision, "credential_cleanup")
+        assert network_calls == 1
+        assert await source.load() == _credentials("old")
+
+        await provider_two._load_if_needed()
+        provider_two._is_stale = lambda: True
+        with pytest.raises(CredentialCleanupError) as proactive:
+            await provider_two._refresh_if_stale()
+        assert proactive.value.__context__ is None
+        assert provider_two._revision == 0
+        assert await source.load() == _credentials("old")
+    finally:
+        await provider.close()
+        await provider_two.close()
+        await asyncio.gather(*(client.aclose() for client in clients))
+
+
+@_asyncio_test
+async def test_context_delegates_owned_and_external_http_client_lifecycle(
+    tmp_path: Path,
+):
+    owned_source = OpenAICodexCredentialSource(tmp_path / "owned.json")
+    external_source = OpenAICodexCredentialSource(tmp_path / "external.json")
+    await owned_source.save(_credentials("owned"))
+    await external_source.save(_credentials("external"))
+
+    owned_provider = create_pydantic_ai_codex_provider(owned_source)
+    owned_client = owned_provider._http_client
+    async with owned_provider as entered:
+        assert entered is owned_provider
+        assert owned_client.is_closed is False
+    assert owned_client.is_closed is True
+    assert owned_provider._auth is None
+    assert owned_provider._http_client is None
+    assert owned_provider._client is None
+    assert owned_provider._credentials is None
+
+    external_client = httpx2.AsyncClient(
+        transport=httpx2.MockTransport(
+            lambda _request: httpx2.Response(500, json={"error": "unused"})
+        )
+    )
+    external_provider = create_pydantic_ai_codex_provider(
+        external_source, http_client=external_client
+    )
+    try:
+        async with external_provider:
+            assert external_client.is_closed is False
+        assert external_client.is_closed is False
+        assert external_client.auth is None
+        assert external_provider._auth is None
+        assert external_provider._http_client is None
+        assert external_provider._client is None
+        assert external_provider._credentials is None
+    finally:
+        await external_client.aclose()
+
+
+@_asyncio_test
+async def test_partial_context_enter_drains_owned_client_and_scope(
+    monkeypatch, tmp_path: Path
+):
+    from pydantic_ai.providers import Provider
+
+    source = OpenAICodexCredentialSource(tmp_path / "partial.json")
+    await source.save(_credentials("partial"))
+    provider = create_pydantic_ai_codex_provider(source)
+    client = provider._http_client
+
+    async def fail_enter(_provider):
+        raise RuntimeError("synthetic partial enter")
+
+    monkeypatch.setattr(Provider, "__aenter__", fail_enter)
+    with pytest.raises(RuntimeError, match="synthetic partial enter"):
+        await provider.__aenter__()
+    assert client.is_closed is True
+    assert provider._auth is None
+    assert provider._http_client is None
+    assert provider._client is None
+    assert provider._credentials is None
+
+
+@_asyncio_test
+async def test_context_cancellation_drains_owned_client_and_scope(tmp_path: Path):
+    source = OpenAICodexCredentialSource(tmp_path / "cancelled.json")
+    await source.save(_credentials("cancelled"))
+    pressure = ProviderPressure(1)
+    provider = create_pydantic_ai_codex_provider(source, pressure=pressure)
+    client = provider._http_client
+    entered = asyncio.Event()
+
+    async def use_provider():
+        async with provider:
+            entered.set()
+            await asyncio.Event().wait()
+
+    task = asyncio.create_task(use_provider())
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert client.is_closed is True
+    assert provider._auth is None
+    assert provider._http_client is None
+    assert provider._client is None
+    assert provider._credentials is None
+    assert pressure._scopes == {0}
+    assert pressure._pending_admissions == {}
+    assert pressure._active == {}
+    await provider.close()
