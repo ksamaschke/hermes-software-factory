@@ -394,6 +394,63 @@ with kb.connect_closing(db) as conn:
         "review_remediation_handoff_key": receipt["handoff_key"],
         "scope_manifest_sha256": remediation_scope,
     }
+
+    class StringSubclass(str):
+        pass
+
+    class StringableLookalike:
+        def __init__(self, value):
+            self.value = value
+
+        def __str__(self):
+            return self.value
+
+    invalid_request_values = [
+        ("candidate_commit", int("1" * 40)),
+        ("candidate_commit", True),
+        ("candidate_commit", 1.0),
+        ("candidate_commit", b"a" * 40),
+        ("candidate_commit", StringSubclass(remediation_head)),
+        ("candidate_commit", StringableLookalike(remediation_head)),
+        ("scope_manifest_sha256", int("1" * 64)),
+        ("scope_manifest_sha256", b"b" * 64),
+        ("scope_manifest_sha256", StringSubclass(remediation_scope)),
+        ("review_remediation_handoff_key", True),
+        ("review_remediation_handoff_key", b"opaque"),
+        (
+            "review_remediation_handoff_key",
+            StringSubclass(receipt["handoff_key"]),
+        ),
+    ]
+    for field, value in invalid_request_values:
+        invalid_metadata = dict(review_metadata)
+        invalid_metadata[field] = value
+        before_receipts = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events WHERE task_id = ? "
+            "AND kind = 'review_requested'",
+            (successor_id,),
+        ).fetchone()["n"]
+        with active("implementer"):
+            requested, request_reason = kb.request_review(
+                conn,
+                successor_id,
+                summary="reject typed remediation lookalike",
+                metadata=invalid_metadata,
+                reviewer="reviewer",
+                expected_run_id=implementation_claim.current_run_id,
+                with_reason=True,
+            )
+        assert not requested, (field, value, request_reason)
+        assert kb.get_task(conn, successor_id).status == "running"
+        implementation_run = kb.latest_run(conn, successor_id)
+        assert implementation_run.status == "running"
+        assert implementation_run.outcome is None
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events WHERE task_id = ? "
+            "AND kind = 'review_requested'",
+            (successor_id,),
+        ).fetchone()["n"] == before_receipts
+
     original_redact_review_value = kb.redact_review_value
 
     def redactor_that_masks_opaque_handoff(value):
@@ -455,6 +512,41 @@ with kb.connect_closing(db) as conn:
         conn, successor_id, claimer="dispatcher:reviewer:second"
     )
     assert second_review is not None
+    invalid_completion_values = [
+        ("candidate_commit", StringSubclass(remediation_head)),
+        ("candidate_commit", int("1" * 40)),
+        ("review_outcome", StringSubclass("APPROVED")),
+        ("scope_manifest_sha256", StringSubclass(remediation_scope)),
+        (
+            "review_remediation_handoff_key",
+            StringSubclass(receipt["handoff_key"]),
+        ),
+    ]
+    for field, value in invalid_completion_values:
+        invalid_metadata = {"review_outcome": "APPROVED", **review_metadata}
+        invalid_metadata[field] = value
+        before_completed = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events WHERE task_id = ? "
+            "AND kind = 'completed'",
+            (successor_id,),
+        ).fetchone()["n"]
+        with active("reviewer"):
+            assert not kb.complete_task(
+                conn,
+                successor_id,
+                summary="reject typed completion lookalike",
+                metadata=invalid_metadata,
+                expected_run_id=second_review.current_run_id,
+            )
+        assert kb.get_task(conn, successor_id).status == "running"
+        reviewer_run = kb.latest_run(conn, successor_id)
+        assert reviewer_run.status == "running"
+        assert reviewer_run.outcome is None
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events WHERE task_id = ? "
+            "AND kind = 'completed'",
+            (successor_id,),
+        ).fetchone()["n"] == before_completed
     with active("reviewer"):
         assert kb.complete_task(
             conn,

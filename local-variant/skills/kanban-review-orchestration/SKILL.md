@@ -206,10 +206,11 @@ hand internal repair coordination to the operator. Continue the bounded loop:
    without raw database write access. Its exact unexpired implementation run
    requests a distinct reviewer with only
    `candidate_commit`, `review_remediation_handoff_key`, and
-   `scope_manifest_sha256`; the native boundary validates these against the
-   current clean repository/worktree, branch, base, candidate, complete task
-   body, and changed-path manifest. Legacy receipts without current provenance
-   are atomically tombstoned rather than left pending.
+   `scope_manifest_sha256`; all three must be exact built-in strings before
+   normalization, serialization, or redaction. The native boundary validates
+   them against the current clean repository/worktree, branch, base, candidate,
+   complete task body, and changed-path manifest. Legacy receipts without
+   current provenance are atomically tombstoned rather than left pending.
 4. Verify the implementer commit, exact file scope, focused/full gates, and
    clean worktree. Route exactly one fresh independent review for the new
    candidate; never reuse the old leaf or its verdict.

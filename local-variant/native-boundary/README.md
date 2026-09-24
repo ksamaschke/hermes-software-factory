@@ -94,10 +94,15 @@ isolation boundary is stated explicitly.
   profile, live lease and claim lock, prior terminal `review_requested`
   implementation run, immutable packet/body/pointer receipt, clean worktree,
   candidate, changed-path manifest, repository/worktree identity, and local HEAD.
-  Missing, boolean/string/float/stale/expired run IDs, role collisions,
-  non-approval, self-attestation, stale or foreign evidence, pointer/body/graph
-  tampering, and malformed provenance cannot complete the task or release
-  status-gated children.
+  Review identity fields are validated before JSON serialization or redaction:
+  `candidate_commit`, present head aliases, the remediation scope digest and the
+  opaque handoff key must use the exact built-in `str` type. Numbers, booleans,
+  floats, bytes, string subclasses, and stringable lookalikes are rejected
+  atomically without a review or completion receipt. Missing, stale, expired,
+  or otherwise malformed run IDs, role collisions, non-approval,
+  self-attestation, stale or foreign evidence, pointer/body/graph tampering, and
+  malformed provenance cannot complete the task or release status-gated
+  children.
 - before reclaim, orphan repair, promotion, or spawn, a durable-state barrier
   validates non-terminal task scalars, run/event/comment identifiers and
   timestamps, run state, JSON storage, transition schemas, counters, PIDs,

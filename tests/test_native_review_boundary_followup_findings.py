@@ -35,6 +35,18 @@ if not _RUNTIME.is_dir():
 sys.path.insert(0, str(_RUNTIME))
 
 
+class _StringLookalike(str):
+    pass
+
+
+class _StringableLookalike:
+    def __init__(self, value: str):
+        self.value = value
+
+    def __str__(self) -> str:
+        return self.value
+
+
 @pytest.fixture
 def kanban_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
@@ -356,7 +368,16 @@ def test_structured_review_handoff_requires_canonical_candidate_commit(kanban_db
         {"pr_head_sha": "a" * 40},
         {"candidate_commit": "not-a-commit"},
         {"candidate_commit": int("1" * 40)},
+        {"candidate_commit": True},
+        {"candidate_commit": 1.0},
+        {"candidate_commit": b"a" * 40},
+        {"candidate_commit": _StringLookalike("a" * 40)},
+        {"candidate_commit": _StringableLookalike("a" * 40)},
         {"candidate_commit": "a" * 40, "pr_head_sha": int("1" * 40)},
+        {
+            "candidate_commit": "a" * 40,
+            "pr_head_sha": _StringLookalike("a" * 40),
+        },
         {
             "candidate_commit": "a" * 40,
             "post_verification_head": int("1" * 40),
@@ -420,10 +441,23 @@ def test_structured_review_handoff_requires_canonical_candidate_commit(kanban_db
     "metadata",
     [
         {"candidate_commit": int("1" * 40)},
+        {"candidate_commit": True},
+        {"candidate_commit": 1.0},
+        {"candidate_commit": b"a" * 40},
+        {"candidate_commit": _StringLookalike("a" * 40)},
+        {"candidate_commit": _StringableLookalike("a" * 40)},
         {"candidate_commit": "a" * 40, "pr_head_sha": int("1" * 40)},
         {
             "candidate_commit": "a" * 40,
+            "pr_head_sha": _StringLookalike("a" * 40),
+        },
+        {
+            "candidate_commit": "a" * 40,
             "post_verification_head": int("1" * 40),
+        },
+        {
+            "candidate_commit": "a" * 40,
+            "post_verification_head": _StringLookalike("a" * 40),
         },
     ],
 )
@@ -447,6 +481,72 @@ def test_public_review_request_rejects_non_string_candidate_identity(
         tools._handle_request_review(
             {
                 "summary": "must reject non-string candidate identity",
+                "reviewer": "reviewer",
+                "metadata": metadata,
+            }
+        )
+    )
+    assert response.get("ok") is not True
+    assert "error" in response
+    task = module.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == claimed.current_run_id
+    run = module.latest_run(conn, task_id)
+    assert run is not None
+    assert run.status == "running"
+    assert run.outcome is None
+    assert not any(
+        event.kind == "review_requested" for event in module.list_events(conn, task_id)
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("candidate_commit", int("1" * 40)),
+        ("candidate_commit", True),
+        ("candidate_commit", 1.0),
+        ("candidate_commit", b"a" * 40),
+        ("candidate_commit", _StringLookalike("a" * 40)),
+        ("candidate_commit", _StringableLookalike("a" * 40)),
+        ("scope_manifest_sha256", int("1" * 64)),
+        ("scope_manifest_sha256", b"b" * 64),
+        ("scope_manifest_sha256", _StringLookalike("b" * 64)),
+        ("review_remediation_handoff_key", True),
+        ("review_remediation_handoff_key", b"opaque"),
+        (
+            "review_remediation_handoff_key",
+            _StringLookalike("review-remediation:v2:opaque-value"),
+        ),
+    ],
+)
+def test_public_review_request_rejects_non_exact_remediation_identity(
+    kanban_db, monkeypatch, field, value
+):
+    module, conn, db_path = kanban_db
+    task_id, claimed = _claim(module, conn, "typed public remediation handoff")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+    monkeypatch.setenv("HERMES_SESSION_ID", "implementer-session")
+    sys.modules.pop("tools.kanban_tools", None)
+    tools = importlib.import_module("tools.kanban_tools")
+    monkeypatch.setattr(
+        tools,
+        "_connect",
+        lambda board=None: (module, module.connect(db_path)),
+    )
+    metadata = {
+        "candidate_commit": "a" * 40,
+        "review_remediation_handoff_key": "review-remediation:v2:opaque-value",
+        "scope_manifest_sha256": "b" * 64,
+    }
+    metadata[field] = value
+
+    response = json.loads(
+        tools._handle_request_review(
+            {
+                "summary": "must reject non-exact remediation identity",
                 "reviewer": "reviewer",
                 "metadata": metadata,
             }
@@ -613,6 +713,56 @@ def test_remediation_metadata_survives_tool_boundary_exactly(monkeypatch):
     )
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("candidate_commit", int("1" * 40)),
+        ("candidate_commit", True),
+        ("candidate_commit", 1.0),
+        ("candidate_commit", b"a" * 40),
+        ("candidate_commit", _StringLookalike("a" * 40)),
+        ("candidate_commit", _StringableLookalike("a" * 40)),
+        ("scope_manifest_sha256", int("1" * 64)),
+        ("scope_manifest_sha256", b"b" * 64),
+        ("scope_manifest_sha256", _StringLookalike("b" * 64)),
+        ("review_remediation_handoff_key", True),
+        ("review_remediation_handoff_key", b"opaque"),
+        (
+            "review_remediation_handoff_key",
+            _StringLookalike("review-remediation:v2:opaque-value"),
+        ),
+    ],
+)
+def test_remediation_metadata_rejects_non_exact_strings_before_serialization(
+    monkeypatch, field, value
+):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-remediation")
+    monkeypatch.setenv("HERMES_SESSION_ID", "worker-session")
+    sys.modules.pop("tools.kanban_tools", None)
+    tools = importlib.import_module("tools.kanban_tools")
+    metadata = {
+        "candidate_commit": "a" * 40,
+        "review_remediation_handoff_key": "review-remediation:v2:opaque-value",
+        "scope_manifest_sha256": "b" * 64,
+    }
+    metadata[field] = value
+    with pytest.raises(ValueError, match="exact built-in strings"):
+        tools._prepare_request_review_metadata("task-remediation", metadata)
+
+
+def test_remediation_metadata_rejects_string_subclass_key(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-remediation")
+    sys.modules.pop("tools.kanban_tools", None)
+    tools = importlib.import_module("tools.kanban_tools")
+    metadata = {
+        _StringLookalike("candidate_commit"): "a" * 40,
+        "review_remediation_handoff_key": "review-remediation:v2:opaque-value",
+        "scope_manifest_sha256": "b" * 64,
+    }
+    with pytest.raises(ValueError, match="exact built-in strings"):
+        tools._prepare_request_review_metadata("task-remediation", metadata)
+
+
 def test_none_review_metadata_survives_public_tool_boundary(
     kanban_db, monkeypatch
 ):
@@ -729,8 +879,21 @@ def test_public_completion_rejects_normalized_verdict_aliases(
     ("identity_key", "identity_value"),
     [
         ("candidate_commit", int("1" * 40)),
+        ("candidate_commit", True),
+        ("candidate_commit", 1.0),
+        ("candidate_commit", b"a" * 40),
+        ("candidate_commit", _StringLookalike("a" * 40)),
+        ("candidate_commit", _StringableLookalike("a" * 40)),
         ("pr_head_sha", int("1" * 40)),
+        ("pr_head_sha", _StringLookalike("a" * 40)),
         ("post_verification_head", int("1" * 40)),
+        ("post_verification_head", _StringLookalike("a" * 40)),
+        ("review_outcome", _StringLookalike("APPROVED")),
+        ("scope_manifest_sha256", _StringLookalike("b" * 64)),
+        (
+            "review_remediation_handoff_key",
+            _StringLookalike("review-remediation:v2:opaque-value"),
+        ),
     ],
 )
 def test_public_completion_rejects_non_string_candidate_identity(

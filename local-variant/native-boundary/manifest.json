@@ -44,6 +44,10 @@
     {
       "path": "patches/007-review-candidate-type-contract.patch",
       "sha256": "74e3ae9b4d79d7aa91623a992aceab3ec97e9fb034d08c41da6bda809dc257a7"
+    },
+    {
+      "path": "patches/008-review-public-type-boundary.patch",
+      "sha256": "5b0c3351ce115b02dc84174ce1d3a0e8a3598cf06d36bd3f4ae0675b3fb81054"
     }
   ],
   "patched_paths": [
