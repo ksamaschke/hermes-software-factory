@@ -6,11 +6,10 @@ import hashlib
 import json
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from enum import Enum, StrEnum
 from pathlib import Path
-from types import MappingProxyType
-from typing import Annotated, Any, Generic, Literal, Self, TypeAlias, TypeVar
+from typing import Annotated, Any, Generic, Literal, Self, TypeAlias, TypeVar, cast
 from urllib.parse import urlsplit
 
 import yaml
@@ -44,35 +43,431 @@ _MappingValue = TypeVar("_MappingValue")
 class ImmutableMapping(
     Mapping[_MappingKey, _MappingValue], Generic[_MappingKey, _MappingValue]
 ):
-    """A read-only mapping backed by its own defensive dictionary copy."""
+    """A read-only mapping backed only by exact immutable entry tuples.
 
-    __slots__ = ("_data",)
+    This class is also an authority-bearing input container.  Its state is
+    therefore validated through ``object.__getattribute__`` by the helpers
+    below instead of trusting normal attribute access or a mapping proxy.
+    """
+
+    __slots__ = ("_entries",)
 
     def __init__(self, values: Mapping[_MappingKey, _MappingValue]) -> None:
-        # Only the runtime's own exact mapping or an exact dict may become an
-        # immutable mapping.  In particular, do not let a proxy preserve a
-        # hostile dict subclass' iteration hooks at this boundary.
-        if type(values) not in {dict, ImmutableMapping}:
-            raise TypeError("ImmutableMapping requires an exact dict snapshot")
-        object.__setattr__(self, "_data", MappingProxyType(dict(values)))
+        object.__setattr__(self, "_entries", _build_immutable_entries(values))
 
     def __getitem__(self, key: _MappingKey) -> _MappingValue:
-        return self._data[key]
+        entries = _immutable_mapping_entries(self)
+        if type(key) is not str:
+            raise KeyError("ImmutableMapping keys must be built-in strings")
+        for entry_key, value in entries:
+            if entry_key == key:
+                return value  # type: ignore[return-value]
+        raise KeyError(key)
 
-    def __iter__(self):
-        return iter(self._data)
+    def __iter__(self) -> Iterator[_MappingKey]:
+        entries = _immutable_mapping_entries(self)
+        return iter(tuple(entry[0] for entry in entries))  # type: ignore[return-value]
 
     def __len__(self) -> int:
-        return len(self._data)
+        return len(_immutable_mapping_entries(self))
 
     def __repr__(self) -> str:
-        return f"{type(self).__name__}({dict(self._data)!r})"
+        return f"{type(self).__name__}(size={len(self)})"
 
     def __setattr__(self, name: str, value: object) -> None:
         raise AttributeError(f"{type(self).__name__} is immutable")
 
     def __delattr__(self, name: str) -> None:
         raise AttributeError(f"{type(self).__name__} is immutable")
+
+
+def _validate_immutable_entries(
+    entries: object,
+    label: str = "immutable mapping",
+    *,
+    budget: TraversalBudget | None = None,
+    depth: int = 0,
+    keepalive: list[object] | None = None,
+) -> tuple[tuple[str, object], ...]:
+    """Validate one immutable mapping's complete structural representation."""
+
+    if type(entries) is not tuple:
+        raise ValueError(f"{label} entries must be an exact tuple")
+    budget = budget or TraversalBudget()
+    keepalive = keepalive if keepalive is not None else []
+    keepalive.append(entries)
+    try:
+        budget.enter(
+            entries,
+            depth=depth,
+            label=f"{label} entries",
+            length=len(entries),
+        )
+        seen: set[str] = set()
+        for index, entry in enumerate(entries):
+            if type(entry) is not tuple:
+                raise ValueError(f"{label} entry {index} must be an exact tuple")
+            if len(entry) != 2:
+                raise ValueError(f"{label} entry {index} must contain two values")
+            budget.enter(
+                entry,
+                depth=depth + 1,
+                label=f"{label} entry {index}",
+                length=2,
+            )
+            key, nested = entry
+            if type(key) is not str:
+                raise ValueError(f"{label} entry {index} key must be a built-in string")
+            budget.charge_string(key, f"{label} entry {index} key")
+            if key in seen:
+                raise ValueError(f"{label} contains duplicate key {key!r}")
+            seen.add(key)
+            _validate_immutable_value(
+                nested,
+                budget=budget,
+                depth=depth + 2,
+                label=f"{label}.{key}",
+                keepalive=keepalive,
+            )
+    except TraversalBudgetError as exc:
+        raise ValueError(str(exc)) from exc
+    return entries  # type: ignore[return-value]
+
+
+def _immutable_mapping_entries(
+    value: object,
+    label: str = "immutable mapping",
+    *,
+    budget: TraversalBudget | None = None,
+    depth: int = 0,
+    keepalive: list[object] | None = None,
+) -> tuple[tuple[str, object], ...]:
+    """Read and validate exact immutable state without invoking value hooks."""
+
+    if type(value) is not ImmutableMapping:
+        raise ValueError(f"{label} must be an exact ImmutableMapping")
+    try:
+        entries = object.__getattribute__(value, "_entries")
+    except (AttributeError, TypeError) as exc:
+        raise ValueError(f"{label} has no initialized entries") from exc
+    try:
+        extra = object.__getattribute__(value, "__dict__")
+    except AttributeError:
+        extra = None
+    if extra is not None and (type(extra) is not dict or extra):
+        raise ValueError(f"{label} contains unexpected extra state")
+    return _validate_immutable_entries(
+        entries,
+        label,
+        budget=budget,
+        depth=depth,
+        keepalive=keepalive,
+    )
+
+
+def _validate_immutable_value(
+    value: object,
+    *,
+    budget: TraversalBudget,
+    depth: int,
+    label: str,
+    keepalive: list[object],
+) -> None:
+    """Recursively validate exact nested state without reading hostile values."""
+
+    if value is None or type(value) in {bool, int, str}:
+        budget.charge_scalar(value, label)
+        return
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError(f"{label} must contain finite JSON numbers")
+        budget.charge_scalar(value, label)
+        return
+    if type(value) is dict:
+        budget.enter(value, depth=depth, label=label, length=len(value))
+        try:
+            entries = tuple((key, nested) for key, nested in dict.items(value))
+        except (MemoryError, RuntimeError) as exc:
+            raise ValueError(f"{label} could not be safely traversed") from exc
+        keepalive.append(entries)
+        _validate_immutable_entries(
+            entries,
+            label,
+            budget=budget,
+            depth=depth + 1,
+            keepalive=keepalive,
+        )
+        return
+    if type(value) in {list, tuple}:
+        exact_sequence = cast(list[object] | tuple[object, ...], value)
+        budget.enter(
+            exact_sequence,
+            depth=depth,
+            label=label,
+            length=len(exact_sequence),
+        )
+        for index, nested in enumerate(exact_sequence):
+            _validate_immutable_value(
+                nested,
+                budget=budget,
+                depth=depth + 1,
+                label=f"{label}[{index}]",
+                keepalive=keepalive,
+            )
+        return
+    if type(value) is ImmutableMapping:
+        _immutable_mapping_entries(
+            value,
+            label,
+            budget=budget,
+            depth=depth,
+            keepalive=keepalive,
+        )
+        return
+    if type(value) in _TRUSTED_IMMUTABLE_ENUM_TYPES:
+        enum_value = object.__getattribute__(value, "_value_")
+        if enum_value is None or type(enum_value) in {bool, int, str}:
+            budget.charge_scalar(enum_value, label)
+            return
+        if type(enum_value) is float and math.isfinite(enum_value):
+            budget.charge_scalar(enum_value, label)
+            return
+        raise ValueError(f"{label} contains an unsupported enum value")
+    if type(value) in _TRUSTED_IMMUTABLE_MODEL_TYPES:
+        _validate_immutable_model(
+            value,
+            budget=budget,
+            depth=depth,
+            label=label,
+            keepalive=keepalive,
+        )
+        return
+    if type(value) is object:
+        budget.charge_encoded(1, label)
+        return
+    raise ValueError(f"{label} contains an unsupported or hostile value")
+
+
+def _validate_immutable_model(
+    value: object,
+    *,
+    budget: TraversalBudget,
+    depth: int,
+    label: str,
+    keepalive: list[object],
+) -> None:
+    """Validate exact trusted model state without model or serializer hooks."""
+
+    model_type = type(value)
+    if model_type not in _TRUSTED_IMMUTABLE_MODEL_TYPES:
+        raise ValueError(f"{label} contains an untrusted model")
+    budget.enter(value, depth=depth, label=label, length=1)
+    try:
+        raw_state = object.__getattribute__(value, "__dict__")
+        extra = object.__getattribute__(value, "__pydantic_extra__")
+        private = object.__getattribute__(value, "__pydantic_private__")
+    except (AttributeError, TypeError) as exc:
+        raise ValueError(f"{label} has no trusted raw model state") from exc
+    if type(raw_state) is not dict:
+        raise ValueError(f"{label} raw model state is not an exact dict")
+    if extra is not None and (type(extra) is not dict or extra):
+        raise ValueError(f"{label} contains unknown extra fields")
+    if private is not None and (type(private) is not dict or private):
+        raise ValueError(f"{label} contains private model state")
+    budget.enter(
+        raw_state,
+        depth=depth + 1,
+        label=f"{label}.__dict__",
+        length=len(raw_state),
+    )
+    expected_names = tuple(model_type.model_fields)
+    actual_names = tuple(dict.keys(raw_state))
+    if any(type(name) is not str for name in actual_names):
+        raise ValueError(f"{label} contains a non-string field name")
+    if set(actual_names) != set(expected_names):
+        raise ValueError(f"{label} model state is not exact")
+    keepalive.append(raw_state)
+    for field_name in expected_names:
+        _validate_immutable_value(
+            raw_state[field_name],
+            budget=budget,
+            depth=depth + 2,
+            label=f"{label}.{field_name}",
+            keepalive=keepalive,
+        )
+
+
+def _new_immutable_mapping(
+    entries: tuple[tuple[str, object], ...],
+) -> ImmutableMapping[object, object]:
+    """Create an instance only after its exact entries have been frozen."""
+
+    result = object.__new__(ImmutableMapping)
+    object.__setattr__(result, "_entries", entries)
+    return result
+
+
+def _freeze_immutable_value(
+    value: object,
+    *,
+    budget: TraversalBudget,
+    depth: int,
+    label: str,
+    keepalive: list[object],
+) -> object:
+    """Deep-copy exact mutable containers without observing hostile ones."""
+
+    if value is None or type(value) in {bool, int, str}:
+        budget.charge_scalar(value, label)
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError(f"{label} must contain finite JSON numbers")
+        budget.charge_scalar(value, label)
+        return value
+    if type(value) is dict:
+        length = len(value)
+        budget.enter(value, depth=depth, label=label, length=length)
+        entries = tuple((key, nested) for key, nested in dict.items(value))
+        return _new_immutable_mapping(
+            _freeze_immutable_entries(
+                entries,
+                budget=budget,
+                depth=depth + 1,
+                label=label,
+                keepalive=keepalive,
+            )
+        )
+    if type(value) in {list, tuple}:
+        length = len(value)
+        budget.enter(value, depth=depth, label=label, length=length)
+        return tuple(
+            _freeze_immutable_value(
+                item,
+                budget=budget,
+                depth=depth + 1,
+                label=f"{label}[{index}]",
+                keepalive=keepalive,
+            )
+            for index, item in enumerate(value)
+        )
+    if type(value) is ImmutableMapping:
+        entries = _immutable_mapping_entries(value, label)
+        return _new_immutable_mapping(
+            _freeze_immutable_entries(
+                entries,
+                budget=budget,
+                depth=depth + 1,
+                label=label,
+                keepalive=keepalive,
+            )
+        )
+    if type(value) in _TRUSTED_IMMUTABLE_ENUM_TYPES:
+        enum_value = object.__getattribute__(value, "_value_")
+        if enum_value is None or type(enum_value) in {bool, int, str}:
+            budget.charge_scalar(enum_value, label)
+            return value
+        if type(enum_value) is float and math.isfinite(enum_value):
+            budget.charge_scalar(enum_value, label)
+            return value
+        raise ValueError(f"{label} contains an unsupported enum value")
+    if type(value) in _TRUSTED_IMMUTABLE_MODEL_TYPES:
+        _validate_immutable_model(
+            value,
+            budget=budget,
+            depth=depth,
+            label=label,
+            keepalive=keepalive,
+        )
+        return value
+    if type(value) is object:
+        budget.charge_encoded(1, label)
+        return value
+    raise ValueError(f"{label} contains an unsupported or hostile value")
+
+
+def _freeze_immutable_entries(
+    entries: object,
+    *,
+    budget: TraversalBudget,
+    depth: int,
+    label: str,
+    keepalive: list[object],
+) -> tuple[tuple[str, object], ...]:
+    """Freeze exact entry tuples and recursively snapshot their values."""
+
+    if type(entries) is not tuple:
+        raise ValueError(f"{label} entries must be an exact tuple")
+    exact_entries = cast(tuple[object, ...], entries)
+    keepalive.append(exact_entries)
+    budget.enter(
+        exact_entries,
+        depth=depth,
+        label=f"{label} entries",
+        length=len(exact_entries),
+    )
+    result: list[tuple[str, object]] = []
+    seen: set[str] = set()
+    for index, entry in enumerate(exact_entries):
+        if type(entry) is not tuple:
+            raise ValueError(f"{label} entry {index} must be an exact tuple")
+        if len(entry) != 2:
+            raise ValueError(f"{label} entry {index} must contain two values")
+        budget.enter(
+            entry,
+            depth=depth + 1,
+            label=f"{label} entry {index}",
+            length=2,
+        )
+        key, nested = entry
+        if type(key) is not str:
+            raise ValueError(f"{label} entry {index} key must be a built-in string")
+        budget.charge_string(key, f"{label} entry {index} key")
+        if key in seen:
+            raise ValueError(f"{label} contains duplicate key {key!r}")
+        seen.add(key)
+        result.append(
+            (
+                key,
+                _freeze_immutable_value(
+                    nested,
+                    budget=budget,
+                    depth=depth + 2,
+                    label=f"{label}.{key}",
+                    keepalive=keepalive,
+                ),
+            )
+        )
+    return tuple(result)
+
+
+def _build_immutable_entries(
+    values: Mapping[_MappingKey, _MappingValue],
+) -> tuple[tuple[str, object], ...]:
+    """Copy only exact mapping structure into immutable entry tuples."""
+
+    if type(values) is dict:
+        try:
+            entries = tuple((key, nested) for key, nested in dict.items(values))
+        except (MemoryError, RuntimeError) as exc:
+            raise TypeError(
+                "ImmutableMapping could not snapshot the exact dict"
+            ) from exc
+    elif type(values) is ImmutableMapping:
+        entries = _immutable_mapping_entries(values)
+    else:
+        raise TypeError("ImmutableMapping requires an exact dict snapshot")
+    try:
+        keepalive: list[object] = []
+        return _freeze_immutable_entries(
+            entries,
+            budget=TraversalBudget(),
+            depth=0,
+            label="immutable mapping",
+            keepalive=keepalive,
+        )
+    except TraversalBudgetError as exc:
+        raise TypeError(str(exc)) from exc
 
 
 _APPROVED_MAPPING_TYPES = frozenset({dict, ImmutableMapping})
@@ -95,7 +490,7 @@ def _mapping_items(value: object):
     if type(value) is dict:
         return dict.items(value)
     if type(value) is ImmutableMapping:
-        return value.items()  # type: ignore[union-attr]
+        return _immutable_mapping_entries(value)
     raise TypeError("mapping was not exact-admitted")
 
 
@@ -118,10 +513,11 @@ def _deep_freeze(
         budget.charge_scalar(value, path)
         return value
     if type(value) in _APPROVED_MAPPING_TYPES:
-        length = len(value)  # exact type is checked before calling len
+        items = _mapping_items(value)
+        length = len(items)
         budget.enter(value, depth=depth, label=path, length=length)
         result: dict[str, object] = {}
-        for key, nested in _mapping_items(value):
+        for key, nested in items:
             if type(key) is not str:
                 raise ValueError(f"{path} mapping keys must be built-in strings")
             budget.charge_string(key, f"{path}.{key}")
@@ -254,10 +650,11 @@ def _json_safe_value(
         budget.charge_scalar(enum_value, path)
         return enum_value
     if type(value) in _APPROVED_MAPPING_TYPES:
-        length = len(value)  # exact type is checked before calling len
+        items = _mapping_items(value)
+        length = len(items)
         budget.enter(value, depth=depth, label=path, length=length)
         result: dict[str, object] = {}
-        for key, nested in _mapping_items(value):
+        for key, nested in items:
             if type(key) is not str:
                 raise ValueError(f"{path} mapping keys must be strings")
             budget.charge_string(key, f"{path}.{key}")
@@ -1274,6 +1671,22 @@ class FactoryPolicy(PolicyModel):
     )
     def serialize_mapping_fields(self, value: Mapping[str, object], info):
         return _policy_dump_value(value, info.mode)
+
+
+_TRUSTED_IMMUTABLE_MODEL_TYPES = frozenset(
+    {
+        AgentDefinition,
+        CanaryRule,
+        CompatibilityPolicy,
+        FactoryPolicy,
+        HandlerDefinition,
+        LegacySettings,
+        ProviderDefinition,
+        RetryCompatibilityRule,
+        RoleRoute,
+    }
+)
+_TRUSTED_IMMUTABLE_ENUM_TYPES = frozenset({ExecutorKind, ProviderKind})
 
 
 def _validate_route_references(

@@ -73,6 +73,7 @@ from ..control.policy import (
     ProviderKind,
     RetryCompatibilityRule,
     RoleRoute,
+    _immutable_mapping_entries,
     _validate_exact_route_identifier,
     _validate_model_family,
 )
@@ -198,6 +199,13 @@ class ExecutorBinding(ContractModel):
             _reject_unapproved_mapping(value, "executor binding")
             return value
         data = _approved_mapping_copy(value, "executor binding")
+        for field_name in ("task_id", "run_id", "attempt", "executor_id"):
+            if field_name in data:
+                data[field_name] = _canonical_run_identity_scalar(
+                    data[field_name],
+                    field_name,
+                    f"executor binding {field_name}",
+                )
         if "run" in data:
             run = data.pop("run")
             run_data = _binding_run_payload(run)
@@ -753,13 +761,34 @@ def _validate_public_route_identifier(value: object, label: str) -> str:
         raise RoutingError(str(exc)) from exc
 
 
+def _canonical_run_identity_scalar(
+    value: object,
+    field_name: str,
+    label: str,
+    *,
+    allow_none: bool = False,
+) -> object:
+    """Admit RunIdentity scalars only as exact built-in values."""
+
+    if allow_none and value is None:
+        return None
+    expected_type = int if field_name == "attempt" else str
+    if type(value) is not expected_type:
+        expected_name = "int" if expected_type is int else "str"
+        raise ValueError(f"{label} must be a built-in {expected_name}")
+    return value
+
+
 def _approved_mapping_copy(value: object, label: str) -> dict[str, object]:
     """Materialize one approved mapping without invoking candidate methods."""
 
     if type(value) not in _APPROVED_MAPPING_TYPES:
         raise ValueError(f"{label} must use an approved exact mapping container")
     result: dict[str, object] = {}
-    items = dict.items(value) if type(value) is dict else value.items()  # type: ignore[union-attr]
+    try:
+        items = _mapping_items(value)
+    except RoutingError as exc:
+        raise ValueError(str(exc)) from exc
     for key, nested in items:
         if type(key) is not str:
             raise ValueError(f"{label} mapping keys must be built-in strings")
@@ -775,7 +804,10 @@ def _mapping_items(value: object):
     if type(value) is dict:
         return dict.items(value)
     if type(value) is ImmutableMapping:
-        return value.items()  # type: ignore[union-attr]
+        try:
+            return _immutable_mapping_entries(value, "routing immutable mapping")
+        except (TypeError, ValueError) as exc:
+            raise RoutingError(str(exc)) from exc
     raise TypeError("mapping was not exact-admitted")
 
 
@@ -821,10 +853,11 @@ def _snapshot_value(
             )
         return _snapshot_model(value, type(value), label, depth + 1, budget=budget)
     if type(value) in _APPROVED_MAPPING_TYPES:
-        length = len(value)  # exact type is checked before calling len
+        items = _mapping_items(value)
+        length = len(items)
         budget.enter(value, depth=depth, label=label, length=length)
         result: dict[str, object] = {}
-        for key, nested in _mapping_items(value):
+        for key, nested in items:
             if type(key) is not str:
                 raise RoutingError(f"{label} mapping keys must be built-in strings")
             budget.charge_string(key, f"{label}.{key}")
@@ -949,6 +982,14 @@ def _binding_run_payload(value: object) -> dict[str, object]:
         raise ValueError("executor binding run must use an approved exact mapping")
     else:
         raise ValueError("executor binding run must be an exact RunIdentity mapping")
+    for field_name in ("task_id", "run_id", "attempt", "executor_id"):
+        if field_name in payload:
+            payload[field_name] = _canonical_run_identity_scalar(
+                payload[field_name],
+                field_name,
+                f"executor binding run {field_name}",
+                allow_none=field_name == "executor_id",
+            )
     allowed = {"task_id", "run_id", "attempt", "executor_id"}
     unknown = set(payload) - allowed
     if unknown:
@@ -1046,15 +1087,24 @@ def _materialize_profile_registry(value: object) -> frozenset[str]:
         )
     budget = TraversalBudget()
     try:
-        length = len(value)  # exact container type is checked before len
+        mapping_items: Collection[tuple[object, object]] | None = None
+        if type(value) in {dict, ImmutableMapping}:
+            mapping_items = _mapping_items(value)
+            length = len(mapping_items)
+        else:
+            length = len(value)  # exact container type is checked before len
         if length > _MAX_KNOWN_PROFILES:
             raise RoutingError("profile registry exceeds its bounded size")
         budget.enter(value, depth=0, label="profile registry", length=length)
-        if type(value) in {dict, ImmutableMapping}:
-            try:
-                names = tuple(_approved_mapping_copy(value, "profile registry"))
-            except ValueError as exc:
-                raise RoutingError(str(exc)) from exc
+        if mapping_items is not None:
+            names_list: list[object] = []
+            for key, _ in mapping_items:
+                if type(key) is not str:
+                    raise RoutingError(
+                        "profile registry mapping keys must be built-in strings"
+                    )
+                names_list.append(key)
+            names = tuple(names_list)
         else:
             names = tuple(value)  # all remaining types are exact built-in containers
         checked: list[str] = []

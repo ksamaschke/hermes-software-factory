@@ -261,6 +261,173 @@ def test_mapping_proxy_hostile_dict_is_rejected_at_every_authority_ingress():
     )
 
 
+def _forged_immutable_mapping(payload: dict[str, object]) -> ImmutableMapping:
+    """Build the exact-type forged states used by the trust-boundary regression."""
+
+    forged = object.__new__(ImmutableMapping)
+    hostile_data = MappingProxyType(HostileDict(payload))
+    for field_name in ("_entries", "_data"):
+        try:
+            object.__setattr__(forged, field_name, hostile_data)
+        except AttributeError:
+            # Each representation intentionally exposes only one of these slots.
+            pass
+    return forged
+
+
+def test_forged_immutable_mapping_state_is_rejected_before_hostile_hooks():
+    forged = _forged_immutable_mapping(policy_document())
+    with pytest.raises(PolicyError):
+        load_policy(forged)
+
+    nested_policy = policy_document()
+    nested_policy["runtime"] = {"forged": forged}
+    with pytest.raises(PolicyError):
+        load_policy(nested_policy)
+
+    selected = router()
+    with pytest.raises(RoutingError):
+        selected.select(forged)
+    with pytest.raises(RoutingError):
+        selected.select(
+            {
+                "task_id": "task-42",
+                "run_id": "run-1",
+                "role": "implementer",
+                "opaque": {"forged": forged},
+            }
+        )
+
+
+def test_immutable_mapping_forgery_shapes_fail_closed():
+    uninitialized = object.__new__(ImmutableMapping)
+    duplicate = object.__new__(ImmutableMapping)
+    object.__setattr__(duplicate, "_entries", (("key", 1), ("key", 2)))
+    cyclic = object.__new__(ImmutableMapping)
+    object.__setattr__(cyclic, "_entries", (("self", cyclic),))
+    hostile_value = object.__new__(ImmutableMapping)
+    object.__setattr__(
+        hostile_value,
+        "_entries",
+        (("value", HostileDict({"nested": "hostile"})),),
+    )
+    hostile_scalar = object.__new__(ImmutableMapping)
+    object.__setattr__(
+        hostile_scalar,
+        "_entries",
+        (("value", BindingTrapString("hostile")),),
+    )
+    hostile_integer = object.__new__(ImmutableMapping)
+    object.__setattr__(
+        hostile_integer,
+        "_entries",
+        (("value", BindingTrapInt(1)),),
+    )
+
+    class ForgedImmutableMapping(ImmutableMapping):
+        def __iter__(self):
+            raise AssertionError("subclass iterator executed")
+
+    subclass = object.__new__(ForgedImmutableMapping)
+    for candidate in (
+        uninitialized,
+        duplicate,
+        cyclic,
+        hostile_value,
+        hostile_scalar,
+        hostile_integer,
+        subclass,
+    ):
+        with pytest.raises(PolicyError):
+            load_policy(candidate)
+
+
+def test_immutable_mapping_uses_exact_structural_snapshot_without_mutable_backing():
+    source = policy_document()
+    snapshot = ImmutableMapping(source)
+    source["new_field"] = "must not appear"
+    nested_source = {"nested": {"values": ["original"]}}
+    nested_snapshot = ImmutableMapping(nested_source)
+    nested_source["nested"]["values"].append("mutated")
+
+    entries = object.__getattribute__(snapshot, "_entries")
+    assert type(entries) is tuple
+    assert all(type(entry) is tuple and len(entry) == 2 for entry in entries)
+    assert "new_field" not in snapshot
+    assert nested_snapshot["nested"]["values"] == ("original",)
+    with pytest.raises((AttributeError, TypeError)):
+        snapshot["version"] = 2  # type: ignore[index]
+    with pytest.raises(AttributeError):
+        object.__getattribute__(snapshot, "_data")
+
+
+class BindingTrapString(str):
+    def __eq__(self, other: object) -> bool:
+        del other
+        raise AssertionError("binding string equality trap executed")
+
+    def __ne__(self, other: object) -> bool:
+        del other
+        raise AssertionError("binding string inequality trap executed")
+
+    def __hash__(self) -> int:
+        raise AssertionError("binding string hash trap executed")
+
+    def __len__(self) -> int:
+        raise AssertionError("binding string len trap executed")
+
+
+class BindingTrapInt(int):
+    def __eq__(self, other: object) -> bool:
+        del other
+        raise AssertionError("binding int equality trap executed")
+
+    def __ne__(self, other: object) -> bool:
+        del other
+        raise AssertionError("binding int inequality trap executed")
+
+    def __hash__(self) -> int:
+        raise AssertionError("binding int hash trap executed")
+
+
+def test_binding_run_alias_validates_exact_scalars_before_conflict_comparison():
+    selected = router()
+    binding = selected.select(
+        {"task_id": "task-42", "run_id": "run-1", "role": "implementer"}
+    )
+    payload = binding.model_dump(mode="python")
+    payload["run"] = {
+        "task_id": binding.task_id,
+        "run_id": binding.run_id,
+        "executor_id": binding.executor_id,
+        "attempt": binding.attempt,
+    }
+
+    assert ExecutorBinding.model_validate(payload) == binding
+    conflicting = {**payload, "task_id": "other-task"}
+    with pytest.raises(ValidationError, match="disagrees with run"):
+        ExecutorBinding.model_validate(conflicting)
+
+    top_level_traps = {
+        "task_id": BindingTrapString(binding.task_id),
+        "run_id": BindingTrapString(binding.run_id),
+        "executor_id": BindingTrapString(binding.executor_id),
+        "attempt": BindingTrapInt(binding.attempt),
+    }
+    for field_name, trap in top_level_traps.items():
+        candidate = dict(payload)
+        candidate[field_name] = trap
+        with pytest.raises(ValidationError):
+            ExecutorBinding.model_validate(candidate)
+
+    for field_name, trap in top_level_traps.items():
+        nested_run = dict(payload["run"])
+        nested_run[field_name] = trap
+        candidate = {**payload, "run": nested_run}
+        with pytest.raises(ValidationError):
+            ExecutorBinding.model_validate(candidate)
+
+
 def test_route_lookup_validates_exact_identifier_before_any_hook_or_lookup():
     selected = router()
     trap = TrapString("task-42")
