@@ -1,0 +1,81 @@
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -190 +190 @@
+-    if not isinstance(metadata, dict):
++    if metadata is None:
+@@ -191,0 +192,2 @@
++    if type(metadata) is not dict:
++        return "review metadata must use exact built-in dict"
+@@ -201 +203 @@
+-    return isinstance(metadata, dict) and set(metadata) == set(
++    return type(metadata) is dict and set(metadata) == set(
+@@ -209,0 +212,2 @@
++    if metadata is not None and type(metadata) is not dict:
++        raise ValueError("review metadata must use exact built-in dict")
+@@ -234,0 +239,3 @@
++    if type(metadata) is not dict:
++        raise ValueError("review metadata must use exact built-in dict")
++    metadata = metadata.copy()
+@@ -750,0 +758,4 @@
++    if metadata is not None:
++        if type(metadata) is not dict:
++            return tool_error("review metadata must use exact built-in dict")
++        metadata = metadata.copy()
+@@ -758 +769 @@
+-    if metadata is not None and isinstance(metadata, dict):
++    if metadata is not None and type(metadata) is dict:
+@@ -800 +811 @@
+-            elif not isinstance(metadata, dict):
++            elif type(metadata) is not dict:
+@@ -838 +849 @@
+-    if metadata is not None and not isinstance(metadata, dict):
++    if metadata is not None and type(metadata) is not dict:
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -7210,0 +7211,6 @@
++    if metadata is not None:
++        if type(metadata) is not dict:
++            return False
++        metadata = metadata.copy()
++        if any(type(key) is not str for key in metadata):
++            return False
+@@ -7386 +7392 @@
+-            metadata = dict(metadata) if isinstance(metadata, dict) else {}
++            metadata = dict(metadata) if type(metadata) is dict else {}
+@@ -7388 +7394 @@
+-        if isinstance(metadata, dict):
++        if type(metadata) is dict:
+@@ -7466 +7472 @@
+-                            if isinstance(metadata, dict)
++                            if type(metadata) is dict
+@@ -7483 +7489 @@
+-                            if isinstance(metadata, dict)
++                            if type(metadata) is dict
+@@ -7495 +7501 @@
+-        if isinstance(metadata, dict):
++        if type(metadata) is dict:
+@@ -9890 +9896 @@
+-    if not isinstance(metadata, dict):
++    if type(metadata) is not dict:
+@@ -9891,0 +9898,2 @@
++    if any(type(key) is not str for key in metadata):
++        return "review completion metadata keys must use exact built-in strings"
+@@ -10435,0 +10444,9 @@
++    if metadata is not None:
++        if type(metadata) is not dict:
++            return _ret(False, "review metadata must use exact built-in dict")
++        metadata = metadata.copy()
++        if any(type(key) is not str for key in metadata):
++            return _ret(
++                False,
++                "review metadata keys must use exact built-in strings",
++            )
+@@ -10551 +10568 @@
+-            if not isinstance(raw_metadata, dict) or set(raw_metadata) != {
++            if type(raw_metadata) is not dict or set(raw_metadata) != {
+@@ -10590 +10607 @@
+-                if not isinstance(raw_metadata, dict):
++                if type(raw_metadata) is not dict:
+@@ -10593 +10610 @@
+-                        "structured review request metadata must be a mapping",
++                        "structured review request metadata must use exact built-in dict",

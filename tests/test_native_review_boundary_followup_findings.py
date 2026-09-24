@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import json
 import os
 import sqlite3
 import subprocess
 import sys
 import time
+from collections import UserDict
 from pathlib import Path
 
 import pytest
@@ -32,6 +34,89 @@ if not _RUNTIME.is_dir():
     )
 
 sys.path.insert(0, str(_RUNTIME))
+
+
+class _StringLookalike(str):
+    pass
+
+
+class _StringableLookalike:
+    def __init__(self, value: str):
+        self.value = value
+
+    def __str__(self) -> str:
+        return self.value
+
+
+class _SneakyDict(dict):
+    def __init__(self, raw: dict, exposed: dict):
+        super().__init__(raw)
+        self._exposed = exposed
+
+    def items(self):
+        return self._exposed.items()
+
+    def get(self, key, default=None):
+        return self._exposed.get(key, default)
+
+    def __getitem__(self, key):
+        return self._exposed[key]
+
+
+_PROTECTED_REVIEW_METADATA_FIELDS = (
+    "candidate_commit",
+    "pr_head_sha",
+    "post_verification_head",
+    "review_outcome",
+    "review_remediation_handoff_key",
+    "scope_manifest_sha256",
+)
+_INVALID_PROTECTED_REVIEW_VALUES = (
+    int("1" * 40),
+    True,
+    1.0,
+    b"a" * 64,
+    _StringLookalike("a" * 64),
+    _StringableLookalike("a" * 64),
+)
+_UNSAFE_JSON_METADATA_KINDS = (
+    "bytes",
+    "stringable",
+    "string-subclass",
+    "tuple",
+    "custom-mapping",
+    "nested-bytes",
+    "nested-custom-mapping",
+    "non-finite-float",
+    "oversized-integer",
+    "cycle",
+)
+
+
+def _unsafe_json_metadata_value(kind: str):
+    if kind == "bytes":
+        return b"not-json"
+    if kind == "stringable":
+        return _StringableLookalike("not-json")
+    if kind == "string-subclass":
+        return _StringLookalike("not-json")
+    if kind == "tuple":
+        return ("not", "an", "exact", "list")
+    if kind == "custom-mapping":
+        return UserDict({"nested": "value"})
+    if kind == "nested-bytes":
+        return {"nested": [b"not-json"]}
+    if kind == "nested-custom-mapping":
+        return {"nested": [UserDict({"value": "not-json"})]}
+    if kind == "non-finite-float":
+        return float("nan")
+    if kind == "oversized-integer":
+        return 1 << 20000
+    if kind == "cycle":
+        value: list = []
+        value.append(value)
+        return value
+    raise AssertionError(f"unknown unsafe metadata kind: {kind}")
 
 
 @pytest.fixture
@@ -346,6 +431,333 @@ def test_request_review_force_requires_operator_capability_and_live_lease(kanban
     assert "expired" in str(reason).casefold() or "live" in str(reason).casefold()
 
 
+def test_structured_review_handoff_requires_canonical_candidate_commit(kanban_db):
+    module, conn, _ = kanban_db
+    task_id, claimed = _claim(module, conn, "structured review handoff")
+
+    for metadata in (
+        {},
+        {"pr_head_sha": "a" * 40},
+        {"candidate_commit": "not-a-commit"},
+        {"candidate_commit": int("1" * 40)},
+        {"candidate_commit": True},
+        {"candidate_commit": 1.0},
+        {"candidate_commit": b"a" * 40},
+        {"candidate_commit": _StringLookalike("a" * 40)},
+        {"candidate_commit": _StringableLookalike("a" * 40)},
+        {"candidate_commit": "a" * 40, "pr_head_sha": int("1" * 40)},
+        {
+            "candidate_commit": "a" * 40,
+            "pr_head_sha": _StringLookalike("a" * 40),
+        },
+        {
+            "candidate_commit": "a" * 40,
+            "post_verification_head": int("1" * 40),
+        },
+        {"candidate_commit": "a" * 40, "pr_head_sha": "b" * 40},
+        {
+            "candidate_commit": "a" * 40,
+            "post_verification_head": "b" * 40,
+        },
+    ):
+        ok, reason = module.request_review(
+            conn,
+            task_id,
+            summary="verified",
+            metadata=metadata,
+            reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+            with_reason=True,
+        )
+        assert not ok
+        assert any(
+            field in str(reason)
+            for field in (
+                "candidate_commit",
+                "pr_head_sha",
+                "post_verification_head",
+            )
+        )
+        task = module.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running"
+        assert task.current_run_id == claimed.current_run_id
+
+    candidate = "A" * 40
+    ok, reason = module.request_review(
+        conn,
+        task_id,
+        summary="verified",
+        metadata={
+            "schema": "esg.handoff.v1",
+            "candidate_commit": candidate,
+            "pr_head_sha": candidate.lower(),
+            "post_verification_head": candidate.lower(),
+        },
+        reviewer="reviewer",
+        expected_run_id=claimed.current_run_id,
+        with_reason=True,
+    )
+    assert ok, reason
+
+    event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_requested' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    assert event is not None
+    payload = json.loads(event["payload"])
+    assert payload["metadata"]["candidate_commit"] == candidate.lower()
+    run = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id = ? AND task_id = ?",
+        (claimed.current_run_id, task_id),
+    ).fetchone()
+    assert run is not None
+    assert json.loads(run["metadata"])["candidate_commit"] == candidate.lower()
+
+
+@pytest.mark.parametrize("protected_field", _PROTECTED_REVIEW_METADATA_FIELDS)
+@pytest.mark.parametrize("invalid_value", _INVALID_PROTECTED_REVIEW_VALUES)
+def test_native_request_review_rejects_non_string_protected_metadata(
+    kanban_db, protected_field, invalid_value
+):
+    module, conn, _ = kanban_db
+    candidate = "a" * 40
+    task_id, claimed = _claim(module, conn, "native protected request metadata")
+    metadata = {"candidate_commit": candidate}
+    metadata[protected_field] = invalid_value
+    before_events = [event.id for event in module.list_events(conn, task_id)]
+
+    ok, reason = module.request_review(
+        conn,
+        task_id,
+        summary="must reject every protected non-string value",
+        metadata=metadata,
+        reviewer="reviewer",
+        expected_run_id=claimed.current_run_id,
+        with_reason=True,
+    )
+
+    assert not ok
+    assert protected_field in str(reason)
+    assert "exact built-in string" in str(reason)
+    task = module.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == claimed.current_run_id
+    run = module.latest_run(conn, task_id)
+    assert run is not None
+    assert run.status == "running"
+    assert run.outcome is None
+    assert [event.id for event in module.list_events(conn, task_id)] == before_events
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"candidate_commit": int("1" * 40)},
+        {"candidate_commit": True},
+        {"candidate_commit": 1.0},
+        {"candidate_commit": b"a" * 40},
+        {"candidate_commit": _StringLookalike("a" * 40)},
+        {"candidate_commit": _StringableLookalike("a" * 40)},
+        {"candidate_commit": "a" * 40, "pr_head_sha": int("1" * 40)},
+        {
+            "candidate_commit": "a" * 40,
+            "pr_head_sha": _StringLookalike("a" * 40),
+        },
+        {
+            "candidate_commit": "a" * 40,
+            "post_verification_head": int("1" * 40),
+        },
+        {
+            "candidate_commit": "a" * 40,
+            "post_verification_head": _StringLookalike("a" * 40),
+        },
+    ],
+)
+def test_public_review_request_rejects_non_string_candidate_identity(
+    kanban_db, monkeypatch, metadata
+):
+    module, conn, db_path = kanban_db
+    task_id, claimed = _claim(module, conn, "typed public review handoff")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+    monkeypatch.setenv("HERMES_SESSION_ID", "implementer-session")
+    sys.modules.pop("tools.kanban_tools", None)
+    tools = importlib.import_module("tools.kanban_tools")
+    monkeypatch.setattr(
+        tools,
+        "_connect",
+        lambda board=None: (module, module.connect(db_path)),
+    )
+
+    response = json.loads(
+        tools._handle_request_review(
+            {
+                "summary": "must reject non-string candidate identity",
+                "reviewer": "reviewer",
+                "metadata": metadata,
+            }
+        )
+    )
+    assert response.get("ok") is not True
+    assert "error" in response
+    task = module.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == claimed.current_run_id
+    run = module.latest_run(conn, task_id)
+    assert run is not None
+    assert run.status == "running"
+    assert run.outcome is None
+    assert not any(
+        event.kind == "review_requested" for event in module.list_events(conn, task_id)
+    )
+
+
+def test_public_review_request_rejects_dict_subclass_before_serialization(
+    kanban_db, monkeypatch
+):
+    module, conn, db_path = kanban_db
+    task_id, claimed = _claim(module, conn, "dict subclass public review handoff")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+    monkeypatch.setenv("HERMES_SESSION_ID", "implementer-session")
+    sys.modules.pop("tools.kanban_tools", None)
+    tools = importlib.import_module("tools.kanban_tools")
+    monkeypatch.setattr(
+        tools,
+        "_connect",
+        lambda board=None: (module, module.connect(db_path)),
+    )
+    metadata = _SneakyDict(
+        {"candidate_commit": int("1" * 40)},
+        {"candidate_commit": "a" * 40},
+    )
+
+    response = json.loads(
+        tools._handle_request_review(
+            {
+                "summary": "must reject dict subclass metadata",
+                "reviewer": "reviewer",
+                "metadata": metadata,
+            }
+        )
+    )
+    assert response.get("ok") is not True
+    assert "exact built-in dict" in response["error"]
+    task = module.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == claimed.current_run_id
+    run = module.latest_run(conn, task_id)
+    assert run is not None
+    assert run.status == "running"
+    assert run.outcome is None
+    assert not any(
+        event.kind == "review_requested" for event in module.list_events(conn, task_id)
+    )
+
+
+def test_native_review_request_rejects_dict_subclass_before_lookup(kanban_db):
+    module, conn, _ = kanban_db
+    task_id, claimed = _claim(module, conn, "dict subclass native review handoff")
+    metadata = _SneakyDict(
+        {"candidate_commit": int("1" * 40)},
+        {"candidate_commit": "a" * 40},
+    )
+
+    ok, reason = module.request_review(
+        conn,
+        task_id,
+        summary="must reject dict subclass metadata",
+        reviewer="reviewer",
+        metadata=metadata,
+        expected_run_id=claimed.current_run_id,
+        with_reason=True,
+    )
+    assert not ok
+    assert "exact built-in dict" in str(reason)
+    task = module.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == claimed.current_run_id
+    run = module.latest_run(conn, task_id)
+    assert run is not None
+    assert run.status == "running"
+    assert run.outcome is None
+    assert not any(
+        event.kind == "review_requested" for event in module.list_events(conn, task_id)
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("candidate_commit", int("1" * 40)),
+        ("candidate_commit", True),
+        ("candidate_commit", 1.0),
+        ("candidate_commit", b"a" * 40),
+        ("candidate_commit", _StringLookalike("a" * 40)),
+        ("candidate_commit", _StringableLookalike("a" * 40)),
+        ("scope_manifest_sha256", int("1" * 64)),
+        ("scope_manifest_sha256", b"b" * 64),
+        ("scope_manifest_sha256", _StringLookalike("b" * 64)),
+        ("review_remediation_handoff_key", True),
+        ("review_remediation_handoff_key", b"opaque"),
+        (
+            "review_remediation_handoff_key",
+            _StringLookalike("review-remediation:v2:opaque-value"),
+        ),
+    ],
+)
+def test_public_review_request_rejects_non_exact_remediation_identity(
+    kanban_db, monkeypatch, field, value
+):
+    module, conn, db_path = kanban_db
+    task_id, claimed = _claim(module, conn, "typed public remediation handoff")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+    monkeypatch.setenv("HERMES_SESSION_ID", "implementer-session")
+    sys.modules.pop("tools.kanban_tools", None)
+    tools = importlib.import_module("tools.kanban_tools")
+    monkeypatch.setattr(
+        tools,
+        "_connect",
+        lambda board=None: (module, module.connect(db_path)),
+    )
+    metadata = {
+        "candidate_commit": "a" * 40,
+        "review_remediation_handoff_key": "review-remediation:v2:opaque-value",
+        "scope_manifest_sha256": "b" * 64,
+    }
+    metadata[field] = value
+
+    response = json.loads(
+        tools._handle_request_review(
+            {
+                "summary": "must reject non-exact remediation identity",
+                "reviewer": "reviewer",
+                "metadata": metadata,
+            }
+        )
+    )
+    assert response.get("ok") is not True
+    assert "error" in response
+    task = module.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == claimed.current_run_id
+    run = module.latest_run(conn, task_id)
+    assert run is not None
+    assert run.status == "running"
+    assert run.outcome is None
+    assert not any(
+        event.kind == "review_requested" for event in module.list_events(conn, task_id)
+    )
+
+
 def test_ready_task_cannot_close_foreign_run(kanban_db):
     module, conn, _ = kanban_db
     task_a = module.create_task(conn, title="malformed ready", assignee="implementer")
@@ -490,6 +902,794 @@ def test_remediation_metadata_survives_tool_boundary_exactly(monkeypatch):
     assert (
         tools._prepare_request_review_metadata("task-remediation", metadata) == metadata
     )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("candidate_commit", int("1" * 40)),
+        ("candidate_commit", True),
+        ("candidate_commit", 1.0),
+        ("candidate_commit", b"a" * 40),
+        ("candidate_commit", _StringLookalike("a" * 40)),
+        ("candidate_commit", _StringableLookalike("a" * 40)),
+        ("scope_manifest_sha256", int("1" * 64)),
+        ("scope_manifest_sha256", b"b" * 64),
+        ("scope_manifest_sha256", _StringLookalike("b" * 64)),
+        ("review_remediation_handoff_key", True),
+        ("review_remediation_handoff_key", b"opaque"),
+        (
+            "review_remediation_handoff_key",
+            _StringLookalike("review-remediation:v2:opaque-value"),
+        ),
+    ],
+)
+def test_remediation_metadata_rejects_non_exact_strings_before_serialization(
+    monkeypatch, field, value
+):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-remediation")
+    monkeypatch.setenv("HERMES_SESSION_ID", "worker-session")
+    sys.modules.pop("tools.kanban_tools", None)
+    tools = importlib.import_module("tools.kanban_tools")
+    metadata = {
+        "candidate_commit": "a" * 40,
+        "review_remediation_handoff_key": "review-remediation:v2:opaque-value",
+        "scope_manifest_sha256": "b" * 64,
+    }
+    metadata[field] = value
+    with pytest.raises(ValueError, match="exact built-in strings"):
+        tools._prepare_request_review_metadata("task-remediation", metadata)
+
+
+def test_remediation_metadata_rejects_string_subclass_key(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-remediation")
+    sys.modules.pop("tools.kanban_tools", None)
+    tools = importlib.import_module("tools.kanban_tools")
+    metadata = {
+        _StringLookalike("candidate_commit"): "a" * 40,
+        "review_remediation_handoff_key": "review-remediation:v2:opaque-value",
+        "scope_manifest_sha256": "b" * 64,
+    }
+    with pytest.raises(ValueError, match="exact built-in strings"):
+        tools._prepare_request_review_metadata("task-remediation", metadata)
+
+
+def test_none_review_metadata_survives_public_tool_boundary(kanban_db, monkeypatch):
+    module, conn, db_path = kanban_db
+    task_id, claimed = _claim(module, conn, "legacy public review handoff")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+    monkeypatch.setenv("HERMES_SESSION_ID", "worker-session")
+    sys.modules.pop("tools.kanban_tools", None)
+    tools = importlib.import_module("tools.kanban_tools")
+    monkeypatch.setattr(
+        tools,
+        "_connect",
+        lambda board=None: (module, module.connect(db_path)),
+    )
+
+    response = json.loads(
+        tools._handle_request_review(
+            {
+                "summary": "legacy implementation handoff",
+                "reviewer": "reviewer",
+            }
+        )
+    )
+    assert response["ok"] is True
+    task = module.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "review"
+    run = module.latest_run(conn, task_id)
+    assert run is not None
+    assert run.outcome == "review_requested"
+    assert run.metadata is None
+    event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_requested' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    assert event is not None
+    assert json.loads(event["payload"])["metadata"] is None
+
+
+@pytest.mark.parametrize(
+    "alternate_key",
+    [
+        "overallVerdict",
+        "reviewOutcome",
+        "review-outcome",
+        "REVIEW_OUTCOME",
+        "review verdict",
+        "extra.verdict",
+        "ＴｅｒｍｉｎａｌＶｅｒｄｉｃｔ",
+    ],
+)
+def test_public_completion_rejects_normalized_verdict_aliases(
+    kanban_db, monkeypatch, alternate_key
+):
+    module, conn, db_path = kanban_db
+    candidate = "a" * 40
+    task_id, implementation = _claim(module, conn, "normalized verdict aliases")
+    assert module.request_review(
+        conn,
+        task_id,
+        summary="structured implementation handoff",
+        metadata={"candidate_commit": candidate},
+        reviewer="reviewer",
+        expected_run_id=implementation.current_run_id,
+    )
+    review = module.claim_review_task(
+        conn,
+        task_id,
+        claimer="reviewer:normalized-verdict-test",
+    )
+    assert review is not None
+    assert review.current_run_id is not None
+
+    monkeypatch.setattr(module, "_active_native_profile", lambda: "reviewer")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
+    monkeypatch.setenv("HERMES_SESSION_ID", "reviewer-session")
+    sys.modules.pop("tools.kanban_tools", None)
+    tools = importlib.import_module("tools.kanban_tools")
+    monkeypatch.setattr(
+        tools,
+        "_connect",
+        lambda board=None: (module, module.connect(db_path)),
+    )
+
+    response = json.loads(
+        tools._handle_complete(
+            {
+                "summary": "must reject every alternate verdict spelling",
+                "metadata": {
+                    "review_outcome": "APPROVED",
+                    "candidate_commit": candidate,
+                    alternate_key: "CHANGES_REQUESTED",
+                },
+            }
+        )
+    )
+    assert response.get("ok") is not True
+    assert "error" in response
+    task = module.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == review.current_run_id
+    run = module.latest_run(conn, task_id)
+    assert run is not None
+    assert run.status == "running"
+    assert run.outcome is None
+    assert not any(
+        event.kind == "completed" for event in module.list_events(conn, task_id)
+    )
+
+
+@pytest.mark.parametrize(
+    ("identity_key", "identity_value"),
+    [
+        ("candidate_commit", int("1" * 40)),
+        ("candidate_commit", True),
+        ("candidate_commit", 1.0),
+        ("candidate_commit", b"a" * 40),
+        ("candidate_commit", _StringLookalike("a" * 40)),
+        ("candidate_commit", _StringableLookalike("a" * 40)),
+        ("pr_head_sha", int("1" * 40)),
+        ("pr_head_sha", _StringLookalike("a" * 40)),
+        ("post_verification_head", int("1" * 40)),
+        ("post_verification_head", _StringLookalike("a" * 40)),
+        ("review_outcome", _StringLookalike("APPROVED")),
+        ("scope_manifest_sha256", _StringLookalike("b" * 64)),
+        (
+            "review_remediation_handoff_key",
+            _StringLookalike("review-remediation:v2:opaque-value"),
+        ),
+    ],
+)
+def test_public_completion_rejects_non_string_candidate_identity(
+    kanban_db, monkeypatch, identity_key, identity_value
+):
+    module, conn, db_path = kanban_db
+    candidate = "a" * 40
+    task_id, implementation = _claim(module, conn, "typed review completion")
+    assert module.request_review(
+        conn,
+        task_id,
+        summary="structured implementation handoff",
+        metadata={"candidate_commit": candidate},
+        reviewer="reviewer",
+        expected_run_id=implementation.current_run_id,
+    )
+    review = module.claim_review_task(
+        conn,
+        task_id,
+        claimer="reviewer:typed-candidate-test",
+    )
+    assert review is not None
+    assert review.current_run_id is not None
+
+    monkeypatch.setattr(module, "_active_native_profile", lambda: "reviewer")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
+    monkeypatch.setenv("HERMES_SESSION_ID", "reviewer-session")
+    sys.modules.pop("tools.kanban_tools", None)
+    tools = importlib.import_module("tools.kanban_tools")
+    monkeypatch.setattr(
+        tools,
+        "_connect",
+        lambda board=None: (module, module.connect(db_path)),
+    )
+    metadata = {
+        "review_outcome": "APPROVED",
+        "candidate_commit": candidate,
+    }
+    metadata[identity_key] = identity_value
+
+    response = json.loads(
+        tools._handle_complete(
+            {
+                "summary": "must reject non-string candidate identity",
+                "metadata": metadata,
+            }
+        )
+    )
+    assert response.get("ok") is not True
+    assert "error" in response
+    task = module.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == review.current_run_id
+    run = module.latest_run(conn, task_id)
+    assert run is not None
+    assert run.status == "running"
+    assert run.outcome is None
+    assert not any(
+        event.kind == "completed" for event in module.list_events(conn, task_id)
+    )
+
+
+def test_public_completion_rejects_dict_subclass_before_serialization(
+    kanban_db, monkeypatch
+):
+    module, conn, db_path = kanban_db
+    candidate = "a" * 40
+    task_id, implementation = _claim(module, conn, "dict subclass public completion")
+    assert module.request_review(
+        conn,
+        task_id,
+        summary="structured implementation handoff",
+        metadata={"candidate_commit": candidate},
+        reviewer="reviewer",
+        expected_run_id=implementation.current_run_id,
+    )
+    review = module.claim_review_task(
+        conn,
+        task_id,
+        claimer="reviewer:dict-subclass-public-test",
+    )
+    assert review is not None
+    assert review.current_run_id is not None
+    monkeypatch.setattr(module, "_active_native_profile", lambda: "reviewer")
+    monkeypatch.setattr(module, "_review_workspace_head", lambda _path: candidate)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
+    monkeypatch.setenv("HERMES_SESSION_ID", "reviewer-session")
+    sys.modules.pop("tools.kanban_tools", None)
+    tools = importlib.import_module("tools.kanban_tools")
+    monkeypatch.setattr(
+        tools,
+        "_connect",
+        lambda board=None: (module, module.connect(db_path)),
+    )
+    metadata = _SneakyDict(
+        {
+            "review_outcome": _StringLookalike("APPROVED"),
+            "candidate_commit": int("1" * 40),
+        },
+        {
+            "review_outcome": "APPROVED",
+            "candidate_commit": candidate,
+        },
+    )
+    before_events = [event.id for event in module.list_events(conn, task_id)]
+
+    response = json.loads(
+        tools._handle_complete(
+            {
+                "summary": "must reject dict subclass metadata",
+                "metadata": metadata,
+            }
+        )
+    )
+    assert response.get("ok") is not True
+    assert "exact built-in dict" in response["error"]
+    task = module.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == review.current_run_id
+    run = module.latest_run(conn, task_id)
+    assert run is not None
+    assert run.status == "running"
+    assert run.outcome is None
+    assert [event.id for event in module.list_events(conn, task_id)] == before_events
+
+
+@pytest.mark.parametrize("protected_field", _PROTECTED_REVIEW_METADATA_FIELDS)
+@pytest.mark.parametrize("invalid_value", _INVALID_PROTECTED_REVIEW_VALUES)
+def test_native_completion_rejects_non_string_protected_metadata(
+    kanban_db, monkeypatch, protected_field, invalid_value
+):
+    module, conn, _ = kanban_db
+    candidate = "a" * 40
+    task_id, implementation = _claim(
+        module, conn, "native protected completion metadata"
+    )
+    assert module.request_review(
+        conn,
+        task_id,
+        summary="structured implementation handoff",
+        metadata={"candidate_commit": candidate},
+        reviewer="reviewer",
+        expected_run_id=implementation.current_run_id,
+    )
+    review = module.claim_review_task(
+        conn,
+        task_id,
+        claimer="reviewer:protected-native-completion-test",
+    )
+    assert review is not None
+    assert review.current_run_id is not None
+    monkeypatch.setattr(module, "_active_native_profile", lambda: "reviewer")
+    monkeypatch.setattr(module, "_review_workspace_head", lambda _path: candidate)
+    metadata = {
+        "review_outcome": "APPROVED",
+        "candidate_commit": candidate,
+    }
+    metadata[protected_field] = invalid_value
+
+    assert not module.complete_task(
+        conn,
+        task_id,
+        summary="must reject every protected non-string value",
+        metadata=metadata,
+        expected_run_id=review.current_run_id,
+    )
+    task = module.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == review.current_run_id
+    run = module.latest_run(conn, task_id)
+    assert run is not None
+    assert run.status == "running"
+    assert run.outcome is None
+    assert not any(
+        event.kind == "completed" for event in module.list_events(conn, task_id)
+    )
+
+
+def test_native_completion_rejects_dict_subclass_before_lookup(kanban_db, monkeypatch):
+    module, conn, _ = kanban_db
+    candidate = "a" * 40
+    task_id, implementation = _claim(module, conn, "dict subclass native completion")
+    assert module.request_review(
+        conn,
+        task_id,
+        summary="structured implementation handoff",
+        metadata={"candidate_commit": candidate},
+        reviewer="reviewer",
+        expected_run_id=implementation.current_run_id,
+    )
+    review = module.claim_review_task(
+        conn,
+        task_id,
+        claimer="reviewer:dict-subclass-native-test",
+    )
+    assert review is not None
+    assert review.current_run_id is not None
+    monkeypatch.setattr(module, "_active_native_profile", lambda: "reviewer")
+    monkeypatch.setattr(module, "_review_workspace_head", lambda _path: candidate)
+    metadata = _SneakyDict(
+        {
+            "review_outcome": _StringLookalike("APPROVED"),
+            "candidate_commit": int("1" * 40),
+        },
+        {
+            "review_outcome": "APPROVED",
+            "candidate_commit": candidate,
+        },
+    )
+    before_events = [event.id for event in module.list_events(conn, task_id)]
+
+    assert not module.complete_task(
+        conn,
+        task_id,
+        summary="must reject dict subclass metadata",
+        metadata=metadata,
+        expected_run_id=review.current_run_id,
+    )
+    task = module.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == review.current_run_id
+    run = module.latest_run(conn, task_id)
+    assert run is not None
+    assert run.status == "running"
+    assert run.outcome is None
+    assert [event.id for event in module.list_events(conn, task_id)] == before_events
+
+
+def test_public_completion_accepts_matching_string_candidate_aliases(
+    kanban_db, monkeypatch
+):
+    module, conn, db_path = kanban_db
+    candidate = "a" * 40
+    task_id, implementation = _claim(module, conn, "canonical review completion")
+    assert module.request_review(
+        conn,
+        task_id,
+        summary="structured implementation handoff",
+        metadata={
+            "candidate_commit": candidate.upper(),
+            "pr_head_sha": candidate,
+            "post_verification_head": candidate,
+        },
+        reviewer="reviewer",
+        expected_run_id=implementation.current_run_id,
+    )
+    review = module.claim_review_task(
+        conn,
+        task_id,
+        claimer="reviewer:canonical-candidate-test",
+    )
+    assert review is not None
+    assert review.current_run_id is not None
+
+    monkeypatch.setattr(module, "_active_native_profile", lambda: "reviewer")
+    monkeypatch.setattr(module, "_review_workspace_head", lambda _path: candidate)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
+    monkeypatch.setenv("HERMES_SESSION_ID", "reviewer-session")
+    sys.modules.pop("tools.kanban_tools", None)
+    tools = importlib.import_module("tools.kanban_tools")
+    monkeypatch.setattr(
+        tools,
+        "_connect",
+        lambda board=None: (module, module.connect(db_path)),
+    )
+
+    response = json.loads(
+        tools._handle_complete(
+            {
+                "summary": "canonical candidate identity is approved",
+                "metadata": {
+                    "review_outcome": "APPROVED",
+                    "candidate_commit": candidate.upper(),
+                    "pr_head_sha": candidate,
+                    "post_verification_head": candidate.upper(),
+                },
+            }
+        )
+    )
+    assert response["ok"] is True
+    task = module.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "done"
+    run = module.latest_run(conn, task_id)
+    assert run is not None
+    assert run.status == "done"
+    assert run.outcome == "completed"
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        pytest.param({"candidate_commit": "not-a-commit"}, id="bad-candidate"),
+        pytest.param(
+            {"candidate_commit": "a" * 40, "pr_head_sha": "b" * 40},
+            id="conflicting-pr-head",
+        ),
+        pytest.param(
+            {
+                "candidate_commit": "a" * 40,
+                "post_verification_head": "b" * 40,
+            },
+            id="conflicting-post-verification-head",
+        ),
+        pytest.param(
+            {"candidate_commit": "a" * 40, "review_outcome": "APPROVED"},
+            id="completion-only-outcome",
+        ),
+        pytest.param(
+            {
+                "candidate_commit": "a" * 40,
+                "review_remediation_handoff_key": "arbitrary-key",
+                "scope_manifest_sha256": "b" * 64,
+            },
+            id="remediation-fields-outside-remediation",
+        ),
+        pytest.param(
+            {
+                "candidate_commit": "a" * 40,
+                "review_remediation_handoff_key": "arbitrary-key",
+            },
+            id="unpaired-remediation-key",
+        ),
+        pytest.param(
+            {
+                "candidate_commit": "a" * 40,
+                "review_remediation_handoff_key": "arbitrary-key",
+                "scope_manifest_sha256": "not-a-sha",
+            },
+            id="bad-scope-digest",
+        ),
+    ],
+)
+def test_native_request_rejects_semantically_invalid_protected_metadata(
+    kanban_db, metadata
+):
+    module, conn, _ = kanban_db
+    task_id, implementation = _claim(module, conn, "semantic request boundary")
+    before_events = [event.id for event in module.list_events(conn, task_id)]
+
+    assert not module.request_review(
+        conn,
+        task_id,
+        summary="must reject semantic metadata bypass",
+        metadata=metadata,
+        reviewer="reviewer",
+        expected_run_id=implementation.current_run_id,
+    )
+    task = module.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == implementation.current_run_id
+    run = module.latest_run(conn, task_id)
+    assert run is not None
+    assert run.status == "running"
+    assert [event.id for event in module.list_events(conn, task_id)] == before_events
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        pytest.param({"candidate_commit": "not-a-commit"}, id="bad-candidate"),
+        pytest.param(
+            {"candidate_commit": "a" * 40, "pr_head_sha": "b" * 40},
+            id="conflicting-pr-head",
+        ),
+        pytest.param(
+            {
+                "candidate_commit": "a" * 40,
+                "post_verification_head": "b" * 40,
+            },
+            id="conflicting-post-verification-head",
+        ),
+        pytest.param(
+            {
+                "candidate_commit": "a" * 40,
+                "review_outcome": "CHANGES_REQUESTED",
+            },
+            id="non-approved-outcome",
+        ),
+        pytest.param(
+            {
+                "candidate_commit": "a" * 40,
+                "review_remediation_handoff_key": "arbitrary-key",
+                "scope_manifest_sha256": "b" * 64,
+            },
+            id="remediation-fields-outside-remediation",
+        ),
+        pytest.param(
+            {
+                "candidate_commit": "a" * 40,
+                "review_remediation_handoff_key": "arbitrary-key",
+            },
+            id="unpaired-remediation-key",
+        ),
+        pytest.param(
+            {
+                "candidate_commit": "a" * 40,
+                "review_remediation_handoff_key": "arbitrary-key",
+                "scope_manifest_sha256": "not-a-sha",
+            },
+            id="bad-scope-digest",
+        ),
+    ],
+)
+def test_native_completion_rejects_semantically_invalid_protected_metadata(
+    kanban_db, metadata
+):
+    module, conn, _ = kanban_db
+    task_id, claimed = _claim(module, conn, "semantic completion boundary")
+    before_events = [event.id for event in module.list_events(conn, task_id)]
+
+    assert not module.complete_task(
+        conn,
+        task_id,
+        summary="must reject semantic metadata bypass",
+        metadata=metadata,
+        expected_run_id=claimed.current_run_id,
+    )
+    task = module.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == claimed.current_run_id
+    run = module.latest_run(conn, task_id)
+    assert run is not None
+    assert run.status == "running"
+    assert run.outcome is None
+    assert [event.id for event in module.list_events(conn, task_id)] == before_events
+
+
+@pytest.mark.parametrize("unsafe_kind", _UNSAFE_JSON_METADATA_KINDS)
+def test_native_request_rejects_non_json_metadata_atomically(kanban_db, unsafe_kind):
+    module, conn, _ = kanban_db
+    task_id, claimed = _claim(module, conn, "deep JSON request boundary")
+    before_events = [event.id for event in module.list_events(conn, task_id)]
+
+    assert not module.request_review(
+        conn,
+        task_id,
+        summary="must reject unsupported nested metadata",
+        metadata={
+            "candidate_commit": "a" * 40,
+            "note": _unsafe_json_metadata_value(unsafe_kind),
+        },
+        reviewer="reviewer",
+        expected_run_id=claimed.current_run_id,
+    )
+    task = module.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == claimed.current_run_id
+    run = module.latest_run(conn, task_id)
+    assert run is not None
+    assert run.status == "running"
+    assert [event.id for event in module.list_events(conn, task_id)] == before_events
+
+
+@pytest.mark.parametrize("unsafe_kind", _UNSAFE_JSON_METADATA_KINDS)
+def test_native_completion_rejects_non_json_metadata_atomically(kanban_db, unsafe_kind):
+    module, conn, _ = kanban_db
+    task_id, claimed = _claim(module, conn, "deep JSON completion boundary")
+    before_events = [event.id for event in module.list_events(conn, task_id)]
+
+    assert not module.complete_task(
+        conn,
+        task_id,
+        summary="must reject unsupported nested metadata",
+        metadata={"note": _unsafe_json_metadata_value(unsafe_kind)},
+        expected_run_id=claimed.current_run_id,
+    )
+    task = module.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == claimed.current_run_id
+    run = module.latest_run(conn, task_id)
+    assert run is not None
+    assert run.status == "running"
+    assert run.outcome is None
+    assert [event.id for event in module.list_events(conn, task_id)] == before_events
+
+
+@pytest.mark.parametrize("unsafe_kind", _UNSAFE_JSON_METADATA_KINDS)
+def test_public_completion_returns_error_for_non_json_metadata(
+    kanban_db, monkeypatch, unsafe_kind
+):
+    module, conn, db_path = kanban_db
+    candidate = "a" * 40
+    task_id, implementation = _claim(module, conn, "public deep JSON completion")
+    assert module.request_review(
+        conn,
+        task_id,
+        summary="structured implementation handoff",
+        metadata={"candidate_commit": candidate},
+        reviewer="reviewer",
+        expected_run_id=implementation.current_run_id,
+    )
+    review = module.claim_review_task(
+        conn,
+        task_id,
+        claimer="reviewer:deep-json-test",
+    )
+    assert review is not None and review.current_run_id is not None
+    monkeypatch.setattr(module, "_active_native_profile", lambda: "reviewer")
+    monkeypatch.setattr(module, "_review_workspace_head", lambda _path: candidate)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
+    monkeypatch.setenv("HERMES_SESSION_ID", "reviewer-session")
+    sys.modules.pop("tools.kanban_tools", None)
+    tools = importlib.import_module("tools.kanban_tools")
+    monkeypatch.setattr(
+        tools,
+        "_connect",
+        lambda board=None: (module, module.connect(db_path)),
+    )
+    before_events = [event.id for event in module.list_events(conn, task_id)]
+
+    response = json.loads(
+        tools._handle_complete(
+            {
+                "summary": "must return a normal boundary error",
+                "metadata": {
+                    "review_outcome": "APPROVED",
+                    "candidate_commit": candidate,
+                    "note": _unsafe_json_metadata_value(unsafe_kind),
+                },
+            }
+        )
+    )
+    assert response.get("ok") is not True
+    assert "error" in response
+    task = module.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == review.current_run_id
+    run = module.latest_run(conn, task_id)
+    assert run is not None
+    assert run.status == "running"
+    assert run.outcome is None
+    assert [event.id for event in module.list_events(conn, task_id)] == before_events
+
+
+def test_valid_nested_json_metadata_is_materialized_without_aliasing(kanban_db):
+    module, conn, _ = kanban_db
+    candidate = "A" * 40
+    task_id, claimed = _claim(module, conn, "valid nested metadata")
+    nested = {"labels": ["alpha", 1, True, None, 1.25]}
+
+    assert module.request_review(
+        conn,
+        task_id,
+        summary="valid nested handoff",
+        metadata={"candidate_commit": candidate, "notes": nested},
+        reviewer="reviewer",
+        expected_run_id=claimed.current_run_id,
+    )
+    nested["labels"].append("late mutation")
+    event = next(
+        event
+        for event in module.list_events(conn, task_id)
+        if event.kind == "review_requested"
+    )
+    payload = event.payload
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    assert payload["metadata"]["candidate_commit"] == candidate.casefold()
+    assert payload["metadata"]["notes"]["labels"] == [
+        "alpha",
+        1,
+        True,
+        None,
+        1.25,
+    ]
+
+
+def test_legacy_review_handoff_cannot_complete_without_reviewer_run(kanban_db):
+    module, conn, _ = kanban_db
+    task_id, claimed = _claim(module, conn, "legacy completion fence")
+    assert module.request_review(
+        conn,
+        task_id,
+        summary="legacy implementation handoff",
+        metadata=None,
+        reviewer=None,
+        expected_run_id=claimed.current_run_id,
+    )
+    assert not module.complete_task(
+        conn,
+        task_id,
+        summary="forged approval",
+        metadata={
+            "review_outcome": "APPROVED",
+            "candidate_commit": "a" * 40,
+        },
+    )
+    task = module.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "review"
+    assert task.current_run_id is None
 
 
 def test_ignored_untracked_content_is_not_a_clean_review_tree(kanban_db, tmp_path):

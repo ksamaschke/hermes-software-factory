@@ -464,6 +464,21 @@ def test_verdict_requires_one_literal_canonical_field(kanban_db):
             "verdict": "APPROVED",
             "candidate_commit": "a" * 40,
         },
+        {
+            "review_outcome": "APPROVED",
+            "terminal_verdict": "CHANGES_REQUESTED",
+            "candidate_commit": "a" * 40,
+        },
+        {
+            "review_outcome": "APPROVED",
+            "review_verdict": "CHANGES_REQUESTED",
+            "candidate_commit": "a" * 40,
+        },
+        {
+            "review_outcome": "APPROVED",
+            "extra_verdict": "CHANGES_REQUESTED",
+            "candidate_commit": "a" * 40,
+        },
         {"review_outcome": "APPROVED-", "candidate_commit": "a" * 40},
     )
     for metadata in invalid_metadata:

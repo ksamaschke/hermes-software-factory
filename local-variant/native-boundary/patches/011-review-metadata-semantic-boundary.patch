@@ -1,0 +1,365 @@
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -100,0 +101 @@
++from hermes_cli.review_metadata_boundary import validate_review_metadata
+@@ -7211 +7212,4 @@
+-    metadata, metadata_error = _review_metadata_snapshot(metadata)
++    metadata, metadata_error = validate_review_metadata(
++        metadata,
++        operation="completion",
++    )
+@@ -7213,0 +7218,23 @@
++    if type(metadata) is dict and any(
++        field in metadata
++        for field in (
++            "review_remediation_handoff_key",
++            "scope_manifest_sha256",
++        )
++    ):
++        remediation_task = conn.execute(
++            "SELECT id, body, assignee, created_by, workspace_path, status, "
++            "current_run_id, idempotency_key FROM tasks WHERE id = ?",
++            (task_id,),
++        ).fetchone()
++        if remediation_task is None:
++            return False
++        remediation_handoff, remediation_packet, remediation_error = (
++            _validated_remediation_successor(conn, task_id, remediation_task)
++        )
++        if (
++            remediation_error is not None
++            or remediation_handoff is None
++            or remediation_packet is None
++        ):
++            return False
+@@ -8224,26 +8250,0 @@
+-_REVIEW_METADATA_STRING_FIELDS = (
+-    "candidate_commit",
+-    "pr_head_sha",
+-    "post_verification_head",
+-    "review_outcome",
+-    "review_remediation_handoff_key",
+-    "scope_manifest_sha256",
+-)
+-
+-
+-def _review_metadata_snapshot(
+-    metadata: Any,
+-) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+-    if metadata is None:
+-        return None, None
+-    if type(metadata) is not dict:
+-        return None, "review metadata must use exact built-in dict"
+-    snapshot = metadata.copy()
+-    if any(type(key) is not str for key in snapshot):
+-        return None, "review metadata keys must use exact built-in strings"
+-    for field in _REVIEW_METADATA_STRING_FIELDS:
+-        if field in snapshot and type(snapshot[field]) is not str:
+-            return None, f"review metadata field {field} must use exact built-in string"
+-    return snapshot, None
+-
+-
+@@ -9853,0 +9855,8 @@
++    if remediation_handoff is None and type(metadata) is dict and any(
++        field in metadata
++        for field in (
++            "review_remediation_handoff_key",
++            "scope_manifest_sha256",
++        )
++    ):
++        return "review remediation metadata requires a validated remediation successor"
+@@ -10467 +10476,4 @@
+-    metadata, metadata_error = _review_metadata_snapshot(metadata)
++    metadata, metadata_error = validate_review_metadata(
++        metadata,
++        operation="request",
++    )
+@@ -10622,0 +10635,11 @@
++            if raw_metadata is not None and any(
++                field in raw_metadata
++                for field in (
++                    "review_remediation_handoff_key",
++                    "scope_manifest_sha256",
++                )
++            ):
++                return _ret(
++                    False,
++                    "review remediation metadata requires a validated remediation successor",
++                )
+--- /dev/null
++++ b/hermes_cli/review_metadata_boundary.py
+@@ -0,0 +1,188 @@
++"""Strict, shared metadata boundary for native Kanban reviews.
++
++The public tool handlers, dashboard-backed native entry points, and direct
++Python callers must observe one exact contract.  This module is deliberately
++small and dependency-free so both ``tools.kanban_tools`` and
++``hermes_cli.kanban_db`` can validate before serialization or durable lookup.
++"""
++
++from __future__ import annotations
++
++import math
++import re
++from typing import Any
++
++_REVIEW_COMMIT_RE = re.compile(r"[0-9a-f]{40}")
++_REVIEW_SHA256_RE = re.compile(r"[0-9a-f]{64}")
++_PROTECTED_FIELDS = (
++    "candidate_commit",
++    "pr_head_sha",
++    "post_verification_head",
++    "review_outcome",
++    "review_remediation_handoff_key",
++    "scope_manifest_sha256",
++)
++_REMEDIATION_FIELDS = (
++    "review_remediation_handoff_key",
++    "scope_manifest_sha256",
++)
++_MAX_NESTING = 32
++
++
++def _snapshot_json_value(
++    value: Any,
++    *,
++    active: set[int],
++    depth: int,
++) -> tuple[Any, str | None]:
++    value_type = type(value)
++    if value is None or value_type in (str, bool):
++        return value, None
++    if value_type is int:
++        if value < -(2**63) or value > 2**63 - 1:
++            return (
++                None,
++                "review metadata integers must fit the signed 64-bit JSON range",
++            )
++        return value, None
++    if value_type is float:
++        if not math.isfinite(value):
++            return None, "review metadata floats must be finite"
++        return value, None
++    if depth >= _MAX_NESTING:
++        return None, "review metadata exceeds the maximum nesting depth"
++    if value_type is list:
++        identity = id(value)
++        if identity in active:
++            return None, "review metadata must be acyclic"
++        active.add(identity)
++        try:
++            try:
++                source = list(value)
++            except (RuntimeError, TypeError):
++                return None, "review metadata changed while being materialized"
++            result = []
++            for item in source:
++                snapshot, error = _snapshot_json_value(
++                    item,
++                    active=active,
++                    depth=depth + 1,
++                )
++                if error is not None:
++                    return None, error
++                result.append(snapshot)
++            return result, None
++        finally:
++            active.remove(identity)
++    if value_type is dict:
++        identity = id(value)
++        if identity in active:
++            return None, "review metadata must be acyclic"
++        active.add(identity)
++        try:
++            try:
++                source = list(value.items())
++            except (RuntimeError, TypeError):
++                return None, "review metadata changed while being materialized"
++            result = {}
++            for key, item in source:
++                if type(key) is not str:
++                    return None, "review metadata keys must use exact built-in strings"
++                snapshot, error = _snapshot_json_value(
++                    item,
++                    active=active,
++                    depth=depth + 1,
++                )
++                if error is not None:
++                    return None, error
++                result[key] = snapshot
++            return result, None
++        finally:
++            active.remove(identity)
++    return None, "review metadata must contain only JSON-safe exact built-in values"
++
++
++def _canonical_hex(value: str, pattern: re.Pattern[str]) -> str | None:
++    canonical = value.strip().casefold()
++    return canonical if pattern.fullmatch(canonical) else None
++
++
++def validate_review_metadata(
++    metadata: Any,
++    *,
++    operation: str,
++) -> tuple[dict[str, Any] | None, str | None]:
++    """Materialize and validate review metadata without coercion.
++
++    ``operation`` is either ``request`` or ``completion``.  The returned dict
++    has no aliases to caller-owned containers and contains only strict JSON
++    primitives.  Protected identities are canonicalized only after exact-type
++    validation; failures never stringify or serialize attacker-controlled
++    objects.
++    """
++
++    if operation not in ("request", "completion"):
++        raise ValueError(f"unsupported review metadata operation: {operation}")
++    if metadata is None:
++        return None, None
++    if type(metadata) is not dict:
++        return None, "review metadata must use exact built-in dict"
++    if any(type(key) is not str for key in metadata):
++        return None, "review metadata keys must use exact built-in strings"
++    for field in _PROTECTED_FIELDS:
++        if field in metadata and type(metadata[field]) is not str:
++            return (
++                None,
++                f"review metadata field {field} must use exact built-in strings",
++            )
++
++    snapshot, error = _snapshot_json_value(metadata, active=set(), depth=0)
++    if error is not None:
++        return None, error
++    assert type(snapshot) is dict
++
++    candidate = None
++    if "candidate_commit" in snapshot:
++        candidate = _canonical_hex(snapshot["candidate_commit"], _REVIEW_COMMIT_RE)
++        if candidate is None:
++            return None, "candidate_commit must be a canonical 40-hex commit"
++        snapshot["candidate_commit"] = candidate
++
++    for alias in ("pr_head_sha", "post_verification_head"):
++        if alias not in snapshot:
++            continue
++        alias_commit = _canonical_hex(snapshot[alias], _REVIEW_COMMIT_RE)
++        if alias_commit is None:
++            return None, f"{alias} must be a canonical 40-hex commit"
++        if candidate is None or alias_commit != candidate:
++            return None, f"{alias} must match candidate_commit"
++        snapshot[alias] = alias_commit
++
++    if "review_outcome" in snapshot:
++        if operation == "request":
++            return None, "review_outcome is valid only for review completion"
++        if snapshot["review_outcome"] != "APPROVED":
++            return None, "review_outcome must be the literal APPROVED"
++        if candidate is None:
++            return None, "review_outcome requires candidate_commit"
++
++    remediation_present = [field in snapshot for field in _REMEDIATION_FIELDS]
++    if any(remediation_present) and not all(remediation_present):
++        return (
++            None,
++            "review remediation handoff key and scope digest must appear together",
++        )
++    if all(remediation_present):
++        if candidate is None:
++            return None, "review remediation metadata requires candidate_commit"
++        if not snapshot["review_remediation_handoff_key"].strip():
++            return None, "review remediation handoff key must not be empty"
++        scope_digest = _canonical_hex(
++            snapshot["scope_manifest_sha256"],
++            _REVIEW_SHA256_RE,
++        )
++        if scope_digest is None:
++            return None, "scope_manifest_sha256 must be a canonical 64-hex digest"
++        snapshot["scope_manifest_sha256"] = scope_digest
++
++    return snapshot, None
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -37,0 +38 @@
++from hermes_cli.config import cfg_get, load_config
+@@ -38,0 +40 @@
++from hermes_cli.review_metadata_boundary import validate_review_metadata
+@@ -40 +41,0 @@
+-from hermes_cli.config import cfg_get, load_config
+@@ -177,23 +177,0 @@
+-_REVIEW_TYPED_STRING_FIELDS = frozenset(
+-    {
+-        "candidate_commit",
+-        "post_verification_head",
+-        "pr_head_sha",
+-        "review_outcome",
+-        "review_remediation_handoff_key",
+-        "scope_manifest_sha256",
+-    }
+-)
+-
+-
+-def _review_metadata_type_error(metadata: Optional[dict]) -> Optional[str]:
+-    if metadata is None:
+-        return None
+-    if type(metadata) is not dict:
+-        return "review metadata must use exact built-in dict"
+-    for raw_key, value in metadata.items():
+-        if type(raw_key) is not str:
+-            return "review metadata keys must use exact built-in strings"
+-        if raw_key in _REVIEW_TYPED_STRING_FIELDS and type(value) is not str:
+-            return f"review metadata field {raw_key} must use exact built-in strings"
+-    return None
+@@ -232,0 +211,6 @@
++    metadata, metadata_error = validate_review_metadata(
++        metadata,
++        operation="request",
++    )
++    if metadata_error is not None:
++        raise ValueError(metadata_error)
+@@ -239,6 +222,0 @@
+-    if type(metadata) is not dict:
+-        raise ValueError("review metadata must use exact built-in dict")
+-    metadata = metadata.copy()
+-    type_error = _review_metadata_type_error(metadata)
+-    if type_error is not None:
+-        raise ValueError(type_error)
+@@ -246,4 +223,0 @@
+-        try:
+-            json.dumps(metadata)
+-        except (TypeError, ValueError) as exc:
+-            raise ValueError("metadata could not be safely serialized") from exc
+@@ -251 +225,4 @@
+-    metadata_json = redact_sensitive_text(json.dumps(metadata), force=True)
++    metadata_json = redact_sensitive_text(
++        json.dumps(metadata, allow_nan=False),
++        force=True,
++    )
+@@ -756 +733,4 @@
+-    metadata = args.get("metadata")
++    metadata, metadata_error = validate_review_metadata(
++        args.get("metadata"),
++        operation="completion",
++    )
+@@ -758,7 +738,2 @@
+-    if metadata is not None:
+-        if type(metadata) is not dict:
+-            return tool_error("review metadata must use exact built-in dict")
+-        metadata = metadata.copy()
+-    type_error = _review_metadata_type_error(metadata)
+-    if type_error is not None:
+-        return tool_error(type_error)
++    if metadata_error is not None:
++        return tool_error(metadata_error)
+@@ -769,3 +744 @@
+-    if metadata is not None and type(metadata) is dict:
+-        meta_json = json.dumps(metadata)
+-        meta_json = redact_sensitive_text(meta_json, force=True)
++    if metadata is not None:
+@@ -772,0 +746,2 @@
++            meta_json = json.dumps(metadata, allow_nan=False)
++            meta_json = redact_sensitive_text(meta_json, force=True)
+@@ -774,2 +749,2 @@
+-        except json.JSONDecodeError:
+-            pass
++        except (TypeError, ValueError, json.JSONDecodeError):
++            return tool_error("metadata could not be safely serialized")

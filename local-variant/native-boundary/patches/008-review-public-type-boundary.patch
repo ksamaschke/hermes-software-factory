@@ -1,0 +1,96 @@
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -176,0 +177,21 @@
++_REVIEW_TYPED_STRING_FIELDS = frozenset(
++    {
++        "candidate_commit",
++        "post_verification_head",
++        "pr_head_sha",
++        "review_outcome",
++        "review_remediation_handoff_key",
++        "scope_manifest_sha256",
++    }
++)
++
++
++def _review_metadata_type_error(metadata: Optional[dict]) -> Optional[str]:
++    if not isinstance(metadata, dict):
++        return None
++    for raw_key, value in metadata.items():
++        if type(raw_key) is not str:
++            return "review metadata keys must use exact built-in strings"
++        if raw_key in _REVIEW_TYPED_STRING_FIELDS and type(value) is not str:
++            return f"review metadata field {raw_key} must use exact built-in strings"
++    return None
+@@ -213,0 +235,3 @@
++    type_error = _review_metadata_type_error(metadata)
++    if type_error is not None:
++        raise ValueError(type_error)
+@@ -726,0 +751,3 @@
++    type_error = _review_metadata_type_error(metadata)
++    if type_error is not None:
++        return tool_error(type_error)
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -8213,0 +8214,7 @@
++def _canonical_review_sha256(value: Any) -> Optional[str]:
++    if type(value) is not str:
++        return None
++    digest = value.strip().casefold()
++    return digest if _REVIEW_SHA256_RE.fullmatch(digest) else None
++
++
+@@ -10019,0 +10027,6 @@
++            implementation_handoff_key = implementation_metadata.get(
++                "review_remediation_handoff_key"
++            )
++            implementation_scope = _canonical_review_sha256(
++                implementation_metadata.get("scope_manifest_sha256")
++            )
+@@ -10021,2 +10034,3 @@
+-                implementation_metadata.get("review_remediation_handoff_key")
+-                != remediation_handoff["handoff_key"]
++                type(implementation_handoff_key) is not str
++                or implementation_handoff_key != remediation_handoff["handoff_key"]
++                or implementation_scope is None
+@@ -10026,0 +10041,4 @@
++            approved_handoff_key = metadata.get("review_remediation_handoff_key")
++            approved_scope = _canonical_review_sha256(
++                metadata.get("scope_manifest_sha256")
++            )
+@@ -10028,4 +10046,4 @@
+-                metadata.get("review_remediation_handoff_key")
+-                != remediation_handoff["handoff_key"]
+-                or metadata.get("scope_manifest_sha256")
+-                != implementation_metadata["scope_manifest_sha256"]
++                type(approved_handoff_key) is not str
++                or approved_handoff_key != remediation_handoff["handoff_key"]
++                or approved_scope is None
++                or approved_scope != implementation_scope
+@@ -10037,3 +10055 @@
+-            current_packet["scope_manifest_sha256"] = str(
+-                implementation_metadata.get("scope_manifest_sha256") or ""
+-            )
++            current_packet["scope_manifest_sha256"] = implementation_scope
+@@ -10541,2 +10557,5 @@
+-            candidate = str(raw_metadata.get("candidate_commit") or "").strip().casefold()
+-            candidate_valid = _REVIEW_COMMIT_RE.fullmatch(candidate) is not None
++            candidate = _canonical_review_commit(
++                raw_metadata.get("candidate_commit")
++            )
++            candidate_valid = candidate is not None
++            raw_handoff_key = raw_metadata.get("review_remediation_handoff_key")
+@@ -10544,2 +10563,5 @@
+-                raw_metadata.get("review_remediation_handoff_key")
+-                == remediation_handoff["handoff_key"]
++                type(raw_handoff_key) is str
++                and raw_handoff_key == remediation_handoff["handoff_key"]
++            )
++            scope_manifest_sha256 = _canonical_review_sha256(
++                raw_metadata.get("scope_manifest_sha256")
+@@ -10547,4 +10569 @@
+-            scope_manifest_sha256 = str(
+-                raw_metadata.get("scope_manifest_sha256") or ""
+-            ).strip().casefold()
+-            scope_valid = _REVIEW_SHA256_RE.fullmatch(scope_manifest_sha256) is not None
++            scope_valid = scope_manifest_sha256 is not None

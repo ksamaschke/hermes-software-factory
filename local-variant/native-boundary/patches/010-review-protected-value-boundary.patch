@@ -1,0 +1,52 @@
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -7211,6 +7211,3 @@
+-    if metadata is not None:
+-        if type(metadata) is not dict:
+-            return False
+-        metadata = metadata.copy()
+-        if any(type(key) is not str for key in metadata):
+-            return False
++    metadata, metadata_error = _review_metadata_snapshot(metadata)
++    if metadata_error is not None:
++        return False
+@@ -8226,0 +8224,26 @@
++_REVIEW_METADATA_STRING_FIELDS = (
++    "candidate_commit",
++    "pr_head_sha",
++    "post_verification_head",
++    "review_outcome",
++    "review_remediation_handoff_key",
++    "scope_manifest_sha256",
++)
++
++
++def _review_metadata_snapshot(
++    metadata: Any,
++) -> tuple[Optional[dict[str, Any]], Optional[str]]:
++    if metadata is None:
++        return None, None
++    if type(metadata) is not dict:
++        return None, "review metadata must use exact built-in dict"
++    snapshot = metadata.copy()
++    if any(type(key) is not str for key in snapshot):
++        return None, "review metadata keys must use exact built-in strings"
++    for field in _REVIEW_METADATA_STRING_FIELDS:
++        if field in snapshot and type(snapshot[field]) is not str:
++            return None, f"review metadata field {field} must use exact built-in string"
++    return snapshot, None
++
++
+@@ -10444,9 +10467,3 @@
+-    if metadata is not None:
+-        if type(metadata) is not dict:
+-            return _ret(False, "review metadata must use exact built-in dict")
+-        metadata = metadata.copy()
+-        if any(type(key) is not str for key in metadata):
+-            return _ret(
+-                False,
+-                "review metadata keys must use exact built-in strings",
+-            )
++    metadata, metadata_error = _review_metadata_snapshot(metadata)
++    if metadata_error is not None:
++        return _ret(False, metadata_error)

@@ -94,10 +94,23 @@ isolation boundary is stated explicitly.
   profile, live lease and claim lock, prior terminal `review_requested`
   implementation run, immutable packet/body/pointer receipt, clean worktree,
   candidate, changed-path manifest, repository/worktree identity, and local HEAD.
-  Missing, boolean/string/float/stale/expired run IDs, role collisions,
-  non-approval, self-attestation, stale or foreign evidence, pointer/body/graph
-  tampering, and malformed provenance cannot complete the task or release
-  status-gated children.
+  Review metadata is accepted only in an exact built-in `dict`, recursively
+  materialized into an unaliased snapshot. Every nested mapping/list and key
+  must use exact built-in JSON container/string types; only finite JSON scalars
+  are accepted, with integers bounded to the signed 64-bit range. Cycles,
+  excessive nesting, bytes, tuples, custom mappings, subclasses, and
+  stringable lookalikes are rejected before serialization. Protected values are
+  validated under one shared native/public semantic contract: `candidate_commit`
+  and present head aliases are canonical
+  40-hex commits and aliases must match; `review_outcome` is completion-only and
+  must be the literal `APPROVED`; the remediation scope is a canonical 64-hex
+  digest; and the opaque handoff key and scope must occur together only for a
+  validated remediation successor. Failures are atomic before transaction,
+  JSON serialization, or durable lifecycle receipts. Missing, stale, expired,
+  or otherwise malformed run IDs, role collisions, non-approval,
+  self-attestation, stale or foreign evidence, pointer/body/graph tampering, and
+  malformed provenance cannot complete the task or release status-gated
+  children.
 - before reclaim, orphan repair, promotion, or spawn, a durable-state barrier
   validates non-terminal task scalars, run/event/comment identifiers and
   timestamps, run state, JSON storage, transition schemas, counters, PIDs,
@@ -140,13 +153,17 @@ sufficient free space; do not stage under `/tmp` for the full runtime.
 SOURCE=/home/ksamaschke/.hermes/profiles/orchestrator/runtime-hotfix-20260906
 STAGE="$PWD/.native-boundary-stage/runtime"
 MANIFEST="$PWD/.native-boundary-stage/manifest.json"
+PYTHON=${FACTORY_PYTHON:-/opt/hermes-agent/venv/bin/python}
+test -x "$PYTHON"
 
-python3 -B local-variant/native-boundary/build_native_boundary.py stage \
+PYTHONDONTWRITEBYTECODE=1 "$PYTHON" -B \
+  local-variant/native-boundary/build_native_boundary.py stage \
   --source "$SOURCE" \
   --output "$STAGE" \
   --manifest-output "$MANIFEST"
 
-python3 -B local-variant/native-boundary/build_native_boundary.py verify \
+PYTHONDONTWRITEBYTECODE=1 "$PYTHON" -B \
+  local-variant/native-boundary/build_native_boundary.py verify \
   --manifest "$MANIFEST" \
   --source "$SOURCE"
 ```
@@ -174,6 +191,12 @@ virtualenv site-packages path for required dependencies, and requires
 `kanban_db`, `kanban_specify`, and `native_boundary` to resolve to their exact
 files under `STAGE`. Hosted package checks without `FACTORY_NATIVE_RUNTIME`
 are package evidence only; they are not native activation proof.
+The verifier deliberately uses the interpreter that launched it. Pin
+`FACTORY_PYTHON` to the same dependency-complete Hermes interpreter used by the
+gateway; an ambient `python3` with different site-packages is not reproducible
+artifact evidence. Keep `PYTHONDONTWRITEBYTECODE=1` on both verification and
+the activated gateway so the reviewed runtime tree does not acquire excluded
+`__pycache__` or `*.pyc` entries after activation.
 
 ## Native contract verification
 
@@ -231,11 +254,15 @@ STAGE=/absolute/path/to/.native-boundary-stage/runtime
 MANIFEST=/absolute/path/to/.native-boundary-stage/manifest.json
 SOURCE=/absolute/path/to/runtime-hotfix-source
 REVIEWED_DROPIN=/absolute/path/to/reviewed-10-runtime-hotfix.conf
+PYTHON=${FACTORY_PYTHON:-/opt/hermes-agent/venv/bin/python}
 
-python3 -B local-variant/native-boundary/build_native_boundary.py verify \
+test -x "$PYTHON"
+PYTHONDONTWRITEBYTECODE=1 "$PYTHON" -B \
+  local-variant/native-boundary/build_native_boundary.py verify \
   --manifest "$MANIFEST" --source "$SOURCE"
 test -r "$REVIEWED_DROPIN"
 grep -F "PYTHONPATH=$STAGE" "$REVIEWED_DROPIN"
+grep -F 'PYTHONDONTWRITEBYTECODE=1' "$REVIEWED_DROPIN"
 
 # Freeze admission before inspecting or stopping a KillMode=mixed service.
 MAIN_PID=$(systemctl --user show "$SERVICE" -p MainPID --value)

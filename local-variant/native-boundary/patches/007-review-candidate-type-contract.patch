@@ -1,0 +1,52 @@
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -8206,0 +8207,7 @@
++def _canonical_review_commit(value: Any) -> Optional[str]:
++    if type(value) is not str:
++        return None
++    candidate = value.strip().casefold()
++    return candidate if _REVIEW_COMMIT_RE.fullmatch(candidate) else None
++
++
+@@ -9900,2 +9907,2 @@
+-    candidate = str(metadata.get("candidate_commit") or "").strip().casefold()
+-    if not _REVIEW_COMMIT_RE.fullmatch(candidate):
++    candidate = _canonical_review_commit(metadata.get("candidate_commit"))
++    if candidate is None:
+@@ -9902,0 +9910,6 @@
++    for alias in ("pr_head_sha", "post_verification_head"):
++        if alias not in metadata:
++            continue
++        alias_candidate = _canonical_review_commit(metadata.get(alias))
++        if alias_candidate is None or alias_candidate != candidate:
++            return f"review approval {alias} conflicts with candidate_commit"
+@@ -9994,4 +10007,4 @@
+-        expected_candidate = str(
+-            implementation_metadata.get("candidate_commit") or ""
+-        ).strip().casefold()
+-        if not _REVIEW_COMMIT_RE.fullmatch(expected_candidate):
++        expected_candidate = _canonical_review_commit(
++            implementation_metadata.get("candidate_commit")
++        )
++        if expected_candidate is None:
+@@ -10563,4 +10576,4 @@
+-                candidate = str(
+-                    raw_metadata.get("candidate_commit") or ""
+-                ).strip().casefold()
+-                if _REVIEW_COMMIT_RE.fullmatch(candidate) is None:
++                candidate = _canonical_review_commit(
++                    raw_metadata.get("candidate_commit")
++                )
++                if candidate is None:
+@@ -10574,7 +10587,4 @@
+-                    alias_candidate = str(
+-                        raw_metadata.get(alias) or ""
+-                    ).strip().casefold()
+-                    if (
+-                        _REVIEW_COMMIT_RE.fullmatch(alias_candidate) is None
+-                        or alias_candidate != candidate
+-                    ):
++                    alias_candidate = _canonical_review_commit(
++                        raw_metadata.get(alias)
++                    )
++                    if alias_candidate is None or alias_candidate != candidate:

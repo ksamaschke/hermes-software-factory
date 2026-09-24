@@ -1,6 +1,6 @@
 {
   "schema": "factory.native-boundary.v1",
-  "artifact_version": "1.0.24",
+  "artifact_version": "1.0.25",
   "description": "Fail-closed native Kanban boundary patch for a disposable Hermes runtime copy.",
   "source_files": [
     {
@@ -32,6 +32,34 @@
     {
       "path": "patches/004-review-lifecycle-followup.patch",
       "sha256": "f1ccf928bf6c665272f68f63e8334a5d00de168824016e7445e9e79871c2ffbe"
+    },
+    {
+      "path": "patches/005-review-handoff-contract.patch",
+      "sha256": "7c2461d0ee727fb4b37ff182c9d58fbbade7d1b72cac7a4b8a330fff80bc4c0a"
+    },
+    {
+      "path": "patches/006-review-completion-evidence.patch",
+      "sha256": "3b30c2eccd15a09d285ce273ca6e579cf1f97c8d63e4562f50ca86230b2fdf2b"
+    },
+    {
+      "path": "patches/007-review-candidate-type-contract.patch",
+      "sha256": "74e3ae9b4d79d7aa91623a992aceab3ec97e9fb034d08c41da6bda809dc257a7"
+    },
+    {
+      "path": "patches/008-review-public-type-boundary.patch",
+      "sha256": "5b0c3351ce115b02dc84174ce1d3a0e8a3598cf06d36bd3f4ae0675b3fb81054"
+    },
+    {
+      "path": "patches/009-review-metadata-container-boundary.patch",
+      "sha256": "833c0f8b1f2e365410634f10f73a3ebc9e1f47bf91370538a33dafa4a97726a6"
+    },
+    {
+      "path": "patches/010-review-protected-value-boundary.patch",
+      "sha256": "77efb4e934480fd0e685d27da6f2cc70a9bc87edbc2bd4c7684fc93b3527d01c"
+    },
+    {
+      "path": "patches/011-review-metadata-semantic-boundary.patch",
+      "sha256": "597520eef6e68b7c08f1608e92449b377e9ed64e4a2a9a158e550705107e44df"
     }
   ],
   "patched_paths": [
@@ -39,6 +67,7 @@
     "hermes_cli/kanban.py",
     "hermes_cli/kanban_specify.py",
     "hermes_cli/native_boundary.py",
+    "hermes_cli/review_metadata_boundary.py",
     "tools/kanban_tools.py",
     "agent/turn_finalizer.py",
     "plugins/kanban/dashboard/plugin_api.py",
