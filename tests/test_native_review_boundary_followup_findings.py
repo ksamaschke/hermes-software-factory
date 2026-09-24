@@ -62,6 +62,24 @@ class _SneakyDict(dict):
         return self._exposed[key]
 
 
+_PROTECTED_REVIEW_METADATA_FIELDS = (
+    "candidate_commit",
+    "pr_head_sha",
+    "post_verification_head",
+    "review_outcome",
+    "review_remediation_handoff_key",
+    "scope_manifest_sha256",
+)
+_INVALID_PROTECTED_REVIEW_VALUES = (
+    int("1" * 40),
+    True,
+    1.0,
+    b"a" * 64,
+    _StringLookalike("a" * 64),
+    _StringableLookalike("a" * 64),
+)
+
+
 @pytest.fixture
 def kanban_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
@@ -413,7 +431,14 @@ def test_structured_review_handoff_requires_canonical_candidate_commit(kanban_db
             with_reason=True,
         )
         assert not ok
-        assert "candidate_commit" in str(reason)
+        assert any(
+            field in str(reason)
+            for field in (
+                "candidate_commit",
+                "pr_head_sha",
+                "post_verification_head",
+            )
+        )
         task = module.get_task(conn, task_id)
         assert task is not None
         assert task.status == "running"
@@ -450,6 +475,42 @@ def test_structured_review_handoff_requires_canonical_candidate_commit(kanban_db
     ).fetchone()
     assert run is not None
     assert json.loads(run["metadata"])["candidate_commit"] == candidate.lower()
+
+
+@pytest.mark.parametrize("protected_field", _PROTECTED_REVIEW_METADATA_FIELDS)
+@pytest.mark.parametrize("invalid_value", _INVALID_PROTECTED_REVIEW_VALUES)
+def test_native_request_review_rejects_non_string_protected_metadata(
+    kanban_db, protected_field, invalid_value
+):
+    module, conn, _ = kanban_db
+    candidate = "a" * 40
+    task_id, claimed = _claim(module, conn, "native protected request metadata")
+    metadata = {"candidate_commit": candidate}
+    metadata[protected_field] = invalid_value
+    before_events = [event.id for event in module.list_events(conn, task_id)]
+
+    ok, reason = module.request_review(
+        conn,
+        task_id,
+        summary="must reject every protected non-string value",
+        metadata=metadata,
+        reviewer="reviewer",
+        expected_run_id=claimed.current_run_id,
+        with_reason=True,
+    )
+
+    assert not ok
+    assert protected_field in str(reason)
+    assert "exact built-in string" in str(reason)
+    task = module.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == claimed.current_run_id
+    run = module.latest_run(conn, task_id)
+    assert run is not None
+    assert run.status == "running"
+    assert run.outcome is None
+    assert [event.id for event in module.list_events(conn, task_id)] == before_events
 
 
 @pytest.mark.parametrize(
@@ -1113,6 +1174,59 @@ def test_public_completion_rejects_dict_subclass_before_serialization(
     assert run.status == "running"
     assert run.outcome is None
     assert [event.id for event in module.list_events(conn, task_id)] == before_events
+
+
+@pytest.mark.parametrize("protected_field", _PROTECTED_REVIEW_METADATA_FIELDS)
+@pytest.mark.parametrize("invalid_value", _INVALID_PROTECTED_REVIEW_VALUES)
+def test_native_completion_rejects_non_string_protected_metadata(
+    kanban_db, monkeypatch, protected_field, invalid_value
+):
+    module, conn, _ = kanban_db
+    candidate = "a" * 40
+    task_id, implementation = _claim(
+        module, conn, "native protected completion metadata"
+    )
+    assert module.request_review(
+        conn,
+        task_id,
+        summary="structured implementation handoff",
+        metadata={"candidate_commit": candidate},
+        reviewer="reviewer",
+        expected_run_id=implementation.current_run_id,
+    )
+    review = module.claim_review_task(
+        conn,
+        task_id,
+        claimer="reviewer:protected-native-completion-test",
+    )
+    assert review is not None
+    assert review.current_run_id is not None
+    monkeypatch.setattr(module, "_active_native_profile", lambda: "reviewer")
+    monkeypatch.setattr(module, "_review_workspace_head", lambda _path: candidate)
+    metadata = {
+        "review_outcome": "APPROVED",
+        "candidate_commit": candidate,
+    }
+    metadata[protected_field] = invalid_value
+
+    assert not module.complete_task(
+        conn,
+        task_id,
+        summary="must reject every protected non-string value",
+        metadata=metadata,
+        expected_run_id=review.current_run_id,
+    )
+    task = module.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == review.current_run_id
+    run = module.latest_run(conn, task_id)
+    assert run is not None
+    assert run.status == "running"
+    assert run.outcome is None
+    assert not any(
+        event.kind == "completed" for event in module.list_events(conn, task_id)
+    )
 
 
 def test_native_completion_rejects_dict_subclass_before_lookup(kanban_db, monkeypatch):

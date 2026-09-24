@@ -52,6 +52,10 @@
     {
       "path": "patches/009-review-metadata-container-boundary.patch",
       "sha256": "833c0f8b1f2e365410634f10f73a3ebc9e1f47bf91370538a33dafa4a97726a6"
+    },
+    {
+      "path": "patches/010-review-protected-value-boundary.patch",
+      "sha256": "77efb4e934480fd0e685d27da6f2cc70a9bc87edbc2bd4c7684fc93b3527d01c"
     }
   ],
   "patched_paths": [

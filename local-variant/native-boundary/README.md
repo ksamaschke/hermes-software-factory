@@ -98,10 +98,12 @@ isolation boundary is stated explicitly.
   must be exact built-in strings, and the accepted mapping is copied once before
   validation or persistence. Review identity fields are validated before JSON
   serialization or redaction:
-  `candidate_commit`, present head aliases, the remediation scope digest and the
-  opaque handoff key must use the exact built-in `str` type. Numbers, booleans,
-  floats, bytes, string subclasses, and stringable lookalikes are rejected
-  atomically without a review or completion receipt. Missing, stale, expired,
+  `candidate_commit`, present head aliases, `review_outcome`, the remediation
+  scope digest and the opaque handoff key must use the exact built-in `str`
+  type whenever present, even outside a recognized remediation payload. Numbers,
+  booleans, floats, bytes, string subclasses, and stringable lookalikes are
+  rejected atomically before lookup, serialization, or durable lifecycle
+  receipts. Missing, stale, expired,
   or otherwise malformed run IDs, role collisions, non-approval,
   self-attestation, stale or foreign evidence, pointer/body/graph tampering, and
   malformed provenance cannot complete the task or release status-gated
