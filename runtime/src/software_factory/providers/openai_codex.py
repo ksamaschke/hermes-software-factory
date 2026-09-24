@@ -22,10 +22,9 @@ import json
 import math
 import os
 import stat
-import threading
 import time
 from collections import OrderedDict, deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Hashable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Protocol, Self, TypeAlias, cast
@@ -54,6 +53,8 @@ __all__ = (
     "OpenAICodexCredentials",
     "PressureAdmissionTimeoutError",
     "ProviderAdmission",
+    "ProviderCompletion",
+    "ProviderGeneration",
     "ProviderLoopError",
     "ProviderOperationError",
     "ProviderPressure",
@@ -72,6 +73,8 @@ _MAX_ADMISSION_TIMEOUT = 3_600.0
 _DEFAULT_MAX_BACKOFF = 60.0
 _DEFAULT_MAX_QUEUE = 128
 _DEFAULT_MAX_RETAINED_GENERATIONS = 128
+_DEFAULT_MAX_GENERATION_SCOPES = 64
+_MAX_GENERATION_VALUE = (1 << 63) - 1
 
 _SCHEMA_FIELDS = ("access_token", "refresh_token", "account_id")
 _SCHEMA_FIELD_SET = frozenset(_SCHEMA_FIELDS)
@@ -326,8 +329,7 @@ class OpenAICodexCredentials:
 
 
 CredentialRefreshCallback: TypeAlias = Callable[
-    [OpenAICodexCredentials],
-    OpenAICodexCredentials | Awaitable[OpenAICodexCredentials],
+    [OpenAICodexCredentials], Awaitable[OpenAICodexCredentials]
 ]
 
 
@@ -459,6 +461,81 @@ def _validate_duration(
     return float(resolved)
 
 
+_DRAIN_FAILED = object()
+
+
+async def _drain_cancelled_task(task: asyncio.Task[Any]) -> object:
+    """Drain a shielded task while preserving every caller cancellation."""
+
+    current = asyncio.current_task()
+    cancellations = current.cancelling() if current is not None else 0
+    if current is not None:
+        for _ in range(cancellations):
+            current.uncancel()
+    try:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if current is not None:
+                    newly_cancelled = current.cancelling()
+                    for _ in range(newly_cancelled):
+                        current.uncancel()
+                    cancellations += newly_cancelled
+                continue
+            except BaseException:  # noqa: BLE001 - drain before sanitizing
+                break
+        if task.cancelled():
+            return _DRAIN_FAILED
+        try:
+            return task.result()
+        except BaseException:  # noqa: BLE001 - caller receives a safe failure
+            return _DRAIN_FAILED
+    finally:
+        if current is not None:
+            for _ in range(cancellations):
+                current.cancel()
+
+
+async def _await_task_drained(awaitable: Awaitable[Any]) -> Any:
+    """Await an operation without orphaning it when the caller is cancelled."""
+
+    task = asyncio.ensure_future(awaitable)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await _drain_cancelled_task(task)
+        raise
+
+
+async def _await_before_deadline(
+    awaitable: Awaitable[Any], deadline: float, *, timeout_code: str
+) -> Any:
+    """Await one operation and drain it before reporting timeout/cancellation."""
+
+    task = asyncio.ensure_future(awaitable)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        task.cancel()
+        await _drain_cancelled_task(task)
+        raise CredentialRefreshError(timeout_code)
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+    except TimeoutError:
+        task.cancel()
+        await _drain_cancelled_task(task)
+        raise CredentialRefreshError(timeout_code)
+    except asyncio.CancelledError:
+        await _drain_cancelled_task(task)
+        raise
+
+
+def _is_async_refresh_callback(callback: object) -> bool:
+    return inspect.iscoroutinefunction(callback) or inspect.iscoroutinefunction(
+        type(callback).__call__
+    )
+
+
 def _fingerprint(credentials: OpenAICodexCredentials) -> bytes:
     digest = hashlib.sha256()
     for value in (
@@ -519,6 +596,8 @@ class _CredentialPathMixin:
     max_file_bytes: int
     _anchor_fd: int
     _parent_identity: tuple[int, int]
+    _parent_metadata: tuple[int, int, int, int]
+    _filesystem_supported: bool
 
     @staticmethod
     def _supported() -> bool:
@@ -536,8 +615,11 @@ class _CredentialPathMixin:
         )
         return all(required)
 
-    def _open_trusted_anchor(self) -> int:
-        if not self._supported():
+    def _open_configured_parent(self) -> int:
+        supported = getattr(self, "_filesystem_supported", None)
+        if supported is None:
+            supported = self._supported()
+        if not supported:
             raise CredentialPermissionError("unsupported_filesystem")
         flags = os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW | _O_CLOEXEC
         current: int | None = None
@@ -591,6 +673,9 @@ class _CredentialPathMixin:
                 os.close(root)
         return current
 
+    def _open_trusted_anchor(self) -> int:
+        return self._open_configured_parent()
+
     def _validate_anchor(self, descriptor: int) -> CodexCredentialError | None:
         try:
             info = os.fstat(descriptor)
@@ -598,7 +683,24 @@ class _CredentialPathMixin:
             return CredentialPermissionError("parent_stat_failed")
         if (info.st_dev, info.st_ino) != self._parent_identity:
             return CredentialPermissionError("parent_changed_identity")
+        if (
+            info.st_uid,
+            info.st_gid,
+            stat.S_IMODE(info.st_mode),
+        ) != self._parent_metadata[1:]:
+            return CredentialPermissionError("parent_changed_metadata")
         return _directory_error(info)
+
+    def _validate_configured_parent(self) -> CodexCredentialError | None:
+        try:
+            descriptor = self._open_configured_parent()
+        except CodexCredentialError as error:
+            return error
+        try:
+            return self._validate_anchor(descriptor)
+        finally:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
 
     def _lock_marker_error(self, parent_fd: int) -> CodexCredentialError | None:
         try:
@@ -613,11 +715,19 @@ class _CredentialPathMixin:
         # is never created by this backend; any marker is treated as tampering.
         return CredentialLockError("lock_marker_present")
 
+    def _assert_current_parent(self, parent_fd: int) -> None:
+        failure = self._validate_anchor(parent_fd) or self._validate_configured_parent()
+        if failure is not None:
+            raise failure
+
     def _open_operation_parent(self) -> tuple[int | None, CodexCredentialError | None]:
         flags = os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW | _O_CLOEXEC
         anchor_fd = getattr(self, "_anchor_fd", None)
         if type(anchor_fd) is not int:
             return None, CredentialPermissionError("backend_closed")
+        failure = self._validate_configured_parent()
+        if failure is not None:
+            return None, failure
         try:
             descriptor = os.open(".", flags, dir_fd=anchor_fd)
         except OSError:
@@ -625,6 +735,11 @@ class _CredentialPathMixin:
         failure = self._validate_anchor(descriptor) or self._lock_marker_error(
             descriptor
         )
+        if failure is None:
+            # Re-open the configured path after opening the lock descriptor.  The
+            # descriptor-relative operation remains anchored, but a recreated
+            # pathname must never silently acquire the old directory's lock.
+            failure = self._validate_configured_parent()
         if failure is not None:
             with contextlib.suppress(OSError):
                 os.close(descriptor)
@@ -647,7 +762,9 @@ class _CredentialPathMixin:
             with contextlib.suppress(OSError):
                 os.close(descriptor)
             return None, CredentialLockError("lock_acquire_failed")
-        failure = self._lock_marker_error(descriptor)
+        failure = (
+            self._lock_marker_error(descriptor) or self._validate_configured_parent()
+        )
         if failure is not None:
             self._release_fd(descriptor)
             return None, failure
@@ -697,9 +814,15 @@ class _CredentialPathMixin:
             except asyncio.CancelledError:
                 # The attempt is non-blocking.  Own and drain it before closing
                 # a descriptor so cancellation cannot strand a process lock.
-                descriptor, _failure = await asyncio.shield(task)
-                if descriptor is not None:
-                    await asyncio.to_thread(self._release_fd, descriptor)
+                outcome = await _drain_cancelled_task(task)
+                if outcome is not _DRAIN_FAILED:
+                    descriptor, _failure = cast(
+                        tuple[int | None, CodexCredentialError | None], outcome
+                    )
+                    if descriptor is not None:
+                        await _await_task_drained(
+                            asyncio.to_thread(self._release_fd, descriptor)
+                        )
                 raise
             if failure is not None:
                 raise failure
@@ -752,6 +875,7 @@ class _CredentialPathMixin:
         return descriptor, None
 
     def _read_unlocked(self, parent_fd: int) -> OpenAICodexCredentials:
+        self._assert_current_parent(parent_fd)
         expected, failure = self._stat_target(parent_fd, require_mode=True)
         if failure is not None:
             raise failure
@@ -800,6 +924,10 @@ class _CredentialPathMixin:
                     current.st_ino,
                 ) != (expected.st_dev, expected.st_ino):
                     read_failure = CredentialPermissionError("target_changed_identity")
+                else:
+                    parent_failure = self._validate_configured_parent()
+                    if parent_failure is not None:
+                        read_failure = parent_failure
         finally:
             with contextlib.suppress(OSError):
                 os.close(descriptor)
@@ -822,6 +950,7 @@ class _CredentialPathMixin:
         *,
         allow_insecure_existing: bool,
     ) -> None:
+        self._assert_current_parent(parent_fd)
         data = _serialized_credentials(credentials, path=self.path)
         existing, failure = self._stat_target(
             parent_fd, require_mode=not allow_insecure_existing
@@ -914,6 +1043,7 @@ class _CredentialPathMixin:
             ):
                 write_failure = CredentialPermissionError("target_changed_identity")
                 raise write_failure
+            self._assert_current_parent(parent_fd)
             try:
                 os.rename(
                     temporary_name,
@@ -926,6 +1056,7 @@ class _CredentialPathMixin:
             except OSError:
                 write_failure = CredentialPersistenceError("atomic_replace_failed")
                 raise write_failure
+            self._assert_current_parent(parent_fd)
 
             published, failure = self._stat_target(parent_fd, require_mode=True)
             if failure is not None:
@@ -957,6 +1088,7 @@ class _CredentialPathMixin:
     def _save_unlocked(
         self, parent_fd: int, credentials: OpenAICodexCredentials
     ) -> None:
+        self._assert_current_parent(parent_fd)
         existing, failure = self._stat_target(parent_fd, require_mode=True)
         if failure is not None:
             raise failure
@@ -971,6 +1103,7 @@ class _CredentialPathMixin:
         self, parent_fd: int, credentials: OpenAICodexCredentials
     ) -> None:
         # Recovery still rejects symlinks, non-files, hardlinks, and foreign owners.
+        self._assert_current_parent(parent_fd)
         self._write_atomic_unlocked(
             parent_fd, credentials, allow_insecure_existing=True
         )
@@ -1006,30 +1139,57 @@ class _CredentialPathMixin:
         finally:
             self._release_fd(descriptor)
 
-    async def _await_blocking(self, function: Callable[..., Any], *args: Any) -> Any:
-        task = asyncio.create_task(asyncio.to_thread(function, *args))
+    async def _await_blocking(
+        self,
+        function: Callable[..., Any],
+        *args: Any,
+        deadline: float | None = None,
+    ) -> Any:
+        if deadline is not None and time.monotonic() > deadline:
+            raise CredentialRefreshError("refresh_timeout")
         try:
-            return await asyncio.shield(task)
+            result = await _await_task_drained(asyncio.to_thread(function, *args))
         except asyncio.CancelledError:
-            # Drain bounded local I/O before the caller closes the descriptor.
-            await asyncio.shield(task)
             raise
+        except BaseException:
+            if deadline is not None and time.monotonic() > deadline:
+                raise CredentialRefreshError("refresh_timeout")
+            raise
+        if deadline is not None and time.monotonic() > deadline:
+            raise CredentialRefreshError("refresh_timeout")
+        return result
 
-    async def _read_locked_async(self, descriptor: int) -> OpenAICodexCredentials:
+    async def _read_locked_async(
+        self, descriptor: int, *, deadline: float | None = None
+    ) -> OpenAICodexCredentials:
         return cast(
             OpenAICodexCredentials,
-            await self._await_blocking(self._read_unlocked, descriptor),
+            await self._await_blocking(
+                self._read_unlocked, descriptor, deadline=deadline
+            ),
         )
 
     async def _save_locked_async(
-        self, descriptor: int, value: OpenAICodexCredentials
+        self,
+        descriptor: int,
+        value: OpenAICodexCredentials,
+        *,
+        deadline: float | None = None,
     ) -> None:
-        await self._await_blocking(self._save_unlocked, descriptor, value)
+        await self._await_blocking(
+            self._save_unlocked, descriptor, value, deadline=deadline
+        )
 
     async def _recover_locked_async(
-        self, descriptor: int, value: OpenAICodexCredentials
+        self,
+        descriptor: int,
+        value: OpenAICodexCredentials,
+        *,
+        deadline: float | None = None,
     ) -> None:
-        await self._await_blocking(self._recover_unlocked, descriptor, value)
+        await self._await_blocking(
+            self._recover_unlocked, descriptor, value, deadline=deadline
+        )
 
 
 class FileCodexCredentialBackend(_CredentialPathMixin):
@@ -1075,6 +1235,7 @@ class FileCodexCredentialBackend(_CredentialPathMixin):
             code="refresh_timeout must be finite and bounded",
         )
         self.lock_path = Path(f"{self.path}.lock")
+        self._filesystem_supported = self._supported()
         self._anchor_fd = self._open_trusted_anchor()
         try:
             info = os.fstat(self._anchor_fd)
@@ -1084,9 +1245,13 @@ class FileCodexCredentialBackend(_CredentialPathMixin):
         if info is None:
             raise CredentialPermissionError("parent_stat_failed")
         self._parent_identity = (info.st_dev, info.st_ino)
+        self._parent_metadata = (
+            info.st_dev,
+            info.st_uid,
+            info.st_gid,
+            stat.S_IMODE(info.st_mode),
+        )
         self._last_fingerprint: bytes | None = None
-        self._callback_tasks: set[asyncio.Task[Any]] = set()
-        self._callback_lock = threading.Lock()
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(application_owned=True)"
@@ -1105,7 +1270,7 @@ class FileCodexCredentialBackend(_CredentialPathMixin):
         value: object | None = None
         failure: CodexCredentialError | None = None
         try:
-            value = await asyncio.to_thread(self._load_sync)
+            value = await _await_task_drained(asyncio.to_thread(self._load_sync))
         except asyncio.CancelledError:
             raise
         except CodexCredentialError as error:
@@ -1121,7 +1286,7 @@ class FileCodexCredentialBackend(_CredentialPathMixin):
     async def save(self, credentials: OpenAICodexCredentials) -> None:
         failure: CodexCredentialError | None = None
         try:
-            await asyncio.to_thread(self._save_sync, credentials)
+            await _await_task_drained(asyncio.to_thread(self._save_sync, credentials))
         except asyncio.CancelledError:
             raise
         except CodexCredentialError as error:
@@ -1136,7 +1301,9 @@ class FileCodexCredentialBackend(_CredentialPathMixin):
     async def recover(self, credentials: OpenAICodexCredentials) -> None:
         failure: CodexCredentialError | None = None
         try:
-            await asyncio.to_thread(self._recover_sync, credentials)
+            await _await_task_drained(
+                asyncio.to_thread(self._recover_sync, credentials)
+            )
         except asyncio.CancelledError:
             raise
         except CodexCredentialError as error:
@@ -1156,7 +1323,7 @@ class FileCodexCredentialBackend(_CredentialPathMixin):
         try:
             yield None
         finally:
-            await asyncio.to_thread(self._release_fd, descriptor)
+            await _await_task_drained(asyncio.to_thread(self._release_fd, descriptor))
 
     @contextlib.contextmanager
     def refresh_lock_sync(self, *, timeout: float | None = None):
@@ -1172,50 +1339,18 @@ class FileCodexCredentialBackend(_CredentialPathMixin):
         current: OpenAICodexCredentials,
         deadline: float,
     ) -> object:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        if not _is_async_refresh_callback(callback):
+            raise CredentialRefreshError("refresh_callback_async_required")
+        if time.monotonic() > deadline:
             raise CredentialRefreshError("refresh_timeout")
-        callback_callable = inspect.iscoroutinefunction(
-            callback
-        ) or inspect.iscoroutinefunction(type(callback).__call__)
-        if callback_callable:
-            result = callback(current)
-        else:
-            task = asyncio.create_task(asyncio.to_thread(callback, current))
-            with self._callback_lock:
-                self._callback_tasks.add(task)
-            task.add_done_callback(self._consume_callback_task)
-            callback_failure: str | None = None
-            try:
-                result = await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
-            except TimeoutError:
-                callback_failure = "refresh_callback_timeout"
-                result = None
-            if callback_failure is not None:
-                raise CredentialRefreshError(callback_failure)
-        if inspect.isawaitable(result):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise CredentialRefreshError("refresh_timeout")
-            callback_failure = None
-            try:
-                awaited_result = await asyncio.wait_for(
-                    cast(Awaitable[Any], result), timeout=remaining
-                )
-            except TimeoutError:
-                callback_failure = "refresh_callback_timeout"
-                awaited_result = None
-            if callback_failure is not None:
-                raise CredentialRefreshError(callback_failure)
-            return awaited_result
-        return result
-
-    def _consume_callback_task(self, task: asyncio.Task[Any]) -> None:
-        with self._callback_lock:
-            self._callback_tasks.discard(task)
-        if not task.cancelled():
-            with contextlib.suppress(BaseException):
-                task.exception()
+        result = callback(current)
+        if not inspect.isawaitable(result):
+            raise CredentialRefreshError("refresh_callback_async_required")
+        return await _await_before_deadline(
+            cast(Awaitable[Any], result),
+            deadline,
+            timeout_code="refresh_callback_timeout",
+        )
 
     async def refresh(
         self,
@@ -1259,8 +1394,11 @@ class FileCodexCredentialBackend(_CredentialPathMixin):
         )
         deadline = time.monotonic() + duration
         descriptor = await self._acquire_async(max(0.0, deadline - time.monotonic()))
+        if time.monotonic() > deadline:
+            await _await_task_drained(asyncio.to_thread(self._release_fd, descriptor))
+            raise CredentialRefreshError("refresh_timeout")
         try:
-            current = await self._read_locked_async(descriptor)
+            current = await self._read_locked_async(descriptor, deadline=deadline)
             if expected is not None and not _same_credentials(current, expected):
                 self._last_fingerprint = _fingerprint(current)
                 return current
@@ -1291,7 +1429,9 @@ class FileCodexCredentialBackend(_CredentialPathMixin):
             if time.monotonic() > deadline:
                 raise CredentialRefreshError("refresh_timeout")
             try:
-                await self._save_locked_async(descriptor, rotated)
+                await self._save_locked_async(descriptor, rotated, deadline=deadline)
+            except CredentialRefreshError:
+                raise
             except CredentialPersistenceError as error:
                 persistence_code = error.code
                 persistence_failure = CredentialPersistenceError(persistence_code)
@@ -1303,10 +1443,12 @@ class FileCodexCredentialBackend(_CredentialPathMixin):
                 persistence_failure = None
             if persistence_failure is not None:
                 raise persistence_failure
+            if time.monotonic() > deadline:
+                raise CredentialRefreshError("refresh_timeout")
             self._last_fingerprint = _fingerprint(rotated)
             return rotated
         finally:
-            await asyncio.to_thread(self._release_fd, descriptor)
+            await _await_task_drained(asyncio.to_thread(self._release_fd, descriptor))
 
     def load_sync(self) -> OpenAICodexCredentials:
         failure: CodexCredentialError | None = None
@@ -1379,51 +1521,13 @@ class FileCodexCredentialBackend(_CredentialPathMixin):
         expected: OpenAICodexCredentials | None,
         timeout: float | None,
     ) -> OpenAICodexCredentials:
+        del expected, timeout
         if not callable(refresh_callback):
             raise CredentialRefreshError("refresh_callback_invalid")
-        duration = _validate_duration(
-            timeout,
-            default=self.refresh_timeout,
-            maximum=_MAX_REFRESH_TIMEOUT,
-            code="refresh_timeout must be finite and bounded",
-        )
-        deadline = time.monotonic() + duration
-        descriptor = self._acquire_sync(max(0.0, deadline - time.monotonic()))
-        try:
-            current = self._read_unlocked(descriptor)
-            if expected is not None and not _same_credentials(current, expected):
-                self._last_fingerprint = _fingerprint(current)
-                return current
-            try:
-                candidate = refresh_callback(current)
-                if inspect.isawaitable(candidate):
-                    raise CredentialRefreshError("refresh_callback_async")
-            except CredentialRefreshError as error:
-                callback_code = error.code
-                candidate = None
-            except BaseException:  # noqa: BLE001 - callback details are untrusted
-                callback_code = "refresh_callback_failed"
-                candidate = None
-            else:
-                callback_code = None
-            if callback_code is not None:
-                raise CredentialRefreshError(callback_code)
-            invalid_result = False
-            try:
-                rotated = _coerce_credentials(candidate, path=self.path)
-            except BaseException:  # noqa: BLE001 - callback result is untrusted
-                invalid_result = True
-                rotated = None
-            if invalid_result:
-                raise CredentialRefreshError("refresh_result_invalid")
-            assert rotated is not None
-            if time.monotonic() > deadline:
-                raise CredentialRefreshError("refresh_timeout")
-            self._save_unlocked(descriptor, rotated)
-            self._last_fingerprint = _fingerprint(rotated)
-            return rotated
-        finally:
-            self._release_fd(descriptor)
+        # There is no killable, portable way to bound an arbitrary synchronous
+        # callback while this method owns the refresh lock.  Keep the legacy
+        # entry point fail-closed rather than invoking one.
+        raise CredentialRefreshError("refresh_callback_async_required")
 
 
 class OpenAICodexCredentialSource:
@@ -1518,6 +1622,10 @@ class OpenAICodexCredentialSource:
         expected: OpenAICodexCredentials | None = None,
         timeout: float | None = None,
     ) -> OpenAICodexCredentials:
+        if not callable(refresh_callback):
+            raise CredentialRefreshError("refresh_callback_invalid")
+        if not _is_async_refresh_callback(refresh_callback):
+            raise CredentialRefreshError("refresh_callback_async_required")
         duration = _validate_duration(
             timeout,
             default=self.refresh_timeout,
@@ -1532,10 +1640,13 @@ class OpenAICodexCredentialSource:
                     refresh_callback, expected=expected, timeout=duration
                 )
             else:
-                async with asyncio.timeout(duration):
-                    value = await self._backend.refresh(
+                value = await _await_before_deadline(
+                    self._backend.refresh(
                         refresh_callback, expected=expected, timeout=duration
-                    )
+                    ),
+                    time.monotonic() + duration,
+                    timeout_code="refresh_timeout",
+                )
         except asyncio.CancelledError:
             raise
         except TimeoutError:
@@ -1628,13 +1739,95 @@ FileCredentialSource = OpenAICodexCredentialSource
 # Bounded provider pressure
 
 
+class ProviderGeneration:
+    """Validated, bounded sequence identity for one pressure scope."""
+
+    __slots__ = ("scope", "sequence")
+
+    def __init__(self, scope: int, sequence: int) -> None:
+        if type(scope) is not int or type(sequence) is not int:
+            raise TypeError("generation scope and sequence must be integers")
+        if not 0 <= scope <= _MAX_GENERATION_VALUE:
+            raise ValueError("generation scope is out of bounds")
+        if not 1 <= sequence <= _MAX_GENERATION_VALUE:
+            raise ValueError("generation sequence is out of bounds")
+        self.scope = scope
+        self.sequence = sequence
+
+    def __repr__(self) -> str:
+        return f"<ProviderGeneration scope={self.scope} sequence={self.sequence}>"
+
+    def __hash__(self) -> int:
+        return hash((self.scope, self.sequence))
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            type(other) is ProviderGeneration
+            and self.scope == other.scope
+            and self.sequence == other.sequence
+        )
+
+
+class ProviderCompletion:
+    """Opaque outcome returned when a generation was already settled."""
+
+    __slots__ = ("status",)
+
+    def __init__(self, status: str = "completed") -> None:
+        self.status = _safe_code(status, "completed")
+
+    def __repr__(self) -> str:
+        return f"<ProviderCompletion status={self.status!r}>"
+
+
+class _CompletionMetadata:
+    __slots__ = ("status",)
+
+    def __init__(self, status: str) -> None:
+        self.status = _safe_code(status, "completed")
+
+
+class _ScrubbableFuture(asyncio.Future[None]):
+    """Signal completion without storing the operation result in the Future."""
+
+    __slots__ = ("_delivery",)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._delivery: Any = None
+
+    def set_result(self, result: Any) -> None:
+        # asyncio.Future keeps its result for the lifetime of the object.  Keep
+        # the credential in a private delivery slot only while participants can
+        # still observe it, and resolve the actual Future with a null signal.
+        self._delivery = result
+        super().set_result(None)
+
+    def delivered_result(self) -> Any:
+        return self._delivery
+
+    def scrub(self) -> None:
+        self._delivery = None
+
+
+class _SharedOperation:
+    __slots__ = ("future", "participants")
+
+    def __init__(self, future: asyncio.Future[Any]) -> None:
+        self.future: asyncio.Future[Any] | None = future
+        self.participants = 1
+
+
 class ProviderAdmission:
     """A capacity lease owned by :class:`ProviderPressure`."""
 
     __slots__ = ("_identity", "_pressure", "generation")
 
     def __init__(
-        self, pressure: ProviderPressure, generation: Hashable | None, identity: int
+        self,
+        pressure: ProviderPressure,
+        generation: ProviderGeneration | None,
+        identity: int,
     ) -> None:
         self._pressure = pressure
         self.generation = generation
@@ -1654,14 +1847,13 @@ class ProviderAdmission:
 
 
 class ProviderPressure:
-    """Finite provider concurrency with immediate wakeups and single-flight.
+    """Finite provider concurrency with secret-free, bounded single-flight state.
 
-    The queue, active operations, retained generations, and rate-limit
-    observations are all bounded.  A logical generation is retained in a small
-    LRU of completed safe futures, so repeated retry requests cannot re-run a
-    completed operation merely because another generation was observed in
-    between.  Futures may contain a successful provider result internally, but
-    they are never serialized or rendered as telemetry.
+    An active future can deliver an operation's result to its current owner and
+    waiters.  It is scrubbed as soon as those participants settle.  Completed
+    state contains only a safe status code; a replayed generation therefore
+    cannot recover a credential or re-run a refresh after bounded metadata is
+    evicted.
     """
 
     def __init__(
@@ -1672,6 +1864,7 @@ class ProviderPressure:
         max_backoff: float = _DEFAULT_MAX_BACKOFF,
         max_queue: int = _DEFAULT_MAX_QUEUE,
         max_retained_generations: int = _DEFAULT_MAX_RETAINED_GENERATIONS,
+        max_generation_scopes: int = _DEFAULT_MAX_GENERATION_SCOPES,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if type(capacity) is not int or capacity < 1:
@@ -1680,9 +1873,12 @@ class ProviderPressure:
             raise ValueError("max_queue must be a positive integer")
         if type(max_retained_generations) is not int or max_retained_generations < 1:
             raise ValueError("max_retained_generations must be a positive integer")
+        if type(max_generation_scopes) is not int or max_generation_scopes < 1:
+            raise ValueError("max_generation_scopes must be a positive integer")
         self.capacity = capacity
         self.max_queue = max_queue
         self.max_retained_generations = max_retained_generations
+        self.max_generation_scopes = max_generation_scopes
         self.admission_timeout = _validate_duration(
             admission_timeout,
             default=_DEFAULT_ADMISSION_TIMEOUT,
@@ -1705,11 +1901,30 @@ class ProviderPressure:
         self._in_flight = 0
         self._blocked_until = 0.0
         self._leases: dict[int, ProviderAdmission] = {}
-        self._active: dict[Hashable, asyncio.Future[Any]] = {}
-        self._completed: OrderedDict[Hashable, asyncio.Future[Any]] = OrderedDict()
-        self._rate_limit_generations: OrderedDict[Hashable, None] = OrderedDict()
-        self._rate_limit_deadlines: OrderedDict[Hashable, float] = OrderedDict()
-        self._anonymous_generation = 0
+        self._scopes = {0}
+        self._next_scope = 1
+        self._generation_high_water: dict[int, int] = {0: 0}
+        self._active: dict[ProviderGeneration, _SharedOperation] = {}
+        self._completed: OrderedDict[ProviderGeneration, _CompletionMetadata] = (
+            OrderedDict()
+        )
+        self._rate_limit_high_water: dict[int, int] = {0: 0}
+        self._rate_limit_deadlines: dict[int, float] = {}
+
+    def __repr__(self) -> str:
+        return "<ProviderPressure bounded application state>"
+
+    def new_scope(self) -> int:
+        """Reserve one bounded provider scope for a shared pressure object."""
+
+        if len(self._scopes) >= self.max_generation_scopes:
+            raise ProviderOperationError("generation_scope_limit")
+        scope = self._next_scope
+        self._next_scope += 1
+        self._scopes.add(scope)
+        self._generation_high_water[scope] = 0
+        self._rate_limit_high_water[scope] = 0
+        return scope
 
     def _bind_loop(self) -> asyncio.AbstractEventLoop:
         try:
@@ -1726,9 +1941,35 @@ class ProviderPressure:
             raise ProviderLoopError()
         return loop
 
-    def _assert_generation(self, generation: Hashable) -> None:
-        if not isinstance(generation, Hashable):
-            raise TypeError("generation must be hashable")
+    def _normalize_generation(
+        self, generation: object | None, *, allow_none: bool = True
+    ) -> ProviderGeneration | None:
+        if generation is None:
+            if allow_none:
+                return None
+            raise TypeError("generation is required")
+        if type(generation) is int:
+            scope = 0
+            sequence = generation
+        elif type(generation) is ProviderGeneration:
+            scope = generation.scope
+            sequence = generation.sequence
+        else:
+            raise TypeError("generation must be a bounded integer sequence")
+        if type(scope) is not int or type(sequence) is not int:
+            raise TypeError("generation scope and sequence must be integers")
+        if not 0 <= scope <= _MAX_GENERATION_VALUE:
+            raise ValueError("generation scope is out of bounds")
+        if not 1 <= sequence <= _MAX_GENERATION_VALUE:
+            raise ValueError("generation sequence is out of bounds")
+        if scope not in self._scopes:
+            raise ValueError("generation scope is not registered")
+        return ProviderGeneration(scope, sequence)
+
+    def _assert_generation(self, generation: object) -> ProviderGeneration:
+        normalized = self._normalize_generation(generation, allow_none=False)
+        assert normalized is not None
+        return normalized
 
     @property
     def queued(self) -> int:
@@ -1771,8 +2012,13 @@ class ProviderPressure:
         if loop.is_closed():
             raise ProviderLoopError("event_loop_closed")
 
+    def _recompute_pressure(self) -> None:
+        self._blocked_until = max(
+            self._rate_limit_deadlines.values(), default=self._clock()
+        )
+
     def observe_rate_limit(
-        self, retry_after: float | None, *, generation: Hashable | None = None
+        self, retry_after: float | None, *, generation: object | None = None
     ) -> None:
         self._require_sync_loop()
         if retry_after is None:
@@ -1781,42 +2027,31 @@ class ProviderPressure:
             float(retry_after)
         ):
             return
-        if generation is not None:
-            self._assert_generation(generation)
-            key = generation
-            if key in self._rate_limit_generations:
-                return
-            self._rate_limit_generations[key] = None
-            self._rate_limit_generations.move_to_end(key)
-        else:
-            self._anonymous_generation += 1
-            key = ("anonymous", self._anonymous_generation)
-            self._rate_limit_generations[key] = None
+        normalized = self._normalize_generation(generation)
+        if normalized is None:
+            current = self._rate_limit_high_water[0]
+            if current >= _MAX_GENERATION_VALUE:
+                raise ProviderOperationError("generation_exhausted")
+            normalized = ProviderGeneration(0, current + 1)
+        high_water = self._rate_limit_high_water[normalized.scope]
+        if normalized.sequence <= high_water:
+            return
+        self._rate_limit_high_water[normalized.scope] = normalized.sequence
         delay = max(0.0, min(float(retry_after), self.max_backoff))
-        self._rate_limit_deadlines[key] = self._clock() + delay
-        self._rate_limit_deadlines.move_to_end(key)
-        while len(self._rate_limit_generations) > self.max_retained_generations:
-            old, _ = self._rate_limit_generations.popitem(last=False)
-            self._rate_limit_deadlines.pop(old, None)
-        self._blocked_until = max(
-            self._rate_limit_deadlines.values(), default=self._clock()
-        )
+        self._rate_limit_deadlines[normalized.scope] = self._clock() + delay
+        self._recompute_pressure()
         self._wake_waiters()
 
     record_rate_limit = observe_rate_limit
 
-    def clear_pressure(self, *, generation: Hashable | None = None) -> None:
+    def clear_pressure(self, *, generation: object | None = None) -> None:
         self._require_sync_loop()
-        if generation is not None:
-            self._assert_generation(generation)
-            self._rate_limit_deadlines.pop(generation, None)
-            self._rate_limit_generations.pop(generation, None)
-        else:
+        normalized = self._normalize_generation(generation)
+        if normalized is None:
             self._rate_limit_deadlines.clear()
-            self._rate_limit_generations.clear()
-        self._blocked_until = max(
-            self._rate_limit_deadlines.values(), default=self._clock()
-        )
+        elif normalized.sequence == self._rate_limit_high_water[normalized.scope]:
+            self._rate_limit_deadlines.pop(normalized.scope, None)
+        self._recompute_pressure()
         self._wake_waiters()
 
     def _release(self, lease: ProviderAdmission) -> None:
@@ -1828,11 +2063,10 @@ class ProviderPressure:
         self._wake_waiters()
 
     async def acquire(
-        self, *, timeout: float | None = None, generation: Hashable | None = None
+        self, *, timeout: float | None = None, generation: object | None = None
     ) -> ProviderAdmission:
         self._bind_loop()
-        if generation is not None:
-            self._assert_generation(generation)
+        normalized = self._normalize_generation(generation)
         duration = _validate_duration(
             timeout,
             default=self.admission_timeout,
@@ -1858,7 +2092,7 @@ class ProviderPressure:
                 ):
                     self._queue.popleft()
                     self._in_flight += 1
-                    lease = ProviderAdmission(self, generation, id(ticket))
+                    lease = ProviderAdmission(self, normalized, id(ticket))
                     self._leases[id(ticket)] = lease
                     return lease
                 remaining = deadline - now
@@ -1883,7 +2117,7 @@ class ProviderPressure:
 
     @asynccontextmanager
     async def slot(
-        self, *, timeout: float | None = None, generation: Hashable | None = None
+        self, *, timeout: float | None = None, generation: object | None = None
     ) -> AsyncIterator[ProviderAdmission]:
         lease = await self.acquire(timeout=timeout, generation=generation)
         try:
@@ -1891,31 +2125,73 @@ class ProviderPressure:
         finally:
             lease.release()
 
+    @staticmethod
+    def _scrub_future(future: asyncio.Future[Any]) -> None:
+        # asyncio.Future has no public clear-result API.  This is performed only
+        # after every participant has settled, never while a waiter can observe
+        # the delivery.
+        if isinstance(future, _ScrubbableFuture):
+            future.scrub()
+        with contextlib.suppress(AttributeError):
+            future._result = None  # type: ignore[attr-defined]
+        with contextlib.suppress(AttributeError):
+            future._exception = None  # type: ignore[attr-defined]
+        with contextlib.suppress(AttributeError):
+            future._log_traceback = False  # type: ignore[attr-defined]
+        with contextlib.suppress(AttributeError):
+            future._callbacks = None  # type: ignore[attr-defined]
+
+    async def _settle_participant(self, shared: _SharedOperation) -> None:
+        assert self._state_lock is not None
+        async with self._state_lock:
+            shared.participants = max(0, shared.participants - 1)
+            if shared.participants == 0 and shared.future is not None:
+                future = shared.future
+                self._scrub_future(future)
+                shared.future = None
+
     async def run(
         self,
-        generation: Hashable,
+        generation: object,
         operation: Callable[[], Any | Awaitable[Any]],
         *,
         timeout: float | None = None,
     ) -> Any:
         self._bind_loop()
-        self._assert_generation(generation)
+        normalized = self._assert_generation(generation)
         if not callable(operation):
             raise TypeError("operation must be callable")
         assert self._state_lock is not None
+        owner = False
+        shared: _SharedOperation | None = None
         async with self._state_lock:
-            shared = self._completed.get(generation)
-            owner = False
+            shared = self._active.get(normalized)
             if shared is not None:
-                self._completed.move_to_end(generation)
+                shared.participants += 1
             else:
-                shared = self._active.get(generation)
-                if shared is None:
-                    shared = asyncio.get_running_loop().create_future()
-                    self._active[generation] = shared
-                    owner = True
+                high_water = self._generation_high_water[normalized.scope]
+                if normalized.sequence <= high_water or normalized in self._completed:
+                    metadata = self._completed.get(normalized)
+                    return ProviderCompletion(
+                        metadata.status if metadata is not None else "replayed"
+                    )
+                self._generation_high_water[normalized.scope] = normalized.sequence
+                future = _ScrubbableFuture()
+                shared = _SharedOperation(future)
+                self._active[normalized] = shared
+                owner = True
+        assert shared is not None
         if not owner:
-            return await asyncio.shield(shared)
+            assert shared.future is not None
+            future = shared.future
+            try:
+                await asyncio.shield(future)
+                if isinstance(future, _ScrubbableFuture):
+                    return future.delivered_result()
+                return future.result()
+            finally:
+                cleanup = asyncio.create_task(self._settle_participant(shared))
+                await _await_task_drained(cleanup)
 
         failure_code: str | None = None
         cancelled = False
@@ -1928,13 +2204,15 @@ class ProviderPressure:
                 code="operation_timeout must be finite and bounded",
             )
             async with asyncio.timeout(duration):
-                async with self.slot(timeout=duration, generation=generation):
+                async with self.slot(timeout=duration, generation=normalized):
                     result = operation()
                     if inspect.isawaitable(result):
                         result = await result
         except asyncio.CancelledError:
             failure_code = "operation_cancelled"
             cancelled = True
+        except CredentialPersistenceError:
+            failure_code = "credential_persistence"
         except PressureAdmissionTimeoutError:
             failure_code = "admission_timeout"
         except ProviderQueueFullError:
@@ -1942,8 +2220,6 @@ class ProviderPressure:
         except TimeoutError:
             failure_code = "operation_timeout"
         except BaseException:  # noqa: BLE001 - every waiter receives a safe error
-            # This includes provider BaseException paths.  The original object
-            # is never placed in the shared future or re-raised to another waiter.
             failure_code = "operation_aborted"
 
         safe_failure: (
@@ -1959,27 +2235,32 @@ class ProviderPressure:
         elif failure_code is not None:
             safe_failure = ProviderOperationError(failure_code)
 
+        assert shared.future is not None
         if safe_failure is None:
-            if not shared.done():
-                shared.set_result(result)
+            shared.future.set_result(result)
+            completion_status = "completed"
         else:
-            if not shared.done():
-                shared.set_exception(safe_failure)
-                with contextlib.suppress(BaseException):
-                    shared.exception()
+            shared.future.set_exception(safe_failure)
+            with contextlib.suppress(BaseException):
+                shared.future.exception()
+            completion_status = safe_failure.code
 
         async with self._state_lock:
-            self._active.pop(generation, None)
-            self._completed[generation] = shared
-            self._completed.move_to_end(generation)
+            self._active.pop(normalized, None)
+            self._completed[normalized] = _CompletionMetadata(completion_status)
+            self._completed.move_to_end(normalized)
             while len(self._completed) > self.max_retained_generations:
                 self._completed.popitem(last=False)
 
-        if cancelled:
-            raise asyncio.CancelledError
-        if safe_failure is not None:
-            raise safe_failure
-        return result
+        try:
+            if cancelled:
+                raise asyncio.CancelledError
+            if safe_failure is not None:
+                raise safe_failure
+            return result
+        finally:
+            cleanup = asyncio.create_task(self._settle_participant(shared))
+            await _await_task_drained(cleanup)
 
 
 CodexProviderPressure = ProviderPressure

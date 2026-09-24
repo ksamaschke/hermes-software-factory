@@ -13,6 +13,7 @@ import stat
 import threading
 import time
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from software_factory.providers.openai_codex import (
@@ -27,6 +28,7 @@ from software_factory.providers.openai_codex import (
     OpenAICodexCredentials,
     OpenAICodexCredentialSource,
     PressureAdmissionTimeoutError,
+    ProviderCompletion,
     ProviderLoopError,
     ProviderOperationError,
     ProviderPressure,
@@ -142,15 +144,15 @@ def _cross_process_refresh_worker(
     old = credentials("old")
     new = credentials("new")
 
-    def rotate(current: OpenAICodexCredentials) -> OpenAICodexCredentials:
+    async def rotate(current: OpenAICodexCredentials) -> OpenAICodexCredentials:
         assert current == old
         with counter_lock:
             counter.value += 1
-        time.sleep(0.08)
+        await asyncio.sleep(0.08)
         return new
 
     try:
-        result = source.refresh_sync(rotate, expected=old, timeout=2.0)
+        result = asyncio.run(source.refresh(rotate, expected=old, timeout=2.0))
         result_queue.put(result == new)
     except Exception:  # noqa: BLE001 - child reports only a safe boolean
         result_queue.put(False)
@@ -191,8 +193,12 @@ def test_lock_timeout_is_bounded_and_cancellation_releases_lock(tmp_path: Path):
     async def probe() -> None:
         async with source.refresh_lock():
             with pytest.raises(CredentialLockTimeoutError):
+
+                async def callback(_current: OpenAICodexCredentials):
+                    return credentials("new")
+
                 await source.refresh(
-                    lambda _current: credentials("new"),
+                    callback,
                     expected=credentials("old"),
                     timeout=0.02,
                 )
@@ -397,9 +403,9 @@ async def _pressure_capacity_probe() -> None:
         await release.wait()
         active -= 1
 
-    first = asyncio.create_task(pressure.run("generation-one", operation))
+    first = asyncio.create_task(pressure.run(1, operation))
     await entered.wait()
-    second = asyncio.create_task(pressure.run("generation-two", operation))
+    second = asyncio.create_task(pressure.run(2, operation))
     await asyncio.sleep(0.02)
     assert pressure.queued == 1
     assert not second.done()
@@ -416,11 +422,11 @@ def test_provider_capacity_queues_without_duplicate_concurrency():
 def test_rate_limit_backoff_is_bounded_and_updates_admission_pressure():
     async def probe() -> None:
         pressure = ProviderPressure(1, admission_timeout=0.03, max_backoff=0.5)
-        pressure.observe_rate_limit(0.5, generation="retry-one")
+        pressure.observe_rate_limit(0.5, generation=1)
         assert pressure.pressure_state()["queued"] == 0
         with pytest.raises(PressureAdmissionTimeoutError):
             await pressure.acquire(timeout=0.02)
-        pressure.clear_pressure(generation="retry-one")
+        pressure.clear_pressure(generation=1)
         async with pressure.slot(timeout=0.1):
             assert pressure.in_flight == 1
 
@@ -441,10 +447,7 @@ def test_provider_single_flight_deduplicates_one_logical_retry_generation():
             await release.wait()
             return "safe-result"
 
-        tasks = [
-            asyncio.create_task(pressure.run("retry-generation", operation))
-            for _ in range(5)
-        ]
+        tasks = [asyncio.create_task(pressure.run(1, operation)) for _ in range(5)]
         await started.wait()
         await asyncio.sleep(0.01)
         assert calls == 1
@@ -463,7 +466,7 @@ def test_provider_operation_failures_are_redacted_for_shared_waiters():
             raise RuntimeError("access-one.synthetic refresh-one.synthetic")
 
         with pytest.raises(ProviderOperationError) as error:
-            await pressure.run("failure-generation", operation)
+            await pressure.run(1, operation)
         assert "synthetic" not in str(error.value)
 
     run(probe())
@@ -499,8 +502,12 @@ def test_secret_store_backend_protocol_keeps_source_api_stable():
     backend = MemoryBackend(credentials("old"))
     source = OpenAICodexCredentialSource(backend=backend)
     new = credentials("new")
+
+    async def rotate(_current: OpenAICodexCredentials) -> OpenAICodexCredentials:
+        return new
+
     assert run(source.load()) == credentials("old")
-    assert run(source.refresh(lambda _current: new, expected=credentials("old"))) == new
+    assert run(source.refresh(rotate, expected=credentials("old"))) == new
     assert run(source.save(new)) is None
     assert backend.saves == 2
     assert run(source.load()) == new
@@ -580,37 +587,43 @@ def test_hung_async_callback_times_out_and_releases_process_lock(tmp_path: Path)
     run(probe())
 
 
-def test_sync_callback_is_offloaded_and_bounded(tmp_path: Path):
+def test_sync_callback_is_rejected_before_invocation(tmp_path: Path):
     async def probe() -> None:
         source = OpenAICodexCredentialSource(tmp_path / "credentials.json")
         current = credentials("old")
         await source.save(current)
-        started = threading.Event()
-        ticked = asyncio.Event()
+        called = False
 
         def callback(_current: OpenAICodexCredentials):
-            started.set()
-            time.sleep(0.15)
+            nonlocal called
+            called = True
             return credentials("new")
 
-        async def ticker() -> None:
-            await asyncio.sleep(0.01)
-            ticked.set()
-
-        refresh = asyncio.create_task(
-            source.refresh(callback, expected=current, timeout=0.03)
-        )
-        tick = asyncio.create_task(ticker())
-        await asyncio.to_thread(started.wait, 1.0)
-        assert started.is_set()
         with pytest.raises(CredentialRefreshError) as raised:
-            await refresh
-        await tick
-        assert raised.value.code == "refresh_callback_timeout"
-        assert ticked.is_set()
+            await source.refresh(callback, expected=current, timeout=0.03)
+        assert raised.value.code == "refresh_callback_async_required"
+        assert not called
         assert await source.load() == current
 
     run(probe())
+
+
+def test_sync_refresh_entrypoint_rejects_before_lock_or_invocation(tmp_path: Path):
+    backend = FileCodexCredentialBackend(tmp_path / "credentials.json")
+    current = credentials("old")
+    backend.save_sync(current)
+    called = False
+
+    def callback(_current: OpenAICodexCredentials):
+        nonlocal called
+        called = True
+        return credentials("new")
+
+    with pytest.raises(CredentialRefreshError) as raised:
+        backend.refresh_sync(cast(Any, callback), expected=current, timeout=0.03)
+    assert raised.value.code == "refresh_callback_async_required"
+    assert not called
+    assert backend.load_sync() == current
 
 
 def test_descriptor_anchor_does_not_follow_parent_replacement(tmp_path: Path):
@@ -624,10 +637,25 @@ def test_descriptor_anchor_does_not_follow_parent_replacement(tmp_path: Path):
     redirected = tmp_path / "redirected-parent"
     redirected.mkdir()
     parent.symlink_to(redirected, target_is_directory=True)
-    backend.save_sync(credentials("anchored"))
+    with pytest.raises(CredentialPermissionError):
+        backend.save_sync(credentials("anchored"))
     assert not (redirected / "credentials.json").exists()
-    assert (moved / "credentials.json").exists()
-    assert backend.load_sync() == credentials("anchored")
+    assert not (moved / "credentials.json").exists()
+    with pytest.raises(CredentialPermissionError):
+        backend.load_sync()
+
+
+def test_descriptor_anchor_rejects_parent_metadata_change(tmp_path: Path):
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    parent.chmod(0o700)
+    backend = FileCodexCredentialBackend(parent / "credentials.json")
+    parent.chmod(0o750)
+    try:
+        with pytest.raises(CredentialPermissionError):
+            backend.save_sync(credentials("new"))
+    finally:
+        parent.chmod(0o700)
 
 
 def test_hardlink_retention_is_observed_before_publishing(tmp_path: Path, monkeypatch):
@@ -681,12 +709,12 @@ def test_lock_marker_replacement_fails_before_refresh(tmp_path: Path):
     outside = tmp_path / "outside-lock"
     outside.write_text("not-a-lock", encoding="utf-8")
     marker.symlink_to(outside)
+
+    async def callback(_current: OpenAICodexCredentials):
+        return credentials("new")
+
     with pytest.raises(CredentialLockError):
-        run(
-            source.refresh(
-                lambda _current: credentials("new"), expected=credentials("old")
-            )
-        )
+        run(source.refresh(callback, expected=credentials("old")))
     marker.unlink()
     assert run(source.load()) == credentials("old")
 
@@ -694,11 +722,11 @@ def test_lock_marker_replacement_fails_before_refresh(tmp_path: Path):
 def test_provider_pressure_wakes_clear_immediately_and_bounds_queue():
     async def probe() -> None:
         pressure = ProviderPressure(1, admission_timeout=1.0, max_queue=1)
-        pressure.observe_rate_limit(10.0, generation="pressure-a")
+        pressure.observe_rate_limit(10.0, generation=1)
         waiter = asyncio.create_task(pressure.acquire(timeout=0.5))
         await asyncio.sleep(0.02)
         assert not waiter.done()
-        pressure.clear_pressure(generation="pressure-a")
+        pressure.clear_pressure(generation=1)
         lease = await asyncio.wait_for(waiter, timeout=0.2)
         lease.release()
 
@@ -723,18 +751,18 @@ def test_provider_pressure_settles_waiters_on_base_exception_and_deduplicates_re
     async def probe() -> None:
         pressure = ProviderPressure(1, admission_timeout=0.5)
         started = asyncio.Event()
+        release = asyncio.Event()
 
         async def aborting_operation():
             started.set()
+            await release.wait()
             raise SyntheticAbort()
 
-        owner = asyncio.create_task(
-            pressure.run("abort-generation", aborting_operation)
-        )
+        owner = asyncio.create_task(pressure.run(1, aborting_operation))
         await started.wait()
-        waiter = asyncio.create_task(
-            pressure.run("abort-generation", aborting_operation)
-        )
+        waiter = asyncio.create_task(pressure.run(1, aborting_operation))
+        await asyncio.sleep(0)
+        release.set()
         with pytest.raises(ProviderOperationError):
             await owner
         with pytest.raises(ProviderOperationError):
@@ -749,9 +777,9 @@ def test_provider_pressure_settles_waiters_on_base_exception_and_deduplicates_re
             calls += 1
             return calls
 
-        assert await pressure.run("retained-a", operation) == 1
-        assert await pressure.run("retained-b", operation) == 2
-        assert await pressure.run("retained-a", operation) == 1
+        assert await pressure.run(2, operation) == 1
+        assert await pressure.run(3, operation) == 2
+        assert isinstance(await pressure.run(2, operation), ProviderCompletion)
         assert calls == 2
 
     run(probe())
@@ -766,12 +794,14 @@ def test_provider_pressure_bounds_operation_timeout_and_enforces_loop_affinity()
             await never.wait()
 
         with pytest.raises(ProviderOperationError) as raised:
-            await pressure.run("timeout-generation", hanging_operation, timeout=0.03)
+            await pressure.run(1, hanging_operation, timeout=0.03)
         assert raised.value.code == "operation_timeout"
         assert pressure.in_flight == 0
         assert pressure.queued == 0
-        with pytest.raises(ProviderOperationError):
-            await pressure.run("timeout-generation", lambda: "not-called", timeout=0.03)
+        assert isinstance(
+            await pressure.run(1, lambda: "not-called", timeout=0.03),
+            ProviderCompletion,
+        )
 
     run(timeout_probe())
     pressure = ProviderPressure()
@@ -789,13 +819,16 @@ def test_provider_pressure_bounds_operation_timeout_and_enforces_loop_affinity()
 def test_rate_limit_generation_deduplication_is_bounded():
     async def probe() -> None:
         pressure = ProviderPressure(max_retained_generations=2)
-        pressure.observe_rate_limit(0.5, generation="rate-a")
+        pressure.observe_rate_limit(0.5, generation=1)
         first_deadline = pressure.blocked_until
-        pressure.observe_rate_limit(0.5, generation="rate-a")
+        pressure.observe_rate_limit(0.5, generation=1)
         assert pressure.blocked_until == first_deadline
-        pressure.observe_rate_limit(0.5, generation="rate-b")
-        pressure.observe_rate_limit(0.5, generation="rate-c")
-        assert len(pressure._rate_limit_generations) <= 2
+        pressure.observe_rate_limit(0.5, generation=2)
+        pressure.observe_rate_limit(0.5, generation=3)
+        assert pressure._rate_limit_high_water[0] == 3
+        deadline = pressure.blocked_until
+        pressure.observe_rate_limit(0.5, generation=1)
+        assert pressure.blocked_until == deadline
 
     run(probe())
 
@@ -810,9 +843,9 @@ def test_provider_pressure_owner_cancellation_settles_shared_waiters():
             started.set()
             await never.wait()
 
-        owner = asyncio.create_task(pressure.run("cancel-generation", operation))
+        owner = asyncio.create_task(pressure.run(1, operation))
         await started.wait()
-        waiter = asyncio.create_task(pressure.run("cancel-generation", operation))
+        waiter = asyncio.create_task(pressure.run(1, operation))
         owner.cancel()
         with pytest.raises(asyncio.CancelledError):
             await owner
@@ -822,5 +855,116 @@ def test_provider_pressure_owner_cancellation_settles_shared_waiters():
         assert raised.value.__context__ is None
         assert pressure.in_flight == 0
         assert pressure.queued == 0
+
+    run(probe())
+
+
+def test_provider_pressure_scrubs_successful_results_and_rejects_old_replays():
+    async def probe() -> None:
+        pressure = ProviderPressure(max_retained_generations=1)
+        started = asyncio.Event()
+        release = asyncio.Event()
+        secret = credentials("pressure-secret")
+        calls = 0
+
+        async def operation():
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+            return secret
+
+        owner = asyncio.create_task(pressure.run(1, operation))
+        await started.wait()
+        shared = pressure._active[next(iter(pressure._active))]
+        future = shared.future
+        assert future is not None
+        waiter = asyncio.create_task(pressure.run(1, operation))
+        await asyncio.sleep(0)
+        release.set()
+        assert await owner == secret
+        assert await waiter == secret
+        assert future._result is None  # type: ignore[attr-defined]
+        assert future._exception is None  # type: ignore[attr-defined]
+        assert getattr(future, "_delivery", None) is None
+        assert not pressure._active
+        assert all(
+            type(value).__name__ == "_CompletionMetadata"
+            for value in pressure._completed.values()
+        )
+
+        for generation in range(2, 8):
+            assert (
+                await pressure.run(generation, lambda generation=generation: generation)
+                == generation
+            )
+        replay = await pressure.run(1, operation)
+        assert isinstance(replay, ProviderCompletion)
+        assert calls == 1
+
+    run(probe())
+
+
+def test_refresh_deadline_rejects_a_save_that_finishes_late(
+    tmp_path: Path, monkeypatch
+):
+    async def probe() -> None:
+        backend = FileCodexCredentialBackend(tmp_path / "credentials.json")
+        old = credentials("old")
+        new = credentials("new")
+        await backend.save(old)
+        original = backend._save_unlocked
+
+        def delayed_save(descriptor: int, value: OpenAICodexCredentials) -> None:
+            time.sleep(0.05)
+            original(descriptor, value)
+
+        monkeypatch.setattr(backend, "_save_unlocked", delayed_save)
+
+        async def callback(_current: OpenAICodexCredentials):
+            return new
+
+        with pytest.raises(CredentialRefreshError) as raised:
+            await backend.refresh(callback, expected=old, timeout=0.02)
+        assert raised.value.code == "refresh_timeout"
+        assert await backend.load() == new
+        await backend.save(credentials("after-timeout"))
+
+    run(probe())
+
+
+@pytest.mark.parametrize("operation_name", ["load", "save", "recover"])
+def test_cancelled_file_operation_drains_its_worker(
+    tmp_path: Path, monkeypatch, operation_name: str
+):
+    async def probe() -> None:
+        backend = FileCodexCredentialBackend(tmp_path / f"{operation_name}.json")
+        old = credentials("old")
+        new = credentials("new")
+        await backend.save(old)
+        original = getattr(backend, f"_{operation_name}_sync")
+        started = threading.Event()
+
+        def delayed(*args: object) -> object:
+            started.set()
+            time.sleep(0.05)
+            return original(*args)
+
+        monkeypatch.setattr(backend, f"_{operation_name}_sync", delayed)
+        if operation_name == "load":
+            task = asyncio.create_task(backend.load())
+        elif operation_name == "save":
+            task = asyncio.create_task(backend.save(new))
+        else:
+            task = asyncio.create_task(backend.recover(new))
+        await asyncio.to_thread(started.wait, 1.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        if operation_name == "load":
+            assert await backend.load() == old
+        else:
+            assert await backend.load() == new
+        await backend.save(credentials("after-drain"))
 
     run(probe())

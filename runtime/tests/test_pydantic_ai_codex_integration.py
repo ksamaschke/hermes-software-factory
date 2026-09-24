@@ -12,6 +12,7 @@ import asyncio
 import multiprocessing as mp
 from functools import wraps
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -20,6 +21,7 @@ httpx2 = pytest.importorskip("httpx2")
 
 import pydantic_ai.providers.openai_codex as pydantic_codex
 from software_factory.providers import (
+    CredentialPersistenceError,
     OpenAICodexCredentials,
     OpenAICodexCredentialSource,
     ProviderPressure,
@@ -51,6 +53,51 @@ def test_guarded_class_is_the_pinned_real_provider():
     provider_class = get_pydantic_ai_codex_provider_class()
     assert issubclass(provider_class, pydantic_codex.OpenAICodexProvider)
     assert getattr(pydantic_ai, "__version__", "2.48.0") == "2.48.0"
+
+
+def test_same_signature_refresh_mutation_fails_closed(monkeypatch):
+    async def replacement(credentials, *, http_client=None):
+        del http_client
+        return credentials
+
+    monkeypatch.setattr(pydantic_codex, "_refresh_credentials", replacement)
+    with pytest.raises(PydanticAIIntegrationError) as raised:
+        get_pydantic_ai_codex_provider_class()
+    assert raised.value.code == "pydantic_ai_reviewed_seam_changed"
+
+
+@_asyncio_test
+async def test_persistence_failure_uses_the_guarded_upstream_exception(monkeypatch):
+    current = _credentials("old")
+
+    class FailingBackend:
+        async def load(self) -> OpenAICodexCredentials:
+            return current
+
+        async def save(self, _value: OpenAICodexCredentials) -> None:
+            raise AssertionError("save should not be reached")
+
+        async def refresh(
+            self,
+            _callback: object,
+            *,
+            expected: OpenAICodexCredentials | None = None,
+            timeout: float | None = None,
+        ) -> OpenAICodexCredentials:
+            del expected, timeout
+            raise CredentialPersistenceError("synthetic_backend_failure")
+
+    source = OpenAICodexCredentialSource(backend=cast(Any, FailingBackend()))
+    provider = create_pydantic_ai_codex_provider(source)
+    await provider._load_if_needed()
+    monkeypatch.setattr(provider, "_is_stale", lambda: True)
+    with pytest.raises(pydantic_codex.CredentialsPersistenceError) as raised:
+        await provider._refresh_if_stale()
+    assert str(raised.value) == (
+        "Application-owned credential persistence failed after refresh."
+    )
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
 
 
 @_asyncio_test
@@ -225,12 +272,12 @@ def _provider_process_worker(path: str, calls, calls_lock, ready, results) -> No
         )
 
     async def run() -> None:
+        source = OpenAICodexCredentialSource(path)
+        provider = create_pydantic_ai_codex_provider(source)
+        await provider._load_if_needed()
         original = pydantic_codex._refresh_credentials
         pydantic_codex._refresh_credentials = fake_refresh
         try:
-            source = OpenAICodexCredentialSource(path)
-            provider = create_pydantic_ai_codex_provider(source)
-            await provider._load_if_needed()
             await asyncio.to_thread(ready.wait)
             await provider._refresh_for_401(
                 provider._revision,
