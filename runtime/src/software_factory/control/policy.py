@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
@@ -79,6 +81,24 @@ def _deep_freeze(value: object) -> object:
     return value
 
 
+_APPROVED_MAPPING_TYPES = frozenset({dict, ImmutableMapping, MappingProxyType})
+
+
+def _approved_mapping_copy(value: object, field_name: str) -> dict[str, object]:
+    """Materialize only exact mappings with exact built-in string keys."""
+
+    if type(value) not in _APPROVED_MAPPING_TYPES:
+        raise ValueError(f"{field_name} must use an approved exact mapping container")
+    result: dict[str, object] = {}
+    for key, nested in value.items():  # type: ignore[union-attr]
+        if type(key) is not str:
+            raise ValueError(f"{field_name} mapping keys must be built-in strings")
+        if key in result:
+            raise ValueError(f"{field_name} contains duplicate key {key!r}")
+        result[key] = nested
+    return result
+
+
 def _policy_dump_value(value: object, mode: str) -> object:
     """Turn immutable policy values back into ordinary Pydantic output values."""
 
@@ -132,12 +152,8 @@ class PolicyModel(BaseModel):
 
 
 def _as_tuple_input(value: object, field_name: str) -> tuple[object, ...]:
-    if isinstance(value, (str, bytes, bytearray, Mapping)) or not isinstance(
-        value, Sequence
-    ):
-        raise ValueError(  # noqa: TRY004 - Pydantic v2 escapes TypeError from validators
-            f"{field_name} must be a sequence, not a scalar or mapping"
-        )
+    if type(value) not in {list, tuple}:
+        raise ValueError(f"{field_name} must be an exact list or tuple")
     return tuple(value)
 
 
@@ -150,14 +166,16 @@ def _json_safe_value(value: object, path: str) -> object:
         if not math.isfinite(value):
             raise ValueError(f"{path} must contain finite JSON numbers")
         return value
-    if isinstance(value, Mapping):
+    if type(value) in {dict, ImmutableMapping, MappingProxyType}:
         result: dict[str, object] = {}
         for key, nested in value.items():
             if type(key) is not str:
                 raise ValueError(f"{path} mapping keys must be strings")
+            if key in result:
+                raise ValueError(f"{path} contains duplicate mapping key {key!r}")
             result[key] = _json_safe_value(nested, f"{path}.{key}")
         return result
-    if isinstance(value, (list, tuple)):
+    if type(value) in {list, tuple}:
         return [_json_safe_value(item, f"{path}[]") for item in value]
     raise ValueError(
         f"{path} must contain only JSON-safe scalar, array, or mapping values"
@@ -165,10 +183,8 @@ def _json_safe_value(value: object, path: str) -> object:
 
 
 def _json_safe_mapping(value: object, field_name: str) -> dict[str, object]:
-    if not isinstance(value, Mapping):
-        raise ValueError(  # noqa: TRY004 - Pydantic v2 escapes TypeError from validators
-            f"{field_name} must be a JSON-safe mapping"
-        )
+    if type(value) not in {dict, ImmutableMapping, MappingProxyType}:
+        raise ValueError(f"{field_name} must be a JSON-safe mapping")
     checked = _json_safe_value(value, field_name)
     assert isinstance(checked, dict)
     return checked
@@ -318,6 +334,17 @@ def _validate_model_family(kind: ProviderKind, model: str, field_name: str) -> s
     return model
 
 
+_GLOB_SYNTAX = frozenset("*?[]{}\\()!+@^~")
+
+
+def _validate_exact_route_identifier(value: str, field_name: str) -> str:
+    """Require a literal route identity, never a glob or escaped pattern."""
+
+    if any(character in _GLOB_SYNTAX for character in value):
+        raise ValueError(f"{field_name} must be an exact literal identifier")
+    return value
+
+
 class ProviderDefinition(PolicyModel):
     kind: ProviderKind
     credential_source: Identifier | None = None
@@ -335,6 +362,10 @@ class ProviderDefinition(PolicyModel):
     @field_validator("models")
     @classmethod
     def models_are_unique(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        for model in values:
+            if type(model) is not str:
+                raise ValueError("provider models must contain built-in strings")
+            _validate_exact_route_identifier(model, "provider model")
         if len(values) != len(set(values)):
             raise ValueError("provider models must not contain duplicates")
         return values
@@ -359,6 +390,22 @@ class RoleRoute(PolicyModel):
     max_in_progress: StrictInt | None = Field(default=None, ge=1)
     max_runtime_seconds: StrictInt | None = Field(default=None, ge=1)
     read_only_source: StrictBool | None = None
+
+    @field_validator(
+        "agent",
+        "profile",
+        "provider",
+        "model",
+        "handler",
+        "vendor_family",
+    )
+    @classmethod
+    def route_identities_are_exact(cls, value: str | None, info) -> str | None:
+        return (
+            None
+            if value is None
+            else _validate_exact_route_identifier(value, f"route {info.field_name}")
+        )
 
     @model_validator(mode="after")
     def route_shape_is_strict(self) -> RoleRoute:
@@ -423,9 +470,7 @@ class CanaryRule(PolicyModel):
     @field_validator("task_id")
     @classmethod
     def task_id_is_exact(cls, value: str) -> str:
-        if any(marker in value for marker in ("*", "?", "[", "]")):
-            raise ValueError("canary task_id must be an exact identifier")
-        return value
+        return _validate_exact_route_identifier(value, "canary task_id")
 
     @field_validator("role")
     @classmethod
@@ -456,13 +501,14 @@ class RetryCompatibilityRule(PolicyModel):
     from_read_only_source: StrictBool | None
     to_read_only_source: StrictBool | None
     role: Identifier
+    rule_identity: Identifier | None = Field(default=None, alias="rule_id")
 
     @model_validator(mode="before")
     @classmethod
     def normalize_executor_aliases(cls, value: object) -> object:
-        if not isinstance(value, Mapping):
+        if type(value) not in _APPROVED_MAPPING_TYPES:
             return value
-        data = dict(value)
+        data = _approved_mapping_copy(value, "retry compatibility rule")
         aliases = {
             "source_executor": "from_executor",
             "source_kind": "from_executor",
@@ -471,8 +517,10 @@ class RetryCompatibilityRule(PolicyModel):
             "target_kind": "to_executor",
             "to_kind": "to_executor",
             "source_id": "from_id",
+            "source_executor_id": "from_id",
             "from_executor_id": "from_id",
             "target_id": "to_id",
+            "target_executor_id": "to_id",
             "to_executor_id": "to_id",
             "source_provider": "from_provider",
             "target_provider": "to_provider",
@@ -482,7 +530,15 @@ class RetryCompatibilityRule(PolicyModel):
             "target_vendor_family": "to_vendor_family",
             "source_read_only_source": "from_read_only_source",
             "target_read_only_source": "to_read_only_source",
+            "id": "rule_id",
+            "rule": "rule_id",
         }
+        if "rule_identity" in data:
+            if "rule_id" in data:
+                raise ValueError(
+                    "retry compatibility rule defines both 'rule_identity' and 'rule_id'"
+                )
+            data["rule_id"] = data.pop("rule_identity")
         for alias, canonical in aliases.items():
             if alias not in data:
                 continue
@@ -499,6 +555,94 @@ class RetryCompatibilityRule(PolicyModel):
         if value not in ROLE_KEYS:
             raise ValueError(f"unknown retry compatibility role: {value!r}")
         return value
+
+    @field_validator(
+        "from_id",
+        "to_id",
+        "from_provider",
+        "to_provider",
+        "from_model",
+        "to_model",
+        "from_vendor_family",
+        "to_vendor_family",
+    )
+    @classmethod
+    def backend_identities_are_exact(cls, value: str | None, info) -> str | None:
+        return (
+            None
+            if value is None
+            else _validate_exact_route_identifier(value, f"retry {info.field_name}")
+        )
+
+    @field_validator("rule_identity")
+    @classmethod
+    def rule_identity_is_exact(cls, value: str | None) -> str | None:
+        return (
+            None
+            if value is None
+            else _validate_exact_route_identifier(value, "retry rule_id")
+        )
+
+    @property
+    def rule_id(self) -> str:
+        """Return the stable identity of this complete literal rule."""
+
+        return self.rule_identity or retry_compatibility_rule_identity(self)
+
+
+def retry_compatibility_rule_identity(rule: RetryCompatibilityRule) -> str:
+    """Hash only the exact authorization fields of one retry rule."""
+
+    return retry_compatibility_identity(
+        from_executor=rule.from_executor,
+        to_executor=rule.to_executor,
+        from_id=rule.from_id,
+        to_id=rule.to_id,
+        from_provider=rule.from_provider,
+        to_provider=rule.to_provider,
+        from_model=rule.from_model,
+        to_model=rule.to_model,
+        from_vendor_family=rule.from_vendor_family,
+        to_vendor_family=rule.to_vendor_family,
+        from_read_only_source=rule.from_read_only_source,
+        to_read_only_source=rule.to_read_only_source,
+        role=rule.role,
+    )
+
+
+def retry_compatibility_identity(
+    *,
+    from_executor: ExecutorKind,
+    to_executor: ExecutorKind,
+    from_id: str,
+    to_id: str,
+    from_provider: str | None,
+    to_provider: str | None,
+    from_model: str | None,
+    to_model: str | None,
+    from_vendor_family: str | None,
+    to_vendor_family: str | None,
+    from_read_only_source: bool | None,
+    to_read_only_source: bool | None,
+    role: str,
+) -> str:
+    values = (
+        from_executor.value,
+        to_executor.value,
+        from_id,
+        to_id,
+        from_provider,
+        to_provider,
+        from_model,
+        to_model,
+        from_vendor_family,
+        to_vendor_family,
+        from_read_only_source,
+        to_read_only_source,
+        role,
+    )
+    payload = json.dumps(values, ensure_ascii=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 # These are the deterministic lifecycle handlers named by the architecture
@@ -543,6 +687,12 @@ class CompatibilityPolicy(PolicyModel):
     retry_compatibility: tuple[RetryCompatibilityRule, ...] = Field(
         default_factory=tuple
     )
+
+    @field_validator("fallback_executors", mode="before")
+    @classmethod
+    def fallback_mapping_is_approved(cls, value: object) -> dict[str, object]:
+        return _approved_mapping_copy(value, "fallback_executors")
+
     legacy_settings: LegacySettings | None = None
 
     @model_validator(mode="before")
@@ -550,9 +700,9 @@ class CompatibilityPolicy(PolicyModel):
     def normalize_routing_aliases(cls, value: object) -> object:
         """Accept descriptive aliases, but reject ambiguous policy sources."""
 
-        if not isinstance(value, Mapping):
+        if type(value) not in _APPROVED_MAPPING_TYPES:
             return value
-        data = dict(value)
+        data = _approved_mapping_copy(value, "compatibility policy")
 
         canary_aliases = (
             "canary",
@@ -574,8 +724,10 @@ class CompatibilityPolicy(PolicyModel):
             raise ValueError("canary rule forms must not be combined")
         if present_canary and present_canary[0] != "canary_rules":
             data["canary_rules"] = data.pop(present_canary[0])
-        if isinstance(data.get("canary_rules"), Mapping):
-            canary_mapping = data["canary_rules"]
+        if type(data.get("canary_rules")) in _APPROVED_MAPPING_TYPES:
+            canary_mapping = _approved_mapping_copy(
+                data["canary_rules"], "compatibility canary_rules"
+            )
             if "admitted" in canary_mapping and len(canary_mapping) == 1:
                 data["canary_rules"] = canary_mapping["admitted"]
 
@@ -667,35 +819,34 @@ class CompatibilityPolicy(PolicyModel):
     ) -> tuple[Mapping[str, object], ...]:
         if value is None:
             return ()
-        if isinstance(value, Mapping):
-            if "task_id" in value or "role" in value:
-                raw_rules: tuple[object, ...] = (value,)
+        if type(value) in _APPROVED_MAPPING_TYPES:
+            data = _approved_mapping_copy(value, "canary_rules")
+            if "task_id" in data or "role" in data:
+                raw_rules: tuple[object, ...] = (data,)
             else:
                 raw_rules = tuple(
-                    {"task_id": task_id, "role": role}
-                    for task_id, role in value.items()
+                    {"task_id": task_id, "role": role} for task_id, role in data.items()
                 )
         else:
             raw_rules = _as_tuple_input(value, "canary_rules")
 
         expanded: list[Mapping[str, object]] = []
         for raw_rule in raw_rules:
-            if not isinstance(raw_rule, Mapping):
-                raise ValueError("canary rules must be mappings")  # noqa: TRY004
-            if "task_ids" in raw_rule or "roles" in raw_rule:
-                if "task_id" in raw_rule or "role" in raw_rule:
+            data = _approved_mapping_copy(raw_rule, "canary rule")
+            if "task_ids" in data or "roles" in data:
+                if "task_id" in data or "role" in data:
                     raise ValueError(
                         "canary rules must use singular or plural fields, not both"
                     )
-                task_ids = _as_tuple_input(raw_rule.get("task_ids", ()), "task_ids")
-                roles = _as_tuple_input(raw_rule.get("roles", ()), "roles")
+                task_ids = _as_tuple_input(data.get("task_ids", ()), "task_ids")
+                roles = _as_tuple_input(data.get("roles", ()), "roles")
                 if not task_ids or not roles:
                     raise ValueError("plural canary rules require task_ids and roles")
                 for task_id in task_ids:
                     for role in roles:
                         expanded.append({"task_id": task_id, "role": role})
                 continue
-            expanded.append(dict(raw_rule))
+            expanded.append(data)
         return tuple(expanded)
 
     @field_validator("retry_compatibility", mode="before")
@@ -703,8 +854,8 @@ class CompatibilityPolicy(PolicyModel):
     def retry_rules_are_a_sequence(cls, value: object) -> tuple[object, ...]:
         if value is None:
             return ()
-        if isinstance(value, Mapping):
-            return (value,)
+        if type(value) in _APPROVED_MAPPING_TYPES:
+            return (_approved_mapping_copy(value, "retry_compatibility"),)
         return _as_tuple_input(value, "retry_compatibility")
 
     @model_validator(mode="after")
@@ -718,6 +869,7 @@ class CompatibilityPolicy(PolicyModel):
             seen_task_ids.add(rule.task_id)
 
         seen_retry_rules: set[tuple[object, ...]] = set()
+        seen_retry_rule_ids: set[str] = set()
         for rule in self.retry_compatibility:
             key = (
                 rule.from_executor,
@@ -737,6 +889,9 @@ class CompatibilityPolicy(PolicyModel):
             if key in seen_retry_rules:
                 raise ValueError("duplicate retry compatibility rule")
             seen_retry_rules.add(key)
+            if rule.rule_id in seen_retry_rule_ids:
+                raise ValueError("duplicate retry compatibility rule identity")
+            seen_retry_rule_ids.add(rule.rule_id)
         return self
 
     @model_validator(mode="after")
@@ -858,6 +1013,13 @@ class FactoryPolicy(PolicyModel):
 
     @field_validator("providers", "agents", "handlers")
     @classmethod
+    def registries_are_approved_mappings(
+        cls, values: object, info
+    ) -> dict[str, object]:
+        return _approved_mapping_copy(values, info.field_name)
+
+    @field_validator("providers", "agents", "handlers")
+    @classmethod
     def registry_keys_are_non_empty(
         cls, values: Mapping[str, object], info
     ) -> Mapping[str, object]:
@@ -866,7 +1028,13 @@ class FactoryPolicy(PolicyModel):
                 raise ValueError(
                     f"{info.field_name} contains an invalid registry key: {key!r}"
                 )
+            _validate_exact_route_identifier(key, f"{info.field_name} registry key")
         return values
+
+    @field_validator("roles", mode="before")
+    @classmethod
+    def roles_are_approved_mapping(cls, values: object) -> dict[str, object]:
+        return _approved_mapping_copy(values, "roles")
 
     @field_validator("roles")
     @classmethod
@@ -1083,9 +1251,45 @@ def _load_yaml(text: str) -> object:
     return yaml.load(text, Loader=_UniqueKeySafeLoader)
 
 
+class _DuplicateJSONKey(ValueError):
+    """Raised before a JSON object can silently overwrite a member."""
+
+
+def _construct_unique_json_mapping(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateJSONKey(f"found duplicate key {key!r}")
+        result[key] = value
+    return result
+
+
+def _load_json(text: str) -> object:
+    return json.loads(text, object_pairs_hook=_construct_unique_json_mapping)
+
+
+def _load_text_document(text: str) -> object:
+    stripped = text.lstrip()
+    if stripped.startswith(("{", "[")):
+        try:
+            return _load_json(text)
+        except _DuplicateJSONKey:
+            raise
+        except json.JSONDecodeError:
+            pass
+    return _load_yaml(text)
+
+
 def _read_document(source: str | Path | Mapping[str, Any]) -> dict[str, Any]:
-    if isinstance(source, Mapping):
-        document = dict(source)
+    if type(source) in {dict, ImmutableMapping, MappingProxyType}:
+        try:
+            document = _json_safe_mapping(source, "project policy")
+        except ValueError as exc:
+            raise PolicyError(str(exc)) from exc
+    elif isinstance(source, Mapping):
+        raise PolicyError("project policy mapping must use an approved container")
     else:
         raw_source = str(source)
         looks_like_yaml = isinstance(source, str) and (
@@ -1093,7 +1297,11 @@ def _read_document(source: str | Path | Mapping[str, Any]) -> dict[str, Any]:
         )
         if looks_like_yaml:
             try:
-                document = _load_yaml(raw_source)
+                document = _load_text_document(raw_source)
+            except _DuplicateJSONKey as exc:
+                raise PolicyError(
+                    f"policy JSON contains a duplicate key: {exc}"
+                ) from exc
             except yaml.YAMLError as exc:
                 raise PolicyError(f"policy text is not valid YAML: {exc}") from exc
         else:
@@ -1106,23 +1314,34 @@ def _read_document(source: str | Path | Mapping[str, Any]) -> dict[str, Any]:
                 ) from exc
             if exists:
                 try:
-                    document = _load_yaml(path.read_text(encoding="utf-8"))
+                    document = _load_text_document(path.read_text(encoding="utf-8"))
                 except OSError as exc:
                     raise PolicyError(f"cannot read policy {path}: {exc}") from exc
+                except _DuplicateJSONKey as exc:
+                    raise PolicyError(
+                        f"policy {path} JSON contains a duplicate key: {exc}"
+                    ) from exc
                 except yaml.YAMLError as exc:
                     raise PolicyError(
                         f"policy {path} is not valid YAML: {exc}"
                     ) from exc
             else:
                 try:
-                    document = _load_yaml(raw_source)
+                    document = _load_text_document(raw_source)
+                except _DuplicateJSONKey as exc:
+                    raise PolicyError(
+                        f"policy JSON contains a duplicate key: {exc}"
+                    ) from exc
                 except yaml.YAMLError as exc:
                     raise PolicyError(
                         f"policy path does not exist and text is invalid: {source}: {exc}"
                     ) from exc
-    if not isinstance(document, dict):
+    if type(document) not in {dict, ImmutableMapping, MappingProxyType}:
         raise PolicyError("project policy must be a YAML mapping")
-    return document
+    try:
+        return _json_safe_mapping(document, "project policy")
+    except ValueError as exc:
+        raise PolicyError(str(exc)) from exc
 
 
 _LEGACY_ROUTE_ROLES = (

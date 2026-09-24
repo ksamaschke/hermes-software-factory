@@ -239,12 +239,8 @@ def test_backend_change_on_retry_is_rejected_without_explicit_policy():
     selected = router(canary=[{"task_id": "task-42", "role": "implementer"}])
     retry = selected.select(request(run_id="run-2", attempt=2))
 
-    decision = selected.decide_retry(prior, retry, prior_state=terminal_state(prior))
-
-    assert decision.allowed is False
-    assert decision.decision is RetryDecisionKind.BACKEND_CHANGE_REJECTED
-    assert decision.reason is RetryDecisionReason.BACKEND_CHANGE_NOT_ALLOWED
-    assert decision.new_selection == retry
+    with pytest.raises(RetryRoutingError, match="cross-policy"):
+        selected.decide_retry(prior, retry, prior_state=terminal_state(prior))
 
 
 def test_backend_change_requires_concrete_comparison_and_explicit_compatibility():
@@ -265,11 +261,11 @@ def test_backend_change_requires_concrete_comparison_and_explicit_compatibility(
             "role": "implementer",
         }
     ]
-    prior = router().select(request())
     selected = router(
         canary=[{"task_id": "task-42", "role": "implementer"}],
         retry_compatibility=compatibility,
     )
+    prior = selected.select(request(admitted=False))
     retry = selected.select(request(run_id="run-2", attempt=2))
 
     decision = selected.decide_retry(prior, retry, prior_state=terminal_state(prior))
@@ -305,11 +301,11 @@ def test_active_run_cannot_be_replaced_by_a_retry_even_when_policy_allows_change
             "role": "implementer",
         }
     ]
-    prior = router().select(request())
     selected = router(
         canary=[{"task_id": "task-42", "role": "implementer"}],
         retry_compatibility=compatibility,
     )
+    prior = selected.select(request(admitted=False))
     retry = selected.select(request(run_id="run-2", attempt=2))
     running = TaskState(task_id=prior.task_id, state="running", run=prior.run)
 
@@ -360,7 +356,6 @@ def test_retry_compatibility_requires_the_complete_backend_identity():
             )
         )
 
-    prior = router().select(request())
     selected = PolicyExecutorRouter(
         load_policy(
             rich_policy_document(
@@ -369,6 +364,7 @@ def test_retry_compatibility_requires_the_complete_backend_identity():
             )
         )
     )
+    prior = selected.select(request(admitted=False))
     retry = selected.select(request(run_id="run-2", attempt=2))
     evidence = terminal_state(prior)
 
@@ -391,11 +387,12 @@ def test_retry_compatibility_requires_the_complete_backend_identity():
         canary=[{"task_id": "task-42", "role": "implementer"}],
         allow_backend_change=True,
     )
+    arbitrary_prior = arbitrary.select(request(admitted=False))
     arbitrary_retry = arbitrary.select(request(run_id="run-2", attempt=2))
     arbitrary_decision = arbitrary.decide_retry(
-        prior,
+        arbitrary_prior,
         arbitrary_retry,
-        prior_state=evidence,
+        prior_state=terminal_state(arbitrary_prior),
         allow_backend_change=True,
     )
     assert arbitrary_decision.allowed is False

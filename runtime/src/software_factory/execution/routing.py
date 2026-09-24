@@ -10,13 +10,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import Collection, Mapping
-from enum import StrEnum
+from datetime import date, datetime, time
+from enum import Enum, StrEnum
+from types import MappingProxyType
 from typing import Any, Protocol, runtime_checkable
 
 from pydantic import (
     BaseModel,
     Field,
+    HttpUrl,
     StrictBool,
     StrictInt,
     StrictStr,
@@ -25,19 +29,51 @@ from pydantic import (
 )
 
 from ..api.contracts import (
+    AcceptanceCriterion,
+    BlockedOutcome,
+    Blocker,
+    ChangedPath,
     ClaimedRun,
+    CommandSpec,
     ContractModel,
+    DecisionRequest,
+    Dependency,
+    EventAttribute,
+    FactoryEvent,
+    FailedOutcome,
+    Failure,
     Identifier,
+    ImplementationOutcome,
+    Lease,
+    PlanOutcome,
+    PlanTask,
+    RepositoryIdentity,
+    ReviewFinding,
+    ReviewOutcome,
     Revision,
     RunIdentity,
+    TaskConstraints,
     TaskEnvelope,
+    TaskRole,
     TaskState,
+    TestEvidence,
+    WorkspaceIdentity,
 )
 from ..control.policy import (
     ROLE_KEYS,
+    AgentDefinition,
+    CanaryRule,
+    CompatibilityPolicy,
     ExecutorKind,
     FactoryPolicy,
+    HandlerDefinition,
+    ImmutableMapping,
+    LegacySettings,
+    ProviderDefinition,
+    ProviderKind,
+    RetryCompatibilityRule,
     RoleRoute,
+    _validate_exact_route_identifier,
     _validate_model_family,
 )
 
@@ -93,6 +129,11 @@ class DispatchRequest(ContractModel):
     attempt: StrictInt = Field(default=1, ge=1)
     admitted: StrictBool = True
 
+    @field_validator("task_id", "run_id", "role")
+    @classmethod
+    def route_request_identities_are_exact(cls, value: str, info) -> str:
+        return _validate_exact_route_identifier(value, f"dispatch {info.field_name}")
+
     @property
     def run(self) -> RunIdentity:
         """Return the run identity represented by this pre-admission request."""
@@ -122,20 +163,35 @@ class ExecutorBinding(ContractModel):
     policy_fingerprint: StrictStr = Field(min_length=71, max_length=71)
     selection_reason: SelectionReason
 
+    @field_validator(
+        "task_id",
+        "run_id",
+        "role",
+        "executor_id",
+        "agent",
+        "profile",
+        "handler",
+        "provider",
+        "model",
+        "vendor_family",
+    )
+    @classmethod
+    def binding_identities_are_exact(cls, value: str | None, info) -> str | None:
+        return (
+            None
+            if value is None
+            else _validate_exact_route_identifier(value, f"binding {info.field_name}")
+        )
+
     @model_validator(mode="before")
     @classmethod
     def normalize_routing_names(cls, value: object) -> object:
-        if not isinstance(value, Mapping):
+        if type(value) not in {dict, ImmutableMapping, MappingProxyType}:
             return value
-        data = dict(value)
+        data = _approved_mapping_copy(value, "executor binding")
         if "run" in data:
             run = data.pop("run")
-            if isinstance(run, RunIdentity):
-                run_data = run.model_dump(mode="python")
-            elif isinstance(run, Mapping):
-                run_data = dict(run)
-            else:
-                raise ValueError("executor binding run must be a RunIdentity mapping")
+            run_data = _binding_run_payload(run)
             for field_name in ("task_id", "run_id", "attempt"):
                 if field_name in data and field_name in run_data:
                     if data[field_name] != run_data[field_name]:
@@ -144,7 +200,10 @@ class ExecutorBinding(ContractModel):
                         )
                 elif field_name in run_data:
                     data[field_name] = run_data[field_name]
-            if "executor_id" not in data and run_data.get("executor_id") is not None:
+            if "executor_id" in data and "executor_id" in run_data:
+                if data["executor_id"] != run_data["executor_id"]:
+                    raise ValueError("executor binding executor_id disagrees with run")
+            elif "executor_id" not in data and run_data.get("executor_id") is not None:
                 data["executor_id"] = run_data["executor_id"]
         aliases = {
             "logical_role": "role",
@@ -307,9 +366,9 @@ class ExecutorSelectionRecord(ContractModel):
     @model_validator(mode="before")
     @classmethod
     def normalize_selection_alias(cls, value: object) -> object:
-        if not isinstance(value, Mapping):
+        if type(value) not in _APPROVED_MAPPING_TYPES:
             return value
-        data = dict(value)
+        data = _approved_mapping_copy(value, "selection record")
         if "selection" in data:
             if "binding" in data:
                 raise ValueError("selection record defines both selection and binding")
@@ -343,6 +402,121 @@ class ExecutorSelectionRecord(ContractModel):
         return self.binding
 
 
+class RetryCompatibilityProof(ContractModel):
+    """Complete authorization proof for one exact backend transition."""
+
+    from_executor: ExecutorKind
+    to_executor: ExecutorKind
+    from_id: Identifier
+    to_id: Identifier
+    from_provider: Identifier | None
+    to_provider: Identifier | None
+    from_model: Revision | None
+    to_model: Revision | None
+    from_vendor_family: Identifier | None
+    to_vendor_family: Identifier | None
+    from_read_only_source: StrictBool | None
+    to_read_only_source: StrictBool | None
+    role: Identifier
+    policy_version: StrictInt = Field(ge=1)
+    policy_fingerprint: StrictStr = Field(min_length=71, max_length=71)
+    rule_id: Identifier
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_proof_names(cls, value: object) -> object:
+        if type(value) not in {dict, ImmutableMapping, MappingProxyType}:
+            return value
+        data = _approved_mapping_copy(value, "retry compatibility proof")
+        aliases = {
+            "source_executor": "from_executor",
+            "source_kind": "from_executor",
+            "from_kind": "from_executor",
+            "target_executor": "to_executor",
+            "target_kind": "to_executor",
+            "to_kind": "to_executor",
+            "source_id": "from_id",
+            "source_executor_id": "from_id",
+            "from_executor_id": "from_id",
+            "target_id": "to_id",
+            "target_executor_id": "to_id",
+            "to_executor_id": "to_id",
+            "source_provider": "from_provider",
+            "target_provider": "to_provider",
+            "source_model": "from_model",
+            "target_model": "to_model",
+            "source_vendor_family": "from_vendor_family",
+            "target_vendor_family": "to_vendor_family",
+            "source_read_only_source": "from_read_only_source",
+            "target_read_only_source": "to_read_only_source",
+            "id": "rule_id",
+            "rule": "rule_id",
+        }
+        for alias, canonical in aliases.items():
+            if alias not in data:
+                continue
+            if canonical in data:
+                raise ValueError(
+                    f"retry compatibility proof defines both {alias!r} and {canonical!r}"
+                )
+            data[canonical] = data.pop(alias)
+        return data
+
+    @field_validator("policy_fingerprint")
+    @classmethod
+    def fingerprint_is_stable_sha256(cls, value: str) -> str:
+        return _validate_sha256_fingerprint(value, "policy_fingerprint")
+
+    @field_validator("rule_id")
+    @classmethod
+    def rule_id_is_exact(cls, value: str) -> str:
+        return _validate_exact_route_identifier(value, "retry proof rule_id")
+
+    @field_validator(
+        "from_id",
+        "to_id",
+        "from_provider",
+        "to_provider",
+        "from_model",
+        "to_model",
+        "from_vendor_family",
+        "to_vendor_family",
+    )
+    @classmethod
+    def proof_identities_are_exact(cls, value: str | None, info) -> str | None:
+        return (
+            None
+            if value is None
+            else _validate_exact_route_identifier(
+                value, f"retry proof {info.field_name}"
+            )
+        )
+
+    @model_validator(mode="after")
+    def proof_is_complete_and_stable(self) -> RetryCompatibilityProof:
+        source = (
+            self.from_executor.value,
+            self.from_id,
+            self.from_provider,
+            self.from_model,
+            self.from_vendor_family,
+            self.from_read_only_source,
+        )
+        target = (
+            self.to_executor.value,
+            self.to_id,
+            self.to_provider,
+            self.to_model,
+            self.to_vendor_family,
+            self.to_read_only_source,
+        )
+        if source == target:
+            raise ValueError(
+                "retry compatibility proof must authorize a backend change"
+            )
+        return self
+
+
 class RetryDecision(ContractModel):
     """Immutable comparison of one terminal run and one distinct retry run."""
 
@@ -354,19 +528,29 @@ class RetryDecision(ContractModel):
     allowed: StrictBool
     decision: RetryDecisionKind
     reason: RetryDecisionReason
+    compatibility_proof: RetryCompatibilityProof | None = None
+
+    @field_validator("task_id")
+    @classmethod
+    def decision_task_id_is_exact(cls, value: str) -> str:
+        return _validate_exact_route_identifier(value, "retry decision task_id")
 
     @model_validator(mode="before")
     @classmethod
     def normalize_retry_names(cls, value: object) -> object:
-        if not isinstance(value, Mapping):
+        if type(value) not in _APPROVED_MAPPING_TYPES:
             return value
-        data = dict(value)
+        data = _approved_mapping_copy(value, "retry decision")
         aliases = {
             "previous_selection": "prior_selection",
             "prior_binding": "prior_selection",
             "retry_selection": "new_selection",
             "retry_binding": "new_selection",
             "accepted": "allowed",
+            "compatibility": "compatibility_proof",
+            "authorization": "compatibility_proof",
+            "capability": "compatibility_proof",
+            "proof": "compatibility_proof",
         }
         for alias, canonical in aliases.items():
             if alias not in data:
@@ -403,10 +587,33 @@ class RetryDecision(ContractModel):
         backend_changed = (
             self.prior_selection.backend_key() != self.new_selection.backend_key()
         )
+        if self.compatibility_proof is not None:
+            proof = self.compatibility_proof
+            if (
+                proof.role != self.prior_selection.role
+                or proof.from_executor is not self.prior_selection.executor
+                or proof.to_executor is not self.new_selection.executor
+                or proof.from_id != self.prior_selection.executor_id
+                or proof.to_id != self.new_selection.executor_id
+                or proof.from_provider != self.prior_selection.provider
+                or proof.to_provider != self.new_selection.provider
+                or proof.from_model != self.prior_selection.model
+                or proof.to_model != self.new_selection.model
+                or proof.from_vendor_family != self.prior_selection.vendor_family
+                or proof.to_vendor_family != self.new_selection.vendor_family
+                or proof.from_read_only_source != self.prior_selection.read_only_source
+                or proof.to_read_only_source != self.new_selection.read_only_source
+                or proof.policy_version != self.prior_selection.policy_version
+                or proof.policy_version != self.new_selection.policy_version
+                or proof.policy_fingerprint != self.prior_selection.policy_fingerprint
+                or proof.policy_fingerprint != self.new_selection.policy_fingerprint
+            ):
+                raise ValueError("retry compatibility proof does not match selections")
         if self.reason is RetryDecisionReason.ACTIVE_RUN:
             if (
                 self.allowed
                 or self.decision is not RetryDecisionKind.BACKEND_CHANGE_REJECTED
+                or self.compatibility_proof is not None
             ):
                 raise ValueError("active-run retry decisions must reject the retry")
             return self
@@ -417,13 +624,15 @@ class RetryDecision(ContractModel):
                 if (
                     self.decision is not RetryDecisionKind.BACKEND_CHANGE_ALLOWED
                     or self.reason is not RetryDecisionReason.EXPLICIT_COMPATIBILITY
+                    or self.compatibility_proof is None
                 ):
                     raise ValueError(
-                        "allowed backend changes require explicit compatibility"
+                        "allowed backend changes require complete compatibility proof"
                     )
             elif (
                 self.decision is not RetryDecisionKind.BACKEND_CHANGE_REJECTED
                 or self.reason is not RetryDecisionReason.BACKEND_CHANGE_NOT_ALLOWED
+                or self.compatibility_proof is not None
             ):
                 raise ValueError("rejected backend changes require a rejection reason")
             return self
@@ -431,6 +640,7 @@ class RetryDecision(ContractModel):
             not self.allowed
             or self.decision is not RetryDecisionKind.SAME_BACKEND
             or self.reason is not RetryDecisionReason.SAME_BACKEND
+            or self.compatibility_proof is not None
         ):
             raise ValueError("same-backend retry decisions must be allowed")
         return self
@@ -452,37 +662,307 @@ class RetryDecision(ContractModel):
         return self.new_selection
 
 
-def _snapshot_default(value: object) -> object:
+_APPROVED_MAPPING_TYPES = frozenset({dict, ImmutableMapping, MappingProxyType})
+_APPROVED_SEQUENCE_TYPES = frozenset({list, tuple})
+_MAX_SNAPSHOT_DEPTH = 64
+
+_TRUSTED_SNAPSHOT_MODELS = frozenset(
+    {
+        AcceptanceCriterion,
+        AgentDefinition,
+        BlockedOutcome,
+        Blocker,
+        CanaryRule,
+        ChangedPath,
+        ClaimedRun,
+        CommandSpec,
+        CompatibilityPolicy,
+        DecisionRequest,
+        Dependency,
+        EventAttribute,
+        ExecutorBinding,
+        ExecutorSelectionRecord,
+        FactoryEvent,
+        FactoryPolicy,
+        FailedOutcome,
+        Failure,
+        HandlerDefinition,
+        ImplementationOutcome,
+        Lease,
+        LegacySettings,
+        PlanOutcome,
+        PlanTask,
+        ProviderDefinition,
+        RetryCompatibilityProof,
+        RetryCompatibilityRule,
+        RetryDecision,
+        RepositoryIdentity,
+        ReviewFinding,
+        ReviewOutcome,
+        RoleRoute,
+        RunIdentity,
+        TaskConstraints,
+        TaskEnvelope,
+        TaskState,
+        TestEvidence,
+        WorkspaceIdentity,
+        DispatchRequest,
+    }
+)
+_TRUSTED_SNAPSHOT_ENUMS = frozenset(
+    {
+        ExecutorKind,
+        ProviderKind,
+        RetryDecisionKind,
+        RetryDecisionReason,
+        SelectionReason,
+        TaskRole,
+    }
+)
+
+
+def _approved_mapping_copy(value: object, label: str) -> dict[str, object]:
+    """Materialize one approved mapping without invoking candidate methods."""
+
+    if type(value) not in _APPROVED_MAPPING_TYPES:
+        raise ValueError(f"{label} must use an approved exact mapping container")
+    result: dict[str, object] = {}
+    for key, nested in value.items():  # type: ignore[union-attr]
+        if type(key) is not str:
+            raise ValueError(f"{label} mapping keys must be built-in strings")
+        if key in result:
+            raise ValueError(f"{label} contains duplicate key {key!r}")
+        result[key] = nested
+    return result
+
+
+def _snapshot_value(value: object, label: str, depth: int = 0) -> object:
+    """Copy only exact built-ins, approved containers, enums, and known models."""
+
+    if depth > _MAX_SNAPSHOT_DEPTH:
+        raise RoutingError(f"{label} exceeds the snapshot nesting limit")
+    if value is None or type(value) in {bool, int, str}:
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise RoutingError(f"{label} contains a non-finite float")
+        return value
+    if isinstance(value, Enum):
+        if type(value) not in _TRUSTED_SNAPSHOT_ENUMS:
+            raise RoutingError(f"{label} contains an untrusted enum")
+        enum_value = value.value
+        if type(enum_value) not in {bool, int, float, str}:
+            raise RoutingError(f"{label} contains an unsupported enum value")
+        return enum_value
+    if type(value) in {datetime, date, time}:
+        return value
+    if type(value) is HttpUrl:
+        return str(value)
     if isinstance(value, BaseModel):
-        return json.loads(value.model_dump_json())
-    raise TypeError(f"value of type {type(value).__name__} is not JSON serializable")
-
-
-def _snapshot_json(value: object, label: str) -> str:
-    try:
-        if isinstance(value, BaseModel):
-            return value.model_dump_json()
-        return json.dumps(
-            value,
-            default=_snapshot_default,
-            ensure_ascii=True,
-            separators=(",", ":"),
+        if type(value) not in _TRUSTED_SNAPSHOT_MODELS:
+            raise RoutingError(
+                f"{label} contains an unexpected or subclassed Pydantic model"
+            )
+        return _snapshot_model(value, type(value), label, depth + 1)
+    if type(value) in _APPROVED_MAPPING_TYPES:
+        result: dict[str, object] = {}
+        for key, nested in value.items():  # type: ignore[union-attr]
+            if type(key) is not str:
+                raise RoutingError(f"{label} mapping keys must be built-in strings")
+            if key in result:
+                raise RoutingError(f"{label} contains duplicate key {key!r}")
+            result[key] = _snapshot_value(nested, f"{label}.{key}", depth + 1)
+        return result
+    if type(value) in _APPROVED_SEQUENCE_TYPES:
+        return tuple(
+            _snapshot_value(item, f"{label}[{index}]", depth + 1)
+            for index, item in enumerate(value)  # type: ignore[arg-type]
         )
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise RoutingError(f"{label} has no trusted JSON snapshot") from exc
+    raise RoutingError(f"{label} contains an unsupported or hostile value")
+
+
+def _snapshot_model(
+    value: BaseModel,
+    model_type: type[BaseModel],
+    label: str,
+    depth: int = 0,
+) -> dict[str, object]:
+    """Read a model's raw declared state without serializer or copy hooks."""
+
+    if type(value) is not model_type or model_type not in _TRUSTED_SNAPSHOT_MODELS:
+        raise RoutingError(f"{label} is not the exact trusted model type")
+    try:
+        raw_state = object.__getattribute__(value, "__dict__")
+        extra = object.__getattribute__(value, "__pydantic_extra__")
+        private = object.__getattribute__(value, "__pydantic_private__")
+    except (AttributeError, TypeError) as exc:
+        raise RoutingError(f"{label} has no trusted raw model state") from exc
+    if type(raw_state) is not dict:
+        raise RoutingError(f"{label} raw model state is not an exact dict")
+    if extra is not None and (type(extra) is not dict or extra):
+        raise RoutingError(f"{label} contains unknown extra fields")
+    if private is not None and (type(private) is not dict or private):
+        raise RoutingError(f"{label} contains private model state")
+    declared = model_type.model_fields
+    expected_names = tuple(declared)
+    actual_names = tuple(raw_state)
+    if any(type(name) is not str for name in actual_names):
+        raise RoutingError(f"{label} contains a non-string field name")
+    if set(actual_names) != set(expected_names):
+        missing = sorted(set(expected_names) - set(actual_names))
+        extra_names = sorted(set(actual_names) - set(expected_names))
+        raise RoutingError(
+            f"{label} field state is not exact (missing={missing!r}, extra={extra_names!r})"
+        )
+    return {
+        name: _snapshot_value(raw_state[name], f"{label}.{name}", depth + 1)
+        for name in expected_names
+    }
+
+
+def _validated_payload(
+    model_type: type[BaseModel], payload: dict[str, object], label: str
+) -> Any:
+    try:
+        return model_type.model_validate(payload)
+    except Exception as exc:
+        raise RoutingError(f"{label} failed trusted validation") from exc
 
 
 def _validated_snapshot(model_type: type[BaseModel], value: object, label: str) -> Any:
-    try:
-        return model_type.model_validate_json(_snapshot_json(value, label))
-    except Exception as exc:
-        raise RoutingError(f"{label} failed trusted validation") from exc
+    """Take a hook-free immutable snapshot, then validate a fresh model."""
+
+    if type(value) is model_type:
+        payload = _snapshot_model(value, model_type, label)
+    elif type(value) in _APPROVED_MAPPING_TYPES:
+        payload = _snapshot_value(value, label)
+        assert isinstance(payload, dict)
+    else:
+        raise RoutingError(
+            f"{label} must be an exact trusted model or approved mapping"
+        )
+    return _validated_payload(model_type, payload, label)
+
+
+def _binding_run_payload(value: object) -> dict[str, object]:
+    """Validate the binding's limited run alias without dropping fields."""
+
+    if type(value) is RunIdentity:
+        payload = _snapshot_model(value, RunIdentity, "executor binding run")
+        if payload["lease_id"] is not None:
+            raise ValueError("executor binding run must not contain lease_id")
+        payload.pop("lease_id")
+    elif type(value) in _APPROVED_MAPPING_TYPES:
+        snapshot = _snapshot_value(value, "executor binding run")
+        assert isinstance(snapshot, dict)
+        payload = snapshot
+    else:
+        raise ValueError("executor binding run must be an exact RunIdentity mapping")
+    allowed = {"task_id", "run_id", "attempt", "executor_id"}
+    unknown = set(payload) - allowed
+    if unknown:
+        raise ValueError(
+            "executor binding run contains unknown field(s): "
+            + ", ".join(sorted(unknown))
+        )
+    required = {"task_id", "run_id", "attempt", "executor_id"}
+    missing = required - set(payload)
+    if missing:
+        raise ValueError(
+            "executor binding run is missing field(s): " + ", ".join(sorted(missing))
+        )
+    canonical = _validated_payload(RunIdentity, payload, "executor binding run")
+    return {
+        field_name: object.__getattribute__(canonical, field_name)
+        for field_name in allowed
+        if field_name in payload
+    }
+
+
+def _snapshot_jsonable(value: object) -> object:
+    """Convert an already-safe snapshot to deterministic JSON primitives."""
+
+    if value is None or type(value) in {bool, int, float, str}:
+        return value
+    if isinstance(value, Enum):
+        return value.value
+    if type(value) is datetime:
+        return datetime.isoformat(value)
+    if type(value) is date:
+        return date.isoformat(value)
+    if type(value) is time:
+        return time.isoformat(value)
+    if type(value) is dict:
+        return {key: _snapshot_jsonable(nested) for key, nested in value.items()}
+    if type(value) is tuple:
+        return [_snapshot_jsonable(item) for item in value]
+    raise RoutingError("trusted snapshot is not JSON-safe")
+
+
+def _validate_sha256_fingerprint(value: str, label: str) -> str:
+    if not value.startswith("sha256:"):
+        raise ValueError(f"{label} must use the sha256:<hex> form")
+    digest = value[7:]
+    if len(digest) != 64 or any(
+        character not in "0123456789abcdef" for character in digest
+    ):
+        raise ValueError(f"{label} must contain a lowercase SHA-256 digest")
+    return value
 
 
 def _require_exact_bool(value: object, label: str) -> bool:
     if type(value) is not bool:
         raise RoutingError(f"{label} must be a built-in bool")
     return value
+
+
+_MAX_KNOWN_PROFILES = 4096
+_APPROVED_PROFILE_CONTAINERS = frozenset(
+    {list, tuple, set, frozenset, dict, ImmutableMapping, MappingProxyType}
+)
+
+
+def _materialize_profile_registry(value: object) -> frozenset[str]:
+    """Validate profile identifiers before any caller-controlled hashing."""
+
+    if type(value) not in _APPROVED_PROFILE_CONTAINERS:
+        raise RoutingError(
+            "profile registry must be an exact list, tuple, set, frozenset, "
+            "or approved immutable mapping"
+        )
+    if len(value) > _MAX_KNOWN_PROFILES:  # type: ignore[arg-type]
+        raise RoutingError("profile registry exceeds its bounded size")
+    if type(value) in {dict, ImmutableMapping, MappingProxyType}:
+        try:
+            names = tuple(_approved_mapping_copy(value, "profile registry"))
+        except ValueError as exc:
+            raise RoutingError(str(exc)) from exc
+    else:
+        names = tuple(value)  # all remaining types are exact built-in containers
+    checked: list[str] = []
+    seen: set[str] = set()
+    for index, name in enumerate(names):
+        if type(name) is not str:
+            raise RoutingError(
+                f"profile registry entry {index} must be a built-in identifier string"
+            )
+        if (
+            not name
+            or len(name) > 256
+            or any(character.isspace() for character in name)
+        ):
+            raise RoutingError(
+                f"profile registry entry {index} must be a non-empty identifier"
+            )
+        if "\x00" in name:
+            raise RoutingError(f"profile registry entry {index} must not contain NUL")
+        if name in seen:
+            raise RoutingError(
+                f"profile registry contains duplicate identifier {name!r}"
+            )
+        seen.add(name)
+        checked.append(name)
+    return frozenset(checked)
 
 
 @runtime_checkable
@@ -556,14 +1036,11 @@ class PolicyExecutorRouter:
         )
         self._policy = _validated_snapshot(FactoryPolicy, policy, "policy")
         self._policy_fingerprint = policy_fingerprint(self._policy)
-        try:
-            self._known_profiles = (
-                None if configured_profiles is None else frozenset(configured_profiles)
-            )
-        except (TypeError, ValueError) as exc:
-            raise RoutingError(
-                "profile registry must be a stable identifier collection"
-            ) from exc
+        self._known_profiles = (
+            None
+            if configured_profiles is None
+            else _materialize_profile_registry(configured_profiles)
+        )
         self._validate_known_profiles()
 
     @property
@@ -777,15 +1254,20 @@ class PolicyExecutorRouter:
                 admitted=True if admitted is None else admitted,
             )
         if request is not None:
+            if type(request) not in _APPROVED_MAPPING_TYPES:
+                raise RoutingError("dispatch request must use an approved mapping")
+            request_snapshot = _snapshot_value(request, "dispatch request")
+            assert isinstance(request_snapshot, dict)
             if admitted is not None:
-                request_data = dict(request)
-                if "admitted" in request_data and request_data["admitted"] != admitted:
-                    raise RoutingError("request admitted flag was specified twice")
-                request_data["admitted"] = admitted
-            else:
-                request_data = request
-            return _validated_snapshot(
-                DispatchRequest, request_data, "dispatch request"
+                if "admitted" in request_snapshot:
+                    request_admitted = _require_exact_bool(
+                        request_snapshot["admitted"], "request admitted"
+                    )
+                    if request_admitted is not admitted:
+                        raise RoutingError("request admitted flag was specified twice")
+                request_snapshot["admitted"] = admitted
+            return _validated_payload(
+                DispatchRequest, request_snapshot, "dispatch request"
             )
         if task_id is None or run_id is None or role is None:
             raise RoutingError("task_id, run_id, and role are required for selection")
@@ -938,15 +1420,19 @@ class PolicyExecutorRouter:
             raise RetryRoutingError(
                 "authoritative terminal lifecycle evidence is required, not RunIdentity"
             )
-        if isinstance(evidence, Mapping):
-            if "state" in evidence:
+        if type(evidence) in _APPROVED_MAPPING_TYPES:
+            snapshot = _snapshot_value(evidence, "lifecycle evidence")
+            assert isinstance(snapshot, dict)
+            if "state" in snapshot:
                 return PolicyExecutorRouter._canonical_lifecycle_evidence(
-                    _validated_snapshot(TaskState, evidence, "task state evidence")
+                    _validated_payload(TaskState, snapshot, "task state evidence")
                 )
-            if "lease" in evidence or "envelope" in evidence:
+            if "lease" in snapshot or "envelope" in snapshot:
                 return PolicyExecutorRouter._canonical_lifecycle_evidence(
-                    _validated_snapshot(ClaimedRun, evidence, "claimed run evidence")
+                    _validated_payload(ClaimedRun, snapshot, "claimed run evidence")
                 )
+        elif isinstance(evidence, Mapping):
+            raise RetryRoutingError("lifecycle evidence must use an approved mapping")
         raise RetryRoutingError("lifecycle evidence is not authoritative")
 
     @staticmethod
@@ -968,6 +1454,116 @@ class PolicyExecutorRouter:
         if len(supplied) > 1:
             raise RetryRoutingError("provide only one lifecycle evidence value")
         return supplied[0]
+
+    @staticmethod
+    def _retry_rule_matches(
+        rule: RetryCompatibilityRule,
+        prior: ExecutorBinding,
+        new: ExecutorBinding,
+    ) -> bool:
+        return (
+            rule.role == prior.role == new.role
+            and rule.from_executor is prior.executor
+            and rule.to_executor is new.executor
+            and rule.from_id == prior.executor_id
+            and rule.to_id == new.executor_id
+            and rule.from_provider == prior.provider
+            and rule.to_provider == new.provider
+            and rule.from_model == prior.model
+            and rule.to_model == new.model
+            and rule.from_vendor_family == prior.vendor_family
+            and rule.to_vendor_family == new.vendor_family
+            and rule.from_read_only_source == prior.read_only_source
+            and rule.to_read_only_source == new.read_only_source
+        )
+
+    def _matching_retry_rule(
+        self, prior: ExecutorBinding, new: ExecutorBinding
+    ) -> RetryCompatibilityRule | None:
+        if self._policy.compatibility.allow_backend_change_on_retry != (
+            "explicit_policy_only"
+        ):
+            return None
+        matches = tuple(
+            rule
+            for rule in self._policy.compatibility.retry_compatibility
+            if self._retry_rule_matches(rule, prior, new)
+        )
+        if len(matches) > 1:
+            raise RetryRoutingError(
+                "retry compatibility proof must correspond to exactly one active policy rule"
+            )
+        return matches[0] if matches else None
+
+    def _compatibility_proof(
+        self,
+        prior: ExecutorBinding,
+        new: ExecutorBinding,
+        rule: RetryCompatibilityRule,
+    ) -> RetryCompatibilityProof:
+        return RetryCompatibilityProof(
+            from_executor=prior.executor,
+            to_executor=new.executor,
+            from_id=prior.executor_id,
+            to_id=new.executor_id,
+            from_provider=prior.provider,
+            to_provider=new.provider,
+            from_model=prior.model,
+            to_model=new.model,
+            from_vendor_family=prior.vendor_family,
+            to_vendor_family=new.vendor_family,
+            from_read_only_source=prior.read_only_source,
+            to_read_only_source=new.read_only_source,
+            role=prior.role,
+            policy_version=self._policy.version,
+            policy_fingerprint=self._policy_fingerprint,
+            rule_id=rule.rule_id,
+        )
+
+    def _validate_retry_decision_authorization(self, decision: RetryDecision) -> None:
+        """Verify a backend-change proof against exactly one active rule."""
+
+        self._validate_active_binding(decision.prior_selection)
+        self._validate_active_binding(decision.new_selection)
+        backend_changed = (
+            decision.prior_selection.backend_key()
+            != decision.new_selection.backend_key()
+        )
+        if not backend_changed or not decision.allowed:
+            if decision.compatibility_proof is not None:
+                raise RetryRoutingError(
+                    "same-backend or rejected retry decisions must not carry compatibility proof"
+                )
+            return
+        rule = self._matching_retry_rule(
+            decision.prior_selection, decision.new_selection
+        )
+        if rule is None:
+            raise RetryRoutingError(
+                "retry compatibility proof does not match an active policy rule"
+            )
+        expected = self._compatibility_proof(
+            decision.prior_selection, decision.new_selection, rule
+        )
+        if decision.compatibility_proof != expected:
+            raise RetryRoutingError(
+                "retry compatibility proof is forged or not canonical for the active policy"
+            )
+
+    def validate_retry_decision(
+        self, decision: RetryDecision | Mapping[str, Any]
+    ) -> RetryDecision:
+        """Validate direct retry-decision readback against this active policy."""
+
+        canonical = _validated_snapshot(RetryDecision, decision, "retry decision")
+        try:
+            self._validate_retry_decision_authorization(canonical)
+        except RoutingError as exc:
+            raise RetryRoutingError(str(exc)) from exc
+        return canonical
+
+    def _finalize_retry_decision(self, decision: RetryDecision) -> RetryDecision:
+        return self.validate_retry_decision(decision)
 
     def decide_retry(
         self,
@@ -1007,18 +1603,27 @@ class PolicyExecutorRouter:
         ):
             raise RetryRoutingError("allow_backend_change and explicit_policy disagree")
 
-        prior = _validated_snapshot(ExecutorBinding, prior_selection, "prior binding")
-        new = _validated_snapshot(ExecutorBinding, new_selection, "retry binding")
         try:
-            self._validate_binding_registries(prior, require_current=False)
-            self._validate_binding_registries(new, require_current=False)
-            if new.policy_fingerprint != self._policy_fingerprint:
+            prior = _validated_snapshot(
+                ExecutorBinding, prior_selection, "prior binding"
+            )
+            new = _validated_snapshot(ExecutorBinding, new_selection, "retry binding")
+        except RoutingError as exc:
+            raise RetryRoutingError("retry binding failed trusted validation") from exc
+        try:
+            if (
+                prior.policy_version != self._policy.version
+                or prior.policy_fingerprint != self._policy_fingerprint
+                or new.policy_version != self._policy.version
+                or new.policy_fingerprint != self._policy_fingerprint
+            ):
                 raise RetryRoutingError(
-                    "retry binding is not canonical for the active policy"
+                    "cross-policy retries are unsupported; both bindings must be current"
                 )
+            self._validate_binding_registries(prior, require_current=True)
+            self._validate_binding_registries(new, require_current=True)
+            self._validate_active_binding(prior)
             self._validate_active_binding(new)
-            if prior.policy_fingerprint == self._policy_fingerprint:
-                self._validate_active_binding(prior)
         except RetryRoutingError:
             raise
         except RoutingError as exc:
@@ -1039,7 +1644,48 @@ class PolicyExecutorRouter:
                 raise RetryRoutingError(f"{label} contradicts lifecycle evidence")
 
         if lifecycle_active:
-            return RetryDecision(
+            return self._finalize_retry_decision(
+                RetryDecision(
+                    task_id=prior.task_id,
+                    prior_run=prior.run,
+                    retry_run=new.run,
+                    prior_selection=prior,
+                    new_selection=new,
+                    allowed=False,
+                    decision=RetryDecisionKind.BACKEND_CHANGE_REJECTED,
+                    reason=RetryDecisionReason.ACTIVE_RUN,
+                )
+            )
+        if prior.backend_key() == new.backend_key():
+            return self._finalize_retry_decision(
+                RetryDecision(
+                    task_id=prior.task_id,
+                    prior_run=prior.run,
+                    retry_run=new.run,
+                    prior_selection=prior,
+                    new_selection=new,
+                    allowed=True,
+                    decision=RetryDecisionKind.SAME_BACKEND,
+                    reason=RetryDecisionReason.SAME_BACKEND,
+                )
+            )
+        rule = self._matching_retry_rule(prior, new)
+        if rule is not None:
+            return self._finalize_retry_decision(
+                RetryDecision(
+                    task_id=prior.task_id,
+                    prior_run=prior.run,
+                    retry_run=new.run,
+                    prior_selection=prior,
+                    new_selection=new,
+                    allowed=True,
+                    decision=RetryDecisionKind.BACKEND_CHANGE_ALLOWED,
+                    reason=RetryDecisionReason.EXPLICIT_COMPATIBILITY,
+                    compatibility_proof=self._compatibility_proof(prior, new, rule),
+                )
+            )
+        return self._finalize_retry_decision(
+            RetryDecision(
                 task_id=prior.task_id,
                 prior_run=prior.run,
                 retry_run=new.run,
@@ -1047,39 +1693,8 @@ class PolicyExecutorRouter:
                 new_selection=new,
                 allowed=False,
                 decision=RetryDecisionKind.BACKEND_CHANGE_REJECTED,
-                reason=RetryDecisionReason.ACTIVE_RUN,
+                reason=RetryDecisionReason.BACKEND_CHANGE_NOT_ALLOWED,
             )
-        if prior.backend_key() == new.backend_key():
-            return RetryDecision(
-                task_id=prior.task_id,
-                prior_run=prior.run,
-                retry_run=new.run,
-                prior_selection=prior,
-                new_selection=new,
-                allowed=True,
-                decision=RetryDecisionKind.SAME_BACKEND,
-                reason=RetryDecisionReason.SAME_BACKEND,
-            )
-        if self._explicit_backend_change_allowed(prior, new):
-            return RetryDecision(
-                task_id=prior.task_id,
-                prior_run=prior.run,
-                retry_run=new.run,
-                prior_selection=prior,
-                new_selection=new,
-                allowed=True,
-                decision=RetryDecisionKind.BACKEND_CHANGE_ALLOWED,
-                reason=RetryDecisionReason.EXPLICIT_COMPATIBILITY,
-            )
-        return RetryDecision(
-            task_id=prior.task_id,
-            prior_run=prior.run,
-            retry_run=new.run,
-            prior_selection=prior,
-            new_selection=new,
-            allowed=False,
-            decision=RetryDecisionKind.BACKEND_CHANGE_REJECTED,
-            reason=RetryDecisionReason.BACKEND_CHANGE_NOT_ALLOWED,
         )
 
     def retry(
@@ -1134,31 +1749,9 @@ class PolicyExecutorRouter:
     def _explicit_backend_change_allowed(
         self, prior: ExecutorBinding, new: ExecutorBinding
     ) -> bool:
-        # A caller boolean is only a request and never grants authority.  A
-        # boolean policy value is likewise non-authorizing; only the explicit
-        # exact-rule mode can reach the rule comparison below.
-        if self._policy.compatibility.allow_backend_change_on_retry != (
-            "explicit_policy_only"
-        ):
-            return False
-        for rule in self._policy.compatibility.retry_compatibility:
-            if (
-                rule.role == prior.role
-                and rule.from_executor is prior.executor
-                and rule.to_executor is new.executor
-                and rule.from_id == prior.executor_id
-                and rule.to_id == new.executor_id
-                and rule.from_provider == prior.provider
-                and rule.to_provider == new.provider
-                and rule.from_model == prior.model
-                and rule.to_model == new.model
-                and rule.from_vendor_family == prior.vendor_family
-                and rule.to_vendor_family == new.vendor_family
-                and rule.from_read_only_source == prior.read_only_source
-                and rule.to_read_only_source == new.read_only_source
-            ):
-                return True
-        return False
+        """Compatibility shim that never grants authority by itself."""
+
+        return self._matching_retry_rule(prior, new) is not None
 
     @staticmethod
     def _validate_retry_candidates(
@@ -1178,11 +1771,13 @@ def policy_fingerprint(policy: FactoryPolicy | Mapping[str, Any]) -> str:
     """Return a deterministic credential-free fingerprint of validated policy."""
 
     canonical = _validated_snapshot(FactoryPolicy, policy, "policy")
+    snapshot = _snapshot_model(canonical, FactoryPolicy, "policy")
     payload = json.dumps(
-        canonical.model_dump(mode="json"),
+        _snapshot_jsonable(snapshot),
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=True,
+        allow_nan=False,
     ).encode("utf-8")
     return "sha256:" + hashlib.sha256(payload).hexdigest()
 
@@ -1214,6 +1809,7 @@ __all__ = [
     "ExecutorSelectionRouter",
     "PluggableExecutorRouter",
     "PolicyExecutorRouter",
+    "RetryCompatibilityProof",
     "RetryDecision",
     "RetryDecisionKind",
     "RetryDecisionReason",
