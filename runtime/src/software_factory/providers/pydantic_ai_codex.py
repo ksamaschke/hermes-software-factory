@@ -213,6 +213,12 @@ _REVIEWED_NAMESPACE_SOURCES: dict[str, tuple[str, str, str, str]] = {
         "OpenAICodexProvider._set_http_client",
         "637e5ecc678e88d4af08eb52267dba3966d96aa9455ae5385b5989259e17379f",
     ),
+    "OpenAICodexProvider._create_http_client": (
+        "function",
+        "pydantic_ai.providers.openai_codex",
+        "OpenAICodexProvider._create_http_client",
+        "0636f17f676c50cd04bb161c3f02c3ff05314f7de1aef4e7ab3667d16889dfc7",
+    ),
     "OpenAICodexProvider.name": (
         "function",
         "pydantic_ai.providers.openai_codex",
@@ -260,6 +266,12 @@ _REVIEWED_NAMESPACE_SOURCES: dict[str, tuple[str, str, str, str]] = {
         "pydantic_ai.providers.openai_codex",
         "OpenAICodexProvider._refresh_locked",
         "59e281ab33601f2560ad7ec8903efef3170eb13e28096bff387c1d164418337b",
+    ),
+    "OpenAICodexProvider._refresh_lock": (
+        "function",
+        "pydantic_ai.providers.openai_codex",
+        "OpenAICodexProvider._refresh_lock",
+        "1daa1007fd977f1e1eaf80c73e05eb40e186c495b16e6d79c704eb22ff6a15c4",
     ),
     "OpenAICodexProvider._replace": (
         "function",
@@ -344,6 +356,11 @@ def _static_member(owner: type[Any], name: str) -> object | None:
         return member.__func__
     if isinstance(member, property):
         return member.fget
+    if (
+        type(member).__module__ == "functools"
+        and type(member).__name__ == "cached_property"
+    ):
+        return getattr(member, "func", None)
     return member
 
 
