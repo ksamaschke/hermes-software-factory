@@ -30,6 +30,11 @@ class TraversalBudget:
     string_bytes: int = 0
     encoded_bytes: int = 0
     identities: set[int] = field(default_factory=set)
+    # Trusted immutable model snapshots may intentionally share a child model
+    # (for example, ClaimedRun.run and Lease.run).  Cache those snapshots while
+    # still rejecting recursive active traversal.
+    model_snapshots: dict[int, object] = field(default_factory=dict)
+    active_models: set[int] = field(default_factory=set)
 
     def enter(
         self,

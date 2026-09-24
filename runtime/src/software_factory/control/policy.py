@@ -31,9 +31,94 @@ from yaml.constructor import ConstructorError
 from .._safety import TraversalBudget, TraversalBudgetError
 from ..api.contracts import MAX_IDENTIFIER_LENGTH, Identifier, Revision
 
+_POLICY_ERROR_MESSAGES = {
+    "invalid": "invalid project policy",
+    "source_type": "policy source must use an exact supported type or approved container",
+    "text_type": "policy text must be a built-in string",
+    "yaml": "policy text is not valid YAML",
+    "duplicate_key": "policy contains a duplicate key",
+    "mapping": "project policy mapping must use an approved container",
+    "mapping_keys": "project policy mapping keys must be built-in strings",
+    "unsupported_value": "project policy contains an unsupported value",
+    "safety": "policy exceeds the bounded safety limits; cycles and repeated snapshots are rejected",
+    "roles_required": "policy must define runtime roles or legacy profiles",
+    "roles_profiles": "policy cannot define both runtime roles and legacy profiles",
+    "legacy": "invalid legacy profile settings",
+    "executor": "invalid project policy: executor",
+    "unknown_agent": "invalid project policy: unknown agent",
+    "unknown_provider": "invalid project policy: unknown provider",
+    "unknown_handler": "invalid project policy: unknown handler",
+    "undeclared_model": "invalid project policy: undeclared model",
+    "retry_fields": "invalid project policy: retry compatibility rule requires from_provider",
+    "provider_kind": "invalid project policy: provider kind",
+    "unknown_role": "invalid project policy: unknown role route",
+    "overlapping": "invalid project policy: overlapping canary rule",
+    "exact": "invalid project policy: exact literal identifier required",
+    "cycle": "invalid project policy: provider fallback cycle",
+    "alias": "invalid project policy: ambiguous policy field alias",
+    "alias_source_id": "invalid project policy: retry compatibility rule defines both 'source_id' and 'from_id'",
+    "alias_rule_identity": "invalid project policy: retry compatibility rule defines both 'rule_identity' and 'rule_id'",
+    "provider_prefix": "invalid project policy: model must include a provider prefix",
+}
+
 
 class PolicyError(ValueError):
-    """Raised when a project policy cannot be loaded fail-closed."""
+    """Raised when a project policy cannot be loaded fail-closed.
+
+    Only a code from the static table above becomes observable.  In particular,
+    callers must not be able to turn this boundary exception into a rendering of
+    a YAML parser exception, a Pydantic validation input, or a policy value.
+    """
+
+    __slots__ = ("code",)
+
+    def __init__(self, code: str = "invalid") -> None:
+        safe_code = (
+            code if type(code) is str and code in _POLICY_ERROR_MESSAGES else "invalid"
+        )
+        self.code = safe_code
+        super().__init__(_POLICY_ERROR_MESSAGES[safe_code])
+
+    def __repr__(self) -> str:
+        return f"PolicyError(code={self.code!r})"
+
+
+class _PolicyValidationFailure(ValueError):
+    """Internal static classification for a policy validation failure."""
+
+    __slots__ = ("code",)
+
+    def __init__(self, code: str) -> None:
+        self.code = code if code in _POLICY_ERROR_MESSAGES else "invalid"
+        super().__init__(_POLICY_ERROR_MESSAGES[self.code])
+
+
+def _policy_failure(code: str) -> _PolicyValidationFailure:
+    return _PolicyValidationFailure(code)
+
+
+def _copy_exact_dict(value: object, label: str) -> dict[object, object]:
+    """Take one hook-free snapshot of an exact built-in dict."""
+
+    if type(value) is not dict:
+        raise ValueError(_POLICY_ERROR_MESSAGES["mapping"])
+    try:
+        return dict.copy(value)
+    except (MemoryError, RecursionError, RuntimeError):
+        raise _policy_failure("safety") from None
+
+
+def _copy_exact_sequence(value: object) -> list[object] | tuple[object, ...]:
+    """Take one hook-free snapshot of an exact built-in sequence."""
+
+    if type(value) is list:
+        try:
+            return list.copy(value)
+        except (MemoryError, RecursionError, RuntimeError):
+            raise _policy_failure("safety") from None
+    if type(value) is tuple:
+        return value
+    raise _policy_failure("unsupported_value")
 
 
 _MappingKey = TypeVar("_MappingKey")
@@ -129,8 +214,8 @@ def _validate_immutable_entries(
                 label=f"{label}.{key}",
                 keepalive=keepalive,
             )
-    except TraversalBudgetError as exc:
-        raise ValueError(str(exc)) from exc
+    except TraversalBudgetError:
+        raise ValueError(f"{label} exceeds the bounded safety limits") from None
     return entries  # type: ignore[return-value]
 
 
@@ -148,8 +233,8 @@ def _immutable_mapping_entries(
         raise ValueError(f"{label} must be an exact ImmutableMapping")
     try:
         entries = object.__getattribute__(value, "_entries")
-    except (AttributeError, TypeError) as exc:
-        raise ValueError(f"{label} has no initialized entries") from exc
+    except (AttributeError, TypeError):
+        raise ValueError(f"{label} has no initialized entries") from None
     try:
         extra = object.__getattribute__(value, "__dict__")
     except AttributeError:
@@ -184,11 +269,10 @@ def _validate_immutable_value(
         budget.charge_scalar(value, label)
         return
     if type(value) is dict:
-        budget.enter(value, depth=depth, label=label, length=len(value))
-        try:
-            entries = tuple((key, nested) for key, nested in dict.items(value))
-        except (MemoryError, RuntimeError) as exc:
-            raise ValueError(f"{label} could not be safely traversed") from exc
+        snapshot = _copy_exact_dict(value, label)
+        budget.enter(value, depth=depth, label=label, length=len(snapshot))
+        entries = tuple(dict.items(snapshot))
+        keepalive.append(snapshot)
         keepalive.append(entries)
         _validate_immutable_entries(
             entries,
@@ -199,7 +283,7 @@ def _validate_immutable_value(
         )
         return
     if type(value) in {list, tuple}:
-        exact_sequence = cast(list[object] | tuple[object, ...], value)
+        exact_sequence = _copy_exact_sequence(value)
         budget.enter(
             exact_sequence,
             depth=depth,
@@ -264,32 +348,48 @@ def _validate_immutable_model(
     budget.enter(value, depth=depth, label=label, length=1)
     try:
         raw_state = object.__getattribute__(value, "__dict__")
-        extra = object.__getattribute__(value, "__pydantic_extra__")
-        private = object.__getattribute__(value, "__pydantic_private__")
-    except (AttributeError, TypeError) as exc:
-        raise ValueError(f"{label} has no trusted raw model state") from exc
+    except (AttributeError, TypeError):
+        raise ValueError(f"{label} has no trusted raw model state") from None
     if type(raw_state) is not dict:
         raise ValueError(f"{label} raw model state is not an exact dict")
-    if extra is not None and (type(extra) is not dict or extra):
-        raise ValueError(f"{label} contains unknown extra fields")
-    if private is not None and (type(private) is not dict or private):
-        raise ValueError(f"{label} contains private model state")
+    try:
+        raw_snapshot = dict.copy(raw_state)
+    except (MemoryError, RecursionError, RuntimeError):
+        raise ValueError(f"{label} could not be safely snapshotted") from None
+    try:
+        extra = object.__getattribute__(value, "__pydantic_extra__")
+    except AttributeError:
+        extra = None
+    try:
+        private = object.__getattribute__(value, "__pydantic_private__")
+    except AttributeError:
+        private = None
+    if extra is not None:
+        if type(extra) is not dict:
+            raise ValueError(f"{label} contains unknown extra fields")
+        if dict.copy(extra):
+            raise ValueError(f"{label} contains unknown extra fields")
+    if private is not None:
+        if type(private) is not dict:
+            raise ValueError(f"{label} contains private model state")
+        if dict.copy(private):
+            raise ValueError(f"{label} contains private model state")
     budget.enter(
         raw_state,
         depth=depth + 1,
         label=f"{label}.__dict__",
-        length=len(raw_state),
+        length=len(raw_snapshot),
     )
     expected_names = tuple(model_type.model_fields)
-    actual_names = tuple(dict.keys(raw_state))
+    actual_names = tuple(dict.keys(raw_snapshot))
     if any(type(name) is not str for name in actual_names):
         raise ValueError(f"{label} contains a non-string field name")
     if set(actual_names) != set(expected_names):
         raise ValueError(f"{label} model state is not exact")
-    keepalive.append(raw_state)
+    keepalive.append(raw_snapshot)
     for field_name in expected_names:
         _validate_immutable_value(
-            raw_state[field_name],
+            raw_snapshot[field_name],
             budget=budget,
             depth=depth + 2,
             label=f"{label}.{field_name}",
@@ -326,9 +426,9 @@ def _freeze_immutable_value(
         budget.charge_scalar(value, label)
         return value
     if type(value) is dict:
-        length = len(value)
-        budget.enter(value, depth=depth, label=label, length=length)
-        entries = tuple((key, nested) for key, nested in dict.items(value))
+        snapshot = _copy_exact_dict(value, label)
+        budget.enter(value, depth=depth, label=label, length=len(snapshot))
+        entries = tuple(dict.items(snapshot))
         return _new_immutable_mapping(
             _freeze_immutable_entries(
                 entries,
@@ -339,7 +439,8 @@ def _freeze_immutable_value(
             )
         )
     if type(value) in {list, tuple}:
-        length = len(value)
+        exact_sequence = _copy_exact_sequence(value)
+        length = len(exact_sequence)
         budget.enter(value, depth=depth, label=label, length=length)
         return tuple(
             _freeze_immutable_value(
@@ -349,7 +450,7 @@ def _freeze_immutable_value(
                 label=f"{label}[{index}]",
                 keepalive=keepalive,
             )
-            for index, item in enumerate(value)
+            for index, item in enumerate(exact_sequence)
         )
     if type(value) is ImmutableMapping:
         entries = _immutable_mapping_entries(value, label)
@@ -448,11 +549,12 @@ def _build_immutable_entries(
 
     if type(values) is dict:
         try:
-            entries = tuple((key, nested) for key, nested in dict.items(values))
-        except (MemoryError, RuntimeError) as exc:
+            snapshot = _copy_exact_dict(values, "immutable mapping")
+            entries = tuple(dict.items(snapshot))
+        except ValueError:
             raise TypeError(
                 "ImmutableMapping could not snapshot the exact dict"
-            ) from exc
+            ) from None
     elif type(values) is ImmutableMapping:
         entries = _immutable_mapping_entries(values)
     else:
@@ -466,11 +568,12 @@ def _build_immutable_entries(
             label="immutable mapping",
             keepalive=keepalive,
         )
-    except TraversalBudgetError as exc:
-        raise TypeError(str(exc)) from exc
+    except TraversalBudgetError:
+        raise TypeError("ImmutableMapping exceeds the bounded safety limits") from None
 
 
 _APPROVED_MAPPING_TYPES = frozenset({dict, ImmutableMapping})
+_APPROVED_PATH_TYPES = frozenset({type(Path())})
 
 
 def _reject_unapproved_mapping(value: object, field_name: str) -> None:
@@ -488,7 +591,7 @@ def _mapping_items(value: object):
     """Iterate only an already exact-admitted mapping."""
 
     if type(value) is dict:
-        return dict.items(value)
+        return tuple(dict.items(_copy_exact_dict(value, "policy mapping")))
     if type(value) is ImmutableMapping:
         return _immutable_mapping_entries(value)
     raise TypeError("mapping was not exact-admitted")
@@ -528,11 +631,12 @@ def _deep_freeze(
             )
         return ImmutableMapping(result)
     if type(value) in {list, tuple}:
-        length = len(value)  # exact type is checked before calling len
+        exact_sequence = _copy_exact_sequence(value)
+        length = len(exact_sequence)
         budget.enter(value, depth=depth, label=path, length=length)
         return tuple(
             _deep_freeze(item, budget=budget, depth=depth + 1, path=f"{path}[{index}]")
-            for index, item in enumerate(value)
+            for index, item in enumerate(exact_sequence)
         )
     if isinstance(value, BaseModel):
         # Nested policy models have already passed their typed validators.  We
@@ -620,7 +724,7 @@ class PolicyModel(BaseModel):
 def _as_tuple_input(value: object, field_name: str) -> tuple[object, ...]:
     if type(value) not in {list, tuple}:
         raise ValueError(f"{field_name} must be an exact list or tuple")
-    return tuple(value)
+    return tuple(_copy_exact_sequence(value))
 
 
 def _json_safe_value(
@@ -656,25 +760,24 @@ def _json_safe_value(
         result: dict[str, object] = {}
         for key, nested in items:
             if type(key) is not str:
-                raise ValueError(f"{path} mapping keys must be strings")
+                raise _policy_failure("mapping_keys")
             budget.charge_string(key, f"{path}.{key}")
             if key in result:
-                raise ValueError(f"{path} contains duplicate mapping key {key!r}")
+                raise _policy_failure("mapping_keys")
             result[key] = _json_safe_value(
                 nested, f"{path}.{key}", budget=budget, depth=depth + 1
             )
         return result
     if type(value) in {list, tuple}:
-        length = len(value)  # exact type is checked before calling len
+        exact_sequence = _copy_exact_sequence(value)
+        length = len(exact_sequence)
         budget.enter(value, depth=depth, label=path, length=length)
         return [
             _json_safe_value(item, f"{path}[{index}]", budget=budget, depth=depth + 1)
-            for index, item in enumerate(value)
+            for index, item in enumerate(exact_sequence)
         ]
     _reject_unapproved_mapping(value, path)
-    raise ValueError(
-        f"{path} must contain only JSON-safe scalar, array, or mapping values"
-    )
+    raise _policy_failure("unsupported_value")
 
 
 def _json_safe_mapping(value: object, field_name: str) -> dict[str, object]:
@@ -684,6 +787,37 @@ def _json_safe_mapping(value: object, field_name: str) -> dict[str, object]:
     checked = _json_safe_value(value, field_name, budget=TraversalBudget())
     assert isinstance(checked, dict)
     return checked
+
+
+def _policy_code_from_value_error(error: ValueError) -> str:
+    """Classify an internal failure without rendering its exception text."""
+
+    if type(error) is TraversalBudgetError:
+        return "safety"
+    if isinstance(error, _PolicyValidationFailure):
+        return error.code
+    return "invalid"
+
+
+def _policy_code_from_validation(error: ValidationError) -> str:
+    """Extract only static validation metadata; never inspect input values."""
+
+    try:
+        details = error.errors(include_input=False, include_url=False)
+    except Exception:  # noqa: BLE001 - sanitize every Pydantic rendering failure
+        return "invalid"
+    for detail in details:
+        if type(detail) is not dict:
+            continue
+        context = detail.get("ctx")
+        if type(context) is dict:
+            failure = context.get("error")
+            if isinstance(failure, _PolicyValidationFailure):
+                return failure.code
+        location = detail.get("loc")
+        if type(location) is tuple and "from_provider" in location:
+            return "retry_fields"
+    return "invalid"
 
 
 _ALLOWED_CREDENTIAL_SCHEMES = frozenset(
@@ -819,7 +953,7 @@ def _validate_model_family(kind: ProviderKind, model: str, field_name: str) -> s
         )
     model_provider, _, model_id = model.partition(":")
     if not model_provider:
-        raise ValueError(f"{field_name} must include a non-empty provider prefix")
+        raise _policy_failure("provider_prefix")
     if not model_id:
         raise ValueError(f"{field_name} must include a non-empty model id")
     expected_prefix = _PROVIDER_MODEL_PREFIXES[kind]
@@ -837,16 +971,13 @@ def _validate_exact_route_identifier(value: str, field_name: str) -> str:
     """Require a literal route identity, never a glob or escaped pattern."""
 
     if type(value) is not str:
-        raise ValueError(f"{field_name} must be a built-in identifier string")
+        raise _policy_failure("exact")
     if not value or len(value) > MAX_IDENTIFIER_LENGTH:
-        raise ValueError(
-            f"{field_name} must be a non-empty identifier no longer than "
-            f"{MAX_IDENTIFIER_LENGTH} characters"
-        )
+        raise _policy_failure("exact")
     if "\x00" in value or any(character.isspace() for character in value):
-        raise ValueError(f"{field_name} must not contain whitespace or NUL")
+        raise _policy_failure("exact")
     if any(character in _GLOB_SYNTAX for character in value):
-        raise ValueError(f"{field_name} must be an exact literal identifier")
+        raise _policy_failure("exact")
     return value
 
 
@@ -858,6 +989,13 @@ class ProviderDefinition(PolicyModel):
     refresh_lock: Literal["required", "optional", "disabled"] | None = None
     fallback_provider: Identifier | None = None
     models: tuple[Revision, ...] = Field(default_factory=tuple)
+
+    @field_validator("kind", mode="before")
+    @classmethod
+    def provider_kind_is_supported(cls, value: object) -> object:
+        if type(value) is not str or value not in {kind.value for kind in ProviderKind}:
+            raise _policy_failure("provider_kind")
+        return value
 
     @field_validator("models", mode="before")
     @classmethod
@@ -895,6 +1033,13 @@ class RoleRoute(PolicyModel):
     max_in_progress: StrictInt | None = Field(default=None, ge=1)
     max_runtime_seconds: StrictInt | None = Field(default=None, ge=1)
     read_only_source: StrictBool | None = None
+
+    @field_validator("executor", mode="before")
+    @classmethod
+    def executor_kind_is_supported(cls, value: object) -> object:
+        if type(value) is not str or value not in {kind.value for kind in ExecutorKind}:
+            raise _policy_failure("executor")
+        return value
 
     @field_validator(
         "agent",
@@ -1042,17 +1187,14 @@ class RetryCompatibilityRule(PolicyModel):
         }
         if "rule_identity" in data:
             if "rule_id" in data:
-                raise ValueError(
-                    "retry compatibility rule defines both 'rule_identity' and 'rule_id'"
-                )
+                raise _policy_failure("alias_rule_identity")
             data["rule_id"] = data.pop("rule_identity")
         for alias, canonical in aliases.items():
             if alias not in data:
                 continue
             if canonical in data:
-                raise ValueError(
-                    f"retry compatibility rule defines both {alias!r} and {canonical!r}"
-                )
+                code = "alias_source_id" if alias == "source_id" else "alias"
+                raise _policy_failure(code)
             data[canonical] = data.pop(alias)
         return data
 
@@ -1372,9 +1514,7 @@ class CompatibilityPolicy(PolicyModel):
         seen_task_ids: set[str] = set()
         for rule in self.canary_rules:
             if rule.task_id in seen_task_ids:
-                raise ValueError(
-                    f"overlapping canary rule for exact task_id {rule.task_id!r}"
-                )
+                raise _policy_failure("overlapping")
             seen_task_ids.add(rule.task_id)
 
         seen_retry_rules: set[tuple[object, ...]] = set()
@@ -1396,10 +1536,10 @@ class CompatibilityPolicy(PolicyModel):
                 rule.role,
             )
             if key in seen_retry_rules:
-                raise ValueError("duplicate retry compatibility rule")
+                raise _policy_failure("overlapping")
             seen_retry_rules.add(key)
             if rule.rule_id in seen_retry_rule_ids:
-                raise ValueError("duplicate retry compatibility rule identity")
+                raise _policy_failure("overlapping")
             seen_retry_rule_ids.add(rule.rule_id)
         return self
 
@@ -1566,7 +1706,7 @@ class FactoryPolicy(PolicyModel):
     ) -> Mapping[str, RoleRoute]:
         unknown = sorted(set(values) - ROLE_KEYS)
         if unknown:
-            raise ValueError(f"unknown role route(s): {', '.join(unknown)}")
+            raise _policy_failure("unknown_role")
         return values
 
     @model_validator(mode="after")
@@ -1699,32 +1839,22 @@ def _validate_route_references(
 ) -> None:
     prefix = f"roles.{role}"
     if route.agent is not None and route.agent not in agents:
-        raise ValueError(f"{prefix}.agent references unknown agent {route.agent!r}")
+        raise _policy_failure("unknown_agent")
     if route.agent is not None:
         output_contract = agents[route.agent].output_contract
         if output_contract not in SUPPORTED_OUTCOME_CONTRACTS:
-            raise ValueError(
-                f"{prefix}.agent references unsupported output contract "
-                f"{output_contract!r}"
-            )
+            raise _policy_failure("unknown_agent")
     if route.provider is not None and route.provider not in providers:
-        raise ValueError(
-            f"{prefix}.provider references unknown provider {route.provider!r}"
-        )
+        raise _policy_failure("unknown_provider")
     if route.handler is not None and route.handler not in handlers:
-        raise ValueError(
-            f"{prefix}.handler references unknown handler {route.handler!r}"
-        )
+        raise _policy_failure("unknown_handler")
     if route.model is None:
         return
     if route.provider is None or route.provider not in providers:
         return
     provider = providers[route.provider]
     if provider.models and route.model not in provider.models:
-        raise ValueError(
-            f"{prefix}.model references an undeclared model {route.model!r} for "
-            f"provider {route.provider!r}"
-        )
+        raise _policy_failure("undeclared_model")
     _validate_model_family(provider.kind, route.model, f"{prefix}.model")
 
 
@@ -1738,8 +1868,7 @@ def _validate_provider_fallback_graph(
 
     def visit(provider_name: str, path: tuple[str, ...] = ()) -> None:
         if provider_name in visiting:
-            cycle = " -> ".join((*path, provider_name))
-            raise ValueError(f"provider fallback cycle detected: {cycle}")
+            raise _policy_failure("cycle")
         if provider_name in visited:
             return
         visiting.add(provider_name)
@@ -1766,6 +1895,10 @@ AgentSpec = AgentDefinition
 ProviderSpec = ProviderDefinition
 
 
+class _DuplicateYAMLKey(ConstructorError):
+    """Raised for a duplicate YAML mapping key without retaining its value."""
+
+
 class _UniqueKeySafeLoader(yaml.SafeLoader):
     """Safe YAML loader that rejects duplicate mapping keys."""
 
@@ -1786,10 +1919,10 @@ def _construct_unique_mapping(loader: _UniqueKeySafeLoader, node, deep: bool = F
                 key_node.start_mark,
             ) from exc
         if duplicate:
-            raise ConstructorError(
+            raise _DuplicateYAMLKey(
                 "while constructing a mapping",
                 node.start_mark,
-                f"found duplicate key {key!r}",
+                "found duplicate mapping key",
                 key_node.start_mark,
             )
         mapping[key] = loader.construct_object(value_node, deep=deep)
@@ -1827,11 +1960,11 @@ def _load_json(text: str) -> object:
 
 def _load_text_document(text: str) -> object:
     if type(text) is not str:
-        raise PolicyError("policy text must be a built-in string")
+        raise _policy_failure("text_type")
     try:
         TraversalBudget().charge_string(text, "policy text")
-    except TraversalBudgetError as exc:
-        raise PolicyError(str(exc)) from exc
+    except TraversalBudgetError:
+        raise _policy_failure("safety") from None
     stripped = text.lstrip()
     if stripped.startswith(("{", "[")):
         try:
@@ -1844,71 +1977,112 @@ def _load_text_document(text: str) -> object:
 
 
 def _read_document(source: str | Path | Mapping[str, Any]) -> dict[str, Any]:
+    document: object = None
+    raw_source: str | None = None
+    text: str | None = None
+    path: Path | None = None
+    error_code: str | None = None
+
     if type(source) in _APPROVED_MAPPING_TYPES:
         try:
             document = _json_safe_mapping(source, "project policy")
-        except ValueError as exc:
-            raise PolicyError(str(exc)) from exc
-    elif isinstance(source, Mapping):
-        raise PolicyError("project policy mapping must use an approved container")
-    else:
-        if isinstance(source, str):
-            if type(source) is not str:
-                raise PolicyError("policy text must be a built-in string")
-            raw_source = source
-            looks_like_yaml = "\n" in source or source.lstrip().startswith(
-                ("{", "[", "version:")
-            )
-        else:
-            raw_source = str(source)
-            looks_like_yaml = False
+        except ValueError as failure:
+            error_code = _policy_code_from_value_error(failure)
+    elif type(source) is str:
+        raw_source = source
+        looks_like_yaml = "\n" in raw_source or raw_source.lstrip().startswith(
+            ("{", "[", "version:")
+        )
         if looks_like_yaml:
             try:
                 document = _load_text_document(raw_source)
-            except _DuplicateJSONKey as exc:
-                raise PolicyError(
-                    f"policy JSON contains a duplicate key: {exc}"
-                ) from exc
-            except yaml.YAMLError as exc:
-                raise PolicyError(f"policy text is not valid YAML: {exc}") from exc
+            except _DuplicateJSONKey:
+                error_code = "duplicate_key"
+            except _DuplicateYAMLKey:
+                error_code = "duplicate_key"
+            except yaml.YAMLError:
+                error_code = "yaml"
+            except ValueError as failure:
+                error_code = _policy_code_from_value_error(failure)
         else:
-            path = Path(source)
             try:
+                path = Path(raw_source)
                 exists = path.exists()
-            except OSError as exc:
-                raise PolicyError(
-                    f"cannot inspect policy source {source!r}: {exc}"
-                ) from exc
-            if exists:
+            except (OSError, ValueError):
+                error_code = "invalid"
+                exists = False
+            if error_code is None and exists:
+                assert path is not None
                 try:
-                    document = _load_text_document(path.read_text(encoding="utf-8"))
-                except OSError as exc:
-                    raise PolicyError(f"cannot read policy {path}: {exc}") from exc
-                except _DuplicateJSONKey as exc:
-                    raise PolicyError(
-                        f"policy {path} JSON contains a duplicate key: {exc}"
-                    ) from exc
-                except yaml.YAMLError as exc:
-                    raise PolicyError(
-                        f"policy {path} is not valid YAML: {exc}"
-                    ) from exc
-            else:
+                    text = path.read_text(encoding="utf-8")
+                    document = _load_text_document(text)
+                except OSError:
+                    error_code = "invalid"
+                except _DuplicateJSONKey:
+                    error_code = "duplicate_key"
+                except yaml.YAMLError:
+                    error_code = "yaml"
+                except ValueError as failure:
+                    error_code = _policy_code_from_value_error(failure)
+            elif error_code is None:
                 try:
                     document = _load_text_document(raw_source)
-                except _DuplicateJSONKey as exc:
-                    raise PolicyError(
-                        f"policy JSON contains a duplicate key: {exc}"
-                    ) from exc
-                except yaml.YAMLError as exc:
-                    raise PolicyError(
-                        f"policy path does not exist and text is invalid: {source}: {exc}"
-                    ) from exc
-    if type(document) not in _APPROVED_MAPPING_TYPES:
-        raise PolicyError("project policy must be a YAML mapping")
-    try:
-        return _json_safe_mapping(document, "project policy")
-    except ValueError as exc:
-        raise PolicyError(str(exc)) from exc
+                except _DuplicateJSONKey:
+                    error_code = "duplicate_key"
+                except _DuplicateYAMLKey:
+                    error_code = "duplicate_key"
+                except yaml.YAMLError:
+                    error_code = "yaml"
+                except ValueError as failure:
+                    error_code = _policy_code_from_value_error(failure)
+    elif type(source) in _APPROVED_PATH_TYPES:
+        path = cast(Path, source)
+        try:
+            exists = path.exists()
+        except OSError:
+            exists = False
+            error_code = "invalid"
+        if error_code is None and exists:
+            try:
+                text = path.read_text(encoding="utf-8")
+                document = _load_text_document(text)
+            except OSError:
+                error_code = "invalid"
+            except _DuplicateJSONKey:
+                error_code = "duplicate_key"
+            except _DuplicateYAMLKey:
+                error_code = "duplicate_key"
+            except yaml.YAMLError:
+                error_code = "yaml"
+            except ValueError as failure:
+                error_code = _policy_code_from_value_error(failure)
+        elif error_code is None:
+            error_code = "invalid"
+    else:
+        error_code = "source_type"
+
+    if error_code is None and type(document) not in _APPROVED_MAPPING_TYPES:
+        error_code = "mapping"
+    if error_code is None:
+        try:
+            result = _json_safe_mapping(document, "project policy")
+        except ValueError as failure:
+            error_code = _policy_code_from_value_error(failure)
+        else:
+            source = None  # type: ignore[assignment]
+            raw_source = None
+            text = None
+            path = None
+            document = None
+            return result
+
+    source = None  # type: ignore[assignment]
+    raw_source = None
+    text = None
+    path = None
+    document = None
+    error = PolicyError(error_code)
+    raise error
 
 
 _LEGACY_ROUTE_ROLES = (
@@ -1926,12 +2100,26 @@ _LEGACY_ROUTE_ROLES = (
 
 def _legacy_policy(document: Mapping[str, Any]) -> dict[str, Any]:
     profiles = document.get("profiles")
-    if not isinstance(profiles, Mapping):
-        raise PolicyError("legacy project policy requires a profiles mapping")
+    if type(profiles) not in _APPROVED_MAPPING_TYPES:
+        document = None  # type: ignore[assignment]
+        profiles = None
+        error = PolicyError("legacy")
+        raise error
+    legacy_settings: LegacySettings | None = None
+    error_code: str | None = None
     try:
         legacy_settings = LegacySettings.model_validate(profiles)
-    except ValidationError as exc:
-        raise PolicyError(f"invalid legacy profile settings: {exc}") from exc
+    except ValidationError:
+        error_code = "legacy"
+
+    if error_code is not None:
+        document = None  # type: ignore[assignment]
+        profiles = None
+        legacy_settings = None
+        error = PolicyError(error_code)
+        raise error
+
+    assert legacy_settings is not None
 
     roles: dict[str, dict[str, str]] = {}
     fallbacks: dict[str, dict[str, str]] = {}
@@ -1966,27 +2154,53 @@ def load_policy(source: str | Path | Mapping[str, Any]) -> FactoryPolicy:
     compatibility mapper; they are never silently treated as runtime routes.
     """
 
+    document: dict[str, Any] | None = None
+    result: FactoryPolicy | None = None
+    error_code: str | None = None
     try:
         document = _read_document(source)
         if "roles" not in document:
             if "profiles" not in document:
-                raise PolicyError("policy must define runtime roles or legacy profiles")
-            document = _legacy_policy(document)
+                error_code = "roles_required"
+            else:
+                document = _legacy_policy(document)
         elif "profiles" in document:
-            raise PolicyError(
-                "policy cannot define both runtime roles and legacy profiles"
-            )
-        return FactoryPolicy.model_validate(document)
-    except (RecursionError, MemoryError) as exc:
-        raise PolicyError("policy exceeds the bounded safety limits") from exc
-    except ValidationError as exc:
-        raise PolicyError(f"invalid project policy: {exc}") from exc
+            error_code = "roles_profiles"
+        if error_code is None:
+            result = FactoryPolicy.model_validate(document)
+    except PolicyError as failure:
+        error_code = failure.code
+    except ValidationError as failure:
+        error_code = _policy_code_from_validation(failure)
+    except (RecursionError, MemoryError, TraversalBudgetError):
+        error_code = "safety"
+    except Exception:  # noqa: BLE001 - public policy errors must never render input
+        error_code = "invalid"
+
+    source = None  # type: ignore[assignment]
+    document = None
+    if error_code is not None:
+        error = PolicyError(error_code)
+        raise error
+    assert result is not None
+    return result
 
 
 def load_project_policy(source: str | Path | Mapping[str, Any]) -> FactoryPolicy:
     """Backward-compatible name for :func:`load_policy`."""
 
-    return load_policy(source)
+    result: FactoryPolicy | None = None
+    error_code: str | None = None
+    try:
+        result = load_policy(source)
+    except PolicyError as failure:
+        error_code = failure.code
+    source = None  # type: ignore[assignment]
+    if error_code is not None:
+        error = PolicyError(error_code)
+        raise error
+    assert result is not None
+    return result
 
 
 __all__ = [
